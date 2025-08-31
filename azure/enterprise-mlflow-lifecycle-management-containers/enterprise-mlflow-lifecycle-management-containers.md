@@ -4,12 +4,12 @@ id: f4a8b2c6
 category: machine-learning
 difficulty: 200
 subject: azure
-services: Azure Machine Learning, Azure Container Apps, MLflow, Azure Monitor
+services: Azure Machine Learning, Azure Container Apps, Azure Monitor, Azure Container Registry
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: mlflow, model-lifecycle, machine-learning, containerization, monitoring, devops
 recipe-generator-version: 1.3
@@ -85,11 +85,12 @@ graph TB
 
 ## Prerequisites
 
-1. Azure subscription with appropriate permissions for Azure Machine Learning, Container Apps, and Monitor
+1. Azure subscription with appropriate permissions for Azure Machine Learning, Container Apps, and Azure Monitor
 2. Azure CLI v2.45.0 or later installed and configured
 3. Python 3.8+ with MLflow and Azure ML SDK installed
-4. Basic understanding of machine learning workflows and containerization
-5. Estimated cost: $50-100 for a full day of testing with standard compute instances
+4. Docker installed for container image building
+5. Basic understanding of machine learning workflows and containerization
+6. Estimated cost: $50-100 for a full day of testing with standard compute instances
 
 > **Note**: This recipe uses Azure Machine Learning's built-in MLflow integration, eliminating the need for a separate MLflow server while providing enterprise-grade features and security.
 
@@ -164,10 +165,12 @@ echo "✅ Container Registry created: ${CONTAINER_REGISTRY_NAME}"
        --workspace-name ${LOG_ANALYTICS_NAME} \
        --location ${LOCATION}
    
-   # Get Log Analytics workspace ID
-   LOG_ANALYTICS_ID=$(az monitor log-analytics workspace show \
+   # Get Application Insights resource ID for ML workspace
+   APPINSIGHTS_ID=$(az monitor app-insights component create \
+       --app ${LOG_ANALYTICS_NAME} \
+       --location ${LOCATION} \
        --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${LOG_ANALYTICS_NAME} \
+       --workspace ${LOG_ANALYTICS_NAME} \
        --query id --output tsv)
    
    # Create ML workspace with MLflow integration
@@ -178,7 +181,7 @@ echo "✅ Container Registry created: ${CONTAINER_REGISTRY_NAME}"
        --storage-account ${STORAGE_ACCOUNT_NAME} \
        --key-vault ${KEY_VAULT_NAME} \
        --container-registry ${CONTAINER_REGISTRY_NAME} \
-       --application-insights ${LOG_ANALYTICS_ID}
+       --application-insights ${APPINSIGHTS_ID}
    
    echo "✅ ML Workspace created with MLflow integration"
    ```
@@ -283,6 +286,7 @@ echo "✅ Container Registry created: ${CONTAINER_REGISTRY_NAME}"
 
    ```bash
    # Execute model training with MLflow tracking
+   python mlflow_config.py
    python train_model.py
    
    # List registered models to verify registration
@@ -319,18 +323,25 @@ echo "✅ Container Registry created: ${CONTAINER_REGISTRY_NAME}"
    Azure Container Apps provides a serverless container platform with built-in scaling, load balancing, and monitoring capabilities. Creating a container app environment establishes the foundation for scalable model serving with automatic resource management and integration with Azure Monitor for comprehensive observability.
 
    ```bash
+   # Get Log Analytics workspace ID for Container Apps
+   LOG_ANALYTICS_ID=$(az monitor log-analytics workspace show \
+       --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${LOG_ANALYTICS_NAME} \
+       --query customerId --output tsv)
+   
+   LOG_ANALYTICS_KEY=$(az monitor log-analytics workspace get-shared-keys \
+       --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${LOG_ANALYTICS_NAME} \
+       --query primarySharedKey --output tsv)
+   
    # Create Container Apps environment
    az containerapp env create \
        --name ${CONTAINER_APP_ENV} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --logs-workspace-id ${LOG_ANALYTICS_ID}
-   
-   # Enable monitoring and diagnostics
-   az containerapp env show \
-       --name ${CONTAINER_APP_ENV} \
-       --resource-group ${RESOURCE_GROUP} \
-       --query properties.appLogsConfiguration
+       --logs-destination log-analytics \
+       --logs-workspace-id ${LOG_ANALYTICS_ID} \
+       --logs-workspace-key ${LOG_ANALYTICS_KEY}
    
    echo "✅ Container App environment created with monitoring"
    ```
@@ -428,9 +439,10 @@ echo "✅ Container Registry created: ${CONTAINER_REGISTRY_NAME}"
    
    WORKDIR /app
    
-   # Install system dependencies
+   # Install system dependencies including curl for health checks
    RUN apt-get update && apt-get install -y \
        gcc \
+       curl \
        && rm -rf /var/lib/apt/lists/*
    
    # Copy requirements and install Python packages
@@ -451,15 +463,15 @@ echo "✅ Container Registry created: ${CONTAINER_REGISTRY_NAME}"
    CMD ["python", "app.py"]
    EOF
    
-   # Create requirements file
+   # Create requirements file with current package versions
    cat > requirements.txt << 'EOF'
-   flask==2.3.3
-   mlflow==2.8.0
-   azureml-mlflow==1.54.0
-   scikit-learn==1.3.0
-   numpy==1.24.3
-   pandas==2.0.3
-   azureml-core==1.54.0
+   flask==3.0.0
+   mlflow==2.9.2
+   azureml-mlflow==1.55.0
+   scikit-learn==1.3.2
+   numpy==1.24.4
+   pandas==2.1.4
+   azureml-core==1.55.0
    EOF
    
    cd ..
@@ -517,7 +529,8 @@ echo "✅ Container Registry created: ${CONTAINER_REGISTRY_NAME}"
        --max-replicas 10 \
        --cpu 1.0 \
        --memory 2.0Gi \
-       --env-vars MODEL_NAME=demo-regression-model MODEL_VERSION=latest
+       --env-vars MODEL_NAME=demo-regression-model \
+                  MODEL_VERSION=latest
    
    echo "✅ Container app deployed with model serving"
    ```
@@ -534,29 +547,6 @@ echo "✅ Container Registry created: ${CONTAINER_REGISTRY_NAME}"
        --name ${CONTAINER_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query properties.configuration.ingress.fqdn --output tsv)
-   
-   # Create custom metrics for model monitoring
-   cat > monitoring-config.json << EOF
-   {
-       "metrics": [
-           {
-               "name": "model_prediction_latency",
-               "description": "Model prediction response time",
-               "unit": "Milliseconds"
-           },
-           {
-               "name": "model_accuracy_score",
-               "description": "Model accuracy metrics",
-               "unit": "Percent"
-           },
-           {
-               "name": "model_request_count",
-               "description": "Number of prediction requests",
-               "unit": "Count"
-           }
-       ]
-   }
-   EOF
    
    # Create alert rules for model performance
    az monitor metrics alert create \
@@ -735,15 +725,15 @@ echo "✅ Container Registry created: ${CONTAINER_REGISTRY_NAME}"
 
 ## Discussion
 
-This comprehensive MLflow model lifecycle management solution demonstrates how Azure Machine Learning and Azure Container Apps work together to provide enterprise-grade ML operations capabilities. The integration between Azure ML's built-in MLflow support and Container Apps' serverless container platform creates a seamless workflow from experimentation to production deployment. For detailed information about Azure Machine Learning's MLflow integration, see the [official documentation](https://docs.microsoft.com/en-us/azure/machine-learning/how-to-use-mlflow-configure-tracking).
+This comprehensive MLflow model lifecycle management solution demonstrates how Azure Machine Learning and Azure Container Apps work together to provide enterprise-grade ML operations capabilities. The integration between Azure ML's built-in MLflow support and Container Apps' serverless container platform creates a seamless workflow from experimentation to production deployment. Azure Machine Learning's MLflow integration automatically manages experiment tracking, model versioning, and artifact storage, following the [MLOps best practices](https://learn.microsoft.com/en-us/azure/machine-learning/concept-model-management-and-deployment) outlined in Microsoft's documentation.
 
-The architecture follows MLOps best practices by providing centralized experiment tracking, automated model versioning, and scalable deployment infrastructure. Azure Machine Learning's managed MLflow service eliminates the operational overhead of maintaining MLflow servers while providing enterprise security, compliance, and integration with Azure's ecosystem. The [Azure Container Apps documentation](https://docs.microsoft.com/en-us/azure/container-apps/overview) provides comprehensive guidance on serverless container deployment and scaling strategies.
+The architecture follows Azure Well-Architected Framework principles by providing centralized experiment tracking, automated model versioning, and scalable deployment infrastructure. Azure Machine Learning's managed MLflow service eliminates the operational overhead of maintaining MLflow servers while providing enterprise security, compliance, and integration with Azure's ecosystem. The [Azure Container Apps documentation](https://learn.microsoft.com/en-us/azure/container-apps/overview) provides comprehensive guidance on serverless container deployment and scaling strategies that complement this MLflow implementation.
 
-Azure Monitor's integration provides comprehensive observability across the entire ML lifecycle, from experiment tracking to model performance monitoring. This enables proactive detection of model drift, performance degradation, and infrastructure issues. The combination of custom metrics, automated alerting, and log analytics provides the foundation for reliable production ML systems. For advanced monitoring patterns, consult the [Azure Monitor documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/overview).
+Azure Monitor's integration provides comprehensive observability across the entire ML lifecycle, from experiment tracking to model performance monitoring. This enables proactive detection of model drift, performance degradation, and infrastructure issues. The combination of custom metrics, automated alerting, and log analytics provides the foundation for reliable production ML systems. For advanced monitoring patterns and best practices, consult the [Azure Monitor documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/overview) and [ML monitoring guides](https://learn.microsoft.com/en-us/azure/machine-learning/how-to-monitor-datasets).
 
-The solution's serverless architecture ensures cost-effective scaling, where resources are consumed only when needed. Container Apps automatically scale based on demand, while Azure Machine Learning provides managed compute resources for training and experimentation. This approach optimizes both performance and cost for variable ML workloads. For cost optimization strategies, review the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/cost/) principles.
+The solution's serverless architecture ensures cost-effective scaling, where resources are consumed only when needed. Container Apps automatically scale based on demand, while Azure Machine Learning provides managed compute resources for training and experimentation. This approach optimizes both performance and cost for variable ML workloads, following the [cost optimization principles](https://learn.microsoft.com/en-us/azure/architecture/framework/cost/) of the Azure Well-Architected Framework.
 
-> **Tip**: Use Azure DevOps or GitHub Actions to automate the container image building and deployment process, creating a complete CI/CD pipeline for your ML models. This enables automatic deployment of new model versions while maintaining proper testing and validation procedures.
+> **Tip**: Use Azure DevOps or GitHub Actions to automate the container image building and deployment process, creating a complete CI/CD pipeline for your ML models. This enables automatic deployment of new model versions while maintaining proper testing and validation procedures according to Azure MLOps best practices.
 
 ## Challenge
 
@@ -761,4 +751,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

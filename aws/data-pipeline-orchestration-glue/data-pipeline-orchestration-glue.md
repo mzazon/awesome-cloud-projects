@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: glue, s3, iam, cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: etl, data-pipeline, orchestration, workflow, serverless, data-catalog
 recipe-generator-version: 1.3
@@ -37,8 +37,7 @@ graph TB
     subgraph "AWS Glue Workflow"
         START_TRIGGER[Schedule Trigger]
         CRAWLER1[Source Data Crawler]
-        ETL_JOB1[Data Cleaning Job]
-        ETL_JOB2[Data Transformation Job]
+        ETL_JOB1[Data Processing Job]
         CRAWLER2[Target Data Crawler]
         EVENT_TRIGGER[Event Trigger]
     end
@@ -55,18 +54,15 @@ graph TB
     S3_RAW --> CRAWLER1
     START_TRIGGER --> CRAWLER1
     CRAWLER1 --> ETL_JOB1
-    ETL_JOB1 --> ETL_JOB2
-    ETL_JOB2 --> CRAWLER2
+    ETL_JOB1 --> CRAWLER2
     EVENT_TRIGGER --> ETL_JOB1
     
     CRAWLER1 --> CATALOG
     CRAWLER2 --> CATALOG
     ETL_JOB1 --> S3_PROCESSED
-    ETL_JOB2 --> S3_PROCESSED
     
     CRAWLER1 --> CW
     ETL_JOB1 --> CW
-    ETL_JOB2 --> CW
     CRAWLER2 --> CW
     
     START_TRIGGER --> CW_METRICS
@@ -132,7 +128,7 @@ echo "✅ Environment prepared successfully"
 
 1. **Create IAM Role for Glue Workflow Operations**:
 
-   AWS Glue Workflows require IAM roles with specific permissions to access S3, execute jobs, and manage crawlers. This role enables the serverless execution model where AWS Glue assumes the role to perform operations on your behalf, ensuring secure and controlled access to your data resources.
+   AWS Glue Workflows require IAM roles with specific permissions to access S3, execute jobs, and manage crawlers. This role enables the serverless execution model where AWS Glue assumes the role to perform operations on your behalf, ensuring secure and controlled access to your data resources following the principle of least privilege.
 
    ```bash
    # Create trust policy for Glue service
@@ -190,6 +186,9 @@ echo "✅ Environment prepared successfully"
        --policy-name S3AccessPolicy \
        --policy-document file://s3-access-policy.json
    
+   # Wait for role propagation
+   sleep 30
+   
    # Store the role ARN for later use
    export GLUE_ROLE_ARN=$(aws iam get-role \
        --role-name ${GLUE_ROLE_NAME} \
@@ -198,7 +197,7 @@ echo "✅ Environment prepared successfully"
    echo "✅ IAM role created: ${GLUE_ROLE_ARN}"
    ```
 
-   The IAM role is now configured with appropriate permissions for Glue operations. This security foundation enables workflows to access S3 data sources and execute ETL operations while maintaining the principle of least privilege.
+   The IAM role is now configured with appropriate permissions for Glue operations. This security foundation enables workflows to access S3 data sources and execute ETL operations while maintaining AWS security best practices.
 
 2. **Create Data Catalog Database**:
 
@@ -420,9 +419,13 @@ echo "✅ Environment prepared successfully"
     aws glue start-workflow-run \
         --name ${WORKFLOW_NAME}
     
+    # Wait for the workflow run to be created
+    sleep 5
+    
     # Get workflow run ID for monitoring
     export WORKFLOW_RUN_ID=$(aws glue get-workflow-runs \
         --name ${WORKFLOW_NAME} \
+        --max-results 1 \
         --query 'Runs[0].WorkflowRunId' --output text)
     
     echo "✅ Workflow started with run ID: ${WORKFLOW_RUN_ID}"
@@ -475,6 +478,7 @@ echo "✅ Environment prepared successfully"
    aws s3 ls s3://${S3_BUCKET_PROCESSED}/output/ --recursive
    
    # Download and inspect sample processed data
+   mkdir -p processed-data
    aws s3 cp s3://${S3_BUCKET_PROCESSED}/output/ \
        ./processed-data/ --recursive --exclude "*" --include "*.parquet"
    ```
@@ -562,7 +566,7 @@ echo "✅ Environment prepared successfully"
 
 ## Discussion
 
-AWS Glue Workflows provide a powerful orchestration framework that transforms complex ETL operations into manageable, automated data pipelines. The workflow model addresses the fundamental challenge of coordinating multiple interdependent data processing components while maintaining visibility into execution states and providing robust error handling capabilities.
+AWS Glue Workflows provide a powerful orchestration framework that transforms complex ETL operations into manageable, automated data pipelines. The workflow model addresses the fundamental challenge of coordinating multiple interdependent data processing components while maintaining visibility into execution states and providing robust error handling capabilities. This serverless approach follows AWS Well-Architected Framework principles by eliminating infrastructure management overhead while delivering automatic scaling and cost optimization.
 
 The architecture demonstrated in this recipe showcases the three core workflow components working in harmony. Crawlers automatically discover and catalog data schemas, eliminating manual metadata management while ensuring catalog consistency. ETL jobs execute transformation logic using serverless Spark clusters, providing automatic scaling and cost optimization. Triggers create sophisticated dependency chains that coordinate execution based on success states, schedules, or external events, enabling complex orchestration patterns without custom coordination logic.
 
@@ -576,16 +580,23 @@ The serverless nature of Glue Workflows delivers substantial cost and operationa
 
 Extend this solution by implementing these enhancements:
 
-1. **Add EventBridge Integration**: Configure workflows to start based on S3 object creation events using EventBridge triggers, enabling real-time data processing capabilities.
+1. **Add EventBridge Integration**: Configure workflows to start based on S3 object creation events using EventBridge triggers, enabling real-time data processing capabilities for streaming data scenarios.
 
-2. **Implement Data Quality Checks**: Create additional Glue jobs within the workflow that validate data quality metrics and implement conditional logic to handle quality failures.
+2. **Implement Data Quality Checks**: Create additional Glue jobs within the workflow that validate data quality metrics and implement conditional logic to handle quality failures with retry mechanisms.
 
-3. **Build Multi-Environment Workflow**: Extend the workflow to support development, staging, and production environments with parameter-driven configuration management.
+3. **Build Multi-Environment Workflow**: Extend the workflow to support development, staging, and production environments with parameter-driven configuration management using AWS Systems Manager Parameter Store.
 
-4. **Add Advanced Error Handling**: Implement retry logic, dead letter queues, and SNS notifications for workflow failures using Step Functions integration.
+4. **Add Advanced Error Handling**: Implement retry logic, dead letter queues, and SNS notifications for workflow failures using AWS Step Functions integration for complex error handling patterns.
 
-5. **Create Workflow Templates**: Develop CloudFormation or CDK templates that parameterize the workflow creation process for repeatable deployments across multiple data pipelines.
+5. **Create Workflow Templates**: Develop CloudFormation or CDK templates that parameterize the workflow creation process for repeatable deployments across multiple data pipelines and teams.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

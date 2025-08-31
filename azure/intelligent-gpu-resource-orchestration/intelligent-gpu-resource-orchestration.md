@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Container Apps, Azure Batch, Azure Monitor, Azure Key Vault
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: gpu-computing, machine-learning, container-orchestration, cost-optimization, serverless, batch-processing
 recipe-generator-version: 1.3
@@ -96,7 +96,7 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-gpu-orchestration"
+export RESOURCE_GROUP="rg-gpu-orchestration-${RANDOM_SUFFIX}"
 export LOCATION="westus3"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -268,33 +268,32 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
    The Container Apps environment is now configured with Log Analytics integration for comprehensive monitoring. GPU workload profiles enable serverless GPU computing with automatic scaling and pay-per-second billing for real-time ML inference workloads.
 
-4. **Deploy ML Inference Container App with GPU Configuration**:
+4. **Add GPU Workload Profile and Deploy ML Inference Container App**:
 
    The Container App provides serverless GPU-accelerated ML inference with automatic scaling based on HTTP requests. This configuration uses NVIDIA T4 GPUs for cost-effective real-time inference while maintaining sub-second response times for interactive applications.
 
    ```bash
+   # Add GPU workload profile to environment 
+   az containerapp env workload-profile add \
+       --name ${ACA_ENVIRONMENT} \
+       --resource-group ${RESOURCE_GROUP} \
+       --workload-profile-name "gpu-t4-profile" \
+       --workload-profile-type "Consumption-GPU-NC8as-T4"
+   
    # Create the ML inference container app with GPU
    az containerapp create \
        --name ${ACA_APP} \
        --resource-group ${RESOURCE_GROUP} \
        --environment ${ACA_ENVIRONMENT} \
-       --image "mcr.microsoft.com/azuredocs/aci-tutorial-app" \
+       --image "mcr.microsoft.com/k8se/gpu-quickstart:latest" \
        --target-port 80 \
        --ingress external \
-       --cpu 2.0 \
-       --memory 4Gi \
-       --workload-profile-name "Consumption" \
-       --min-replicas 0 \
-       --max-replicas 10
-   
-   # Update app to include GPU configuration
-   az containerapp update \
-       --name ${ACA_APP} \
-       --resource-group ${RESOURCE_GROUP} \
-       --container-name ${ACA_APP} \
-       --set-env-vars "MODEL_PATH=/models" "GPU_ENABLED=true" \
        --cpu 4.0 \
-       --memory 8Gi
+       --memory 8Gi \
+       --workload-profile-name "gpu-t4-profile" \
+       --min-replicas 0 \
+       --max-replicas 10 \
+       --env-vars "MODEL_PATH=/models" "GPU_ENABLED=true"
    
    # Get the Container App URL
    export ACA_URL=$(az containerapp show \
@@ -385,19 +384,19 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    Azure Monitor provides comprehensive observability for GPU resource utilization, application performance, and cost metrics. Custom metrics and alerts enable proactive scaling decisions and cost optimization by monitoring queue depth, response times, and GPU utilization across both Container Apps and Batch pools.
 
    ```bash
-   # Create custom metric for GPU utilization tracking
+   # Create alert for Container Apps request volume
    az monitor metrics alert create \
-       --name "HighGPUUtilization" \
+       --name "HighGPURequestVolume" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes $(az containerapp show --name ${ACA_APP} \
            --resource-group ${RESOURCE_GROUP} --query id --output tsv) \
        --condition "avg Requests > 50" \
-       --description "High GPU utilization detected" \
+       --description "High GPU request volume detected" \
        --evaluation-frequency 1m \
        --window-size 5m \
        --severity 2
    
-   # Create alert for batch queue depth
+   # Create alert for storage queue depth
    az monitor metrics alert create \
        --name "HighBatchQueueDepth" \
        --resource-group ${RESOURCE_GROUP} \
@@ -409,13 +408,13 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --window-size 5m \
        --severity 3
    
-   # Create cost optimization alert
+   # Create resource group level cost alert
    az monitor metrics alert create \
-       --name "HighGPUCost" \
+       --name "HighResourceGroupCost" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}" \
-       --condition "avg Microsoft.Consumption/usageDetails > 100" \
-       --description "GPU costs exceeding threshold" \
+       --condition "total cost > 100" \
+       --description "Resource group costs exceeding threshold" \
        --evaluation-frequency 1h \
        --window-size 6h \
        --severity 1
@@ -658,4 +657,9 @@ Extend this solution by implementing these advanced GPU orchestration capabiliti
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

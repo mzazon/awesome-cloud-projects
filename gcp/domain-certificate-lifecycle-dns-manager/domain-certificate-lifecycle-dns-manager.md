@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud DNS, Certificate Manager, Cloud Scheduler, Cloud Functions
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ssl, tls, dns, automation, certificates, security, domain-management
 recipe-generator-version: 1.3
@@ -120,7 +120,8 @@ gcloud services enable dns.googleapis.com \
     cloudfunctions.googleapis.com \
     cloudscheduler.googleapis.com \
     secretmanager.googleapis.com \
-    monitoring.googleapis.com
+    monitoring.googleapis.com \
+    compute.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Domain configured: ${DOMAIN_NAME}"
@@ -215,6 +216,7 @@ echo "✅ Domain configured: ${DOMAIN_NAME}"
    
    # Create main function file
    cat > main.py << 'EOF'
+import os
 import json
 import logging
 from datetime import datetime, timedelta
@@ -348,13 +350,13 @@ def update_dns_record(request):
         return {'status': 'error', 'message': str(e)}, 500
 EOF
    
-   # Create requirements file
+   # Create requirements file with updated versions
    cat > requirements.txt << 'EOF'
-google-cloud-certificate-manager==1.13.0
-google-cloud-dns==0.35.0
-google-cloud-monitoring==2.21.0
-google-cloud-secret-manager==2.20.0
-functions-framework==3.5.0
+google-cloud-certificate-manager>=1.14.1
+google-cloud-dns>=0.35.1
+google-cloud-monitoring>=2.21.0
+google-cloud-secret-manager>=2.20.0
+functions-framework>=3.8.2
 EOF
    
    echo "✅ Function source code prepared"
@@ -369,7 +371,7 @@ EOF
    ```bash
    # Deploy certificate monitoring function
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python311 \
+       --runtime python312 \
        --trigger-http \
        --allow-unauthenticated \
        --source . \
@@ -381,7 +383,7 @@ EOF
    
    # Deploy DNS update function
    gcloud functions deploy dns-update-${RANDOM_SUFFIX} \
-       --runtime python311 \
+       --runtime python312 \
        --trigger-http \
        --allow-unauthenticated \
        --source . \
@@ -416,7 +418,8 @@ EOF
        --uri="${CERT_FUNCTION_URL}" \
        --http-method=GET \
        --description="Automated certificate health monitoring" \
-       --time-zone="UTC"
+       --time-zone="UTC" \
+       --location=${REGION}
    
    # Create additional job for daily comprehensive checks
    gcloud scheduler jobs create http daily-cert-audit-${RANDOM_SUFFIX} \
@@ -424,7 +427,8 @@ EOF
        --uri="${CERT_FUNCTION_URL}" \
        --http-method=GET \
        --description="Daily comprehensive certificate audit" \
-       --time-zone="UTC"
+       --time-zone="UTC" \
+       --location=${REGION}
    
    echo "✅ Scheduled monitoring jobs created"
    echo "Certificate monitoring will run every 6 hours"
@@ -438,11 +442,20 @@ EOF
    The Application Load Balancer provides the production endpoint where certificates are actually utilized, demonstrating the complete integration between Certificate Manager, Cloud DNS, and Google Cloud's load balancing infrastructure. This configuration shows how automated certificate management integrates with real traffic serving.
 
    ```bash
-   # Create backend service (placeholder for demonstration)
+   # Create health check for backend service
+   gcloud compute health-checks create http basic-health-check-${RANDOM_SUFFIX} \
+       --port 80 \
+       --request-path "/" \
+       --check-interval 30s \
+       --timeout 5s \
+       --healthy-threshold 2 \
+       --unhealthy-threshold 3
+   
+   # Create backend service
    gcloud compute backend-services create demo-backend-${RANDOM_SUFFIX} \
        --protocol=HTTP \
        --port-name=http \
-       --health-checks-region=${REGION} \
+       --health-checks=basic-health-check-${RANDOM_SUFFIX} \
        --global
    
    # Create URL map
@@ -553,10 +566,12 @@ EOF
 
    ```bash
    # Check scheduler job status
-   gcloud scheduler jobs describe ${SCHEDULER_JOB}
+   gcloud scheduler jobs describe ${SCHEDULER_JOB} \
+       --location=${REGION}
    
    # View recent job executions
-   gcloud scheduler jobs list --filter="name:${SCHEDULER_JOB}"
+   gcloud scheduler jobs list --location=${REGION} \
+       --filter="name:${SCHEDULER_JOB}"
    ```
 
 ## Cleanup
@@ -565,8 +580,10 @@ EOF
 
    ```bash
    # Delete scheduler jobs
-   gcloud scheduler jobs delete ${SCHEDULER_JOB} --quiet
-   gcloud scheduler jobs delete daily-cert-audit-${RANDOM_SUFFIX} --quiet
+   gcloud scheduler jobs delete ${SCHEDULER_JOB} \
+       --location=${REGION} --quiet
+   gcloud scheduler jobs delete daily-cert-audit-${RANDOM_SUFFIX} \
+       --location=${REGION} --quiet
    
    echo "✅ Deleted scheduler jobs"
    ```
@@ -599,6 +616,10 @@ EOF
    # Delete backend service
    gcloud compute backend-services delete demo-backend-${RANDOM_SUFFIX} \
        --global --quiet
+   
+   # Delete health check
+   gcloud compute health-checks delete basic-health-check-${RANDOM_SUFFIX} \
+       --quiet
    
    echo "✅ Deleted load balancer components"
    ```
@@ -647,7 +668,7 @@ The serverless architecture using Cloud Functions and Cloud Scheduler provides c
 
 The solution follows Google Cloud security best practices by implementing least-privilege service accounts, encrypting data in transit through HTTPS everywhere, and using managed services that handle security patching and updates automatically. Certificate Manager's integration with Google's global infrastructure ensures high availability and performance for certificate validation and renewal processes. For organizations with compliance requirements, this automated approach provides consistent certificate management with full audit trails through Cloud Logging.
 
-This architecture pattern scales efficiently from development environments to enterprise production deployments, supporting multiple domains, complex certificate hierarchies, and integration with existing CI/CD pipelines. The modular design allows teams to extend functionality for specific use cases, such as integration with external monitoring systems, custom certificate validation workflows, or multi-cloud certificate management strategies.
+This architecture pattern scales efficiently from development environments to enterprise production deployments, supporting multiple domains, complex certificate hierarchies, and integration with existing CI/CD pipelines. The modular design allows teams to extend functionality for specific use cases, such as integration with external monitoring systems, custom certificate validation workflows, or multi-cloud certificate management strategies. See the [Google Cloud Certificate Manager documentation](https://cloud.google.com/certificate-manager/docs) and [Google Cloud DNS best practices](https://cloud.google.com/dns/docs/best-practices) for additional guidance.
 
 > **Tip**: Monitor certificate validation metrics in Cloud Monitoring to identify DNS propagation issues or domain ownership challenges that could affect automatic renewal processes.
 
@@ -667,4 +688,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

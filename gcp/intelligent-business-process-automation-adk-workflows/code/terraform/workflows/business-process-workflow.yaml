@@ -1,0 +1,428 @@
+# =============================================================================
+# INTELLIGENT BUSINESS PROCESS AUTOMATION WORKFLOW
+# =============================================================================
+# Cloud Workflows definition for intelligent business process automation
+# with conditional routing, error handling, and comprehensive audit logging.
+# =============================================================================
+
+main:
+  params: [input]
+  steps:
+    # ==========================================================================
+    # INITIALIZATION AND VALIDATION
+    # ==========================================================================
+    - init:
+        assign:
+          - request_id: $${input.request_id}
+          - process_type: $${input.process_type}
+          - requester_email: $${input.requester_email}
+          - request_data: $${input.request_data}
+          - priority: $${default(input.priority, 3)}
+          - ai_confidence: $${default(input.ai_confidence, 0.8)}
+          - original_message: $${default(input.original_message, "")}
+          - approval_url: "${approval_function_url}"
+          - notification_url: "${notification_function_url}"
+          - workflow_start_time: $${time.format(sys.now())}
+          
+    # Validate input parameters
+    - validate_input:
+        switch:
+          - condition: $${request_id == null or request_id == ""}
+            raise: 
+              code: 400
+              message: "Missing required parameter: request_id"
+          - condition: $${process_type == null or process_type == ""}
+            raise:
+              code: 400 
+              message: "Missing required parameter: process_type"
+          - condition: $${requester_email == null or requester_email == ""}
+            raise:
+              code: 400
+              message: "Missing required parameter: requester_email"
+    
+    # Log workflow start
+    - log_workflow_start:
+        call: sys.log
+        args:
+          text: $${json.encode(map.merge(input, {"workflow_action": "started", "timestamp": workflow_start_time}))}
+          severity: INFO
+          
+    # ==========================================================================
+    # INTELLIGENT REQUEST ANALYSIS AND CLASSIFICATION
+    # ==========================================================================
+    - analyze_request:
+        call: classify_process_type
+        args:
+          process_type: $${process_type}
+          priority: $${priority}
+          request_data: $${request_data}
+          ai_confidence: $${ai_confidence}
+        result: classification
+        
+    # Log classification results
+    - log_classification:
+        call: sys.log
+        args:
+          text: $${json.encode(map.merge(classification, {"request_id": request_id, "workflow_action": "classified"}))}
+          severity: INFO
+          
+    # ==========================================================================
+    # CONDITIONAL WORKFLOW ROUTING
+    # ==========================================================================
+    - route_process:
+        switch:
+          # High-confidence automatic processing path
+          - condition: $${classification.auto_process and ai_confidence >= 0.9}
+            steps:
+              - log_auto_processing:
+                  call: sys.log
+                  args:
+                    text: $${json.encode({"request_id": request_id, "workflow_action": "auto_processing", "reason": "high_confidence_auto_approve"}))}
+                    severity: INFO
+                    
+              - auto_approve_request:
+                  call: http.post
+                  args:
+                    url: $${approval_url}
+                    headers:
+                      Content-Type: "application/json"
+                    body:
+                      request_id: $${request_id}
+                      decision: "approve"
+                      approver_email: "system@automation"
+                      comments: $${text.printf("Auto-approved based on AI analysis (confidence: %.2f)", ai_confidence)}
+                    timeout: 30
+                  result: auto_approval_result
+                  
+              - handle_auto_approval_response:
+                  switch:
+                    - condition: $${auto_approval_result.code >= 400}
+                      raise:
+                        code: $${auto_approval_result.code}
+                        message: $${auto_approval_result.body.error}
+                        
+              - notify_auto_approval:
+                  call: http.post
+                  args:
+                    url: $${notification_url}
+                    headers:
+                      Content-Type: "application/json" 
+                    body:
+                      request_id: $${request_id}
+                      type: "process_completed"
+                      recipient_email: $${requester_email}
+                      message: "Your request was automatically approved based on AI analysis"
+                      priority: $${if(priority <= 2, "high", "medium")}
+                    timeout: 30
+                  result: auto_notification_result
+                  
+          # Manual approval required path
+          - condition: $${classification.requires_approval}
+            steps:
+              - log_manual_approval:
+                  call: sys.log
+                  args:
+                    text: $${json.encode({"request_id": request_id, "workflow_action": "requires_manual_approval", "approver": classification.approver_email}))}
+                    severity: INFO
+                    
+              # Parallel execution: request approval and notify stakeholders
+              - parallel_approval_processing:
+                  parallel:
+                    shared: [request_id, approval_url, notification_url, classification]
+                    branches:
+                      # Branch 1: Process approval decision
+                      - approval_branch:
+                          steps:
+                            - conditional_approval:
+                                switch:
+                                  - condition: $${classification.auto_approve and priority <= 2}
+                                    steps:
+                                      - auto_approve_high_priority:
+                                          call: http.post
+                                          args:
+                                            url: $${approval_url}
+                                            headers:
+                                              Content-Type: "application/json"
+                                            body:
+                                              request_id: $${request_id}
+                                              decision: "approve"
+                                              approver_email: $${classification.approver_email}
+                                              comments: "Auto-approved for high priority request meeting business rules"
+                                            timeout: 30
+                                          result: approval_result
+                                  - condition: true
+                                    steps:
+                                      - request_manual_approval:
+                                          call: http.post
+                                          args:
+                                            url: $${approval_url}
+                                            headers:
+                                              Content-Type: "application/json"
+                                            body:
+                                              request_id: $${request_id}
+                                              decision: "pending"
+                                              approver_email: $${classification.approver_email}
+                                              comments: "Pending manual approval based on business rules"
+                                            timeout: 30
+                                          result: approval_result
+                                          
+                      # Branch 2: Send approval notification to approver
+                      - notification_branch:
+                          steps:
+                            - notify_approver:
+                                call: http.post
+                                args:
+                                  url: $${notification_url}
+                                  headers:
+                                    Content-Type: "application/json"
+                                  body:
+                                    request_id: $${request_id}
+                                    type: "approval_requested"
+                                    recipient_email: $${classification.approver_email}
+                                    message: $${text.printf("New %s requires approval (Priority: %s)", process_type, if(priority == 1, "High", if(priority == 2, "Medium", "Low")))}
+                                    priority: $${if(priority <= 2, "high", "medium")}
+                                  timeout: 30
+                                result: approver_notification_result
+                  
+          # Low-confidence requests require human review
+          - condition: $${ai_confidence < 0.7}
+            steps:
+              - log_low_confidence:
+                  call: sys.log
+                  args:
+                    text: $${json.encode({"request_id": request_id, "workflow_action": "low_confidence_review", "ai_confidence": ai_confidence}))}
+                    severity: WARNING
+                    
+              - request_human_review:
+                  call: http.post
+                  args:
+                    url: $${notification_url}
+                    headers:
+                      Content-Type: "application/json"
+                    body:
+                      request_id: $${request_id}
+                      type: "error_notification"
+                      recipient_email: "admin@company.com"
+                      message: $${text.printf("Request requires human review due to low AI confidence (%.2f). Original message: %s", ai_confidence, original_message)}
+                      priority: "high"
+                    timeout: 30
+                  result: review_notification_result
+                  
+              - notify_requester_review:
+                  call: http.post
+                  args:
+                    url: $${notification_url}
+                    headers:
+                      Content-Type: "application/json"
+                    body:
+                      request_id: $${request_id}
+                      type: "status_update"
+                      recipient_email: $${requester_email}
+                      message: "Your request is under review by our team for clarification"
+                      priority: "medium"
+                    timeout: 30
+                  result: requester_review_notification
+                  
+          # Default path for standard processing
+          - condition: true
+            steps:
+              - standard_processing:
+                  call: sys.log
+                  args:
+                    text: $${json.encode({"request_id": request_id, "workflow_action": "standard_processing", "process_type": process_type}))}
+                    severity: INFO
+                    
+              - standard_approval:
+                  call: http.post
+                  args:
+                    url: $${approval_url}
+                    headers:
+                      Content-Type: "application/json"
+                    body:
+                      request_id: $${request_id}
+                      decision: "pending"
+                      approver_email: $${classification.approver_email}
+                      comments: "Standard processing workflow"
+                    timeout: 30
+                  result: standard_approval_result
+    
+    # ==========================================================================
+    # ERROR HANDLING AND RECOVERY
+    # ==========================================================================
+    - handle_processing_errors:
+        try:
+          steps:
+            - verify_processing_success:
+                call: sys.log
+                args:
+                  text: $${json.encode({"request_id": request_id, "workflow_action": "processing_completed"}))}
+                  severity: INFO
+        except:
+          as: processing_error
+          steps:
+            - log_processing_error:
+                call: sys.log
+                args:
+                  text: $${json.encode({"request_id": request_id, "workflow_action": "processing_error", "error": processing_error}))}
+                  severity: ERROR
+                  
+            - notify_error:
+                call: http.post
+                args:
+                  url: $${notification_url}
+                  headers:
+                    Content-Type: "application/json"
+                  body:
+                    request_id: $${request_id}
+                    type: "error_notification"
+                    recipient_email: "admin@company.com"
+                    message: $${text.printf("Workflow processing error for request %s: %s", request_id, processing_error.message)}
+                    priority: "high"
+                  timeout: 30
+                result: error_notification_result
+    
+    # ==========================================================================
+    # FINAL NOTIFICATIONS AND WORKFLOW COMPLETION
+    # ==========================================================================
+    - final_notification:
+        try:
+          steps:
+            - send_completion_notification:
+                call: http.post
+                args:
+                  url: $${notification_url}
+                  headers:
+                    Content-Type: "application/json"
+                  body:
+                    request_id: $${request_id}
+                    type: "status_update"
+                    recipient_email: $${requester_email}
+                    message: $${text.printf("Your %s request has been processed and is now %s", process_type, if(classification.auto_approve, "approved", "pending approval"))}
+                    priority: $${if(priority <= 2, "high", "medium")}
+                  timeout: 30
+                result: final_notification_result
+        except:
+          as: notification_error
+          steps:
+            - log_notification_error:
+                call: sys.log
+                args:
+                  text: $${json.encode({"request_id": request_id, "workflow_action": "notification_error", "error": notification_error}))}
+                  severity: WARNING
+    
+    # ==========================================================================
+    # WORKFLOW COMPLETION AND AUDIT
+    # ==========================================================================
+    - log_workflow_completion:
+        call: sys.log
+        args:
+          text: $${json.encode({"request_id": request_id, "workflow_action": "completed", "duration_seconds": sys.now() - sys.time(workflow_start_time), "classification": classification}))}
+          severity: INFO
+          
+    - return_workflow_result:
+        return:
+          status: "completed"
+          request_id: $${request_id}
+          classification: $${classification}
+          workflow_duration: $${sys.now() - sys.time(workflow_start_time)}
+          timestamp: $${time.format(sys.now())}
+
+# =============================================================================
+# SUBWORKFLOW: PROCESS TYPE CLASSIFICATION
+# =============================================================================
+classify_process_type:
+  params: [process_type, priority, request_data, ai_confidence]
+  steps:
+    - determine_routing_rules:
+        switch:
+          # Expense approval routing
+          - condition: $${process_type == "expense_approval"}
+            assign:
+              - requires_approval: true
+              - auto_approve: $${priority <= 2 and request_data.amount != null and double(request_data.amount) < 1000}
+              - approver_email: "finance@company.com"
+              - auto_process: false
+              - approval_threshold: 1000
+              - escalation_required: $${request_data.amount != null and double(request_data.amount) > 5000}
+              
+          # Leave request routing  
+          - condition: $${process_type == "leave_request"}
+            assign:
+              - requires_approval: true
+              - auto_approve: $${priority >= 3 and request_data.duration != null and text.match_regex(request_data.duration, "^(1|2)\\s+days?$")}
+              - approver_email: "hr@company.com"
+              - auto_process: false
+              - approval_threshold: 2
+              - escalation_required: $${request_data.duration != null and text.match_regex(request_data.duration, "(weeks?|months?)")}
+              
+          # Access request routing
+          - condition: $${process_type == "access_request"}
+            assign:
+              - requires_approval: true
+              - auto_approve: $${priority >= 3 and ai_confidence >= 0.9}
+              - approver_email: "security@company.com"
+              - auto_process: false
+              - approval_threshold: 0
+              - escalation_required: $${text.match_regex(text.lower(request_data.system), "(admin|root|database)")}
+              
+          # Procurement request routing
+          - condition: $${process_type == "procurement_request"}
+            assign:
+              - requires_approval: true
+              - auto_approve: $${priority <= 2 and request_data.amount != null and double(request_data.amount) < 500}
+              - approver_email: "procurement@company.com"
+              - auto_process: false
+              - approval_threshold: 500
+              - escalation_required: $${request_data.amount != null and double(request_data.amount) > 2500}
+              
+          # Travel request routing
+          - condition: $${process_type == "travel_request"}
+            assign:
+              - requires_approval: true
+              - auto_approve: $${priority <= 2 and text.match_regex(text.lower(request_data.destination), "(local|domestic)")}
+              - approver_email: "travel@company.com"
+              - auto_process: false
+              - approval_threshold: 0
+              - escalation_required: $${text.match_regex(text.lower(request_data.destination), "(international|overseas)")}
+              
+          # General/unknown request routing
+          - condition: true
+            assign:
+              - requires_approval: $${ai_confidence >= 0.7}
+              - auto_approve: false
+              - approver_email: "admin@company.com"
+              - auto_process: $${ai_confidence < 0.7}
+              - approval_threshold: 0
+              - escalation_required: false
+              
+    # Add business hours consideration
+    - check_business_hours:
+        assign:
+          - current_hour: $${int(text.substring(time.format(sys.now()), 11, 13))}
+          - is_business_hours: $${current_hour >= 9 and current_hour <= 17}
+          - after_hours_processing: $${not is_business_hours and priority == 1}
+          
+    # Adjust routing based on business hours
+    - adjust_for_business_hours:
+        switch:
+          - condition: $${not is_business_hours and not after_hours_processing}
+            assign:
+              - auto_approve: false
+              - requires_approval: true
+              - approver_email: "on-call@company.com"
+          - condition: $${after_hours_processing}
+            assign:
+              - approver_email: "emergency@company.com"
+              
+    # Return classification results
+    - return_classification:
+        return:
+          requires_approval: $${requires_approval}
+          auto_approve: $${auto_approve}
+          approver_email: $${approver_email}
+          auto_process: $${auto_process}
+          approval_threshold: $${approval_threshold}
+          escalation_required: $${escalation_required}
+          is_business_hours: $${is_business_hours}
+          routing_reason: $${text.printf("Classified as %s with priority %s", process_type, priority)}
+          ai_confidence: $${ai_confidence}

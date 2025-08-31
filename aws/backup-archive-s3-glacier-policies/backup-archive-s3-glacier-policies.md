@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: S3, Glacier, IAM, CloudWatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: storage, backup, archiving, glacier, lifecycle-policies
 recipe-generator-version: 1.3
 ---
 
 # Backup and Archive Strategies with S3 Glacier
-
 
 ## Problem
 
@@ -119,10 +118,16 @@ export LIFECYCLE_POLICY_NAME="backup-archive-lifecycle-policy"
 export CLOUDWATCH_ALARM_NAME="glacier-cost-alarm-${RANDOM_SUFFIX}"
 
 # Create S3 bucket for backup and archiving
-aws s3api create-bucket \
-    --bucket $BACKUP_BUCKET_NAME \
-    --region $AWS_REGION \
-    --create-bucket-configuration LocationConstraint=$AWS_REGION
+if [ "$AWS_REGION" = "us-east-1" ]; then
+    aws s3api create-bucket \
+        --bucket $BACKUP_BUCKET_NAME \
+        --region $AWS_REGION
+else
+    aws s3api create-bucket \
+        --bucket $BACKUP_BUCKET_NAME \
+        --region $AWS_REGION \
+        --create-bucket-configuration LocationConstraint=$AWS_REGION
+fi
 
 # Enable versioning for backup integrity
 aws s3api put-bucket-versioning \
@@ -340,8 +345,7 @@ echo "✅ Created backup bucket: $BACKUP_BUCKET_NAME"
        --threshold 50.0 \
        --comparison-operator GreaterThanThreshold \
        --dimensions Name=Currency,Value=USD Name=ServiceName,Value=AmazonS3 \
-       --evaluation-periods 1 \
-       --alarm-actions arn:aws:sns:$AWS_REGION:$AWS_ACCOUNT_ID:billing-alerts
+       --evaluation-periods 1
    
    # Create metric filter for tracking lifecycle transitions
    aws logs create-log-group \
@@ -353,22 +357,22 @@ echo "✅ Created backup bucket: $BACKUP_BUCKET_NAME"
 
    Cost monitoring and logging infrastructure is now active, providing visibility into storage expenses and lifecycle transition events. These monitoring capabilities enable proactive cost management and support compliance reporting requirements for data governance and financial oversight.
 
-6. **Create IAM Role for Glacier Operations**:
+6. **Create IAM Role for Enhanced S3 Operations**:
 
-   IAM roles provide secure, temporary credential access for AWS services to perform operations on your behalf, following the principle of least privilege. For Glacier operations, service-linked roles enable S3 to perform lifecycle transitions and restoration operations without requiring permanent access keys or overly broad permissions that could compromise security.
+   IAM roles provide secure, temporary credential access for AWS services to perform operations on your behalf, following the principle of least privilege. For S3 lifecycle and archiving operations, properly configured roles enable automated processes without requiring permanent access keys or overly broad permissions that could compromise security.
 
    This security model ensures that automated archiving processes have only the specific permissions needed to function, reducing potential attack surfaces while maintaining operational efficiency. Understanding IAM role delegation helps implement secure automation that meets enterprise security requirements and compliance standards.
 
    ```bash
-   # Create trust policy for Glacier operations
-   cat > glacier-trust-policy.json << 'EOF'
+   # Create trust policy for S3 service
+   cat > s3-trust-policy.json << 'EOF'
    {
      "Version": "2012-10-17",
      "Statement": [
        {
          "Effect": "Allow",
          "Principal": {
-           "Service": "glacier.amazonaws.com"
+           "Service": "s3.amazonaws.com"
          },
          "Action": "sts:AssumeRole"
        }
@@ -376,51 +380,22 @@ echo "✅ Created backup bucket: $BACKUP_BUCKET_NAME"
    }
    EOF
    
-   # Create IAM role for Glacier operations
+   # Create IAM role for S3 operations
    aws iam create-role \
-       --role-name GlacierOperationsRole \
-       --assume-role-policy-document file://glacier-trust-policy.json
+       --role-name S3ArchiveOperationsRole \
+       --assume-role-policy-document file://s3-trust-policy.json
    
-   # Attach policy for S3 and Glacier operations
+   # Attach policy for S3 operations
    aws iam attach-role-policy \
-       --role-name GlacierOperationsRole \
+       --role-name S3ArchiveOperationsRole \
        --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
    
-   echo "✅ Created IAM role for Glacier operations"
+   echo "✅ Created IAM role for S3 operations"
    ```
 
-   The IAM role is now configured to enable secure Glacier operations with appropriate permissions. This security foundation ensures that lifecycle transitions and restore operations can proceed automatically while maintaining strict access controls and audit trails for compliance purposes.
+   The IAM role is now configured to enable secure S3 operations with appropriate permissions. This security foundation ensures that lifecycle transitions and restore operations can proceed automatically while maintaining strict access controls and audit trails for compliance purposes.
 
-7. **Configure Data Retrieval Policy for Cost Control**:
-
-   Data retrieval policies prevent unexpected costs from bulk restore operations by limiting the amount of data that can be retrieved from Glacier storage classes within a given time period. Glacier charges for both storage and data retrieval, with costs varying significantly based on retrieval speed and volume, making cost controls essential for budget management.
-
-   The BytesPerHour strategy limits retrieval to 1GB per hour, preventing accidental bulk restores that could result in substantial charges. This approach balances data accessibility with cost control, ensuring that organizations can retrieve archived data when needed while maintaining predictable expenses for budget planning and financial governance.
-
-   ```bash
-   # Create data retrieval policy to control costs
-   cat > data-retrieval-policy.json << 'EOF'
-   {
-     "Rules": [
-       {
-         "Strategy": "BytesPerHour",
-         "BytesPerHour": 1073741824
-       }
-     ]
-   }
-   EOF
-   
-   # Apply the data retrieval policy
-   aws glacier set-data-retrieval-policy \
-       --account-id $AWS_ACCOUNT_ID \
-       --policy file://data-retrieval-policy.json
-   
-   echo "✅ Configured data retrieval policy for cost control"
-   ```
-
-   Data retrieval cost controls are now active, preventing unexpected charges from bulk restore operations. This safety mechanism ensures that archived data remains accessible while maintaining predictable costs for financial planning and budget management.
-
-8. **Test Archive Retrieval Process**:
+7. **Test Archive Retrieval Process**:
 
    Understanding the archive retrieval process is essential for business continuity planning and compliance requirements. S3 Glacier Flexible Retrieval offers three retrieval options: Expedited (1-5 minutes), Standard (3-5 hours), and Bulk (5-12 hours), each with different cost implications. Testing these processes ensures that recovery time objectives (RTO) align with business requirements and disaster recovery plans.
 
@@ -451,7 +426,7 @@ echo "✅ Created backup bucket: $BACKUP_BUCKET_NAME"
 
    The restore request has been submitted and S3 will process the retrieval according to the specified tier and duration. This test validates the retrieval workflow and confirms that archived data can be accessed when needed, supporting business continuity and disaster recovery requirements.
 
-9. **Create Backup and Archive Automation Script**:
+8. **Create Backup and Archive Automation Script**:
 
    Automation scripts standardize backup operations and ensure consistent data classification across different systems and teams. Automated backup processes reduce human error, improve reliability, and enable scheduled operations that align with business requirements and maintenance windows. This approach supports enterprise backup strategies that require predictable, repeatable processes for compliance and operational efficiency.
 
@@ -509,62 +484,64 @@ echo "✅ Created backup bucket: $BACKUP_BUCKET_NAME"
 
    The automation script is now ready for deployment and can be integrated into existing backup workflows or scheduled operations. This tool enables consistent backup operations with appropriate data classification, supporting enterprise data management strategies and compliance requirements.
 
-10. **Set Up Compliance Reporting**:
+9. **Set Up Compliance Reporting**:
 
-    Compliance reporting capabilities enable organizations to demonstrate adherence to data retention policies, regulatory requirements, and internal governance standards. Automated reporting reduces manual audit overhead while providing detailed visibility into storage utilization, lifecycle transitions, and cost optimization effectiveness. These reports support various compliance frameworks including SOX, GDPR, HIPAA, and industry-specific regulations.
+   Compliance reporting capabilities enable organizations to demonstrate adherence to data retention policies, regulatory requirements, and internal governance standards. Automated reporting reduces manual audit overhead while providing detailed visibility into storage utilization, lifecycle transitions, and cost optimization effectiveness. These reports support various compliance frameworks including SOX, GDPR, HIPAA, and industry-specific regulations.
 
-    The comprehensive reporting script provides insights into storage class distribution, archived object inventory, and cost trends that support financial planning and regulatory compliance. Understanding these metrics helps optimize archiving strategies and demonstrates effective data governance to auditors and regulatory bodies.
+   The comprehensive reporting script provides insights into storage class distribution, archived object inventory, and cost trends that support financial planning and regulatory compliance. Understanding these metrics helps optimize archiving strategies and demonstrates effective data governance to auditors and regulatory bodies.
 
-    ```bash
-    # Create compliance report script
-    cat > compliance-report.sh << 'EOF'
-    #!/bin/bash
-    
-    BUCKET_NAME="$1"
-    REPORT_DATE=$(date +%Y%m%d)
-    
-    echo "S3 Glacier Compliance Report - $REPORT_DATE"
-    echo "=============================================="
-    
-    # Get bucket lifecycle configuration
-    echo "Current Lifecycle Policies:"
-    aws s3api get-bucket-lifecycle-configuration \
-        --bucket $BUCKET_NAME \
-        --query 'Rules[].{ID:ID,Status:Status,Transitions:Transitions}' \
-        --output table
-    
-    # Get storage class distribution
-    echo -e "\nStorage Class Distribution:"
-    aws s3api list-objects-v2 \
-        --bucket $BUCKET_NAME \
-        --query 'Contents[].StorageClass' \
-        --output text | sort | uniq -c
-    
-    # Get objects in Glacier classes
-    echo -e "\nObjects in Glacier Storage Classes:"
-    aws s3api list-objects-v2 \
-        --bucket $BUCKET_NAME \
-        --query 'Contents[?StorageClass==`GLACIER` || StorageClass==`DEEP_ARCHIVE`].{Key:Key,StorageClass:StorageClass,LastModified:LastModified}' \
-        --output table
-    
-    # Calculate estimated monthly costs
-    echo -e "\nEstimated Monthly Storage Costs:"
-    aws ce get-cost-and-usage \
-        --time-period Start=2024-01-01,End=2024-01-31 \
-        --granularity MONTHLY \
-        --metrics BlendedCost \
-        --group-by Type=DIMENSION,Key=SERVICE \
-        --filter file://cost-filter.json \
-        --query 'ResultsByTime[0].Groups[?Keys[0]==`Amazon Simple Storage Service`].Metrics.BlendedCost.Amount' \
-        --output text
-    EOF
-    
-    chmod +x compliance-report.sh
-    
-    echo "✅ Created compliance reporting script"
-    ```
+   ```bash
+   # Create compliance report script
+   cat > compliance-report.sh << 'EOF'
+   #!/bin/bash
+   
+   BUCKET_NAME="$1"
+   REPORT_DATE=$(date +%Y%m%d)
+   
+   echo "S3 Glacier Compliance Report - $REPORT_DATE"
+   echo "=============================================="
+   
+   # Get bucket lifecycle configuration
+   echo "Current Lifecycle Policies:"
+   aws s3api get-bucket-lifecycle-configuration \
+       --bucket $BUCKET_NAME \
+       --query 'Rules[].{ID:ID,Status:Status,Transitions:Transitions}' \
+       --output table
+   
+   # Get storage class distribution
+   echo -e "\nStorage Class Distribution:"
+   aws s3api list-objects-v2 \
+       --bucket $BUCKET_NAME \
+       --query 'Contents[].StorageClass' \
+       --output text | sort | uniq -c
+   
+   # Get objects in Glacier classes
+   echo -e "\nObjects in Glacier Storage Classes:"
+   aws s3api list-objects-v2 \
+       --bucket $BUCKET_NAME \
+       --query 'Contents[?StorageClass==`GLACIER` || StorageClass==`DEEP_ARCHIVE`].{Key:Key,StorageClass:StorageClass,LastModified:LastModified}' \
+       --output table
+   
+   # Calculate estimated monthly costs using current year
+   CURRENT_YEAR=$(date +%Y)
+   CURRENT_MONTH=$(date +%m)
+   
+   echo -e "\nEstimated Monthly Storage Costs:"
+   aws ce get-cost-and-usage \
+       --time-period Start=${CURRENT_YEAR}-${CURRENT_MONTH}-01,End=${CURRENT_YEAR}-${CURRENT_MONTH}-$(date -d "${CURRENT_YEAR}-${CURRENT_MONTH}-01 +1 month -1 day" +%d) \
+       --granularity MONTHLY \
+       --metrics BlendedCost \
+       --group-by Type=DIMENSION,Key=SERVICE \
+       --query 'ResultsByTime[0].Groups[?Keys[0]==`Amazon Simple Storage Service`].Metrics.BlendedCost.Amount' \
+       --output text 2>/dev/null || echo "Cost data unavailable for current month"
+   EOF
+   
+   chmod +x compliance-report.sh
+   
+   echo "✅ Created compliance reporting script"
+   ```
 
-    The compliance reporting infrastructure is now configured to provide detailed insights into storage utilization, lifecycle effectiveness, and cost optimization results. These reporting capabilities support audit requirements and enable data-driven decisions for ongoing archiving strategy optimization.
+   The compliance reporting infrastructure is now configured to provide detailed insights into storage utilization, lifecycle effectiveness, and cost optimization results. These reporting capabilities support audit requirements and enable data-driven decisions for ongoing archiving strategy optimization.
 
 ## Validation & Testing
 
@@ -634,7 +611,16 @@ echo "✅ Created backup bucket: $BACKUP_BUCKET_NAME"
        --bucket $BACKUP_BUCKET_NAME \
        --delete "$(aws s3api list-object-versions \
            --bucket $BACKUP_BUCKET_NAME \
-           --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}')"
+           --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}')" \
+       2>/dev/null || echo "No versioned objects to delete"
+   
+   # Delete delete markers
+   aws s3api delete-objects \
+       --bucket $BACKUP_BUCKET_NAME \
+       --delete "$(aws s3api list-object-versions \
+           --bucket $BACKUP_BUCKET_NAME \
+           --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}')" \
+       2>/dev/null || echo "No delete markers to remove"
    
    # Delete the bucket
    aws s3api delete-bucket --bucket $BACKUP_BUCKET_NAME
@@ -661,11 +647,11 @@ echo "✅ Created backup bucket: $BACKUP_BUCKET_NAME"
    ```bash
    # Detach policy from role
    aws iam detach-role-policy \
-       --role-name GlacierOperationsRole \
+       --role-name S3ArchiveOperationsRole \
        --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
    
    # Delete IAM role
-   aws iam delete-role --role-name GlacierOperationsRole
+   aws iam delete-role --role-name S3ArchiveOperationsRole
    
    echo "✅ Removed IAM role"
    ```
@@ -675,8 +661,7 @@ echo "✅ Created backup bucket: $BACKUP_BUCKET_NAME"
    ```bash
    # Remove local configuration files
    rm -f lifecycle-policy.json
-   rm -f glacier-trust-policy.json
-   rm -f data-retrieval-policy.json
+   rm -f s3-trust-policy.json
    rm -f backup-automation.sh
    rm -f compliance-report.sh
    rm -f test-archive.txt
@@ -696,22 +681,29 @@ This comprehensive backup and archive strategy demonstrates how to leverage Amaz
 
 The lifecycle policy configuration showcases three different archiving strategies: backup data follows a comprehensive transition path from Standard to Deep Archive over 7 years, log data has a shorter retention period with automatic deletion, and document archives use tag-based filtering for more granular control. Each strategy balances cost optimization with data accessibility requirements.
 
-Key architectural decisions include using multiple storage classes for different data types, implementing versioning for backup integrity, and setting up monitoring to track costs and compliance. The data retrieval policy prevents unexpected costs from bulk retrieval operations, while the automation scripts enable consistent backup practices across different data sources.
+Key architectural decisions include using multiple storage classes for different data types, implementing versioning for backup integrity, and setting up monitoring to track costs and compliance. The automated scripts enable consistent backup practices, while compliance reporting provides audit trails required for regulatory oversight.
 
 > **Tip**: Use S3 Intelligent-Tiering for data with unpredictable access patterns, as it automatically moves objects between access tiers based on changing access patterns without performance impact or operational overhead. Learn more about [S3 Lifecycle Management](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html) and [Archive Retrieval Options](https://docs.aws.amazon.com/AmazonS3/latest/userguide/restoring-objects-retrieval-options.html).
 
-For organizations with strict compliance requirements, this solution provides audit trails through CloudWatch monitoring and automated compliance reporting. The tag-based filtering enables fine-grained policy application, allowing different retention schedules for various data classifications. Consider implementing AWS CloudTrail for detailed API activity logging and AWS Config for compliance monitoring across your S3 resources.
+For organizations with strict compliance requirements, this solution provides audit trails through CloudWatch monitoring and automated compliance reporting. The tag-based filtering enables fine-grained policy application, allowing different retention schedules for various data classifications. Consider implementing AWS CloudTrail for detailed API activity logging and AWS Config for compliance monitoring across your S3 resources. The AWS Well-Architected Framework emphasizes the importance of automated data lifecycle management for both cost optimization and operational excellence pillars.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Implement Cross-Region Replication** for backup data with automated failover capabilities using S3 Cross-Region Replication and AWS Lambda triggers
-2. **Add Intelligent Cost Optimization** using AWS Cost Explorer APIs and machine learning to predict optimal transition schedules based on historical access patterns
-3. **Create Advanced Compliance Reporting** with automated generation of regulatory compliance reports, including data lineage tracking and retention audit trails
-4. **Integrate with AWS Backup** to create a unified backup strategy across EC2, RDS, EFS, and S3 with centralized backup policies and cross-service recovery testing
-5. **Implement Data Lifecycle Automation** using AWS Step Functions to orchestrate complex backup workflows with error handling, retry logic, and notification systems
+1. **Implement Cross-Region Replication** for backup data with automated failover capabilities using S3 Cross-Region Replication and AWS Lambda triggers for disaster recovery scenarios
+2. **Add Intelligent Cost Optimization** using AWS Cost Explorer APIs and machine learning to predict optimal transition schedules based on historical access patterns and usage analytics
+3. **Create Advanced Compliance Reporting** with automated generation of regulatory compliance reports, including data lineage tracking and retention audit trails using AWS Glue DataCatalog
+4. **Integrate with AWS Backup** to create a unified backup strategy across EC2, RDS, EFS, and S3 with centralized backup policies and cross-service recovery testing workflows
+5. **Implement Data Lifecycle Automation** using AWS Step Functions to orchestrate complex backup workflows with error handling, retry logic, and notification systems via Amazon SNS
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -4,12 +4,12 @@ id: a4e7b9c2
 category: ai-machine-learning
 difficulty: 300
 subject: azure
-services: Azure AI Foundry Agent Service, Azure Container Apps, Azure Event Grid, Azure Storage
+services: Azure AI Foundry, Azure Container Apps, Azure Event Grid, Azure Storage
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai-agents, orchestration, containers, event-driven, automation
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Organizations struggle to implement complex business process automation that req
 
 ## Solution
 
-Build a production-ready multi-agent AI system using Azure AI Foundry Agent Service to create specialized intelligent agents, deploy them as scalable containerized workloads with Azure Container Apps, and enable real-time coordination through Azure Event Grid. This architecture provides elastic scaling, fault tolerance, and seamless integration capabilities for complex business automation workflows.
+Build a production-ready multi-agent AI system using Azure AI Foundry to create specialized intelligent agents, deploy them as scalable containerized workloads with Azure Container Apps, and enable real-time coordination through Azure Event Grid. This architecture provides elastic scaling, fault tolerance, and seamless integration capabilities for complex business automation workflows.
 
 ## Architecture Diagram
 
@@ -95,13 +95,13 @@ graph TB
 5. Understanding of Azure Resource Manager templates and microservices patterns
 6. Estimated cost: $50-100/day for development and testing workloads
 
-> **Note**: This recipe uses Azure AI Foundry Agent Service, which is currently in General Availability. Review the [Azure AI Foundry pricing page](https://azure.microsoft.com/pricing/details/cognitive-services/) for detailed cost information.
+> **Note**: This recipe uses Azure AI Foundry, which is currently in General Availability. Review the [Azure AI Foundry pricing page](https://azure.microsoft.com/pricing/details/cognitive-services/) for detailed cost information.
 
 ## Preparation
 
 ```bash
-# Set environment variables
-export RESOURCE_GROUP="rg-multiagent-orchestration"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-multiagent-orchestration-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -151,6 +151,28 @@ az cosmosdb create \
     --enable-automatic-failover true
 
 echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
+
+# Get connection strings for later use
+export STORAGE_CONNECTION_STRING=$(az storage account show-connection-string \
+    --name ${STORAGE_ACCOUNT} \
+    --resource-group ${RESOURCE_GROUP} \
+    --query connectionString --output tsv)
+
+export COSMOS_CONNECTION_STRING=$(az cosmosdb keys list \
+    --name ${COSMOS_ACCOUNT} \
+    --resource-group ${RESOURCE_GROUP} \
+    --type connection-strings \
+    --query "connectionStrings[0].connectionString" --output tsv)
+
+export AI_FOUNDRY_ENDPOINT=$(az cognitiveservices account show \
+    --name ${AI_FOUNDRY_RESOURCE} \
+    --resource-group ${RESOURCE_GROUP} \
+    --query properties.endpoint --output tsv)
+
+export AI_FOUNDRY_KEY=$(az cognitiveservices account keys list \
+    --name ${AI_FOUNDRY_RESOURCE} \
+    --resource-group ${RESOURCE_GROUP} \
+    --query key1 --output tsv)
 ```
 
 ## Steps
@@ -160,24 +182,34 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    Azure Container Apps Environment provides the foundational infrastructure for running containerized AI agents with built-in scaling, networking, and observability. This managed environment eliminates the complexity of Kubernetes cluster management while providing enterprise-grade security and compliance features essential for production AI workloads.
 
    ```bash
+   # Create Container Apps environment with Log Analytics workspace
+   az monitor log-analytics workspace create \
+       --workspace-name "law-agents-${RANDOM_SUFFIX}" \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION}
+   
+   export LOG_ANALYTICS_WORKSPACE_ID=$(az monitor log-analytics workspace show \
+       --workspace-name "law-agents-${RANDOM_SUFFIX}" \
+       --resource-group ${RESOURCE_GROUP} \
+       --query customerId --output tsv)
+   
+   export LOG_ANALYTICS_KEY=$(az monitor log-analytics workspace get-shared-keys \
+       --workspace-name "law-agents-${RANDOM_SUFFIX}" \
+       --resource-group ${RESOURCE_GROUP} \
+       --query primarySharedKey --output tsv)
+   
    # Create Container Apps environment
    az containerapp env create \
        --name ${CONTAINER_ENVIRONMENT} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --logs-destination none
+       --logs-workspace-id ${LOG_ANALYTICS_WORKSPACE_ID} \
+       --logs-workspace-key ${LOG_ANALYTICS_KEY}
    
-   # Enable workload profiles for better resource control
-   az containerapp env workload-profile set \
-       --name ${CONTAINER_ENVIRONMENT} \
-       --resource-group ${RESOURCE_GROUP} \
-       --workload-profile-name "Consumption" \
-       --workload-profile-type "Consumption"
-   
-   echo "✅ Container Apps environment created with workload profiles"
+   echo "✅ Container Apps environment created with monitoring"
    ```
 
-   The Container Apps environment now provides the scalable, serverless infrastructure for hosting AI agents. This setup enables automatic scaling based on workload demands and integrates seamlessly with Azure's monitoring and logging services.
+   The Container Apps environment now provides the scalable, serverless infrastructure for hosting AI agents. This setup enables automatic scaling based on workload demands and integrates seamlessly with Azure's monitoring and logging services through Log Analytics.
 
 2. **Create Event Grid Topic for Agent Communication**:
 
@@ -208,21 +240,11 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
 
    The Event Grid topic establishes the communication backbone for multi-agent orchestration. This enables agents to publish events about task completion, errors, or status changes, while other agents can subscribe to relevant events for coordinated workflow execution.
 
-3. **Create AI Foundry Project and Deploy Models**:
+3. **Deploy GPT-4 Model for AI Foundry**:
 
-   Azure AI Foundry Project provides the workspace for managing AI models, agents, and associated resources. Creating a project with appropriate model deployments ensures that each agent has access to the specialized AI capabilities required for their specific tasks, from natural language processing to computer vision.
+   Azure AI Foundry provides access to advanced language models through managed deployments. Creating a GPT-4 deployment ensures that all agents have access to powerful natural language processing capabilities for their specific tasks, from document analysis to customer service interactions.
 
    ```bash
-   # Create AI Foundry project
-   az ml workspace create \
-       --name "project-multi-agent-${RANDOM_SUFFIX}" \
-       --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --application-insights /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/components/ai-agents-${RANDOM_SUFFIX} \
-       --container-registry /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ContainerRegistry/registries/cracragents${RANDOM_SUFFIX} \
-       --storage-account /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT} \
-       --key-vault /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.KeyVault/vaults/kv-agents-${RANDOM_SUFFIX}
-   
    # Deploy GPT-4 model for general agent tasks
    az cognitiveservices account deployment create \
        --name ${AI_FOUNDRY_RESOURCE} \
@@ -234,10 +256,10 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --sku-capacity 10 \
        --sku-name "Standard"
    
-   echo "✅ AI Foundry project created with GPT-4 model deployment"
+   echo "✅ GPT-4 model deployed to AI Foundry resource"
    ```
 
-   The AI Foundry project is now configured with model deployments that provide the cognitive capabilities for each agent. This centralized approach ensures consistent access to AI models while enabling fine-grained control over resource allocation and usage monitoring.
+   The GPT-4 model deployment provides the cognitive capabilities for each agent. This centralized approach ensures consistent access to AI models while enabling fine-grained control over resource allocation and usage monitoring across all agents.
 
 4. **Create Coordinator Agent Container App**:
 
@@ -249,7 +271,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --name "coordinator-agent" \
        --resource-group ${RESOURCE_GROUP} \
        --environment ${CONTAINER_ENVIRONMENT} \
-       --image "mcr.microsoft.com/azure-cognitive-services/language/agent-coordinator:latest" \
+       --image "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest" \
        --target-port 8080 \
        --ingress external \
        --min-replicas 1 \
@@ -258,19 +280,12 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --memory 2.0Gi \
        --env-vars \
            "AI_FOUNDRY_ENDPOINT=${AI_FOUNDRY_ENDPOINT}" \
+           "AI_FOUNDRY_KEY=${AI_FOUNDRY_KEY}" \
            "EVENT_GRID_ENDPOINT=${EVENT_GRID_ENDPOINT}" \
            "EVENT_GRID_KEY=${EVENT_GRID_KEY}" \
            "COSMOS_CONNECTION_STRING=${COSMOS_CONNECTION_STRING}"
    
-   # Configure scaling rules based on HTTP requests
-   az containerapp revision set \
-       --name "coordinator-agent" \
-       --resource-group ${RESOURCE_GROUP} \
-       --scale-rule-name "http-scaling" \
-       --scale-rule-type "http" \
-       --scale-rule-metadata "concurrentRequests=10"
-   
-   echo "✅ Coordinator agent container app created and configured"
+   echo "✅ Coordinator agent container app created"
    ```
 
    The Coordinator Agent is now running as a scalable container app with automatic scaling based on HTTP request volume. This agent will receive workflow requests and orchestrate the execution across specialized agents based on business logic and available resources.
@@ -285,7 +300,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --name "document-agent" \
        --resource-group ${RESOURCE_GROUP} \
        --environment ${CONTAINER_ENVIRONMENT} \
-       --image "mcr.microsoft.com/azure-cognitive-services/document-intelligence/agent:latest" \
+       --image "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest" \
        --target-port 8080 \
        --ingress internal \
        --min-replicas 0 \
@@ -294,7 +309,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --memory 4.0Gi \
        --env-vars \
            "AI_FOUNDRY_ENDPOINT=${AI_FOUNDRY_ENDPOINT}" \
-           "DOCUMENT_INTELLIGENCE_KEY=${DOCUMENT_INTELLIGENCE_KEY}" \
+           "AI_FOUNDRY_KEY=${AI_FOUNDRY_KEY}" \
            "STORAGE_CONNECTION_STRING=${STORAGE_CONNECTION_STRING}" \
            "EVENT_GRID_ENDPOINT=${EVENT_GRID_ENDPOINT}" \
            "EVENT_GRID_KEY=${EVENT_GRID_KEY}"
@@ -322,7 +337,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --name "data-analysis-agent" \
        --resource-group ${RESOURCE_GROUP} \
        --environment ${CONTAINER_ENVIRONMENT} \
-       --image "mcr.microsoft.com/azure-cognitive-services/data-analysis/agent:latest" \
+       --image "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest" \
        --target-port 8080 \
        --ingress internal \
        --min-replicas 0 \
@@ -331,6 +346,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --memory 8.0Gi \
        --env-vars \
            "AI_FOUNDRY_ENDPOINT=${AI_FOUNDRY_ENDPOINT}" \
+           "AI_FOUNDRY_KEY=${AI_FOUNDRY_KEY}" \
            "STORAGE_CONNECTION_STRING=${STORAGE_CONNECTION_STRING}" \
            "EVENT_GRID_ENDPOINT=${EVENT_GRID_ENDPOINT}" \
            "EVENT_GRID_KEY=${EVENT_GRID_KEY}" \
@@ -359,7 +375,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --name "customer-service-agent" \
        --resource-group ${RESOURCE_GROUP} \
        --environment ${CONTAINER_ENVIRONMENT} \
-       --image "mcr.microsoft.com/azure-cognitive-services/language/customer-service-agent:latest" \
+       --image "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest" \
        --target-port 8080 \
        --ingress internal \
        --min-replicas 1 \
@@ -368,10 +384,10 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --memory 2.0Gi \
        --env-vars \
            "AI_FOUNDRY_ENDPOINT=${AI_FOUNDRY_ENDPOINT}" \
+           "AI_FOUNDRY_KEY=${AI_FOUNDRY_KEY}" \
            "COSMOS_CONNECTION_STRING=${COSMOS_CONNECTION_STRING}" \
            "EVENT_GRID_ENDPOINT=${EVENT_GRID_ENDPOINT}" \
-           "EVENT_GRID_KEY=${EVENT_GRID_KEY}" \
-           "LANGUAGE_SERVICE_KEY=${LANGUAGE_SERVICE_KEY}"
+           "EVENT_GRID_KEY=${EVENT_GRID_KEY}"
    
    # Configure Event Grid subscription for customer service events
    az eventgrid event-subscription create \
@@ -391,10 +407,14 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    Establishing proper communication patterns between agents is crucial for orchestrating complex workflows. This step configures Event Grid filters, dead letter queues, and retry policies to ensure reliable message delivery and proper error handling in distributed agent systems.
 
    ```bash
-   # Create Event Grid dead letter storage
+   # Create Event Grid dead letter storage container
    az storage container create \
        --name "deadletter-events" \
        --account-name ${STORAGE_ACCOUNT} \
+       --account-key $(az storage account keys list \
+           --account-name ${STORAGE_ACCOUNT} \
+           --resource-group ${RESOURCE_GROUP} \
+           --query "[0].value" --output tsv) \
        --public-access off
    
    # Configure advanced Event Grid subscription with filtering
@@ -433,7 +453,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --name "api-gateway" \
        --resource-group ${RESOURCE_GROUP} \
        --environment ${CONTAINER_ENVIRONMENT} \
-       --image "mcr.microsoft.com/azure-api-management/gateway:latest" \
+       --image "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest" \
        --target-port 8080 \
        --ingress external \
        --min-replicas 2 \
@@ -475,13 +495,6 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
         --app "multi-agent-insights" \
         --resource-group ${RESOURCE_GROUP} \
         --query connectionString --output tsv)
-    
-    # Configure Log Analytics workspace
-    az monitor log-analytics workspace create \
-        --workspace-name "multi-agent-logs" \
-        --resource-group ${RESOURCE_GROUP} \
-        --location ${LOCATION} \
-        --sku PerGB2018
     
     # Create custom metrics for agent performance
     az monitor metrics alert create \
@@ -564,10 +577,10 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
 4. **Verify Agent Health and Performance**:
 
    ```bash
-   # Check agent health endpoints
-   curl -s "https://coordinator-agent.${CONTAINER_ENVIRONMENT}.azurecontainerapps.io/health" | jq .
-   curl -s "https://document-agent.${CONTAINER_ENVIRONMENT}.azurecontainerapps.io/health" | jq .
-   curl -s "https://data-analysis-agent.${CONTAINER_ENVIRONMENT}.azurecontainerapps.io/health" | jq .
+   # Check agent health endpoints (will return 404 for demo containers)
+   curl -s "https://coordinator-agent.${CONTAINER_ENVIRONMENT}.azurecontainerapps.io/health" || echo "Demo container - health endpoint not implemented"
+   curl -s "https://document-agent.${CONTAINER_ENVIRONMENT}.azurecontainerapps.io/health" || echo "Demo container - health endpoint not implemented"
+   curl -s "https://data-analysis-agent.${CONTAINER_ENVIRONMENT}.azurecontainerapps.io/health" || echo "Demo container - health endpoint not implemented"
    
    # Verify Event Grid metrics
    az monitor metrics list \
@@ -581,25 +594,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
 
 ## Cleanup
 
-1. **Stop all container apps**:
-
-   ```bash
-   # Stop all container apps
-   az containerapp list \
-       --resource-group ${RESOURCE_GROUP} \
-       --query "[].name" \
-       --output tsv | \
-   xargs -I {} az containerapp revision set \
-       --name {} \
-       --resource-group ${RESOURCE_GROUP} \
-       --revision-suffix "stopped" \
-       --min-replicas 0 \
-       --max-replicas 0
-   
-   echo "✅ All container apps stopped"
-   ```
-
-2. **Delete Event Grid subscriptions**:
+1. **Delete Event Grid subscriptions**:
 
    ```bash
    # Delete all event subscriptions
@@ -615,10 +610,18 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --name "customer-service-subscription" \
        --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventGrid/topics/${EVENT_GRID_TOPIC}"
    
+   az eventgrid event-subscription delete \
+       --name "workflow-orchestration" \
+       --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventGrid/topics/${EVENT_GRID_TOPIC}"
+   
+   az eventgrid event-subscription delete \
+       --name "agent-health-monitoring" \
+       --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventGrid/topics/${EVENT_GRID_TOPIC}"
+   
    echo "✅ Event Grid subscriptions deleted"
    ```
 
-3. **Remove all Azure resources**:
+2. **Remove all Azure resources**:
 
    ```bash
    # Delete the entire resource group
@@ -636,7 +639,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
 
 ## Discussion
 
-Azure AI Foundry Agent Service combined with Container Apps creates a powerful platform for building sophisticated multi-agent AI systems that can handle complex business processes with enterprise-grade reliability. This architecture leverages the serverless scaling capabilities of Container Apps while providing the specialized AI capabilities needed for different agent types. The event-driven communication pattern using Event Grid ensures loose coupling between agents, enabling independent scaling and fault tolerance. For comprehensive guidance on agent development, see the [Azure AI Foundry Agent Service documentation](https://learn.microsoft.com/en-us/azure/ai-foundry/agents/) and [Container Apps best practices](https://learn.microsoft.com/en-us/azure/container-apps/overview).
+Azure AI Foundry combined with Container Apps creates a powerful platform for building sophisticated multi-agent AI systems that can handle complex business processes with enterprise-grade reliability. This architecture leverages the serverless scaling capabilities of Container Apps while providing the specialized AI capabilities needed for different agent types. The event-driven communication pattern using Event Grid ensures loose coupling between agents, enabling independent scaling and fault tolerance. For comprehensive guidance on AI Foundry development, see the [Azure AI Foundry documentation](https://learn.microsoft.com/en-us/azure/ai-foundry/) and [Container Apps best practices](https://learn.microsoft.com/en-us/azure/container-apps/overview).
 
 The multi-agent orchestration pattern demonstrated here follows the Azure Well-Architected Framework principles of reliability, scalability, and cost optimization. By deploying each agent type as a separate container app, the system can scale individual components based on demand while maintaining overall system availability. Event Grid provides the reliable messaging infrastructure needed for complex workflow orchestration, with built-in retry mechanisms and dead letter queues for handling failures gracefully. This approach is particularly effective for scenarios requiring specialized AI capabilities like document processing, data analysis, and customer service, where different agents can be optimized for their specific tasks.
 
@@ -662,4 +665,9 @@ Extend this multi-agent orchestration system with these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

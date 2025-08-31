@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: mgn, ec2, iam, vpc
 estimated-time: 240 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: migration, mgn, ec2, replication
 recipe-generator-version: 1.3
@@ -98,6 +98,8 @@ graph TB
 4. Network connectivity from source servers to AWS (443/TCP outbound)
 5. Estimated cost: $50-200/month per server during migration (depends on server size and replication duration)
 
+> **Note**: Source servers require minimum 2GB RAM and sufficient disk space for the MGN agent. Network bandwidth planning is essential for initial replication performance.
+
 ## Preparation
 
 ```bash
@@ -113,8 +115,7 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --output text --query RandomPassword)
 
 export MGN_SERVICE_ROLE_NAME="MGNServiceRole-${RANDOM_SUFFIX}"
-export MGN_REPLICATION_SETTINGS_TEMPLATE="MGNReplicationTemplate-${RANDOM_SUFFIX}"
-export MGN_LAUNCH_TEMPLATE="MGNLaunchTemplate-${RANDOM_SUFFIX}"
+export MGN_REPLICATION_TEMPLATE_NAME="MGNReplicationTemplate-${RANDOM_SUFFIX}"
 
 # Create IAM service role for MGN
 aws iam create-role \
@@ -151,10 +152,9 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
    aws mgn initialize-service \
        --region $AWS_REGION
    
-   # Verify initialization status
-   aws mgn get-launch-configuration \
-       --source-server-id "initialization-check" \
-       --region $AWS_REGION 2>/dev/null || echo "MGN service initialized"
+   # Wait for initialization to complete
+   echo "Waiting for MGN service initialization..."
+   sleep 60
    
    echo "✅ MGN service initialized in region: $AWS_REGION"
    ```
@@ -163,30 +163,31 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
 
 2. **Configure Default Replication Settings**:
 
-   Replication settings define how MGN will copy your source servers to AWS. These templates establish the infrastructure configuration for replication servers, storage types, and network routing. Proper configuration ensures optimal performance during the initial replication phase and ongoing synchronization.
+   Replication settings define how MGN will replicate your source servers to AWS. These templates establish the infrastructure configuration for replication servers, storage types, and network routing. Proper configuration ensures optimal performance during the initial replication phase and ongoing synchronization.
 
    ```bash
    # Create replication configuration template
-   aws mgn put-template \
-       --template-id $MGN_REPLICATION_SETTINGS_TEMPLATE \
-       --replication-configuration-template '{
-           "associateDefaultSecurityGroup": true,
-           "bandwidthThrottling": 0,
-           "createPublicIP": false,
-           "dataPlaneRouting": "PRIVATE_IP",
-           "defaultLargeStagingDiskType": "GP3",
-           "ebsEncryption": "DEFAULT",
-           "replicationServerInstanceType": "t3.small",
-           "replicationServersSecurityGroupsIDs": [],
-           "stagingAreaSubnetId": "",
-           "stagingAreaTags": {
-               "Environment": "Migration",
-               "Purpose": "MGN-Staging"
-           },
-           "useDedicatedReplicationServer": false
-       }'
+   aws mgn create-replication-configuration-template \
+       --associate-default-security-group \
+       --bandwidth-throttling 0 \
+       --create-public-ip false \
+       --data-plane-routing PRIVATE_IP \
+       --default-large-staging-disk-type GP3 \
+       --ebs-encryption DEFAULT \
+       --replication-server-instance-type t3.small \
+       --staging-area-tags Environment=Migration,Purpose=MGN-Staging \
+       --use-dedicated-replication-server false \
+       --region $AWS_REGION
    
-   echo "✅ Created replication configuration template"
+   # Get the template ID for later use
+   REPLICATION_TEMPLATE_ID=$(aws mgn describe-replication-configuration-templates \
+       --region $AWS_REGION \
+       --query 'items[0].replicationConfigurationTemplateID' \
+       --output text)
+   
+   export MGN_REPLICATION_TEMPLATE_ID=$REPLICATION_TEMPLATE_ID
+   
+   echo "✅ Created replication configuration template: $REPLICATION_TEMPLATE_ID"
    ```
 
    The replication template is now configured with GP3 storage for optimal performance and cost efficiency. This configuration uses private IP routing for enhanced security and enables automated tagging for resource management and cost allocation.
@@ -247,7 +248,7 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
            Hostname:sourceProperties.identificationHints.hostname,
            OS:sourceProperties.os.fullString,
            ReplicationStatus:dataReplicationInfo.dataReplicationState,
-           Progress:dataReplicationInfo.replicationProgress
+           Progress:dataReplicationInfo.replicatedStorageBytes
        }' \
        --output table
    
@@ -260,7 +261,7 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
                ServerID:sourceServerID,
                Hostname:sourceProperties.identificationHints.hostname,
                Status:dataReplicationInfo.dataReplicationState,
-               Progress:dataReplicationInfo.replicationProgress
+               Progress:dataReplicationInfo.replicatedStorageBytes
            }' \
            --output table
        
@@ -293,33 +294,21 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
        --query 'items[0].sourceServerID' \
        --output text)
    
-   # Configure launch template for test environment
-   aws mgn put-launch-configuration \
+   # Configure launch configuration for the source server
+   aws mgn update-launch-configuration \
        --source-server-id $SOURCE_SERVER_ID \
-       --launch-configuration '{
-           "bootMode": "BIOS",
-           "copyPrivateIp": false,
-           "copyTags": true,
-           "ec2LaunchTemplateID": "",
-           "enableMapAutoTagging": true,
-           "launchDisposition": "STARTED",
-           "licensing": {
-               "osByol": true
-           },
-           "mapAutoTaggingMpeID": "",
-           "name": "MGN-Test-Launch",
-           "postLaunchActions": {
-               "cloudWatchLogGroupName": "",
-               "deployment": "TEST_AND_CUTOVER",
-               "s3LogBucket": "",
-               "s3OutputKeyPrefix": "",
-               "ssmDocuments": []
-           },
-           "sourceServerID": "'$SOURCE_SERVER_ID'",
-           "targetInstanceTypeRightSizingMethod": "BASIC"
-       }'
+       --boot-mode BIOS \
+       --copy-private-ip false \
+       --copy-tags true \
+       --enable-map-auto-tagging true \
+       --launch-disposition STARTED \
+       --licensing osByol=true \
+       --name "MGN-Launch-${SOURCE_SERVER_ID}" \
+       --post-launch-actions deployment=TEST_AND_CUTOVER \
+       --target-instance-type-right-sizing-method BASIC \
+       --region $AWS_REGION
    
-   echo "✅ Configured launch template for server: $SOURCE_SERVER_ID"
+   echo "✅ Configured launch configuration for server: $SOURCE_SERVER_ID"
    ```
 
    The launch configuration is now established with right-sizing recommendations and automated tagging enabled. This ensures migrated instances are appropriately sized for their workloads and properly tagged for governance and cost management.
@@ -396,11 +385,6 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
    # Mark test as complete after validation
    read -p "Press Enter after completing application testing..."
    
-   aws mgn mark-as-archived \
-       --source-server-id $SOURCE_SERVER_ID \
-       --region $AWS_REGION \
-       --account-id $AWS_ACCOUNT_ID
-   
    echo "✅ Test validation completed"
    ```
 
@@ -456,6 +440,8 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
        }' \
        --output table
    ```
+
+   Production cutover is complete with the server successfully launched in AWS. The migrated instance is now running in production and ready to serve business workloads with minimal downtime during the transition.
 
 9. **Verify Migration Success and Finalize**:
 
@@ -513,11 +499,6 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
     # Associate servers with wave
     aws mgn associate-source-servers \
         --wave-id $WAVE_ID \
-        --source-server-ids $SOURCE_SERVER_ID \
-        --region $AWS_REGION
-    
-    # Start wave migration
-    aws mgn start-cutover \
         --source-server-ids $SOURCE_SERVER_ID \
         --region $AWS_REGION
     
@@ -585,11 +566,18 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
        --output text)
    
    for INSTANCE_ID in $INSTANCE_IDS; do
-       echo "Testing connectivity for instance: $INSTANCE_ID"
-       aws ec2 describe-instance-attribute \
-           --instance-id $INSTANCE_ID \
-           --attribute sriovNetSupport \
-           --region $AWS_REGION
+       if [ "$INSTANCE_ID" != "None" ] && [ "$INSTANCE_ID" != "null" ]; then
+           echo "Testing connectivity for instance: $INSTANCE_ID"
+           aws ec2 describe-instance-status \
+               --instance-ids $INSTANCE_ID \
+               --region $AWS_REGION \
+               --query 'InstanceStatuses[0].{
+                   InstanceId:InstanceId,
+                   SystemStatus:SystemStatus.Status,
+                   InstanceStatus:InstanceStatus.Status
+               }' \
+               --output table
+       fi
    done
    ```
 
@@ -635,11 +623,12 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
 
    ```bash
    # Delete replication configuration template
-   aws mgn delete-replication-configuration-template \
-       --replication-configuration-template-id $MGN_REPLICATION_SETTINGS_TEMPLATE \
-       --region $AWS_REGION
-   
-   echo "✅ Deleted replication configuration template"
+   if [ ! -z "$MGN_REPLICATION_TEMPLATE_ID" ]; then
+       aws mgn delete-replication-configuration-template \
+           --replication-configuration-template-id $MGN_REPLICATION_TEMPLATE_ID \
+           --region $AWS_REGION
+       echo "✅ Deleted replication configuration template"
+   fi
    ```
 
 4. **Remove IAM Resources**:
@@ -661,8 +650,8 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
    ```bash
    # Clean up environment variables
    unset MGN_SERVICE_ROLE_NAME
-   unset MGN_REPLICATION_SETTINGS_TEMPLATE
-   unset MGN_LAUNCH_TEMPLATE
+   unset MGN_REPLICATION_TEMPLATE_NAME
+   unset MGN_REPLICATION_TEMPLATE_ID
    unset SOURCE_SERVER_ID
    unset WAVE_ID
    
@@ -671,15 +660,15 @@ echo "✅ Created IAM service role: $MGN_SERVICE_ROLE_NAME"
 
 ## Discussion
 
-AWS Application Migration Service represents a significant advancement in cloud migration technology, offering automated lift-and-shift capabilities that dramatically reduce the complexity and risk associated with large-scale server migrations. The service's block-level replication ensures data consistency while minimizing downtime, making it suitable for mission-critical applications that cannot tolerate extended outages.
+AWS Application Migration Service represents a significant advancement in cloud migration technology, offering automated lift-and-shift capabilities that dramatically reduce the complexity and risk associated with large-scale server migrations. The service's block-level replication ensures data consistency while minimizing downtime, making it suitable for mission-critical applications that cannot tolerate extended outages. MGN follows the AWS Well-Architected Framework principles by providing secure, reliable, and cost-effective migration capabilities with built-in monitoring and automated recovery features.
 
-The wave-based migration approach enables organizations to migrate servers in logical groups, allowing for coordinated cutover events and reduced operational complexity. This methodology is particularly valuable for applications with interdependencies, where the migration sequence must be carefully orchestrated to maintain system functionality. The ability to test migrated workloads before production cutover provides additional confidence and reduces the risk of application compatibility issues.
+The wave-based migration approach enables organizations to migrate servers in logical groups, allowing for coordinated cutover events and reduced operational complexity. This methodology is particularly valuable for applications with interdependencies, where the migration sequence must be carefully orchestrated to maintain system functionality. The ability to test migrated workloads before production cutover provides additional confidence and reduces the risk of application compatibility issues, supporting the reliability pillar of the Well-Architected Framework.
 
-Key architectural considerations include network bandwidth planning for initial replication, security group configuration for replication servers, and launch template customization for different server types. Organizations should also consider implementing automated testing frameworks to validate migrated applications, as manual testing can become a bottleneck in large-scale migrations. The service's integration with AWS CloudWatch and CloudTrail provides comprehensive monitoring and auditing capabilities essential for enterprise migrations.
+Key architectural considerations include network bandwidth planning for initial replication, security group configuration for replication servers, and launch template customization for different server types. Organizations should also consider implementing automated testing frameworks to validate migrated applications, as manual testing can become a bottleneck in large-scale migrations. The service's integration with AWS CloudWatch and CloudTrail provides comprehensive monitoring and auditing capabilities essential for enterprise migrations, as detailed in the [AWS Application Migration Service User Guide](https://docs.aws.amazon.com/mgn/latest/ug/what-is-application-migration-service.html).
 
-Cost optimization strategies include using smaller replication server instance types during off-peak hours, implementing lifecycle policies for staging area storage, and leveraging AWS Cost Explorer to monitor migration-related expenses. The 90-day free tier for each migrated server provides significant cost savings for organizations planning their migration timeline effectively.
+Cost optimization strategies include using smaller replication server instance types during off-peak hours, implementing lifecycle policies for staging area storage, and leveraging AWS Cost Explorer to monitor migration-related expenses. The 90-day free tier for each migrated server provides significant cost savings for organizations planning their migration timeline effectively. Following [AWS cost optimization best practices](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html) ensures migration projects stay within budget while maintaining performance requirements.
 
-> **Tip**: Use AWS MGN's API to automate server grouping and migration orchestration, enabling fully automated migration workflows for consistent and repeatable deployments.
+> **Tip**: Use AWS MGN's API to automate server grouping and migration orchestration, enabling fully automated migration workflows for consistent and repeatable deployments. The [AWS CLI MGN reference](https://docs.aws.amazon.com/cli/latest/reference/mgn/index.html) provides comprehensive command documentation for scripting complex migration scenarios.
 
 ## Challenge
 
@@ -697,4 +686,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

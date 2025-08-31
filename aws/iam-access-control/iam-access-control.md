@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: iam,s3,cloudwatch,sts
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-24
 passed-qa: null
 tags: iam,security,access-control,policies,conditions,least-privilege
 recipe-generator-version: 1.3
@@ -112,7 +112,7 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
 
 1. **Create Time-Based Access Policy**:
 
-   This step demonstrates how to implement temporal access controls using IAM condition keys. Time-based conditions are essential for enforcing business hours access and reducing the attack surface during off-hours.
+   This step demonstrates how to implement temporal access controls using IAM condition keys. Time-based conditions are essential for enforcing business hours access and reducing the attack surface during off-hours. AWS IAM evaluates time conditions in UTC, providing consistent global enforcement.
 
    ```bash
    # Create policy allowing access only during business hours (9 AM - 5 PM UTC)
@@ -132,11 +132,11 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
                    "arn:aws:s3:::${BUCKET_NAME}/*"
                ],
                "Condition": {
-                   "DateGreaterThan": {
-                       "aws:CurrentTime": "09:00Z"
+                   "DateGreaterThanEquals": {
+                       "aws:RequestTime": "09:00Z"
                    },
-                   "DateLessThan": {
-                       "aws:CurrentTime": "17:00Z"
+                   "DateLessThanEquals": {
+                       "aws:RequestTime": "17:00Z"
                    }
                }
            }
@@ -156,13 +156,13 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
    echo "✅ Created time-based access policy"
    ```
 
-   > **Note**: Time-based conditions use UTC format. Consider your organization's global presence when setting time restrictions. Learn more about [date and time condition operators](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html#condition-keys-date) in the AWS documentation.
+   > **Note**: Time-based conditions use UTC format and compare against the request time. Consider your organization's global presence when setting time restrictions. Learn more about [date and time condition operators](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html#condition-keys-date) in the AWS documentation.
 
-   The policy is now created and ready to be attached to IAM principals. This temporal access control foundation provides automated enforcement of business hours restrictions without requiring manual intervention or additional monitoring systems.
+   The policy is now created and ready to be attached to IAM principals. This temporal access control foundation provides automated enforcement of business hours restrictions without requiring manual intervention or additional monitoring systems, significantly reducing the attack surface during off-hours.
 
 2. **Create IP-Based Access Control Policy**:
 
-   Network-based access controls provide an additional security layer by restricting API calls to trusted IP ranges. This is particularly important for administrative operations and sensitive data access.
+   Network-based access controls provide an additional security layer by restricting API calls to trusted IP ranges. This is particularly important for administrative operations and sensitive data access, implementing defense-in-depth security principles.
 
    ```bash
    # Create policy allowing access only from specific IP ranges
@@ -222,11 +222,11 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
 
    > **Warning**: IP-based restrictions can impact users on dynamic IP addresses or VPNs. Consider using [VPC endpoints](https://docs.aws.amazon.com/vpc/latest/privatelink/vpc-endpoints.html) for more reliable network-based access controls in corporate environments.
 
-   The IP-based access control policy establishes network perimeter security at the API level. This dual-statement approach allows legitimate access from approved ranges while blocking all other traffic, creating an effective network-based security boundary.
+   The IP-based access control policy establishes network perimeter security at the API level. This dual-statement approach allows legitimate access from approved ranges while blocking all other traffic, creating an effective network-based security boundary that complements traditional authentication mechanisms.
 
 3. **Create Tag-Based Access Control Policy**:
 
-   Tag-based access control enables attribute-based access control (ABAC) by using both principal tags (attached to users/roles) and resource tags to make authorization decisions. This creates flexible, scalable access patterns.
+   Tag-based access control enables attribute-based access control (ABAC) by using both principal tags (attached to users/roles) and resource tags to make authorization decisions. This creates flexible, scalable access patterns that adapt to organizational structure changes without policy modifications.
 
    ```bash
    # Create policy using resource tags and principal tags for access control
@@ -286,11 +286,11 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
 
    > **Tip**: Tag-based access control scales better than traditional role-based access as organizations grow. Establish a [consistent tagging strategy](https://docs.aws.amazon.com/whitepapers/latest/tagging-best-practices/tagging-best-practices.html) before implementing ABAC patterns.
 
-   This ABAC policy creates a flexible security model where access decisions are made dynamically based on tag attributes. Users can only access resources tagged with their department while shared resources remain accessible to all authorized users, enabling both security isolation and collaboration.
+   This ABAC policy creates a flexible security model where access decisions are made dynamically based on tag attributes. Users can only access resources tagged with their department while shared resources remain accessible to all authorized users, enabling both security isolation and collaboration without complex role hierarchies.
 
 4. **Create Multi-Factor Authentication (MFA) Required Policy**:
 
-   MFA requirements for sensitive operations provide strong authentication controls. This policy demonstrates how to require MFA for write operations while allowing read access without additional authentication.
+   MFA requirements for sensitive operations provide strong authentication controls following AWS security best practices. This policy demonstrates how to require MFA for write operations while allowing read access without additional authentication, balancing security with usability.
 
    ```bash
    # Create policy requiring MFA for sensitive operations
@@ -342,11 +342,11 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
    echo "✅ Created MFA-required policy"
    ```
 
-   This MFA policy implements a security control that balances usability with protection. Read operations remain frictionless while write operations require strong authentication, reducing the risk of unauthorized data modification while maintaining operational efficiency for day-to-day access.
+   This MFA policy implements a security control that balances usability with protection. Read operations remain frictionless while write operations require strong authentication within the last hour, reducing the risk of unauthorized data modification while maintaining operational efficiency for day-to-day access patterns.
 
 5. **Create Test User and Role with Conditions**:
 
-   Creating test principals with appropriate tags and trust relationships allows you to validate policy behavior in a controlled environment before applying to production resources.
+   Creating test principals with appropriate tags and trust relationships allows you to validate policy behavior in a controlled environment before applying to production resources. This testing approach follows AWS security best practices for policy validation.
 
    ```bash
    # Create test user
@@ -397,11 +397,11 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
    echo "✅ Created test user and role with conditional access"
    ```
 
-   The test principals now have the necessary attributes and trust relationships to validate our conditional policies. These test resources include proper tagging and regional restrictions that mirror real-world deployment scenarios, enabling comprehensive policy testing before production implementation.
+   The test principals now have the necessary attributes and trust relationships to validate our conditional policies. These test resources include proper tagging and regional restrictions that mirror real-world deployment scenarios, enabling comprehensive policy testing before production implementation while maintaining security isolation.
 
 6. **Create Resource-Based Policy for Cross-Account Access**:
 
-   Resource-based policies work in conjunction with identity-based policies to provide defense-in-depth. This S3 bucket policy enforces encryption and metadata requirements at the resource level.
+   Resource-based policies work in conjunction with identity-based policies to provide defense-in-depth security. This S3 bucket policy enforces encryption and metadata requirements at the resource level, implementing AWS security best practices for data protection.
 
    ```bash
    # Create S3 bucket policy with advanced conditions
@@ -457,11 +457,11 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
    echo "✅ Applied resource-based policy to S3 bucket"
    ```
 
-   The resource-based policy provides defense-in-depth security by enforcing requirements at the bucket level regardless of the requesting principal's identity-based policies. This dual-layer approach ensures that encryption and metadata requirements are met while denying insecure transport, creating comprehensive data protection.
+   The resource-based policy provides defense-in-depth security by enforcing requirements at the bucket level regardless of the requesting principal's identity-based policies. This dual-layer approach ensures that encryption and metadata requirements are met while denying insecure transport, creating comprehensive data protection that aligns with AWS Well-Architected security principles.
 
 7. **Create Session-Based Access Control Policy**:
 
-   Session-based controls limit the duration and scope of temporary credentials. These policies are particularly useful for automated systems and cross-account access scenarios.
+   Session-based controls limit the duration and scope of temporary credentials, implementing AWS security best practices for temporary access management. These policies are particularly useful for automated systems and cross-account access scenarios where credential lifecycle management is critical.
 
    ```bash
    # Create policy with session duration and name constraints
@@ -481,7 +481,7 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
                        "aws:userid": "${aws:userid}"
                    },
                    "StringLike": {
-                       "aws:rolename": "${PROJECT_NAME}*"
+                       "aws:RequestedRole": "${PROJECT_NAME}*"
                    },
                    "NumericLessThan": {
                        "aws:TokenIssueTime": "${aws:CurrentTime}"
@@ -514,11 +514,11 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
    echo "✅ Created session-based access control policy"
    ```
 
-   Session-based controls limit the lifespan and scope of temporary credentials, reducing the risk window for compromised tokens. This policy ensures that credentials cannot be used indefinitely and restricts session duration to reasonable limits for operational security.
+   Session-based controls limit the lifespan and scope of temporary credentials, reducing the risk window for compromised tokens. This policy ensures that credentials cannot be used indefinitely and restricts session duration to reasonable limits for operational security, following AWS IAM best practices for temporary credential management.
 
 8. **Attach Policies and Test Configuration**:
 
-   Attaching policies to test principals and creating sample resources allows validation of the access control logic before production deployment.
+   Attaching policies to test principals and creating sample resources allows validation of the access control logic before production deployment. This systematic approach ensures policy correctness and prevents potential access issues in production environments.
 
    ```bash
    # Attach tag-based policy to test user
@@ -550,7 +550,7 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
    echo "✅ Applied policies and created test resources"
    ```
 
-   The configuration is now complete with policies attached to test principals and sample data created with appropriate tags and encryption. This setup enables comprehensive validation of all access control patterns before deploying similar configurations to production environments.
+   The configuration is now complete with policies attached to test principals and sample data created with appropriate tags and encryption. This setup enables comprehensive validation of all access control patterns before deploying similar configurations to production environments, ensuring security controls work as intended.
 
 ## Validation & Testing
 
@@ -562,7 +562,7 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
        --policy-source-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-test-role" \
        --action-names "s3:GetObject" \
        --resource-arns "arn:aws:s3:::${BUCKET_NAME}/test-file.txt" \
-       --context-entries ContextKeyName=aws:CurrentTime,ContextKeyValues="14:00:00Z",ContextKeyType=date \
+       --context-entries ContextKeyName=aws:RequestTime,ContextKeyValues="14:00Z",ContextKeyType=date \
        --query 'EvaluationResults[0].EvalDecision' \
        --output text
    ```
@@ -701,30 +701,37 @@ echo "✅ Created test resources: ${BUCKET_NAME}, ${LOG_GROUP_NAME}"
 
 ## Discussion
 
-Fine-grained access control in AWS IAM relies on the sophisticated condition evaluation engine that processes multiple context keys, operators, and values to make authorization decisions. The condition element in IAM policies provides powerful capabilities for implementing context-aware security controls that go far beyond simple allow/deny permissions.
+Fine-grained access control in AWS IAM relies on the sophisticated condition evaluation engine that processes multiple context keys, operators, and values to make authorization decisions. The condition element in IAM policies provides powerful capabilities for implementing context-aware security controls that go far beyond simple allow/deny permissions, enabling organizations to implement zero-trust security principles at the API level.
 
-The policy evaluation process follows a specific order: explicit deny statements always override allow statements, and conditions must evaluate to true for the policy statement to apply. This enables complex access patterns like allowing S3 access only during business hours while requiring MFA for write operations, or restricting API access to specific IP ranges while allowing emergency access through AWS services. Understanding this evaluation logic is crucial for designing effective security policies that balance security with operational requirements.
+The policy evaluation process follows a specific order defined in the [AWS IAM policy evaluation logic](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html): explicit deny statements always override allow statements, and conditions must evaluate to true for the policy statement to apply. This enables complex access patterns like allowing S3 access only during business hours while requiring MFA for write operations, or restricting API access to specific IP ranges while allowing emergency access through AWS services. Understanding this evaluation logic is crucial for designing effective security policies that balance security with operational requirements.
 
-Advanced condition operators like `ForAllValues` and `ForAnyValue` enable sophisticated multi-value comparisons, while policy variables like `${aws:username}` and `${aws:PrincipalTag/Department}` create dynamic policies that adapt to the requesting principal's attributes. These capabilities allow organizations to implement role-based access control (RBAC) and attribute-based access control (ABAC) patterns that scale with organizational growth while maintaining security boundaries.
+Advanced condition operators like `ForAllValues` and `ForAnyValue` enable sophisticated multi-value comparisons, while policy variables like `${aws:username}` and `${aws:PrincipalTag/Department}` create dynamic policies that adapt to the requesting principal's attributes. These capabilities allow organizations to implement role-based access control (RBAC) and attribute-based access control (ABAC) patterns that scale with organizational growth while maintaining security boundaries. The [AWS IAM policy condition keys reference](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html) provides comprehensive documentation for all available context keys and their usage patterns.
 
-Resource-based policies complement identity-based policies by allowing fine-grained control at the resource level, enabling cross-account access scenarios while maintaining security controls. The combination of both policy types provides comprehensive access control that can accommodate complex organizational structures and compliance requirements while supporting automated security controls and audit trails.
+Resource-based policies complement identity-based policies by allowing fine-grained control at the resource level, enabling cross-account access scenarios while maintaining security controls. The combination of both policy types provides comprehensive access control that can accommodate complex organizational structures and compliance requirements while supporting automated security controls and audit trails. This dual-policy approach is essential for implementing the [AWS Well-Architected Framework security pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html) principles in production environments.
 
-> **Tip**: Use AWS IAM Access Analyzer to validate your policies and identify potential security issues before deployment. The tool can detect overly permissive policies and suggest improvements for better security posture.
+> **Tip**: Use [AWS IAM Access Analyzer](https://docs.aws.amazon.com/IAM/latest/UserGuide/what-is-access-analyzer.html) to validate your policies and identify potential security issues before deployment. The tool can detect overly permissive policies and suggest improvements for better security posture.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Dynamic Policy Generation**: Create a Lambda function that generates IAM policies based on user attributes stored in a database, automatically applying appropriate conditions based on user roles, departments, and access patterns.
+1. **Dynamic Policy Generation**: Create a Lambda function that generates IAM policies based on user attributes stored in a database, automatically applying appropriate conditions based on user roles, departments, and access patterns using the [AWS IAM policy generator](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_policy-generator.html).
 
-2. **Temporal Access Controls**: Implement time-based access controls that automatically grant elevated permissions during maintenance windows or emergency situations, with automatic revocation after the specified time period.
+2. **Temporal Access Controls**: Implement time-based access controls that automatically grant elevated permissions during maintenance windows or emergency situations, with automatic revocation after the specified time period using [AWS Systems Manager Change Calendar](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-change-calendar.html).
 
-3. **Conditional Cross-Account Access**: Design a multi-account access pattern where users can assume roles in different accounts based on their project assignments, with conditions that enforce data residency requirements and regional access controls.
+3. **Conditional Cross-Account Access**: Design a multi-account access pattern where users can assume roles in different accounts based on their project assignments, with conditions that enforce data residency requirements and regional access controls using [AWS Organizations SCPs](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html).
 
-4. **Advanced Compliance Automation**: Build a system that automatically validates and remediates IAM policies to ensure they meet regulatory requirements (SOX, PCI-DSS, HIPAA) using AWS Config rules and automated remediation actions.
+4. **Advanced Compliance Automation**: Build a system that automatically validates and remediates IAM policies to ensure they meet regulatory requirements (SOX, PCI-DSS, HIPAA) using [AWS Config rules](https://docs.aws.amazon.com/config/latest/developerguide/evaluate-config.html) and automated remediation actions.
 
-5. **Risk-Based Access Control**: Implement adaptive access controls that adjust permissions based on risk scores calculated from user behavior, device trust levels, and access patterns using Amazon GuardDuty and custom machine learning models.
+5. **Risk-Based Access Control**: Implement adaptive access controls that adjust permissions based on risk scores calculated from user behavior, device trust levels, and access patterns using [Amazon GuardDuty](https://docs.aws.amazon.com/guardduty/latest/ug/what-is-guardduty.html) and custom machine learning models.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

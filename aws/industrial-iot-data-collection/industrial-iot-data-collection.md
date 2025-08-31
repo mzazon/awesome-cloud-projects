@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: iot-sitewise, iot-core, timestream, cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, industrial, sitewise, data-collection, time-series
 recipe-generator-version: 1.3
@@ -207,16 +207,17 @@ echo "✅ Environment prepared for industrial IoT setup"
 
    ```bash
    # Create gateway capability configuration
-   aws iotsitewise create-gateway \
+   GATEWAY_ID=$(aws iotsitewise create-gateway \
        --gateway-name "manufacturing-gateway-${RANDOM_SUFFIX}" \
        --gateway-platform '{
            "greengrass": {
                "groupArn": "arn:aws:greengrass:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':groups/simulation-group"
            }
        }' \
-       --tags "Environment=Development,Project=${SITEWISE_PROJECT_NAME}"
+       --tags "Environment=Development,Project=${SITEWISE_PROJECT_NAME}" \
+       --query 'gatewayId' --output text)
    
-   echo "✅ Gateway configuration established"
+   echo "✅ Gateway configuration established: ${GATEWAY_ID}"
    ```
 
    The gateway is now configured to handle industrial data collection protocols and manage the secure connection between your factory floor and AWS cloud services. In production environments, this gateway would be deployed on industrial-grade hardware within your manufacturing facility.
@@ -293,7 +294,7 @@ echo "✅ Environment prepared for industrial IoT setup"
        --threshold 80.0 \
        --comparison-operator "GreaterThanThreshold" \
        --evaluation-periods 2 \
-       --alarm-actions "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:equipment-alerts"
+       --dimensions "Name=AssetId,Value=${ASSET_ID}"
    
    # Create custom metric for operational efficiency tracking
    aws cloudwatch put-metric-data \
@@ -366,6 +367,17 @@ echo "✅ Environment prepared for industrial IoT setup"
        --query-string "SELECT * FROM \"${TIMESTREAM_DB_NAME}\".\"equipment-metrics\" ORDER BY time DESC LIMIT 10"
    ```
 
+5. Confirm CloudWatch alarm configuration:
+
+   ```bash
+   # Verify alarm was created successfully
+   aws cloudwatch describe-alarms \
+       --alarm-names "ProductionLine-A-HighTemperature" \
+       --query 'MetricAlarms[0].AlarmName'
+   ```
+
+   Expected output: `"ProductionLine-A-HighTemperature"`
+
 ## Cleanup
 
 1. Remove CloudWatch alarms and custom metrics:
@@ -378,9 +390,13 @@ echo "✅ Environment prepared for industrial IoT setup"
    echo "✅ CloudWatch monitoring removed"
    ```
 
-2. Delete IoT SiteWise assets and models:
+2. Delete IoT SiteWise gateway and assets:
 
    ```bash
+   # Delete gateway
+   aws iotsitewise delete-gateway \
+       --gateway-id ${GATEWAY_ID}
+   
    # Delete asset instance
    aws iotsitewise delete-asset \
        --asset-id ${ASSET_ID}
@@ -392,7 +408,7 @@ echo "✅ Environment prepared for industrial IoT setup"
    aws iotsitewise delete-asset-model \
        --asset-model-id ${ASSET_MODEL_ID}
    
-   echo "✅ SiteWise assets and models removed"
+   echo "✅ SiteWise resources removed"
    ```
 
 3. Remove Timestream resources:
@@ -415,18 +431,18 @@ echo "✅ Environment prepared for industrial IoT setup"
    ```bash
    # Clear environment variables
    unset SITEWISE_PROJECT_NAME TIMESTREAM_DB_NAME ASSET_MODEL_ID ASSET_ID
-   unset TEMP_PROPERTY_ID PRESSURE_PROPERTY_ID
+   unset TEMP_PROPERTY_ID PRESSURE_PROPERTY_ID GATEWAY_ID
    
    echo "✅ Environment variables cleared"
    ```
 
 ## Discussion
 
-AWS IoT SiteWise transforms industrial data management by providing a purpose-built platform that understands the unique requirements of manufacturing environments. Unlike generic IoT platforms, SiteWise offers built-in support for industrial protocols like OPC-UA and Modbus, automatic data modeling capabilities, and edge processing that can operate in disconnected factory environments. The service's asset modeling framework enables you to create standardized digital representations of equipment that can scale across multiple facilities and equipment types.
+AWS IoT SiteWise transforms industrial data management by providing a purpose-built platform that understands the unique requirements of manufacturing environments. Unlike generic IoT platforms, SiteWise offers built-in support for industrial protocols like OPC-UA and Modbus, automatic data modeling capabilities, and edge processing that can operate in disconnected factory environments. The service's asset modeling framework enables you to create standardized digital representations of equipment that can scale across multiple facilities and equipment types. This approach aligns with the [AWS Well-Architected IoT Lens](https://docs.aws.amazon.com/wellarchitected/latest/iot-lens/welcome.html) principles for operational excellence in industrial environments.
 
-The integration with Amazon Timestream provides industrial organizations with a cost-effective solution for storing massive volumes of time-series data while maintaining high query performance for real-time analytics. This combination enables use cases ranging from real-time equipment monitoring to predictive maintenance algorithms that can analyze years of historical performance data. The automatic data lifecycle management ensures that frequently accessed recent data remains in high-performance storage while older data transitions to cost-optimized storage tiers.
+The integration with Amazon Timestream provides industrial organizations with a cost-effective solution for storing massive volumes of time-series data while maintaining high query performance for real-time analytics. This combination enables use cases ranging from real-time equipment monitoring to predictive maintenance algorithms that can analyze years of historical performance data. The automatic data lifecycle management ensures that frequently accessed recent data remains in high-performance storage while older data transitions to cost-optimized storage tiers. According to the [Amazon Timestream documentation](https://docs.aws.amazon.com/timestream/latest/developerguide/what-is-timestream.html), this architecture can handle trillions of time-series data points per day.
 
-The architecture supports advanced analytics workflows through seamless integration with services like Amazon QuickSight for visualization, AWS Lambda for custom processing logic, and Amazon SageMaker for machine learning-powered predictive maintenance. Security considerations are paramount in industrial environments, and SiteWise provides enterprise-grade security features including encryption at rest and in transit, VPC support, and integration with AWS Identity and Access Management for fine-grained access controls.
+The architecture supports advanced analytics workflows through seamless integration with services like Amazon QuickSight for visualization, AWS Lambda for custom processing logic, and Amazon SageMaker for machine learning-powered predictive maintenance. Security considerations are paramount in industrial environments, and SiteWise provides enterprise-grade security features including encryption at rest and in transit, VPC support, and integration with AWS Identity and Access Management for fine-grained access controls. The [IoT SiteWise security documentation](https://docs.aws.amazon.com/iot-sitewise/latest/userguide/security.html) provides comprehensive guidance on implementing defense-in-depth security strategies.
 
 > **Tip**: Start with a pilot deployment on non-critical equipment to validate data models and establish operational procedures before scaling to production-critical systems. Consider implementing data governance policies to ensure consistent asset naming and property definitions across your organization.
 
@@ -434,16 +450,23 @@ The architecture supports advanced analytics workflows through seamless integrat
 
 Extend this industrial IoT solution by implementing these advanced capabilities:
 
-1. **Real-time Equipment Monitoring Dashboard**: Create a QuickSight dashboard that displays live equipment status, efficiency metrics, and predictive maintenance alerts with automatic refresh capabilities.
+1. **Real-time Equipment Monitoring Dashboard**: Create a QuickSight dashboard that displays live equipment status, efficiency metrics, and predictive maintenance alerts with automatic refresh capabilities using the [QuickSight IoT Analytics integration](https://docs.aws.amazon.com/quicksight/latest/user/working-with-iot-analytics.html).
 
-2. **Predictive Maintenance Algorithm**: Develop a SageMaker model that analyzes historical equipment data to predict failures and schedule maintenance windows based on operational patterns and performance degradation trends.
+2. **Predictive Maintenance Algorithm**: Develop a SageMaker model that analyzes historical equipment data to predict failures and schedule maintenance windows based on operational patterns and performance degradation trends using [SageMaker time-series forecasting](https://docs.aws.amazon.com/sagemaker/latest/dg/timeseries-forecasting.html).
 
-3. **Multi-facility Data Aggregation**: Implement a hierarchical asset model structure that aggregates data from multiple production lines and facilities, enabling enterprise-wide operational intelligence and comparative analysis.
+3. **Multi-facility Data Aggregation**: Implement a hierarchical asset model structure that aggregates data from multiple production lines and facilities, enabling enterprise-wide operational intelligence and comparative analysis following [SiteWise asset hierarchy patterns](https://docs.aws.amazon.com/iot-sitewise/latest/userguide/asset-hierarchies.html).
 
-4. **Edge Computing Integration**: Deploy AWS IoT Greengrass at the edge to enable local data processing, reduce latency for critical control systems, and maintain operations during network connectivity issues.
+4. **Edge Computing Integration**: Deploy AWS IoT Greengrass at the edge to enable local data processing, reduce latency for critical control systems, and maintain operations during network connectivity issues using the [SiteWise Edge gateway](https://docs.aws.amazon.com/iot-sitewise/latest/userguide/gateways.html).
 
-5. **Advanced Alert Management**: Create a comprehensive alerting system using Amazon SNS and AWS Lambda that correlates multiple equipment signals to reduce false alarms and prioritize maintenance actions based on production impact.
+5. **Advanced Alert Management**: Create a comprehensive alerting system using Amazon SNS and AWS Lambda that correlates multiple equipment signals to reduce false alarms and prioritize maintenance actions based on production impact, implementing the patterns described in the [CloudWatch alarms best practices](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html).
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

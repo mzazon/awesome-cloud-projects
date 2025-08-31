@@ -6,16 +6,16 @@ difficulty: 400
 subject: aws
 services: managed-blockchain, vpc, ec2, cloudformation
 estimated-time: 240 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: blockchain, hyperledger-fabric, managed-blockchain, distributed-ledger
 recipe-generator-version: 1.3
 ---
 
-# Enterprise Blockchain Network
+# Enterprise Blockchain Network with Managed Blockchain
 
 ## Problem
 
@@ -69,11 +69,11 @@ graph TB
 1. AWS account with permissions for Managed Blockchain, VPC, EC2, and IAM
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of blockchain concepts and Hyperledger Fabric
-4. Node.js 16+ and npm for client application development
+4. Node.js 18+ and npm for client application development
 5. Understanding of smart contract development principles
 6. Estimated cost: $50-100 for 4-hour session (includes compute and blockchain network costs)
 
-> **Note**: Amazon Managed Blockchain charges based on peer nodes, storage, and data transfer. Review [pricing details](https://aws.amazon.com/managed-blockchain/pricing/) before proceeding.
+> **Note**: Amazon Managed Blockchain charges based on peer nodes, storage, and data transfer. Review [Amazon Managed Blockchain pricing](https://aws.amazon.com/managed-blockchain/pricing/) before proceeding.
 
 ## Preparation
 
@@ -263,40 +263,50 @@ echo "✅ Subnet created: ${SUBNET_ID}"
    echo "✅ Node ID: ${NODE_ID}"
    ```
 
-5. **Create VPC Endpoint for Blockchain Access**:
+5. **Create Internet Gateway for Client Access**:
 
-   VPC endpoints enable secure, private connectivity between your AWS resources and Managed Blockchain without traversing the public internet. This private network path ensures blockchain communications remain within the AWS backbone, providing enhanced security and performance for sensitive blockchain operations.
+   The client instance requires internet access to download dependencies and connect to the blockchain network endpoints. An Internet Gateway provides secure, controlled internet connectivity for blockchain client applications while maintaining network isolation through security groups.
 
    ```bash
-   # Create VPC endpoint for secure blockchain access
-   aws managedblockchain create-accessor \
-       --accessor-type BILLING_TOKEN \
-       --client-request-token $(uuidgen)
+   # Create Internet Gateway for client connectivity
+   aws ec2 create-internet-gateway \
+       --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=blockchain-igw-${RANDOM_SUFFIX}}]"
    
-   # Get accessor details
-   ACCESSOR_ID=$(aws managedblockchain list-accessors \
-       --query "Accessors[0].Id" \
-       --output text)
+   IGW_ID=$(aws ec2 describe-internet-gateways \
+       --filters "Name=tag:Name,Values=blockchain-igw-${RANDOM_SUFFIX}" \
+       --query 'InternetGateways[0].InternetGatewayId' --output text)
    
-   # Create VPC endpoint
-   aws ec2 create-vpc-endpoint \
+   # Attach Internet Gateway to VPC
+   aws ec2 attach-internet-gateway \
+       --internet-gateway-id ${IGW_ID} \
+       --vpc-id ${VPC_ID}
+   
+   # Create route table for public subnet
+   aws ec2 create-route-table \
        --vpc-id ${VPC_ID} \
-       --service-name com.amazonaws.${AWS_REGION}.managedblockchain.${NETWORK_ID} \
-       --vpc-endpoint-type Interface \
-       --subnet-ids ${SUBNET_ID} \
-       --tag-specifications "ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=${VPC_ENDPOINT_NAME}}]"
+       --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=blockchain-rt-${RANDOM_SUFFIX}}]"
    
-   VPC_ENDPOINT_ID=$(aws ec2 describe-vpc-endpoints \
-       --filters "Name=tag:Name,Values=${VPC_ENDPOINT_NAME}" \
-       --query 'VpcEndpoints[0].VpcEndpointId' \
-       --output text)
+   RT_ID=$(aws ec2 describe-route-tables \
+       --filters "Name=tag:Name,Values=blockchain-rt-${RANDOM_SUFFIX}" \
+       --query 'RouteTables[0].RouteTableId' --output text)
    
-   export VPC_ENDPOINT_ID
+   # Add route to Internet Gateway
+   aws ec2 create-route \
+       --route-table-id ${RT_ID} \
+       --destination-cidr-block 0.0.0.0/0 \
+       --gateway-id ${IGW_ID}
    
-   echo "✅ VPC endpoint created: ${VPC_ENDPOINT_ID}"
+   # Associate route table with subnet
+   aws ec2 associate-route-table \
+       --route-table-id ${RT_ID} \
+       --subnet-id ${SUBNET_ID}
+   
+   export IGW_ID RT_ID
+   
+   echo "✅ Internet connectivity configured: ${IGW_ID}"
    ```
 
-   The VPC endpoint now provides a secure communication channel to your blockchain network. This private connectivity ensures that sensitive blockchain transactions and smart contract interactions remain isolated from public internet traffic.
+   The client infrastructure now has secure internet access for downloading blockchain development tools and connecting to Managed Blockchain service endpoints. This configuration follows AWS security best practices by using security groups to control access while providing necessary connectivity.
 
 6. **Launch Client EC2 Instance**:
 
@@ -314,24 +324,28 @@ echo "✅ Subnet created: ${SUBNET_ID}"
        --query 'SecurityGroups[0].GroupId' \
        --output text)
    
-   # Allow SSH access (adjust source IP as needed)
+   # Allow HTTPS access for blockchain client
    aws ec2 authorize-security-group-ingress \
        --group-id ${SG_ID} \
        --protocol tcp \
-       --port 22 \
-       --cidr 0.0.0.0/0
+       --port 443 \
+       --cidr 10.0.0.0/16
+   
+   # Get the latest Amazon Linux 2023 AMI ID
+   LATEST_AMI=$(aws ssm get-parameters \
+       --names "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64" \
+       --query 'Parameters[0].Value' --output text)
    
    # Launch EC2 instance for blockchain client
    aws ec2 run-instances \
-       --image-id ami-0abcdef1234567890 \
+       --image-id ${LATEST_AMI} \
        --count 1 \
        --instance-type t3.medium \
-       --key-name your-key-pair \
        --security-group-ids ${SG_ID} \
        --subnet-id ${SUBNET_ID} \
        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=blockchain-client-${RANDOM_SUFFIX}}]" \
        --user-data '#!/bin/bash
-       yum update -y
+       dnf update -y
        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
        export NVM_DIR="$HOME/.nvm"
        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
@@ -480,16 +494,16 @@ echo "✅ Subnet created: ${SUBNET_ID}"
 
    Expected output: Status should be `"AVAILABLE"` with a peer endpoint URL.
 
-3. Test VPC endpoint connectivity:
+3. Test internet connectivity:
 
    ```bash
-   # Verify VPC endpoint is available
-   aws ec2 describe-vpc-endpoints \
-       --vpc-endpoint-ids ${VPC_ENDPOINT_ID} \
-       --query 'VpcEndpoints[0].State'
+   # Verify Internet Gateway is attached
+   aws ec2 describe-internet-gateways \
+       --internet-gateway-ids ${IGW_ID} \
+       --query 'InternetGateways[0].State'
    ```
 
-   Expected output: `"Available"`
+   Expected output: `"available"`
 
 4. Validate client application setup:
 
@@ -501,7 +515,7 @@ echo "✅ Subnet created: ${SUBNET_ID}"
    npm list fabric-network
    ```
 
-   Expected output: Node.js version 16+ and fabric-network package listed.
+   Expected output: Node.js version 18+ and fabric-network package listed.
 
 ## Cleanup
 
@@ -557,19 +571,33 @@ echo "✅ Subnet created: ${SUBNET_ID}"
 3. Clean up VPC resources:
 
    ```bash
-   # Delete VPC endpoint
-   aws ec2 delete-vpc-endpoint \
-       --vpc-endpoint-id ${VPC_ENDPOINT_ID}
-   
    # Terminate EC2 instance
    INSTANCE_ID=$(aws ec2 describe-instances \
        --filters "Name=tag:Name,Values=blockchain-client-${RANDOM_SUFFIX}" \
        --query 'Reservations[0].Instances[0].InstanceId' \
        --output text)
    
-   if [ "$INSTANCE_ID" != "None" ]; then
+   if [ "$INSTANCE_ID" != "None" ] && [ "$INSTANCE_ID" != "null" ]; then
        aws ec2 terminate-instances --instance-ids ${INSTANCE_ID}
+       echo "Waiting for instance termination..."
+       aws ec2 wait instance-terminated --instance-ids ${INSTANCE_ID}
    fi
+   
+   # Delete route table association and route table
+   aws ec2 disassociate-route-table \
+       --association-id $(aws ec2 describe-route-tables \
+           --route-table-ids ${RT_ID} \
+           --query 'RouteTables[0].Associations[0].RouteTableAssociationId' \
+           --output text) 2>/dev/null || true
+   
+   aws ec2 delete-route-table --route-table-id ${RT_ID}
+   
+   # Detach and delete Internet Gateway
+   aws ec2 detach-internet-gateway \
+       --internet-gateway-id ${IGW_ID} \
+       --vpc-id ${VPC_ID}
+   
+   aws ec2 delete-internet-gateway --internet-gateway-id ${IGW_ID}
    
    # Delete security group
    aws ec2 delete-security-group --group-id ${SG_ID}
@@ -589,9 +617,11 @@ Amazon Managed Blockchain transforms enterprise blockchain adoption by eliminati
 
 Hyperledger Fabric's permissioned network model makes it particularly suitable for enterprise use cases requiring privacy, regulatory compliance, and controlled access. The modular architecture supports pluggable consensus mechanisms, configurable membership policies, and fine-grained access controls that align with enterprise security requirements. Smart contracts (chaincode) execute in isolated containers, providing deterministic transaction processing while maintaining network security and performance isolation between different business applications.
 
-The integration with AWS services creates powerful hybrid architectures where blockchain provides immutable audit trails and multi-party consensus while traditional cloud services handle user interfaces, analytics, and integration with existing enterprise systems. VPC endpoints ensure that sensitive blockchain communications remain within AWS's private network backbone, addressing security concerns that often arise with public blockchain networks.
+The integration with AWS services creates powerful hybrid architectures where blockchain provides immutable audit trails and multi-party consensus while traditional cloud services handle user interfaces, analytics, and integration with existing enterprise systems. Managed Blockchain networks communicate through secure HTTPS endpoints, eliminating the need for complex VPC endpoint configurations while maintaining enterprise-grade security standards.
 
-> **Tip**: Consider implementing multiple peer nodes across different availability zones for production deployments to ensure high availability and disaster recovery capabilities. See [Hyperledger Fabric documentation](https://hyperledger-fabric.readthedocs.io/) for advanced configuration patterns.
+This architecture follows AWS Well-Architected principles by implementing security in depth, operational excellence through managed services, and cost optimization through pay-per-use pricing models. The blockchain network scales automatically based on transaction volume while maintaining consistent performance and availability across multiple AWS Availability Zones.
+
+> **Tip**: Consider implementing multiple peer nodes across different availability zones for production deployments to ensure high availability and disaster recovery capabilities. See [Amazon Managed Blockchain documentation](https://docs.aws.amazon.com/managed-blockchain/latest/hyperledger-fabric-dev/what-is-managed-blockchain.html) for advanced configuration patterns.
 
 ## Challenge
 
@@ -609,4 +639,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Datastream, BigQuery, Looker Studio
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: real-time analytics, data streaming, business intelligence, change data capture, dashboard
 recipe-generator-version: 1.3
@@ -123,7 +123,7 @@ echo "✅ APIs enabled for Datastream and BigQuery"
    Datastream connection profiles define secure connectivity parameters and authentication credentials for source databases. This configuration enables Datastream to establish encrypted connections to operational databases while maintaining network security and access controls through Google Cloud's managed infrastructure.
 
    ```bash
-   # Create connection profile for source database
+   # Create connection profile for source database (MySQL example)
    # Note: Replace with your actual database details
    gcloud datastream connection-profiles create ${CONNECTION_PROFILE_NAME} \
        --location=${REGION} \
@@ -131,8 +131,9 @@ echo "✅ APIs enabled for Datastream and BigQuery"
        --mysql-hostname=10.0.0.10 \
        --mysql-port=3306 \
        --mysql-username=datastream_user \
-       --mysql-password-file=<(echo "your_secure_password") \
-       --display-name="Source Database Connection"
+       --mysql-password=your_secure_password \
+       --display-name="Source Database Connection" \
+       --static-ip-connectivity
    
    # Verify connection profile creation
    gcloud datastream connection-profiles describe \
@@ -153,7 +154,6 @@ echo "✅ APIs enabled for Datastream and BigQuery"
    gcloud datastream connection-profiles create ${BQ_CONNECTION_PROFILE_NAME} \
        --location=${REGION} \
        --type=bigquery \
-       --bigquery-dataset=${DATASET_NAME} \
        --display-name="BigQuery Analytics Destination"
    
    # Verify BigQuery connection profile
@@ -171,30 +171,84 @@ echo "✅ APIs enabled for Datastream and BigQuery"
    Datastream's change data capture technology monitors database transaction logs to identify and replicate data modifications in near real-time. This step creates the streaming pipeline that captures INSERT, UPDATE, and DELETE operations from the source database and prepares them for replication to BigQuery with minimal impact on operational performance.
 
    ```bash
-   # Create the Datastream configuration
+   # Create BigQuery destination configuration file
+   cat > bigquery_config.json << 'EOF'
+   {
+     "singleTargetDataset": {
+       "datasetId": "PROJECT_ID:DATASET_NAME"
+     },
+     "merge": {},
+     "dataFreshness": "900s"
+   }
+   EOF
+   
+   # Replace placeholders in config file
+   sed -i "s/PROJECT_ID/${PROJECT_ID}/g" bigquery_config.json
+   sed -i "s/DATASET_NAME/${DATASET_NAME}/g" bigquery_config.json
+   
+   # Create MySQL source configuration file (adjust for your database)
+   cat > mysql_config.json << 'EOF'
+   {
+     "includeObjects": {
+       "mysqlDatabases": [
+         {
+           "database": "ecommerce_db",
+           "mysqlTables": [
+             {"table": "sales_orders"},
+             {"table": "customers"},
+             {"table": "products"}
+           ]
+         }
+       ]
+     }
+   }
+   EOF
+   
+   # Create the Datastream
    gcloud datastream streams create ${STREAM_NAME} \
        --location=${REGION} \
-       --source-connection-profile=${CONNECTION_PROFILE_NAME} \
-       --destination-connection-profile=${BQ_CONNECTION_PROFILE_NAME} \
        --display-name="Real-time Sales Analytics Stream" \
-       --include-objects=mysql-database-name.sales_orders,mysql-database-name.customers,mysql-database-name.products \
-       --oracle-source-config-max-concurrent-cdc-tasks=5 \
-       --oracle-source-config-max-concurrent-backfill-tasks=12
+       --source=${CONNECTION_PROFILE_NAME} \
+       --destination=${BQ_CONNECTION_PROFILE_NAME} \
+       --mysql-source-config=mysql_config.json \
+       --bigquery-destination-config=bigquery_config.json \
+       --backfill-all
    
+   echo "✅ Datastream configured and created"
+   ```
+
+   The Datastream is now configured to monitor the source database and replicate changes to BigQuery. The service will perform an initial backfill of existing data followed by continuous streaming of new changes, typically achieving replication latency of seconds to minutes depending on transaction volume and network conditions.
+
+5. **Start the Datastream**:
+
+   Starting the Datastream initiates the data replication process, beginning with a complete backfill of existing data followed by real-time change capture. This step activates the pipeline that will continuously monitor and replicate database modifications to maintain data synchronization between operational and analytical systems.
+
+   ```bash
    # Start the stream to begin data replication
    gcloud datastream streams start ${STREAM_NAME} \
        --location=${REGION}
    
-   echo "✅ Datastream configured and started"
+   # Monitor stream startup status
+   echo "Waiting for stream to start..."
+   sleep 30
+   gcloud datastream streams describe ${STREAM_NAME} \
+       --location=${REGION} \
+       --format="value(state)"
+   
+   echo "✅ Datastream started and running"
    ```
 
-   The Datastream is now actively monitoring the source database and replicating changes to BigQuery. The service will perform an initial backfill of existing data followed by continuous streaming of new changes, typically achieving replication latency of seconds to minutes depending on transaction volume and network conditions.
+   The Datastream is now actively monitoring the source database and replicating changes to BigQuery. Initial backfill may take several minutes to hours depending on data volume, followed by continuous streaming with typically sub-minute latency for new changes.
 
-5. **Verify Data Replication in BigQuery**:
+6. **Verify Data Replication in BigQuery**:
 
    Monitoring the data replication process ensures that Datastream is successfully capturing and transferring database changes to BigQuery. This verification step confirms that tables are being created with the correct schema and that data is flowing consistently from the operational database to the analytical warehouse.
 
    ```bash
+   # Wait for initial data replication
+   echo "Waiting for data replication to begin..."
+   sleep 60
+   
    # Check for replicated tables in BigQuery
    bq ls ${DATASET_NAME}
    
@@ -213,7 +267,7 @@ echo "✅ APIs enabled for Datastream and BigQuery"
 
    The replicated tables now contain both historical data from the initial backfill and real-time changes from ongoing transactions. BigQuery's metadata columns provide audit trails and timestamps that enable tracking data freshness and ensuring analytical queries reflect the most current business state.
 
-6. **Create Analytics Views for Business Intelligence**:
+7. **Create Analytics Views for Business Intelligence**:
 
    BigQuery views abstract complex data transformations and provide business-friendly interfaces for Looker Studio dashboards. These views implement common analytical patterns such as aggregations, joins, and time-based calculations while maintaining real-time data access and enabling business users to focus on insights rather than technical implementation details.
 
@@ -256,7 +310,7 @@ echo "✅ APIs enabled for Datastream and BigQuery"
 
    The analytical views now provide clean, business-ready datasets that automatically reflect real-time changes from the operational database. These views implement best practices for dimensional modeling and time-series analysis while hiding technical complexities from business users who will access the data through Looker Studio dashboards.
 
-7. **Connect BigQuery to Looker Studio**:
+8. **Connect BigQuery to Looker Studio**:
 
    Looker Studio provides self-service business intelligence capabilities with native BigQuery integration, enabling business users to create interactive dashboards and reports without technical expertise. This connection establishes the final link in the real-time analytics pipeline, transforming raw operational data into actionable business insights through compelling visualizations.
 
@@ -278,7 +332,7 @@ echo "✅ APIs enabled for Datastream and BigQuery"
 
    The BigQuery data source is now configured for Looker Studio access. Business users can create dashboards using the analytical views while maintaining real-time data connectivity, ensuring that visualizations reflect the most current business performance and operational metrics as they occur in the source database.
 
-8. **Create Real-Time Dashboard in Looker Studio**:
+9. **Create Real-Time Dashboard in Looker Studio**:
 
    Building interactive dashboards in Looker Studio transforms real-time data into actionable business intelligence through charts, tables, and key performance indicators. This step creates visual representations of sales performance, customer behavior, and operational metrics that automatically update as new data flows through the Datastream pipeline to BigQuery.
 
@@ -334,14 +388,14 @@ echo "✅ APIs enabled for Datastream and BigQuery"
          VALUES (123, 456, 2, 29.99, NOW());"
    
    # Wait for replication and check BigQuery
-   sleep 30
+   sleep 60
    bq query --use_legacy_sql=false \
        "SELECT COUNT(*) as recent_orders 
         FROM \`${PROJECT_ID}.${DATASET_NAME}.sales_orders\` 
-        WHERE _metadata_timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 MINUTE)"
+        WHERE _metadata_timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 5 MINUTE)"
    ```
 
-   Expected output: New records should appear in BigQuery within 1-2 minutes and automatically update Looker Studio dashboard.
+   Expected output: New records should appear in BigQuery within 2-5 minutes and automatically update Looker Studio dashboard.
 
 3. **Validate Dashboard Performance**:
 
@@ -395,13 +449,16 @@ echo "✅ APIs enabled for Datastream and BigQuery"
    echo "✅ BigQuery dataset and tables deleted"
    ```
 
-4. **Remove Looker Studio dashboard**:
+4. **Remove configuration files and Looker Studio dashboard**:
 
    ```bash
+   # Remove local configuration files
+   rm -f bigquery_config.json mysql_config.json
+   
    echo "Manual step: Delete Looker Studio reports at https://lookerstudio.google.com/"
    echo "Navigate to your reports and delete the analytics dashboard"
    
-   echo "✅ Cleanup instructions provided for Looker Studio"
+   echo "✅ Cleanup completed"
    ```
 
 ## Discussion
@@ -432,4 +489,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

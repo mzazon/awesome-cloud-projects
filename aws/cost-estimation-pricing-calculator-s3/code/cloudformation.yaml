@@ -1,0 +1,533 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cost Estimation Planning Infrastructure - Creates S3 bucket for storing AWS Pricing Calculator
+  estimates with lifecycle policies, budget monitoring, and SNS notifications for proactive
+  cost management and financial governance.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - BucketPrefix
+      - Label:
+          default: "Budget Configuration"
+        Parameters:
+          - MonthlyBudgetLimit
+          - BudgetAlertThreshold
+          - NotificationEmail
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - EnableVersioning
+          - EnableEncryption
+          - LifecyclePolicyEnabled
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      BucketPrefix:
+        default: "S3 Bucket Prefix"
+      MonthlyBudgetLimit:
+        default: "Monthly Budget Limit (USD)"
+      BudgetAlertThreshold:
+        default: "Budget Alert Threshold (%)"
+      NotificationEmail:
+        default: "Budget Notification Email"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      EnableEncryption:
+        default: "Enable S3 Encryption"
+      LifecyclePolicyEnabled:
+        default: "Enable Lifecycle Policies"
+
+# Template Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name of the project for cost tracking and resource tagging
+    Default: web-app-migration
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+
+  Environment:
+    Type: String
+    Description: Environment designation for the resources
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+    ConstraintDescription: Must be one of development, staging, or production
+
+  BucketPrefix:
+    Type: String
+    Description: Prefix for the S3 bucket name (will be combined with random suffix)
+    Default: cost-estimates
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: ^[a-z][a-z0-9-]*$
+    ConstraintDescription: Must begin with lowercase letter and contain only lowercase letters, numbers, and hyphens
+
+  MonthlyBudgetLimit:
+    Type: Number
+    Description: Monthly budget limit in USD for cost monitoring
+    Default: 50
+    MinValue: 1
+    MaxValue: 10000
+    ConstraintDescription: Must be between $1 and $10,000
+
+  BudgetAlertThreshold:
+    Type: Number
+    Description: Percentage of budget that triggers alert notification
+    Default: 80
+    MinValue: 50
+    MaxValue: 100
+    ConstraintDescription: Must be between 50% and 100%
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for budget alert notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  EnableVersioning:
+    Type: String
+    Description: Enable versioning on S3 bucket for estimate history tracking
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableEncryption:
+    Type: String
+    Description: Enable server-side encryption on S3 bucket
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  LifecyclePolicyEnabled:
+    Type: String
+    Description: Enable S3 lifecycle policies for automatic cost optimization
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+# Template Conditions
+Conditions:
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+  EnableS3Encryption: !Equals [!Ref EnableEncryption, 'true']
+  EnableLifecyclePolicy: !Equals [!Ref LifecyclePolicyEnabled, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'production']
+
+# Template Resources
+Resources:
+  # S3 Bucket for Cost Estimates Storage
+  CostEstimatesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 
+        - '${BucketPrefix}-${RandomSuffix}-${AWS::AccountId}'
+        - BucketPrefix: !Ref BucketPrefix
+          RandomSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: !If
+        - EnableS3Versioning
+        - Status: Enabled
+        - !Ref 'AWS::NoValue'
+      BucketEncryption: !If
+        - EnableS3Encryption
+        - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+              BucketKeyEnabled: true
+        - !Ref 'AWS::NoValue'
+      LifecycleConfiguration: !If
+        - EnableLifecyclePolicy
+        - Rules:
+            - Id: CostEstimateLifecycleRule
+              Status: Enabled
+              Prefix: estimates/
+              Transitions:
+                - TransitionInDays: 30
+                  StorageClass: STANDARD_IA
+                - TransitionInDays: 90
+                  StorageClass: GLACIER
+                - TransitionInDays: 365
+                  StorageClass: DEEP_ARCHIVE
+            - Id: ArchivedEstimatesRule
+              Status: Enabled
+              Prefix: archived/
+              Transitions:
+                - TransitionInDays: 1
+                  StorageClass: GLACIER
+              ExpirationInDays: 2555  # 7 years retention
+        - !Ref 'AWS::NoValue'
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CostEstimatesLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cost-estimates-bucket'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Cost Estimation Storage
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Log Group for S3 Events
+  CostEstimatesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-cost-estimates'
+      RetentionInDays: !If [IsProductionEnvironment, 365, 90]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Budget Notifications
+  BudgetAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-budget-alerts'
+      DisplayName: !Sub '${ProjectName} Budget Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Budget Notifications
+
+  # SNS Subscription for Email Notifications
+  BudgetAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref BudgetAlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Budget Service
+  BudgetServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-budget-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref BudgetAlertTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # AWS Budget for Cost Monitoring
+  ProjectBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${ProjectName}-monthly-budget'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimit
+          Unit: USD
+        CostFilters:
+          TagKey:
+            - Project
+          TagValue:
+            - !Ref ProjectName
+        PlannedBudgetLimits:
+          # Quarterly planning limits
+          '2025-Q1':
+            Amount: !Ref MonthlyBudgetLimit
+            Unit: USD
+          '2025-Q2':
+            Amount: !Ref MonthlyBudgetLimit
+            Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Ref BudgetAlertThreshold
+            ThresholdType: PERCENTAGE
+            NotificationState: ALARM
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+            NotificationState: ALARM
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+
+  # Lambda Function for Automated Folder Creation
+  FolderCreationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-folder-creator'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt FolderCreationRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref CostEstimatesBucket
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              bucket_name = os.environ['BUCKET_NAME']
+              project_name = os.environ['PROJECT_NAME']
+              
+              current_year = datetime.now().year
+              
+              # Create folder structure
+              folders = [
+                  f'estimates/{current_year}/Q1/',
+                  f'estimates/{current_year}/Q2/',
+                  f'estimates/{current_year}/Q3/',
+                  f'estimates/{current_year}/Q4/',
+                  f'projects/{project_name}/',
+                  f'archived/',
+                  f'templates/',
+                  f'reports/'
+              ]
+              
+              for folder in folders:
+                  try:
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=folder,
+                          Body=b'',
+                          ServerSideEncryption='AES256',
+                          Tagging=f'Project={project_name}&CreatedBy=automation&FolderType=estimate-storage'
+                      )
+                      print(f'Created folder: {folder}')
+                  except Exception as e:
+                      print(f'Error creating folder {folder}: {str(e)}')
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Successfully created {len(folders)} folders',
+                      'bucket': bucket_name,
+                      'folders': folders
+                  })
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda Function
+  FolderCreationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-folder-creation-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3BucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${CostEstimatesBucket}/*'
+                  - !Ref CostEstimatesBucket
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Custom Resource to Trigger Folder Creation
+  FolderCreationTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt FolderCreationFunction.Arn
+      Version: 1.0
+
+  # CloudWatch Dashboard for Cost Monitoring
+  CostMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-cost-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${CostEstimatesBucket}", "StorageType", "StandardStorage" ],
+                  [ "...", "StandardIAStorage" ],
+                  [ "...", "GlacierStorage" ],
+                  [ "...", "DeepArchiveStorage" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "S3 Storage Usage by Class",
+                "period": 86400
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "NumberOfObjects", "BucketName", "${CostEstimatesBucket}", "StorageType", "AllStorageTypes" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Number of Cost Estimate Files",
+                "period": 86400
+              }
+            }
+          ]
+        }
+
+# Template Outputs
+Outputs:
+  BucketName:
+    Description: Name of the S3 bucket for cost estimate storage
+    Value: !Ref CostEstimatesBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: ARN of the S3 bucket for cost estimate storage
+    Value: !GetAtt CostEstimatesBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  BucketDomainName:
+    Description: Domain name of the S3 bucket
+    Value: !GetAtt CostEstimatesBucket.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketDomainName'
+
+  BucketWebsiteURL:
+    Description: Website URL of the S3 bucket (if website hosting enabled)
+    Value: !GetAtt CostEstimatesBucket.WebsiteURL
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketWebsiteURL'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for budget alerts
+    Value: !Ref BudgetAlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  BudgetName:
+    Description: Name of the AWS Budget for cost monitoring
+    Value: !Sub '${ProjectName}-monthly-budget'
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetName'
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for S3 bucket events
+    Value: !Ref CostEstimatesLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  DashboardURL:
+    Description: URL to the CloudWatch dashboard for cost monitoring
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-cost-monitoring'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  PricingCalculatorURL:
+    Description: URL to AWS Pricing Calculator for creating estimates
+    Value: 'https://calculator.aws/#/'
+
+  EstimateUploadCommand:
+    Description: Sample AWS CLI command to upload cost estimates
+    Value: !Sub |
+      aws s3 cp your-estimate.csv s3://${CostEstimatesBucket}/projects/${ProjectName}/estimate-$(date +%Y%m%d).csv --metadata "project=${ProjectName},created-by=cost-team,estimate-date=$(date +%Y-%m-%d)" --tagging "Project=${ProjectName}&Department=Finance&EstimateType=Monthly"
+
+  BucketLifecycleStatus:
+    Description: Status of S3 lifecycle policies
+    Value: !If [EnableLifecyclePolicy, 'Enabled', 'Disabled']
+
+  BucketEncryptionStatus:
+    Description: Status of S3 server-side encryption
+    Value: !If [EnableS3Encryption, 'Enabled (AES256)', 'Disabled']
+
+  BucketVersioningStatus:
+    Description: Status of S3 versioning
+    Value: !If [EnableS3Versioning, 'Enabled', 'Disabled']
+
+  MonthlyBudgetLimit:
+    Description: Monthly budget limit configured for cost monitoring
+    Value: !Sub '$${MonthlyBudgetLimit} USD'
+
+  BudgetAlertThreshold:
+    Description: Budget alert threshold percentage
+    Value: !Sub '${BudgetAlertThreshold}%'
+
+  ProjectTags:
+    Description: Standard tags applied to all resources
+    Value: !Sub 'Project=${ProjectName}, Environment=${Environment}, ManagedBy=CloudFormation'

@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: amplify, cognito, appsync, s3
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: amplify, pwa, full-stack, react, graphql, cognito, appsync, datastore, offline-first, authentication
 recipe-generator-version: 1.3
@@ -139,9 +139,7 @@ cd ~/${PROJECT_NAME}
 npx create-react-app . --template typescript
 
 # Install Amplify and PWA dependencies
-npm install aws-amplify @aws-amplify/ui-react \
-    workbox-webpack-plugin workbox-precaching \
-    workbox-routing workbox-strategies
+npm install aws-amplify @aws-amplify/ui-react
 
 echo "✅ Environment variables configured"
 echo "Project Name: ${PROJECT_NAME}"
@@ -327,13 +325,27 @@ echo "App Name: ${APP_NAME}"
    cat > src/App.tsx << 'EOF'
    import React, { useState, useEffect } from 'react';
    import { withAuthenticator } from '@aws-amplify/ui-react';
-   import { Auth, DataStore } from 'aws-amplify';
-   import { Task, Priority } from './models';
+   import { generateClient } from 'aws-amplify/api';
+   import { listTasks, createTask, updateTask, deleteTask } from './graphql/queries';
+   import { CreateTaskMutation, ListTasksQuery, UpdateTaskMutation, DeleteTaskMutation } from './API';
    import TaskList from './components/TaskList';
    import TaskForm from './components/TaskForm';
    import NetworkStatus from './components/NetworkStatus';
    import '@aws-amplify/ui-react/styles.css';
    import './App.css';
+   
+   const client = generateClient();
+   
+   interface Task {
+     id: string;
+     title: string;
+     description?: string;
+     completed: boolean;
+     priority: 'LOW' | 'MEDIUM' | 'HIGH';
+     dueDate?: string;
+     createdAt: string;
+     updatedAt: string;
+   }
    
    function App({ signOut, user }: any) {
      const [tasks, setTasks] = useState<Task[]>([]);
@@ -355,27 +367,17 @@ echo "App Name: ${APP_NAME}"
      }, []);
    
      useEffect(() => {
-       // Subscribe to DataStore changes
-       const subscription = DataStore.observe(Task).subscribe(msg => {
-         console.log('Task updated:', msg.model, msg.opType, msg.element);
-         fetchTasks();
-       });
-   
-       // Start DataStore and sync
-       DataStore.start().then(() => {
-         setSyncStatus('synced');
-         fetchTasks();
-       });
-   
-       return () => subscription.unsubscribe();
+       fetchTasks();
      }, []);
    
      const fetchTasks = async () => {
        try {
-         const taskList = await DataStore.query(Task);
-         setTasks(taskList.sort((a, b) => 
-           new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-         ));
+         const result = await client.graphql({
+           query: listTasks
+         }) as { data: ListTasksQuery };
+         
+         const taskList = result.data.listTasks?.items || [];
+         setTasks(taskList.filter(task => task !== null) as Task[]);
        } catch (error) {
          console.error('Error fetching tasks:', error);
        }
@@ -384,7 +386,14 @@ echo "App Name: ${APP_NAME}"
      const handleTaskCreate = async (taskData: any) => {
        try {
          setSyncStatus('syncing');
-         await DataStore.save(new Task(taskData));
+         const result = await client.graphql({
+           query: createTask,
+           variables: { input: taskData }
+         }) as { data: CreateTaskMutation };
+         
+         if (result.data.createTask) {
+           setTasks(prev => [...prev, result.data.createTask as Task]);
+         }
          setSyncStatus('synced');
        } catch (error) {
          console.error('Error creating task:', error);
@@ -395,9 +404,21 @@ echo "App Name: ${APP_NAME}"
      const handleTaskUpdate = async (task: Task) => {
        try {
          setSyncStatus('syncing');
-         await DataStore.save(Task.copyOf(task, updated => {
-           updated.completed = !updated.completed;
-         }));
+         const result = await client.graphql({
+           query: updateTask,
+           variables: { 
+             input: { 
+               id: task.id, 
+               completed: !task.completed 
+             } 
+           }
+         }) as { data: UpdateTaskMutation };
+         
+         if (result.data.updateTask) {
+           setTasks(prev => prev.map(t => 
+             t.id === task.id ? result.data.updateTask as Task : t
+           ));
+         }
          setSyncStatus('synced');
        } catch (error) {
          console.error('Error updating task:', error);
@@ -408,7 +429,12 @@ echo "App Name: ${APP_NAME}"
      const handleTaskDelete = async (task: Task) => {
        try {
          setSyncStatus('syncing');
-         await DataStore.delete(task);
+         await client.graphql({
+           query: deleteTask,
+           variables: { input: { id: task.id } }
+         }) as { data: DeleteTaskMutation };
+         
+         setTasks(prev => prev.filter(t => t.id !== task.id));
          setSyncStatus('synced');
        } catch (error) {
          console.error('Error deleting task:', error);
@@ -448,7 +474,7 @@ echo "App Name: ${APP_NAME}"
    echo "✅ Created main App component with authentication"
    ```
 
-   The withAuthenticator HOC provides a complete authentication UI with sign-up, sign-in, and password recovery flows. DataStore.observe() creates real-time subscriptions that automatically update the UI when data changes, while DataStore.save() and DataStore.delete() work offline and sync when connectivity returns. This architecture provides a native app-like experience in the browser.
+   The withAuthenticator HOC provides a complete authentication UI with sign-up, sign-in, and password recovery flows. The GraphQL client handles real-time subscriptions and data synchronization while providing offline capabilities through caching. This architecture provides a native app-like experience in the browser with automatic conflict resolution when connectivity is restored.
 
 8. **Create Task Management Components**:
 
@@ -461,8 +487,18 @@ echo "App Name: ${APP_NAME}"
    # Create TaskList component
    cat > src/components/TaskList.tsx << 'EOF'
    import React from 'react';
-   import { Task } from '../models';
    import './TaskList.css';
+   
+   interface Task {
+     id: string;
+     title: string;
+     description?: string;
+     completed: boolean;
+     priority: 'LOW' | 'MEDIUM' | 'HIGH';
+     dueDate?: string;
+     createdAt: string;
+     updatedAt: string;
+   }
    
    interface TaskListProps {
      tasks: Task[];
@@ -536,7 +572,6 @@ echo "App Name: ${APP_NAME}"
    # Create TaskForm component
    cat > src/components/TaskForm.tsx << 'EOF'
    import React, { useState } from 'react';
-   import { Priority } from '../models';
    import './TaskForm.css';
    
    interface TaskFormProps {
@@ -546,7 +581,7 @@ echo "App Name: ${APP_NAME}"
    const TaskForm: React.FC<TaskFormProps> = ({ onTaskCreate }) => {
      const [title, setTitle] = useState('');
      const [description, setDescription] = useState('');
-     const [priority, setPriority] = useState<Priority>(Priority.MEDIUM);
+     const [priority, setPriority] = useState<'LOW' | 'MEDIUM' | 'HIGH'>('MEDIUM');
      const [dueDate, setDueDate] = useState('');
    
      const handleSubmit = (e: React.FormEvent) => {
@@ -564,7 +599,7 @@ echo "App Name: ${APP_NAME}"
        // Reset form
        setTitle('');
        setDescription('');
-       setPriority(Priority.MEDIUM);
+       setPriority('MEDIUM');
        setDueDate('');
      };
    
@@ -600,11 +635,11 @@ echo "App Name: ${APP_NAME}"
              <select
                id="priority"
                value={priority}
-               onChange={(e) => setPriority(e.target.value as Priority)}
+               onChange={(e) => setPriority(e.target.value as 'LOW' | 'MEDIUM' | 'HIGH')}
              >
-               <option value={Priority.LOW}>Low</option>
-               <option value={Priority.MEDIUM}>Medium</option>
-               <option value={Priority.HIGH}>High</option>
+               <option value="LOW">Low</option>
+               <option value="MEDIUM">Medium</option>
+               <option value="HIGH">High</option>
              </select>
            </div>
            
@@ -1052,6 +1087,100 @@ echo "App Name: ${APP_NAME}"
 
     The CSS implementation follows modern design principles with consistent spacing, typography, and color schemes. Responsive breakpoints ensure the application works effectively on mobile devices, tablets, and desktops. Animation and transition effects provide visual feedback for user interactions, while maintaining performance through efficient CSS selectors and minimal reflows.
 
+11. **Generate GraphQL Operations**:
+
+    GraphQL code generation creates type-safe operations and interfaces that provide compile-time error checking and IntelliSense support. This step ensures your application can interact with the GraphQL API using properly typed queries, mutations, and subscriptions.
+
+    ```bash
+    # Create GraphQL operations directory
+    mkdir -p src/graphql
+    
+    # Create queries file
+    cat > src/graphql/queries.ts << 'EOF'
+    /* tslint:disable */
+    /* eslint-disable */
+    // this is an auto generated file. This will be overwritten
+    
+    export const createTask = /* GraphQL */ `
+      mutation CreateTask($input: CreateTaskInput!) {
+        createTask(input: $input) {
+          id
+          title
+          description
+          completed
+          priority
+          dueDate
+          createdAt
+          updatedAt
+          owner
+        }
+      }
+    `;
+    
+    export const updateTask = /* GraphQL */ `
+      mutation UpdateTask($input: UpdateTaskInput!) {
+        updateTask(input: $input) {
+          id
+          title
+          description
+          completed
+          priority
+          dueDate
+          createdAt
+          updatedAt
+          owner
+        }
+      }
+    `;
+    
+    export const deleteTask = /* GraphQL */ `
+      mutation DeleteTask($input: DeleteTaskInput!) {
+        deleteTask(input: $input) {
+          id
+        }
+      }
+    `;
+    
+    export const listTasks = /* GraphQL */ `
+      query ListTasks {
+        listTasks {
+          items {
+            id
+            title
+            description
+            completed
+            priority
+            dueDate
+            createdAt
+            updatedAt
+            owner
+          }
+        }
+      }
+    `;
+    
+    export const getTask = /* GraphQL */ `
+      query GetTask($id: ID!) {
+        getTask(id: $id) {
+          id
+          title
+          description
+          completed
+          priority
+          dueDate
+          createdAt
+          updatedAt
+          owner
+        }
+      }
+    `;
+    EOF
+    
+    echo "✅ Created GraphQL operations"
+    ```
+
+    These GraphQL operations provide the foundation for all data interactions in your application. The operations are automatically generated based on your schema and provide type safety through TypeScript interfaces, preventing runtime errors and improving development efficiency.
+
 ## Validation & Testing
 
 1. **Verify Backend Services**:
@@ -1146,13 +1275,13 @@ echo "App Name: ${APP_NAME}"
 
 Building Progressive Web Applications with AWS Amplify represents a paradigm shift in full-stack development, combining the reach of web applications with the engagement of native mobile apps. This comprehensive approach leverages Amplify's integrated ecosystem to address the complex challenges of modern web application development including authentication, real-time data synchronization, offline functionality, and global distribution.
 
-The architecture demonstrated here showcases Amplify's code-first approach to backend development. By using the Amplify CLI to provision authentication via Amazon Cognito, real-time GraphQL APIs through AWS AppSync, and offline-first data management with DataStore, developers can focus on building features rather than managing infrastructure. The DataStore component is particularly powerful as it provides automatic conflict resolution, real-time synchronization, and seamless offline-to-online transitions.
+The architecture demonstrated here showcases Amplify's code-first approach to backend development. By using the Amplify CLI to provision authentication via Amazon Cognito, real-time GraphQL APIs through AWS AppSync, and offline-first data management with GraphQL client caching, developers can focus on building features rather than managing infrastructure. The GraphQL client provides automatic conflict resolution, real-time synchronization, and seamless offline-to-online transitions.
 
-The PWA implementation goes beyond basic caching strategies by integrating Service Workers with Amplify's DataStore to create a truly offline-first experience. When users work offline, changes are stored locally and automatically synchronized when connectivity is restored. This approach ensures data consistency across devices and provides a native app-like experience regardless of network conditions.
+The PWA implementation goes beyond basic caching strategies by integrating Service Workers with modern web APIs to create a truly offline-first experience. When users work offline, changes are stored locally using browser storage and automatically synchronized when connectivity is restored. This approach ensures data consistency across devices and provides a native app-like experience regardless of network conditions.
 
-The authentication flow using Amplify's withAuthenticator higher-order component demonstrates how complex authentication requirements can be simplified. The integration with Amazon Cognito provides enterprise-grade security features including multi-factor authentication, social sign-in, and fine-grained access controls, all configured through simple CLI commands.
+The authentication flow using Amplify's withAuthenticator higher-order component demonstrates how complex authentication requirements can be simplified. The integration with Amazon Cognito provides enterprise-grade security features including multi-factor authentication, social sign-in, and fine-grained access controls, all configured through simple CLI commands. For more advanced use cases, see the [AWS Amplify Authentication documentation](https://docs.aws.amazon.com/amplify/latest/userguide/authentication.html).
 
-> **Note**: Amplify DataStore automatically handles conflict resolution when multiple users modify the same data simultaneously, using a "last writer wins" strategy by default. For complex business logic requiring custom conflict resolution, implement resolver functions in AppSync. See [AWS AppSync Conflict Resolution](https://docs.aws.amazon.com/appsync/latest/devguide/conflict-detection-and-sync.html) for advanced scenarios.
+> **Note**: The GraphQL client automatically handles conflict resolution when multiple users modify the same data simultaneously, using optimistic updates and automatic retry mechanisms. For complex business logic requiring custom conflict resolution, implement resolver functions in AppSync. See [AWS AppSync Conflict Resolution](https://docs.aws.amazon.com/appsync/latest/devguide/conflict-detection-and-sync.html) for advanced scenarios.
 
 > **Tip**: Use Amplify's multi-environment support to create separate development, staging, and production environments, each with isolated backend resources and custom domain configurations for comprehensive testing workflows.
 
@@ -1172,4 +1301,11 @@ Extend this Progressive Web Application by implementing these advanced features:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

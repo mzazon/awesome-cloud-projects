@@ -1,0 +1,593 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Resource Tagging Automation with Lambda and EventBridge
+  Automatically applies standardized organizational tags to AWS resources
+  upon creation using EventBridge rules and Lambda functions.
+  Version: 1.1
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Tagging Configuration"
+        Parameters:
+          - Environment
+          - CostCenter
+          - ManagedBy
+      - Label:
+          default: "Function Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - ResourcePrefix
+    ParameterLabels:
+      Environment:
+        default: "Environment Tag Value"
+      CostCenter:
+        default: "Cost Center Tag Value"
+      ManagedBy:
+        default: "Managed By Tag Value"
+      LambdaTimeout:
+        default: "Lambda Function Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Function Memory Size (MB)"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+
+# Input Parameters
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment tag value to apply to all auto-tagged resources
+    AllowedValues:
+      - development
+      - staging
+      - production
+      - testing
+    ConstraintDescription: Must be development, staging, production, or testing
+
+  CostCenter:
+    Type: String
+    Default: engineering
+    Description: Cost center tag value for resource cost allocation
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9\-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  ManagedBy:
+    Type: String
+    Default: automation
+    Description: Managed by tag value to identify automated resources
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9\-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+    Description: Lambda function timeout in seconds (30-900)
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: Lambda function memory allocation in MB
+
+  ResourcePrefix:
+    Type: String
+    Default: auto-tagger
+    Description: Prefix for resource names to ensure uniqueness
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9\-]*$'
+    ConstraintDescription: Must start with lowercase letter and contain only lowercase letters, numbers, and hyphens
+
+# Conditional Resources
+Conditions:
+  IsProductionEnvironment: !Equals [!Ref Environment, production]
+
+# Template Resources
+Resources:
+  # IAM Role for Lambda Function
+  AutoTaggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-lambda-role-${AWS::Region}'
+      Description: IAM role for automated resource tagging Lambda function
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ResourceTaggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch Logs permissions for Lambda function logging
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              # EC2 tagging permissions
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DescribeInstances
+                  - ec2:DescribeImages
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeNetworkInterfaces
+                Resource: '*'
+              # S3 bucket tagging permissions
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketTagging
+                  - s3:GetBucketTagging
+                  - s3:ListBucket
+                Resource: 
+                  - 'arn:aws:s3:::*'
+              # RDS tagging permissions
+              - Effect: Allow
+                Action:
+                  - rds:AddTagsToResource
+                  - rds:ListTagsForResource
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                Resource: '*'
+              # Lambda tagging permissions
+              - Effect: Allow
+                Action:
+                  - lambda:TagResource
+                  - lambda:ListTags
+                  - lambda:GetFunction
+                Resource: '*'
+              # Resource Groups and tagging API permissions
+              - Effect: Allow
+                Action:
+                  - resource-groups:Tag
+                  - resource-groups:GetTags
+                  - tag:GetResources
+                  - tag:TagResources
+                  - tag:UntagResources
+                  - tag:GetTagKeys
+                  - tag:GetTagValues
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: ManagedBy
+          Value: !Ref ManagedBy
+        - Key: Purpose
+          Value: AutomatedTagging
+
+  # Lambda Function for Automated Tagging
+  AutoTaggerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-function-${AWS::StackId}'
+      Description: Automated resource tagging function triggered by EventBridge
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AutoTaggerLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          COST_CENTER: !Ref CostCenter
+          MANAGED_BY: !Ref ManagedBy
+          LOG_LEVEL: !If [IsProductionEnvironment, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          from typing import Dict, Any, List
+
+          # Configure logging
+          logger = logging.getLogger()
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger.setLevel(getattr(logging, log_level.upper()))
+
+          # Initialize AWS clients
+          ec2_client = boto3.client('ec2')
+          s3_client = boto3.client('s3')
+          rds_client = boto3.client('rds')
+          lambda_client = boto3.client('lambda')
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Process CloudTrail events and apply tags to newly created resources
+              
+              Args:
+                  event: EventBridge event containing CloudTrail data
+                  context: Lambda context object
+                  
+              Returns:
+                  Dict containing status code and response message
+              """
+              try:
+                  # Parse EventBridge event
+                  detail = event.get('detail', {})
+                  event_name = detail.get('eventName', '')
+                  source_ip_address = detail.get('sourceIPAddress', 'unknown')
+                  user_identity = detail.get('userIdentity', {})
+                  user_name = user_identity.get('userName', user_identity.get('type', 'unknown'))
+                  event_time = detail.get('eventTime', datetime.now().isoformat())
+                  
+                  logger.info(f"Processing event: {event_name} by user: {user_name} at {event_time}")
+                  
+                  # Define standard tags to apply
+                  standard_tags = {
+                      'AutoTagged': 'true',
+                      'Environment': os.environ.get('ENVIRONMENT', 'production'),
+                      'CostCenter': os.environ.get('COST_CENTER', 'engineering'),
+                      'CreatedBy': user_name,
+                      'CreatedDate': datetime.now().strftime('%Y-%m-%d'),
+                      'ManagedBy': os.environ.get('MANAGED_BY', 'automation'),
+                      'SourceIP': source_ip_address,
+                      'EventSource': detail.get('eventSource', 'unknown')
+                  }
+                  
+                  # Process different resource types based on event name
+                  resources_tagged = 0
+                  
+                  if event_name == 'RunInstances':
+                      resources_tagged += tag_ec2_instances(detail, standard_tags)
+                  elif event_name == 'CreateBucket':
+                      resources_tagged += tag_s3_bucket(detail, standard_tags)
+                  elif event_name in ['CreateDBInstance', 'CreateDBCluster']:
+                      resources_tagged += tag_rds_resource(detail, standard_tags)
+                  elif event_name == 'CreateFunction20150331':
+                      resources_tagged += tag_lambda_function(detail, standard_tags)
+                  else:
+                      logger.warning(f"Unsupported event type: {event_name}")
+                  
+                  logger.info(f"Successfully tagged {resources_tagged} resources")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Tagged {resources_tagged} resources',
+                          'event': event_name,
+                          'user': user_name,
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}", exc_info=True)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'event': event.get('detail', {}).get('eventName', 'unknown')
+                      })
+                  }
+          
+          def tag_ec2_instances(detail: Dict[str, Any], tags: Dict[str, str]) -> int:
+              """Tag EC2 instances created by RunInstances event"""
+              try:
+                  instance_ids = []
+                  
+                  # Extract instance IDs from response elements
+                  response_elements = detail.get('responseElements', {})
+                  instances = response_elements.get('instancesSet', {}).get('items', [])
+                  
+                  for instance in instances:
+                      instance_id = instance.get('instanceId')
+                      if instance_id:
+                          instance_ids.append(instance_id)
+                  
+                  if instance_ids:
+                      tag_list = [{'Key': k, 'Value': v} for k, v in tags.items()]
+                      ec2_client.create_tags(Resources=instance_ids, Tags=tag_list)
+                      logger.info(f"Tagged EC2 instances: {instance_ids}")
+                      return len(instance_ids)
+                  
+                  return 0
+              except Exception as e:
+                  logger.error(f"Error tagging EC2 instances: {str(e)}")
+                  return 0
+          
+          def tag_s3_bucket(detail: Dict[str, Any], tags: Dict[str, str]) -> int:
+              """Tag S3 bucket created by CreateBucket event"""
+              try:
+                  # Extract bucket name from request parameters
+                  request_params = detail.get('requestParameters', {})
+                  bucket_name = request_params.get('bucketName')
+                  
+                  if bucket_name:
+                      # Wait for bucket to be available before tagging
+                      import time
+                      time.sleep(2)
+                      
+                      tag_set = [{'Key': k, 'Value': v} for k, v in tags.items()]
+                      s3_client.put_bucket_tagging(
+                          Bucket=bucket_name,
+                          Tagging={'TagSet': tag_set}
+                      )
+                      logger.info(f"Tagged S3 bucket: {bucket_name}")
+                      return 1
+                  
+                  return 0
+              except Exception as e:
+                  logger.error(f"Error tagging S3 bucket: {str(e)}")
+                  return 0
+          
+          def tag_rds_resource(detail: Dict[str, Any], tags: Dict[str, str]) -> int:
+              """Tag RDS instance or cluster"""
+              try:
+                  # Extract DB resource ARN
+                  response_elements = detail.get('responseElements', {})
+                  db_instance = response_elements.get('dBInstance', {})
+                  db_cluster = response_elements.get('dBCluster', {})
+                  
+                  resource_arn = db_instance.get('dBInstanceArn') or db_cluster.get('dBClusterArn')
+                  
+                  if resource_arn:
+                      tag_list = [{'Key': k, 'Value': v} for k, v in tags.items()]
+                      rds_client.add_tags_to_resource(
+                          ResourceName=resource_arn,
+                          Tags=tag_list
+                      )
+                      logger.info(f"Tagged RDS resource: {resource_arn}")
+                      return 1
+                  
+                  return 0
+              except Exception as e:
+                  logger.error(f"Error tagging RDS resource: {str(e)}")
+                  return 0
+          
+          def tag_lambda_function(detail: Dict[str, Any], tags: Dict[str, str]) -> int:
+              """Tag Lambda function"""
+              try:
+                  # Extract function ARN
+                  response_elements = detail.get('responseElements', {})
+                  function_arn = response_elements.get('functionArn')
+                  
+                  if function_arn:
+                      lambda_client.tag_resource(
+                          Resource=function_arn,
+                          Tags=tags
+                      )
+                      logger.info(f"Tagged Lambda function: {function_arn}")
+                      return 1
+                  
+                  return 0
+              except Exception as e:
+                  logger.error(f"Error tagging Lambda function: {str(e)}")
+                  return 0
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: ManagedBy
+          Value: !Ref ManagedBy
+        - Key: Purpose
+          Value: AutomatedTagging
+
+  # CloudWatch Log Group for Lambda Function
+  AutoTaggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AutoTaggerLambdaFunction}'
+      RetentionInDays: !If [IsProductionEnvironment, 30, 14]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter  
+          Value: !Ref CostCenter
+        - Key: ManagedBy
+          Value: !Ref ManagedBy
+        - Key: Purpose
+          Value: AutomatedTagging
+
+  # EventBridge Rule for Resource Creation Events
+  ResourceCreationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-resource-creation-rule-${AWS::StackId}'
+      Description: Capture AWS resource creation events from CloudTrail
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.ec2
+          - aws.s3
+          - aws.rds
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - RunInstances
+            - CreateBucket
+            - CreateDBInstance
+            - CreateDBCluster
+            - CreateFunction20150331
+          eventSource:
+            - ec2.amazonaws.com
+            - s3.amazonaws.com
+            - rds.amazonaws.com
+            - lambda.amazonaws.com
+          errorCode:
+            - exists: false
+      Targets:
+        - Id: AutoTaggerLambdaTarget
+          Arn: !GetAtt AutoTaggerLambdaFunction.Arn
+
+  # Permission for EventBridge to invoke Lambda
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AutoTaggerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ResourceCreationEventRule.Arn
+
+  # Resource Group for Auto-Tagged Resources
+  AutoTaggedResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name: !Sub '${ResourcePrefix}-auto-tagged-resources-${AWS::StackId}'
+      Description: Resources automatically tagged by the Lambda function
+      ResourceQuery:
+        Type: TAG_FILTERS_1_0
+        Query:
+          ResourceTypeFilters:
+            - AWS::AllSupported
+          TagFilters:
+            - Key: AutoTagged
+              Values:
+                - 'true'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: ManagedBy
+          Value: !Ref ManagedBy
+        - Key: Purpose
+          Value: AutomatedTagging
+
+  # CloudWatch Dashboard for Monitoring (Production only)
+  AutoTaggerDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: IsProductionEnvironment
+    Properties:
+      DashboardName: !Sub '${ResourcePrefix}-tagging-dashboard-${AWS::StackId}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${AutoTaggerLambdaFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Auto Tagger Lambda Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${AutoTaggerLambdaFunction}'\n| fields @timestamp, @message\n| filter @message like /Tagged/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Tagging Activities",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# Stack Outputs
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the automated tagging Lambda function
+    Value: !Ref AutoTaggerLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: ARN of the automated tagging Lambda function
+    Value: !GetAtt AutoTaggerLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  IAMRoleArn:
+    Description: ARN of the IAM role used by the Lambda function
+    Value: !GetAtt AutoTaggerLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule for resource creation events
+    Value: !Ref ResourceCreationEventRule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleName'
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule for resource creation events
+    Value: !GetAtt ResourceCreationEventRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleArn'
+
+  ResourceGroupName:
+    Description: Name of the Resource Group containing auto-tagged resources
+    Value: !Ref AutoTaggedResourceGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceGroupName'
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for Lambda function logs
+    Value: !Ref AutoTaggerLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchLogGroup'
+
+  DashboardURL:
+    Condition: IsProductionEnvironment
+    Description: URL to the CloudWatch Dashboard for monitoring tagging activities
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AutoTaggerDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  StandardTags:
+    Description: Standard tags that will be applied to all auto-tagged resources
+    Value: !Sub |
+      Environment: ${Environment}
+      CostCenter: ${CostCenter}
+      ManagedBy: ${ManagedBy}
+      AutoTagged: true
+    Export:
+      Name: !Sub '${AWS::StackName}-StandardTags'
+
+  DeploymentCommands:
+    Description: Commands to deploy this CloudFormation template
+    Value: !Sub |
+      aws cloudformation create-stack \
+        --stack-name ${AWS::StackName} \
+        --template-body file://cloudformation.yaml \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --parameters ParameterKey=Environment,ParameterValue=${Environment} \
+                     ParameterKey=CostCenter,ParameterValue=${CostCenter} \
+                     ParameterKey=ManagedBy,ParameterValue=${ManagedBy}

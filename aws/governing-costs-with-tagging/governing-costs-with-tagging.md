@@ -4,14 +4,14 @@ id: 1c910c42
 category: cloud financial management
 difficulty: 300
 subject: aws
-services: aws,cost,explorer,aws,config,resource,groups,billing,console
+services: Config, Cost Explorer, Resource Groups, SNS
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: aws,cost,explorer,aws,config,resource,groups,billing,console
+tags: cost management, tagging, config rules, cost explorer, governance
 recipe-generator-version: 1.3
 ---
 
@@ -102,6 +102,8 @@ graph TB
 4. Access to existing AWS resources to apply tagging strategies
 5. Estimated cost: $20-50/month for AWS Config rules, CloudWatch dashboards, and SNS notifications
 
+> **Note**: This recipe follows AWS Well-Architected Framework principles for cost optimization and operational excellence. See [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) for additional guidance.
+
 ## Preparation
 
 ```bash
@@ -119,8 +121,8 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
 export TAG_STRATEGY_NAME="cost-mgmt-${RANDOM_SUFFIX}"
 export SNS_TOPIC_NAME="tag-compliance-${RANDOM_SUFFIX}"
 
-# Enable Cost Explorer (if not already enabled)
-aws ce get-usage-and-costs \
+# Test Cost Explorer access (enable if not already enabled)
+aws ce get-cost-and-usage \
     --time-period Start=$(date -d '1 month ago' +%Y-%m-%d),End=$(date +%Y-%m-%d) \
     --granularity MONTHLY \
     --metrics BlendedCost \
@@ -216,6 +218,11 @@ echo "✅ Environment variables set for tagging strategy implementation"
    export CONFIG_BUCKET="aws-config-${TAG_STRATEGY_NAME}-${AWS_ACCOUNT_ID}"
    aws s3 mb "s3://${CONFIG_BUCKET}" \
        --region "${AWS_REGION}"
+   
+   # Enable S3 bucket versioning for compliance history
+   aws s3api put-bucket-versioning \
+       --bucket "${CONFIG_BUCKET}" \
+       --versioning-configuration Status=Enabled
    
    # Create bucket policy for AWS Config
    cat > config-bucket-policy.json << EOF
@@ -317,7 +324,7 @@ echo "✅ Environment variables set for tagging strategy implementation"
    aws configservice put-delivery-channel \
        --delivery-channel name="default",s3BucketName="${CONFIG_BUCKET}"
    
-   # Create configuration recorder
+   # Create configuration recorder with optimized settings
    aws configservice put-configuration-recorder \
        --configuration-recorder name="default",roleARN="${CONFIG_ROLE_ARN}",recordingGroup='{
          "allSupported": true,
@@ -339,11 +346,11 @@ echo "✅ Environment variables set for tagging strategy implementation"
    AWS Config Rules automate compliance evaluation by continuously checking resources against defined policies. For tag governance, these rules validate that resources contain required tags with acceptable values. The REQUIRED_TAGS rule type is specifically designed for tag compliance, supporting both tag presence validation and value constraints to ensure consistent cost allocation data.
 
    ```bash
-   # Create Config rule for CostCenter tag
+   # Create Config rule for CostCenter tag with allowed values
    aws configservice put-config-rule \
        --config-rule '{
          "ConfigRuleName": "required-tag-costcenter",
-         "Description": "Checks if resources have required CostCenter tag",
+         "Description": "Checks if resources have required CostCenter tag with valid values",
          "Source": {
            "Owner": "AWS",
            "SourceIdentifier": "REQUIRED_TAGS"
@@ -351,11 +358,11 @@ echo "✅ Environment variables set for tagging strategy implementation"
          "InputParameters": "{\"tag1Key\":\"CostCenter\",\"tag1Value\":\"Engineering,Marketing,Sales,Finance,Operations\"}"
        }'
    
-   # Create Config rule for Environment tag
+   # Create Config rule for Environment tag with allowed values
    aws configservice put-config-rule \
        --config-rule '{
          "ConfigRuleName": "required-tag-environment",
-         "Description": "Checks if resources have required Environment tag",
+         "Description": "Checks if resources have required Environment tag with valid values",
          "Source": {
            "Owner": "AWS",
            "SourceIdentifier": "REQUIRED_TAGS"
@@ -363,7 +370,7 @@ echo "✅ Environment variables set for tagging strategy implementation"
          "InputParameters": "{\"tag1Key\":\"Environment\",\"tag1Value\":\"Production,Staging,Development,Testing\"}"
        }'
    
-   # Create Config rule for Project tag
+   # Create Config rule for Project tag (any value accepted)
    aws configservice put-config-rule \
        --config-rule '{
          "ConfigRuleName": "required-tag-project",
@@ -375,7 +382,7 @@ echo "✅ Environment variables set for tagging strategy implementation"
          "InputParameters": "{\"tag1Key\":\"Project\"}"
        }'
    
-   # Create Config rule for Owner tag
+   # Create Config rule for Owner tag (any value accepted)
    aws configservice put-config-rule \
        --config-rule '{
          "ConfigRuleName": "required-tag-owner",
@@ -397,7 +404,7 @@ echo "✅ Environment variables set for tagging strategy implementation"
    AWS Lambda enables serverless automation for tag remediation, responding to Config rule violations with immediate corrective actions. This function applies default tags to non-compliant resources while sending notifications to responsible teams. Automated remediation reduces manual effort and ensures rapid compliance restoration, preventing cost allocation gaps that could impact financial reporting.
 
    ```bash
-   # Create Lambda function code
+   # Create Lambda function code with updated Python runtime
    cat > tag-remediation-lambda.py << 'EOF'
    import json
    import boto3
@@ -406,7 +413,7 @@ echo "✅ Environment variables set for tagging strategy implementation"
    
    def lambda_handler(event, context):
        """
-       Automated tag remediation function
+       Automated tag remediation function for AWS Config compliance
        """
        print(f"Received event: {json.dumps(event)}")
        
@@ -491,7 +498,17 @@ echo "✅ Environment variables set for tagging strategy implementation"
        """Apply tags to S3 bucket"""
        if tags:
            s3 = boto3.client('s3')
-           tag_set = [{'Key': tag['Key'], 'Value': tag['Value']} for tag in tags]
+           # Get existing tags
+           try:
+               existing = s3.get_bucket_tagging(Bucket=bucket_name)
+               tag_set = existing['TagSet']
+           except Exception:
+               tag_set = []
+           
+           # Add new tags
+           for tag in tags:
+               tag_set.append({'Key': tag['Key'], 'Value': tag['Value']})
+           
            s3.put_bucket_tagging(
                Bucket=bucket_name,
                Tagging={'TagSet': tag_set}
@@ -519,6 +536,7 @@ echo "✅ Environment variables set for tagging strategy implementation"
    Auto-Applied Tags: {json.dumps(tags, indent=2)}
    
    Please review and update tags as needed in the AWS Console.
+   Cost allocation accuracy depends on proper tagging.
    """
        
        sns.publish(
@@ -599,11 +617,11 @@ echo "✅ Environment variables set for tagging strategy implementation"
    # Wait for role creation
    sleep 10
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    export LAMBDA_FUNCTION_NAME="tag-remediation-${TAG_STRATEGY_NAME}"
    aws lambda create-function \
        --function-name "${LAMBDA_FUNCTION_NAME}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "${LAMBDA_ROLE_ARN}" \
        --handler tag-remediation-lambda.lambda_handler \
        --zip-file fileb://tag-remediation-lambda.zip \
@@ -622,11 +640,18 @@ echo "✅ Environment variables set for tagging strategy implementation"
    Demonstrating proper tagging implementation through sample resources validates the tagging strategy and provides concrete examples for teams to follow. These resources showcase the complete tag taxonomy applied consistently across different AWS services. Proper tagging from resource creation establishes good practices and ensures immediate compliance with cost allocation requirements.
 
    ```bash
+   # Get the latest Amazon Linux 2 AMI ID
+   export LATEST_AMI=$(aws ec2 describe-images \
+       --owners amazon \
+       --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" \
+           "Name=state,Values=available" \
+       --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
+       --output text)
+   
    # Create sample EC2 instance with proper tags
    export INSTANCE_ID=$(aws ec2 run-instances \
-       --image-id ami-0abcdef1234567890 \
-       --instance-type t2.micro \
-       --key-name default \
+       --image-id "${LATEST_AMI}" \
+       --instance-type t3.micro \
        --tag-specifications 'ResourceType=instance,Tags=[
          {Key=Name,Value=cost-mgmt-demo-instance},
          {Key=CostCenter,Value=Engineering},
@@ -636,7 +661,7 @@ echo "✅ Environment variables set for tagging strategy implementation"
          {Key=Application,Value=web},
          {Key=Backup,Value=false}
        ]' \
-       --query 'Instances[0].InstanceId' --output text 2>/dev/null || echo "t2.micro not available in region")
+       --query 'Instances[0].InstanceId' --output text 2>/dev/null || echo "Instance creation failed - check permissions or capacity")
    
    # Create sample S3 bucket with proper tags
    export DEMO_BUCKET="cost-mgmt-demo-${TAG_STRATEGY_NAME}"
@@ -665,27 +690,41 @@ echo "✅ Environment variables set for tagging strategy implementation"
    AWS Cost Explorer requires explicit activation of user-defined tags for cost allocation reporting. This activation process makes tags available as grouping dimensions in cost analysis, enabling detailed chargeback reports by department, project, or environment. Cost allocation tags bridge the gap between operational tagging and financial reporting, providing the data foundation for accurate cost attribution.
 
    ```bash
-   # Note: Cost allocation tag activation requires AWS CLI v2 and billing permissions
-   # Activate key cost allocation tags (this may require manual activation in Console)
-   echo "📋 Activate the following cost allocation tags in AWS Billing Console:"
-   echo "- CostCenter"
-   echo "- Environment" 
-   echo "- Project"
-   echo "- Owner"
-   echo "- Application"
+   # Note: Cost allocation tag activation requires billing permissions
+   # Create guidance for manual activation
+   echo "📋 To activate cost allocation tags, complete these steps:"
+   echo ""
+   echo "1. Open AWS Billing Console: https://console.aws.amazon.com/billing/home#/tags"
+   echo "2. Navigate to 'Cost allocation tags' in the left menu"
+   echo "3. Activate the following user-defined tags:"
+   echo "   - CostCenter"
+   echo "   - Environment" 
+   echo "   - Project"
+   echo "   - Owner"
+   echo "   - Application"
+   echo ""
+   echo "4. Tags become available in Cost Explorer within 24 hours"
    
    # Create script to check tag activation status
    cat > check-cost-tags.sh << 'EOF'
    #!/bin/bash
    echo "Checking cost allocation tag status..."
    
-   # Try to get cost allocation tags (requires billing permissions)
+   # Test Cost Explorer API access
    aws ce get-cost-and-usage \
        --time-period Start=$(date -d '7 days ago' +%Y-%m-%d),End=$(date +%Y-%m-%d) \
        --granularity DAILY \
        --metrics BlendedCost \
-       --group-by Type=DIMENSION,Key=SERVICE Type=TAG,Key=CostCenter \
-       --max-results 5 2>/dev/null && echo "✅ Cost Explorer API accessible" || echo "❌ Cost Explorer requires manual activation"
+       --group-by Type=TAG,Key=CostCenter \
+       --max-results 5 2>/dev/null && echo "✅ Cost Explorer API accessible with tag grouping" || echo "❌ Cost allocation tags not yet activated"
+   
+   # Check available tags in Cost Explorer
+   echo ""
+   echo "Available cost allocation tags:"
+   aws ce get-tags \
+       --time-period Start=$(date -d '30 days ago' +%Y-%m-%d),End=$(date +%Y-%m-%d) \
+       --tag-key CostCenter \
+       --query 'Tags' --output table 2>/dev/null || echo "No CostCenter tags found in billing data"
    EOF
    
    chmod +x check-cost-tags.sh
@@ -694,7 +733,7 @@ echo "✅ Environment variables set for tagging strategy implementation"
    echo "✅ Cost allocation tag guidance provided"
    ```
 
-   The cost allocation activation process is now initiated, though manual confirmation in the AWS Billing Console may be required. Once activated, these tags will appear in Cost Explorer reports within 24 hours, enabling detailed cost analysis by tag dimensions. This final step completes the integration between operational tagging and financial management systems.
+   The cost allocation activation process is now initiated, though manual confirmation in the AWS Billing Console is required. Once activated, these tags will appear in Cost Explorer reports within 24 hours, enabling detailed cost analysis by tag dimensions. This final step completes the integration between operational tagging and financial management systems.
 
 ## Validation & Testing
 
@@ -756,7 +795,7 @@ echo "✅ Environment variables set for tagging strategy implementation"
 4. **Test Cost Explorer Query with Tags**:
 
    ```bash
-   # Query costs grouped by CostCenter tag
+   # Query costs grouped by CostCenter tag (requires activated tags)
    aws ce get-cost-and-usage \
        --time-period Start=$(date -d '30 days ago' +%Y-%m-%d),End=$(date +%Y-%m-%d) \
        --granularity MONTHLY \
@@ -828,7 +867,7 @@ echo "✅ Environment variables set for tagging strategy implementation"
 
    ```bash
    # Terminate demo EC2 instance (if created)
-   if [ ! -z "${INSTANCE_ID}" ] && [ "${INSTANCE_ID}" != "t2.micro not available in region" ]; then
+   if [ ! -z "${INSTANCE_ID}" ] && [ "${INSTANCE_ID}" != "Instance creation failed - check permissions or capacity" ]; then
        aws ec2 terminate-instances --instance-ids "${INSTANCE_ID}"
        echo "✅ Terminated demo EC2 instance: ${INSTANCE_ID}"
    fi
@@ -860,13 +899,13 @@ echo "✅ Environment variables set for tagging strategy implementation"
 
 ## Discussion
 
-This comprehensive tagging strategy establishes a foundation for effective cost management and governance across AWS resources. The implementation combines standardized tag taxonomies with automated enforcement mechanisms to ensure consistent resource attribution and accurate cost allocation.
+This comprehensive tagging strategy establishes a foundation for effective cost management and governance across AWS resources. The implementation combines standardized tag taxonomies with automated enforcement mechanisms to ensure consistent resource attribution and accurate cost allocation. Following AWS Well-Architected Framework principles, this solution emphasizes operational excellence through automation and cost optimization through detailed visibility.
 
-The AWS Config integration provides continuous compliance monitoring, automatically detecting resources that lack required tags and triggering remediation workflows. This proactive approach prevents cost allocation gaps and maintains data quality for financial reporting. The Lambda-based remediation function applies sensible defaults while notifying teams to update tags with accurate information.
+The AWS Config integration provides continuous compliance monitoring, automatically detecting resources that lack required tags and triggering remediation workflows. This proactive approach prevents cost allocation gaps and maintains data quality for financial reporting. The Lambda-based remediation function applies sensible defaults while notifying teams to update tags with accurate information, ensuring both automated compliance and human oversight.
 
-Cost Explorer integration enables detailed analysis of spending patterns across different dimensions like cost centers, environments, and projects. This granular visibility supports chargeback models where business units pay for their actual resource consumption, encouraging cost-conscious behavior and resource optimization. Resource Groups provide operational views of resources by tag categories, supporting both cost analysis and operational management workflows.
+Cost Explorer integration enables detailed analysis of spending patterns across different dimensions like cost centers, environments, and projects. This granular visibility supports chargeback models where business units pay for their actual resource consumption, encouraging cost-conscious behavior and resource optimization. Resource Groups provide operational views of resources by tag categories, supporting both cost analysis and operational management workflows as described in the [AWS Tagging Best Practices](https://docs.aws.amazon.com/whitepapers/latest/tagging-best-practices/tagging-best-practices.html).
 
-> **Tip**: Implement tag policies at the organization level using AWS Organizations to enforce tagging standards across all accounts in your organization.
+> **Tip**: Implement tag policies at the organization level using AWS Organizations to enforce tagging standards across all accounts in your organization. See [AWS Organizations Tag Policies](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_tag-policies.html) for implementation guidance.
 
 The strategy also supports advanced cost management scenarios like automated budget alerts based on tag values, cost anomaly detection for specific projects, and rightsizing recommendations filtered by resource categories. Regular review of tag compliance reports ensures the strategy evolves with organizational changes and new service adoption.
 
@@ -877,11 +916,18 @@ The strategy also supports advanced cost management scenarios like automated bud
 Extend this tagging strategy by implementing these advanced capabilities:
 
 1. **Implement Organization-Level Tag Policies** using AWS Organizations to enforce tagging standards across multiple AWS accounts with inheritance and exception handling
-2. **Create Automated Cost Anomaly Detection** that monitors spending patterns by tag categories and sends alerts when costs exceed expected thresholds for specific projects or departments
-3. **Build Dynamic Budget Creation** that automatically generates budgets for new projects or cost centers based on tag values and historical spending patterns
-4. **Develop Tag-Based Resource Lifecycle Management** that automatically applies retention policies, backup schedules, and optimization recommendations based on resource tags
-5. **Integrate with External Systems** like ITSM tools or ERP systems to synchronize cost center data and project codes with your tagging taxonomy
+2. **Create Automated Cost Anomaly Detection** that monitors spending patterns by tag categories and sends alerts when costs exceed expected thresholds for specific projects or departments using AWS Cost Anomaly Detection
+3. **Build Dynamic Budget Creation** that automatically generates budgets for new projects or cost centers based on tag values and historical spending patterns using AWS Budgets API
+4. **Develop Tag-Based Resource Lifecycle Management** that automatically applies retention policies, backup schedules, and optimization recommendations based on resource tags using AWS Systems Manager
+5. **Integrate with External Systems** like ITSM tools or ERP systems to synchronize cost center data and project codes with your tagging taxonomy using AWS Lambda and API Gateway
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

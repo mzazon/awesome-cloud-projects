@@ -1,0 +1,387 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Account Optimization Monitoring with AWS Trusted Advisor and CloudWatch
+  
+  This template creates a monitoring system that leverages AWS Trusted Advisor's
+  optimization checks with CloudWatch alarms and SNS notifications to proactively
+  alert teams when account optimization opportunities arise.
+  
+  Recipe: account-optimization-trusted-advisor-cloudwatch
+  Version: 1.1
+  Generated: 2025-01-17
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - SNSTopicDisplayName
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - CostOptimizationThreshold
+          - SecurityThreshold
+          - ServiceLimitsThreshold
+          - AlarmEvaluationPeriods
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+    ParameterLabels:
+      NotificationEmail:
+        default: "Email address for notifications"
+      SNSTopicDisplayName:
+        default: "SNS topic display name"
+      CostOptimizationThreshold:
+        default: "Cost optimization alarm threshold"
+      SecurityThreshold:
+        default: "Security alarm threshold"  
+      ServiceLimitsThreshold:
+        default: "Service limits utilization threshold (%)"
+      AlarmEvaluationPeriods:
+        default: "Alarm evaluation periods"
+      ResourcePrefix:
+        default: "Resource name prefix"
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive Trusted Advisor optimization alerts
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+    
+  SNSTopicDisplayName:
+    Type: String
+    Default: AWS Account Optimization Alerts
+    Description: Display name for the SNS topic
+    MinLength: 1
+    MaxLength: 100
+    
+  CostOptimizationThreshold:
+    Type: Number
+    Default: 1
+    Description: Number of cost optimization recommendations to trigger alarm
+    MinValue: 1
+    MaxValue: 100
+    
+  SecurityThreshold:
+    Type: Number
+    Default: 1
+    Description: Number of security recommendations to trigger alarm
+    MinValue: 1
+    MaxValue: 100
+    
+  ServiceLimitsThreshold:
+    Type: Number
+    Default: 80
+    Description: Service usage percentage threshold to trigger alarm
+    MinValue: 50
+    MaxValue: 95
+    
+  AlarmEvaluationPeriods:
+    Type: Number
+    Default: 1
+    Description: Number of evaluation periods for CloudWatch alarms
+    MinValue: 1
+    MaxValue: 5
+    
+  ResourcePrefix:
+    Type: String
+    Default: trusted-advisor
+    Description: Prefix for resource names to ensure uniqueness
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 1
+    MaxLength: 30
+
+Conditions:
+  # Condition to check if we're in us-east-1 region (required for Trusted Advisor)
+  IsUSEast1Region: !Equals [!Ref 'AWS::Region', 'us-east-1']
+
+Resources:
+  # SNS Topic for Trusted Advisor Notifications
+  TrustedAdvisorAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-alerts-${AWS::AccountId}'
+      DisplayName: !Ref SNSTopicDisplayName
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Purpose
+          Value: TrustedAdvisorMonitoring
+        - Key: Recipe
+          Value: account-optimization-trusted-advisor-cloudwatch
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic Policy to allow CloudWatch to publish messages
+  TrustedAdvisorAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref TrustedAdvisorAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref TrustedAdvisorAlertsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # Email Subscription to SNS Topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref TrustedAdvisorAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for Cost Optimization (EC2 Low Utilization)
+  CostOptimizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsUSEast1Region
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-cost-optimization-${AWS::AccountId}'
+      AlarmDescription: >
+        Alert when Trusted Advisor identifies cost optimization opportunities
+        for underutilized EC2 instances
+      MetricName: YellowResources
+      Namespace: AWS/TrustedAdvisor
+      Statistic: Average
+      Period: 300
+      Threshold: !Ref CostOptimizationThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref TrustedAdvisorAlertsTopic
+      OKActions:
+        - !Ref TrustedAdvisorAlertsTopic
+      Dimensions:
+        - Name: CheckName
+          Value: Low Utilization Amazon EC2 Instances
+      Unit: Count
+      Tags:
+        - Key: Purpose
+          Value: CostOptimization
+        - Key: CheckType  
+          Value: TrustedAdvisor
+        - Key: Recipe
+          Value: account-optimization-trusted-advisor-cloudwatch
+
+  # CloudWatch Alarm for Security Recommendations
+  SecurityMonitoringAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsUSEast1Region
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-security-${AWS::AccountId}'
+      AlarmDescription: >
+        Alert when Trusted Advisor identifies security recommendations
+        for unrestricted security group access
+      MetricName: RedResources
+      Namespace: AWS/TrustedAdvisor
+      Statistic: Average
+      Period: 300
+      Threshold: !Ref SecurityThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref TrustedAdvisorAlertsTopic
+      OKActions:
+        - !Ref TrustedAdvisorAlertsTopic
+      Dimensions:
+        - Name: CheckName
+          Value: Security Groups - Specific Ports Unrestricted
+      Unit: Count
+      Tags:
+        - Key: Purpose
+          Value: SecurityMonitoring
+        - Key: CheckType
+          Value: TrustedAdvisor
+        - Key: Recipe
+          Value: account-optimization-trusted-advisor-cloudwatch
+
+  # CloudWatch Alarm for Service Limits Monitoring
+  ServiceLimitsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsUSEast1Region
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-service-limits-${AWS::AccountId}'
+      AlarmDescription: >
+        Alert when EC2 On-Demand instance usage approaches service limits
+      MetricName: ServiceLimitUsage
+      Namespace: AWS/TrustedAdvisor
+      Statistic: Average
+      Period: 300
+      Threshold: !Ref ServiceLimitsThreshold
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref TrustedAdvisorAlertsTopic
+      OKActions:
+        - !Ref TrustedAdvisorAlertsTopic
+      Dimensions:
+        - Name: ServiceName
+          Value: EC2
+        - Name: ServiceLimit
+          Value: Running On-Demand EC2 Instances
+        - Name: Region
+          Value: !Ref 'AWS::Region'
+      Unit: Percent
+      Tags:
+        - Key: Purpose
+          Value: ServiceLimitsMonitoring
+        - Key: CheckType
+          Value: TrustedAdvisor
+        - Key: Recipe
+          Value: account-optimization-trusted-advisor-cloudwatch
+
+  # Additional Alarm for Performance Optimization
+  PerformanceOptimizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsUSEast1Region
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-performance-${AWS::AccountId}'
+      AlarmDescription: >
+        Alert when Trusted Advisor identifies performance optimization 
+        opportunities for EBS volumes
+      MetricName: YellowResources
+      Namespace: AWS/TrustedAdvisor
+      Statistic: Average
+      Period: 300
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref TrustedAdvisorAlertsTopic
+      Dimensions:
+        - Name: CheckName
+          Value: Amazon EBS Underutilized Volumes
+      Unit: Count
+      Tags:
+        - Key: Purpose
+          Value: PerformanceOptimization
+        - Key: CheckType
+          Value: TrustedAdvisor
+        - Key: Recipe
+          Value: account-optimization-trusted-advisor-cloudformation
+
+  # Additional Alarm for Fault Tolerance Monitoring
+  FaultToleranceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsUSEast1Region
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-fault-tolerance-${AWS::AccountId}'
+      AlarmDescription: >
+        Alert when Trusted Advisor identifies fault tolerance recommendations
+        for RDS backup configuration
+      MetricName: YellowResources
+      Namespace: AWS/TrustedAdvisor
+      Statistic: Average
+      Period: 300
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref TrustedAdvisorAlertsTopic
+      Dimensions:
+        - Name: CheckName
+          Value: Amazon RDS Backups
+      Unit: Count
+      Tags:
+        - Key: Purpose
+          Value: FaultToleranceMonitoring
+        - Key: CheckType
+          Value: TrustedAdvisor
+        - Key: Recipe
+          Value: account-optimization-trusted-advisor-cloudformation
+
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS topic for Trusted Advisor alerts
+    Value: !Ref TrustedAdvisorAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+      
+  SNSTopicName:
+    Description: Name of the SNS topic for Trusted Advisor alerts
+    Value: !GetAtt TrustedAdvisorAlertsTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicName'
+      
+  CostOptimizationAlarmName:
+    Description: Name of the CloudWatch alarm for cost optimization monitoring
+    Value: !Ref CostOptimizationAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-CostOptimizationAlarmName'
+    Condition: IsUSEast1Region
+      
+  SecurityAlarmName:
+    Description: Name of the CloudWatch alarm for security monitoring
+    Value: !Ref SecurityMonitoringAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlarmName'
+    Condition: IsUSEast1Region
+      
+  ServiceLimitsAlarmName:
+    Description: Name of the CloudWatch alarm for service limits monitoring
+    Value: !Ref ServiceLimitsAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceLimitsAlarmName'
+    Condition: IsUSEast1Region
+      
+  PerformanceAlarmName:
+    Description: Name of the CloudWatch alarm for performance monitoring
+    Value: !Ref PerformanceOptimizationAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceAlarmName'
+    Condition: IsUSEast1Region
+      
+  FaultToleranceAlarmName:
+    Description: Name of the CloudWatch alarm for fault tolerance monitoring
+    Value: !Ref FaultToleranceAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-FaultToleranceAlarmName'
+    Condition: IsUSEast1Region
+      
+  EmailSubscriptionArn:
+    Description: ARN of the email subscription to the SNS topic
+    Value: !Ref EmailSubscription
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailSubscriptionArn'
+      
+  Region:
+    Description: AWS Region where the stack is deployed
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+      
+  StackName:
+    Description: Name of the CloudFormation stack
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+      
+  DeploymentInstructions:
+    Description: Instructions for deploying and managing this stack
+    Value: >
+      This stack must be deployed in us-east-1 region for Trusted Advisor integration.
+      Confirm email subscription after deployment. Monitor alarms in CloudWatch console.
+      
+  MonitoringDashboardURL:
+    Description: URL to CloudWatch console for monitoring alarms
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:alarms'
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringDashboardURL'

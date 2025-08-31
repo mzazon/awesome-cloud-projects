@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: CloudFormation, CodeBuild, CodePipeline, CDK
 estimated-time: 240 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: infrastructure-as-code, testing, automation, devops, cloudformation
 recipe-generator-version: 1.3
@@ -185,7 +185,7 @@ echo "✅ Created CodeCommit repository: ${REPOSITORY_NAME}"
 
 2. **Set up unit testing framework**:
 
-   Unit tests provide the foundation for infrastructure testing by validating template syntax, resource configurations, and security settings without deploying actual resources. These tests run quickly and can catch configuration errors early in the development process.
+   Unit tests provide the foundation for infrastructure testing by validating template syntax, resource configurations, and security settings without deploying actual resources. The moto library enables fast, cost-effective testing by mocking AWS services locally, allowing developers to catch configuration errors early in the development process without incurring AWS charges.
 
    ```bash
    # Create unit test for CloudFormation template
@@ -259,11 +259,11 @@ echo "✅ Created CodeCommit repository: ${REPOSITORY_NAME}"
 
    # Create requirements file for Python dependencies
    cat > tests/requirements.txt << 'EOF'
-   boto3==1.34.0
-   moto==4.2.14
-   pytest==7.4.3
-   PyYAML==6.0.1
-   cfn-lint==0.83.0
+   boto3>=1.35.0
+   moto>=4.2.14
+   pytest>=7.4.3
+   PyYAML>=6.0.1
+   cfn-lint>=1.0.0
    EOF
 
    echo "✅ Created unit test framework"
@@ -273,7 +273,7 @@ echo "✅ Created CodeCommit repository: ${REPOSITORY_NAME}"
 
 3. **Create integration testing scripts**:
 
-   Integration tests validate that infrastructure templates deploy successfully and create resources with the expected configurations. These tests use real AWS services but include automatic cleanup to prevent resource accumulation.
+   Integration tests validate that infrastructure templates deploy successfully and create resources with the expected configurations. These tests use real AWS services to verify end-to-end functionality, including resource creation, configuration validation, and automatic cleanup to prevent resource accumulation and associated costs.
 
    ```bash
    # Create integration test script
@@ -349,7 +349,7 @@ echo "✅ Created CodeCommit repository: ${REPOSITORY_NAME}"
 
 4. **Set up security and compliance testing**:
 
-   Security testing ensures that infrastructure templates follow security best practices and organizational compliance requirements. This automated approach prevents common security misconfigurations from reaching production environments.
+   Security testing ensures that infrastructure templates follow security best practices and organizational compliance requirements. By automating security validation through tools like cfn-lint and custom compliance checks, this approach prevents common security misconfigurations from reaching production environments and enforces consistent security standards across all infrastructure deployments.
 
    ```bash
    # Create security testing script
@@ -427,7 +427,7 @@ echo "✅ Created CodeCommit repository: ${REPOSITORY_NAME}"
 
 5. **Create cost analysis automation**:
 
-   Cost analysis helps teams understand the financial impact of infrastructure changes before deployment. This proactive approach prevents unexpected billing surprises and enables informed decision-making about resource allocation.
+   Cost analysis helps teams understand the financial impact of infrastructure changes before deployment. This proactive approach prevents unexpected billing surprises and enables informed decision-making about resource allocation. By providing cost estimates and optimization recommendations, teams can implement cost-conscious infrastructure design patterns from the beginning of the development process.
 
    ```bash
    # Create cost analysis script
@@ -511,7 +511,7 @@ echo "✅ Created CodeCommit repository: ${REPOSITORY_NAME}"
 
 6. **Set up CodeBuild project for automated testing**:
 
-   CodeBuild orchestrates the entire testing pipeline, executing unit tests, security scans, cost analysis, and integration tests in a controlled environment. This automated approach ensures consistent testing across all infrastructure changes.
+   CodeBuild orchestrates the entire testing pipeline, executing unit tests, security scans, cost analysis, and integration tests in a controlled, consistent environment. This serverless build service provides the automation foundation that ensures every infrastructure change undergoes comprehensive validation before deployment, creating a reliable CI/CD process for infrastructure code.
 
    ```bash
    # Create buildspec.yml for CodeBuild
@@ -521,7 +521,7 @@ echo "✅ Created CodeCommit repository: ${REPOSITORY_NAME}"
    phases:
      install:
        runtime-versions:
-         python: 3.9
+         python: 3.11
        commands:
          - echo "Installing dependencies..."
          - pip install -r tests/requirements.txt
@@ -640,7 +640,7 @@ echo "✅ Created CodeCommit repository: ${REPOSITORY_NAME}"
        },
        "environment": {
            "type": "LINUX_CONTAINER",
-           "image": "aws/codebuild/amazonlinux2-x86_64-standard:3.0",
+           "image": "aws/codebuild/amazonlinux-x86_64-standard:5.0",
            "computeType": "BUILD_GENERAL1_SMALL"
        },
        "serviceRole": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-codebuild-role"
@@ -672,7 +672,7 @@ echo "✅ Created CodeCommit repository: ${REPOSITORY_NAME}"
 
 8. **Create CodePipeline for end-to-end automation**:
 
-   CodePipeline orchestrates the complete infrastructure testing workflow, providing visual pipeline management and automated progression through testing stages. This service connects source control changes to comprehensive validation processes, enabling teams to implement continuous integration practices for infrastructure code. The pipeline ensures consistent execution of all testing phases and provides clear feedback on infrastructure quality and compliance status.
+   CodePipeline orchestrates the complete infrastructure testing workflow, providing visual pipeline management and automated progression through testing stages. This managed service connects source control changes to comprehensive validation processes, enabling teams to implement continuous integration practices for infrastructure code. The pipeline ensures consistent execution of all testing phases and provides clear feedback on infrastructure quality and compliance status.
 
    ```bash
    # Create IAM role for CodePipeline
@@ -912,6 +912,9 @@ echo "✅ Created CodeCommit repository: ${REPOSITORY_NAME}"
    # Clean up local files
    cd ..
    rm -rf iac-testing-project
+   rm -f trust-policy.json codebuild-policy.json \
+       pipeline-trust-policy.json pipeline-policy.json \
+       codebuild-project.json pipeline-definition.json
    
    echo "✅ Cleaned up local files"
    ```
@@ -920,11 +923,11 @@ echo "✅ Created CodeCommit repository: ${REPOSITORY_NAME}"
 
 Implementing automated testing strategies for Infrastructure as Code is crucial for maintaining reliable, secure, and cost-effective cloud deployments. This recipe demonstrates a comprehensive approach that integrates multiple testing methodologies into a unified CI/CD pipeline. The solution addresses common challenges teams face when scaling infrastructure deployments, including configuration drift, security vulnerabilities, and unexpected costs.
 
-The testing strategy follows a pyramid approach, starting with fast unit tests that validate template syntax and basic security configurations, progressing to integration tests that verify actual resource deployment, and culminating in comprehensive security and cost analysis. By automating these processes through CodeBuild and CodePipeline, teams can achieve consistent validation across all infrastructure changes while maintaining rapid deployment cycles.
+The testing strategy follows a pyramid approach, starting with fast unit tests that validate template syntax and basic security configurations, progressing to integration tests that verify actual resource deployment, and culminating in comprehensive security and cost analysis. By automating these processes through CodeBuild and CodePipeline, teams can achieve consistent validation across all infrastructure changes while maintaining rapid deployment cycles. This approach aligns with the AWS Well-Architected Framework's operational excellence pillar by emphasizing automation and continuous improvement.
 
-Security testing is particularly important in this context, as infrastructure misconfigurations can lead to significant vulnerabilities. The recipe incorporates CloudFormation linting, custom security compliance checks, and automated validation of security best practices. This multi-layered approach ensures that security requirements are embedded throughout the development lifecycle rather than being an afterthought.
+Security testing is particularly important in this context, as infrastructure misconfigurations can lead to significant vulnerabilities. The recipe incorporates CloudFormation linting, custom security compliance checks, and automated validation of security best practices. This multi-layered approach ensures that security requirements are embedded throughout the development lifecycle rather than being an afterthought. Tools like cfn-lint provide syntax and best practice validation, while custom compliance checks enforce organizational security policies specific to your environment.
 
-Cost analysis automation helps teams understand the financial implications of infrastructure changes before deployment. By providing cost estimates and optimization recommendations, the system enables proactive cost management and helps prevent unexpected billing surprises. The integration with AWS Cost Explorer APIs could be extended to provide more detailed cost projections and trend analysis.
+Cost analysis automation helps teams understand the financial implications of infrastructure changes before deployment. By providing cost estimates and optimization recommendations, the system enables proactive cost management and helps prevent unexpected billing surprises. The integration with AWS Cost Explorer APIs could be extended to provide more detailed cost projections and trend analysis, supporting the cost optimization pillar of the Well-Architected Framework. For additional cost management strategies, see the [AWS Cost Optimization Best Practices](https://docs.aws.amazon.com/cost-management/latest/userguide/cost-optimization-best-practices.html).
 
 > **Tip**: Implement security scanning as a mandatory gate in your testing pipeline using tools like cfn-nag or Checkov for comprehensive analysis. Integrate with AWS Security Hub for centralized security findings management and establish automated remediation workflows. For detailed security best practices, see the [CloudFormation Security Best Practices Guide](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/security-best-practices.html).
 
@@ -932,16 +935,23 @@ Cost analysis automation helps teams understand the financial implications of in
 
 Extend this solution by implementing these enhancements:
 
-1. **Add infrastructure drift detection** by integrating AWS Config rules and CloudFormation drift detection APIs to identify when deployed resources diverge from their expected configurations.
+1. **Add infrastructure drift detection** by integrating AWS Config rules and CloudFormation drift detection APIs to identify when deployed resources diverge from their expected configurations, ensuring ongoing compliance.
 
 2. **Implement performance testing** for infrastructure components by adding load testing scenarios that validate resource performance under various conditions, particularly useful for networking and compute resources.
 
-3. **Create compliance reporting dashboards** using Amazon QuickSight to visualize testing results, security compliance scores, and cost trends across multiple infrastructure projects.
+3. **Create compliance reporting dashboards** using Amazon QuickSight to visualize testing results, security compliance scores, and cost trends across multiple infrastructure projects with automated report generation.
 
-4. **Integrate with third-party security tools** such as Checkov, Terrascan, or AWS Security Hub to provide additional security validation layers and industry-specific compliance checks.
+4. **Integrate with third-party security tools** such as Checkov, Terrascan, or AWS Security Hub to provide additional security validation layers and industry-specific compliance checks like PCI-DSS or HIPAA.
 
-5. **Implement blue-green deployment testing** by creating parallel infrastructure environments for testing changes before promoting to production, including automated rollback capabilities based on test results.
+5. **Implement blue-green deployment testing** by creating parallel infrastructure environments for testing changes before promoting to production, including automated rollback capabilities based on test results and health checks.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

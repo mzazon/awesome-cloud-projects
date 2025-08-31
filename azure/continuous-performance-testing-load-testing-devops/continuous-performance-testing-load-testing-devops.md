@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: azure-load-testing, azure-devops, azure-monitor
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: performance-testing, cicd, automation, devops
 recipe-generator-version: 1.3
@@ -62,26 +62,29 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions to create resources
-2. Azure DevOps organization and project
-3. Azure CLI v2 installed and configured (or use Azure Cloud Shell)
+2. Azure DevOps organization and project with Azure Load Testing extension installed
+3. Azure CLI v2.60 or later installed and configured (or use Azure Cloud Shell)
 4. Basic knowledge of Azure DevOps pipelines and YAML
 5. Target application deployed in Azure for testing
 6. Estimated cost: $50-100 for test execution (varies by test duration and scale)
 
-> **Note**: Ensure your Azure DevOps organization is connected to the same Azure Active Directory tenant as your Azure subscription for seamless authentication.
+> **Note**: Ensure your Azure DevOps organization is connected to the same Microsoft Entra ID tenant as your Azure subscription for seamless authentication. Install the [Azure Load Testing extension](https://marketplace.visualstudio.com/items?itemName=AzloadTest.AzloadTesting) from the Azure DevOps Marketplace.
 
 ## Preparation
 
 ```bash
-# Set environment variables
-export RESOURCE_GROUP="rg-loadtest-devops"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-loadtest-devops-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
-export LOAD_TEST_NAME="alt-perftest-demo"
-export APP_INSIGHTS_NAME="ai-perftest-demo"
-export TARGET_APP_URL="https://your-app.azurewebsites.net"
+export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
-# Generate unique suffix for globally unique names
+# Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
+
+# Set resource names with proper naming conventions
+export LOAD_TEST_NAME="alt-perftest-${RANDOM_SUFFIX}"
+export APP_INSIGHTS_NAME="ai-perftest-${RANDOM_SUFFIX}"
+export TARGET_APP_URL="https://your-app.azurewebsites.net"
 
 # Create resource group
 az group create \
@@ -120,8 +123,8 @@ echo "✅ Preparation completed successfully"
        --location ${LOCATION} \
        --tags environment=demo purpose=cicd
    
-   # Get the Load Testing resource ID
-   LOAD_TEST_ID=$(az load show \
+   # Get the Load Testing resource ID for RBAC assignment
+   export LOAD_TEST_ID=$(az load show \
        --name ${LOAD_TEST_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query id \
@@ -201,7 +204,7 @@ echo "✅ Preparation completed successfully"
    
    env:
    - name: host
-     value: ${TARGET_APP_URL}
+     value: \${TARGET_APP_URL#https://}
    
    autoStop:
      errorPercentage: 90
@@ -255,46 +258,18 @@ echo "✅ Preparation completed successfully"
        steps:
        - checkout: self
        
-       - task: AzureCLI@2
+       - task: AzureLoadTest@1
          displayName: 'Execute Load Test'
          inputs:
            azureSubscription: 'Azure-Service-Connection'
-           scriptType: 'bash'
-           scriptLocation: 'inlineScript'
-           inlineScript: |
-             # Create test run
-             TEST_RUN_ID=$(az load test create \
-                 --test-id "performance-baseline" \
-                 --load-test-resource $(loadTestResource) \
-                 --resource-group $(loadTestResourceGroup) \
-                 --test-plan "./loadtest-scripts/performance-test.jmx" \
-                 --load-test-config-file "./loadtest-scripts/loadtest-config.yaml" \
-                 --display-name "Pipeline Run - $(Build.BuildId)" \
-                 --description "Automated test from pipeline" \
-                 --query testRunId \
-                 --output tsv)
-             
-             echo "Test run created: $TEST_RUN_ID"
-             
-             # Wait for test completion
-             az load test-run wait \
-                 --test-run-id $TEST_RUN_ID \
-                 --load-test-resource $(loadTestResource) \
-                 --resource-group $(loadTestResourceGroup)
-             
-             # Get test results
-             az load test-run metrics \
-                 --test-run-id $TEST_RUN_ID \
-                 --load-test-resource $(loadTestResource) \
-                 --resource-group $(loadTestResourceGroup) \
-                 --metric-namespace LoadTestRunMetrics
-   
-       - task: PublishTestResults@2
-         displayName: 'Publish Load Test Results'
-         inputs:
-           testResultsFormat: 'JUnit'
-           testResultsFiles: '**/loadtest-results.xml'
-           failTaskOnFailedTests: true
+           loadTestConfigFile: './loadtest-scripts/loadtest-config.yaml'
+           loadTestResource: $(loadTestResource)
+           resourceGroup: $(loadTestResourceGroup)
+           env: |
+             webapp=$(TARGET_APP_URL)
+       
+       - publish: $(System.DefaultWorkingDirectory)/loadTest
+         artifact: loadTestResults
    EOF
    
    echo "✅ Azure DevOps pipeline YAML created"
@@ -311,10 +286,10 @@ echo "✅ Preparation completed successfully"
        --name ${SP_NAME} \
        --role "Load Test Contributor" \
        --scopes ${LOAD_TEST_ID} \
-       --sdk-auth)
+       --output json)
    
    echo "✅ Service principal created"
-   echo "Use this JSON in Azure DevOps service connection:"
+   echo "Use this information in Azure DevOps service connection:"
    echo "${SP_OUTPUT}"
    
    # Note: Manual step required in Azure DevOps
@@ -324,6 +299,7 @@ echo "✅ Preparation completed successfully"
    echo "2. Create new Azure Resource Manager connection"
    echo "3. Choose 'Service Principal (manual)'"
    echo "4. Use the JSON output above to configure"
+   echo "5. Test the connection and save"
    ```
 
 6. **Implement Performance Monitoring and Alerts**:
@@ -393,17 +369,21 @@ echo "✅ Preparation completed successfully"
        --test-plan "./loadtest-scripts/performance-test.jmx" \
        --display-name "Manual Validation Test" \
        --engine-instances 1 \
+       --query testId \
+       --output tsv)
+   
+   echo "Test created: ${TEST_RUN}"
+   
+   # Run the test
+   TEST_RUN_ID=$(az load test-run create \
+       --test-id ${TEST_RUN} \
+       --load-test-resource ${LOAD_TEST_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --display-name "Manual Run" \
        --query testRunId \
        --output tsv)
    
-   echo "Test run ID: ${TEST_RUN}"
-   
-   # Check test run status
-   az load test-run show \
-       --test-run-id ${TEST_RUN} \
-       --load-test-resource ${LOAD_TEST_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --query status
+   echo "Test run ID: ${TEST_RUN_ID}"
    ```
 
 3. Verify Application Insights integration:
@@ -480,13 +460,13 @@ echo "✅ Preparation completed successfully"
 
 ## Discussion
 
-Azure Load Testing integrated with Azure DevOps creates a powerful automated performance validation framework that shifts performance testing left in the development lifecycle. This approach follows the principles outlined in the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/), particularly focusing on performance efficiency and operational excellence. By embedding performance tests in CI/CD pipelines, teams can detect and address performance issues before they impact production users.
+Azure Load Testing integrated with Azure DevOps creates a powerful automated performance validation framework that shifts performance testing left in the development lifecycle. This approach follows the principles outlined in the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/), particularly focusing on performance efficiency and operational excellence. By embedding performance tests in CI/CD pipelines, teams can detect and address performance issues before they impact production users.
 
-The combination of Azure Load Testing's managed infrastructure and Azure DevOps' pipeline orchestration eliminates the traditional barriers to continuous performance testing. As documented in the [Azure Load Testing best practices guide](https://docs.microsoft.com/en-us/azure/load-testing/best-practices), this integration enables teams to maintain consistent performance standards across releases while reducing the operational overhead of managing load testing infrastructure.
+The combination of Azure Load Testing's managed infrastructure and Azure DevOps' pipeline orchestration eliminates the traditional barriers to continuous performance testing. As documented in the [Azure Load Testing best practices guide](https://learn.microsoft.com/en-us/azure/load-testing/overview-what-is-azure-load-testing), this integration enables teams to maintain consistent performance standards across releases while reducing the operational overhead of managing load testing infrastructure. The Azure Load Testing extension for Azure DevOps provides seamless integration through the [AzureLoadTest@1 task](https://learn.microsoft.com/en-us/azure/devops/pipelines/tasks/test/azure-load-testing).
 
-From a cost optimization perspective, the consumption-based pricing model of Azure Load Testing ensures you only pay for actual test execution time. The service automatically provisions and de-provisions test infrastructure, eliminating idle resource costs. For detailed pricing guidance, refer to the [Azure Load Testing pricing documentation](https://docs.microsoft.com/en-us/azure/load-testing/pricing).
+From a cost optimization perspective, the consumption-based pricing model of Azure Load Testing ensures you only pay for actual test execution time. The service automatically provisions and de-provisions test infrastructure, eliminating idle resource costs. For detailed pricing guidance, refer to the [Azure Load Testing pricing documentation](https://azure.microsoft.com/en-us/pricing/details/load-testing/).
 
-The integration with Azure Monitor and Application Insights provides comprehensive observability into both test execution and application performance. This unified monitoring approach, as described in the [Azure Monitor documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/), enables correlation between load test results and application metrics, facilitating rapid root cause analysis of performance issues. For advanced scenarios, consider implementing custom metrics as outlined in the [Application Insights custom metrics guide](https://docs.microsoft.com/en-us/azure/azure-monitor/app/api-custom-events-metrics).
+The integration with Azure Monitor and Application Insights provides comprehensive observability into both test execution and application performance. This unified monitoring approach, as described in the [Azure Monitor documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/), enables correlation between load test results and application metrics, facilitating rapid root cause analysis of performance issues. For advanced scenarios, consider implementing custom metrics as outlined in the [Application Insights custom metrics guide](https://learn.microsoft.com/en-us/azure/azure-monitor/app/api-custom-events-metrics).
 
 > **Tip**: Use Azure Load Testing's comparison features to track performance trends across multiple test runs. This helps identify gradual performance degradation that might not trigger immediate alerts but could impact user experience over time.
 
@@ -494,12 +474,17 @@ The integration with Azure Monitor and Application Insights provides comprehensi
 
 Extend this solution by implementing these enhancements:
 
-1. Create multi-region load tests that simulate global user traffic patterns and validate application performance across different Azure regions
-2. Implement automated baseline testing that dynamically adjusts pass/fail criteria based on historical performance data
+1. Create multi-region load tests that simulate global user traffic patterns and validate application performance across different Azure regions using the `regionwise-engines` parameter
+2. Implement automated baseline testing that dynamically adjusts pass/fail criteria based on historical performance data using Azure Data Explorer queries
 3. Add integration with Azure Chaos Studio to combine load testing with chaos engineering for comprehensive resilience validation
 4. Build a custom dashboard using Azure Workbooks that correlates load test results with application telemetry and deployment history
-5. Develop a feedback loop that automatically scales application resources based on load test results and performance predictions
+5. Develop a feedback loop that automatically scales application resources based on load test results and performance predictions using Azure Automation
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

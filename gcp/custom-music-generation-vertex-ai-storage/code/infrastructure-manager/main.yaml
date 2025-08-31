@@ -1,0 +1,591 @@
+# Infrastructure Manager Configuration for Custom Music Generation with Vertex AI and Storage
+# This configuration deploys a complete serverless music generation system using Google Cloud services
+# Recipe: Custom Music Generation with Vertex AI and Storage
+
+# Import required Google Cloud provider and configure project settings
+imports:
+  - path: https://www.googleapis.com/storage/v1/storage
+    name: storage
+  - path: https://www.googleapis.com/cloudfunctions/v2beta/cloudfunctions
+    name: cloudfunctions
+  - path: https://cloud.google.com/deployment-manager/docs/configuration/templates/gcp-types
+
+# Configuration metadata
+info:
+  title: Custom Music Generation System
+  author: Google Cloud Recipe
+  description: |
+    Deploys a complete serverless music generation system using Vertex AI Lyria 2 model,
+    Cloud Storage for file management, and Cloud Functions for API orchestration.
+    This infrastructure enables automated text-to-music generation with scalable storage.
+  version: "1.0"
+
+# Input parameters for customization
+properties:
+  projectId:
+    type: string
+    description: "Google Cloud Project ID for resource deployment"
+    default: "music-generation-project"
+  
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    enum:
+      - "us-central1"
+      - "us-east1" 
+      - "us-west1"
+      - "europe-west1"
+      - "asia-southeast1"
+  
+  randomSuffix:
+    type: string
+    description: "Random suffix for unique resource naming"
+    default: "$(ref.random-suffix.value)"
+  
+  enableVersioning:
+    type: boolean
+    description: "Enable versioning on storage buckets for data protection"
+    default: true
+  
+  functionMemoryMb:
+    type: integer
+    description: "Memory allocation for Cloud Functions in MB"
+    default: 512
+    minimum: 256
+    maximum: 2048
+  
+  functionTimeoutSeconds:
+    type: integer
+    description: "Timeout for Cloud Functions in seconds"
+    default: 540
+    minimum: 60
+    maximum: 540
+
+# Main resource definitions
+resources:
+  # Generate random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/cloudresourcemanager-v1:virtual.randomId
+    properties:
+      byteLength: 3
+
+  # Enable required Google Cloud APIs for the solution
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:serviceusage.services
+    properties:
+      name: projects/$(ref.projectId)/services/storage-component.googleapis.com
+      parent: projects/$(ref.projectId)
+
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:serviceusage.services
+    properties:
+      name: projects/$(ref.projectId)/services/cloudfunctions.googleapis.com
+      parent: projects/$(ref.projectId)
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:serviceusage.services
+    properties:
+      name: projects/$(ref.projectId)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.projectId)
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:serviceusage.services
+    properties:
+      name: projects/$(ref.projectId)/services/run.googleapis.com
+      parent: projects/$(ref.projectId)
+    metadata:
+      dependsOn:
+        - enable-cloudbuild-api
+
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:serviceusage.services
+    properties:
+      name: projects/$(ref.projectId)/services/aiplatform.googleapis.com
+      parent: projects/$(ref.projectId)
+    metadata:
+      dependsOn:
+        - enable-run-api
+
+  # Cloud Storage bucket for storing input prompts and metadata
+  - name: music-prompts-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: music-prompts-$(ref.random-suffix.value)
+      project: $(ref.projectId)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: $(ref.enableVersioning)
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      # Enable object lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          - action:
+              type: Delete
+            condition:
+              age: 365
+      # Configure CORS for web client access
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD", "PUT", "POST", "DELETE"]
+          responseHeader: ["Content-Type", "Access-Control-Allow-Origin"]
+          maxAgeSeconds: 3600
+      # Enable request logging for monitoring
+      logging:
+        logBucket: $(ref.music-output-bucket.name)
+        logObjectPrefix: "access-logs/input-bucket/"
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Cloud Storage bucket for storing generated music files and metadata
+  - name: music-output-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: generated-music-$(ref.random-suffix.value)
+      project: $(ref.projectId)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: $(ref.enableVersioning)
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      # Enhanced lifecycle management for generated content
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          - action:
+              type: SetStorageClass
+              storageClass: ARCHIVE
+            condition:
+              age: 180
+          - action:
+              type: Delete
+            condition:
+              age: 2555  # 7 years retention for generated content
+      # Configure CORS for content delivery
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD"]
+          responseHeader: ["Content-Type", "Access-Control-Allow-Origin", "Cache-Control"]
+          maxAgeSeconds: 86400
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # IAM Service Account for Cloud Functions with minimal required permissions
+  - name: music-generator-service-account
+    type: gcp-types/iam-v1:serviceAccounts
+    properties:
+      accountId: music-generator-sa-$(ref.random-suffix.value)
+      displayName: "Music Generator Service Account"
+      description: "Service account for music generation Cloud Functions with minimal required permissions"
+      project: $(ref.projectId)
+    metadata:
+      dependsOn:
+        - enable-aiplatform-api
+
+  # IAM binding for Vertex AI access
+  - name: vertex-ai-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.projectId)
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.music-generator-service-account.email)
+    metadata:
+      dependsOn:
+        - music-generator-service-account
+
+  # IAM binding for Cloud Storage object admin access
+  - name: storage-object-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.projectId)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.music-generator-service-account.email)
+    metadata:
+      dependsOn:
+        - music-generator-service-account
+
+  # IAM binding for Cloud Functions invoker permissions
+  - name: functions-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.projectId)
+      role: roles/cloudfunctions.invoker
+      member: serviceAccount:$(ref.music-generator-service-account.email)
+    metadata:
+      dependsOn:
+        - music-generator-service-account
+
+  # IAM binding for logging permissions
+  - name: logging-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.projectId)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.music-generator-service-account.email)
+    metadata:
+      dependsOn:
+        - music-generator-service-account
+
+  # Cloud Function for music generation processing (triggered by Storage events)
+  - name: music-generator-function
+    type: gcp-types/cloudfunctions-v2beta:projects.locations.functions
+    properties:
+      parent: projects/$(ref.projectId)/locations/$(ref.region)
+      functionId: music-generator-$(ref.random-suffix.value)
+      function:
+        displayName: "Music Generator Function"
+        description: "Processes music generation requests using Vertex AI Lyria 2 model"
+        sourceArchiveUrl: "gs://$(ref.music-prompts-bucket.name)/function-source/music-generator.zip"
+        # Configuration for second-generation Cloud Functions
+        environment: GEN_2
+        # Event trigger configuration for Cloud Storage
+        eventTrigger:
+          triggerRegion: $(ref.region)
+          eventType: google.cloud.storage.object.v1.finalized
+          eventFilters:
+            - attribute: bucket
+              value: $(ref.music-prompts-bucket.name)
+            - attribute: name
+              value: "requests/*"  # Only trigger on files in requests/ folder
+          serviceAccountEmail: $(ref.music-generator-service-account.email)
+        # Runtime configuration
+        buildConfig:
+          runtime: python311
+          entryPoint: generate_music
+          source:
+            storageSource:
+              bucket: $(ref.music-prompts-bucket.name)
+              object: function-source/music-generator.zip
+          environmentVariables:
+            OUTPUT_BUCKET: $(ref.music-output-bucket.name)
+            GCP_PROJECT: $(ref.projectId)
+            GCP_REGION: $(ref.region)
+        # Service configuration
+        serviceConfig:
+          maxInstanceCount: 100
+          minInstanceCount: 0
+          availableMemory: "$(ref.functionMemoryMb)MB"
+          timeoutSeconds: $(ref.functionTimeoutSeconds)
+          environmentVariables:
+            OUTPUT_BUCKET: $(ref.music-output-bucket.name)
+            GCP_PROJECT: $(ref.projectId)
+            GCP_REGION: $(ref.region)
+          serviceAccountEmail: $(ref.music-generator-service-account.email)
+          ingressSettings: ALLOW_INTERNAL_ONLY
+          # VPC connector configuration for enterprise security (optional)
+          # vpcConnector: projects/$(ref.projectId)/locations/$(ref.region)/connectors/music-vpc-connector
+    metadata:
+      dependsOn:
+        - music-prompts-bucket
+        - music-output-bucket
+        - vertex-ai-user-binding
+        - storage-object-admin-binding
+        - functions-invoker-binding
+        - logging-writer-binding
+
+  # Cloud Function for REST API endpoint (HTTP trigger)
+  - name: music-api-function
+    type: gcp-types/cloudfunctions-v2beta:projects.locations.functions
+    properties:
+      parent: projects/$(ref.projectId)/locations/$(ref.region)
+      functionId: music-api-$(ref.random-suffix.value)
+      function:
+        displayName: "Music API Function"
+        description: "REST API endpoint for submitting music generation requests"
+        sourceArchiveUrl: "gs://$(ref.music-prompts-bucket.name)/function-source/music-api.zip"
+        # Configuration for second-generation Cloud Functions
+        environment: GEN_2
+        # HTTP trigger configuration
+        # Runtime configuration
+        buildConfig:
+          runtime: python311
+          entryPoint: music_api
+          source:
+            storageSource:
+              bucket: $(ref.music-prompts-bucket.name)
+              object: function-source/music-api.zip
+          environmentVariables:
+            INPUT_BUCKET: $(ref.music-prompts-bucket.name)
+        # Service configuration
+        serviceConfig:
+          maxInstanceCount: 1000
+          minInstanceCount: 0
+          availableMemory: "256MB"
+          timeoutSeconds: 60
+          environmentVariables:
+            INPUT_BUCKET: $(ref.music-prompts-bucket.name)
+          serviceAccountEmail: $(ref.music-generator-service-account.email)
+          ingressSettings: ALLOW_ALL
+          # Enable unauthenticated access for public API
+          invoker: allUsers
+    metadata:
+      dependsOn:
+        - music-prompts-bucket
+        - music-generator-service-account
+        - storage-object-admin-binding
+        - logging-writer-binding
+
+  # Cloud Monitoring notification channels for system health monitoring
+  - name: email-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/$(ref.projectId)
+      type: email
+      displayName: "Music Generation System Alerts"
+      description: "Email notifications for music generation system health"
+      labels:
+        email_address: "admin@example.com"  # Update with actual email
+      enabled: true
+
+  # Cloud Monitoring alert policy for function errors
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.projectId)
+      displayName: "Music Generation Function Errors"
+      documentation:
+        content: "Alert when Cloud Functions experience high error rates"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Function error rate"
+          conditionThreshold:
+            filter: |
+              resource.type="cloud_function"
+              resource.labels.function_name=~"music-.*"
+              metric.type="cloudfunctions.googleapis.com/function/execution_count"
+              metric.labels.status!="ok"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 5
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - "resource.labels.function_name"
+      alertStrategy:
+        autoClose: "1800s"  # Auto-close after 30 minutes
+      enabled: true
+      notificationChannels:
+        - $(ref.email-notification-channel.name)
+    metadata:
+      dependsOn:
+        - email-notification-channel
+        - music-generator-function
+        - music-api-function
+
+  # Cloud Monitoring alert policy for storage quota usage
+  - name: storage-quota-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.projectId)
+      displayName: "Storage Quota Usage Alert"
+      documentation:
+        content: "Alert when storage buckets approach quota limits"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Storage bucket size"
+          conditionThreshold:
+            filter: |
+              resource.type="gcs_bucket"
+              resource.labels.bucket_name=~".*music.*"
+              metric.type="storage.googleapis.com/storage/total_bytes"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 10737418240  # 10GB in bytes
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "3600s"  # 1 hour alignment
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - "resource.labels.bucket_name"
+      alertStrategy:
+        autoClose: "3600s"  # Auto-close after 1 hour
+      enabled: true
+      notificationChannels:
+        - $(ref.email-notification-channel.name)
+    metadata:
+      dependsOn:
+        - email-notification-channel
+        - music-prompts-bucket
+        - music-output-bucket
+
+# Output values for integration and verification
+outputs:
+  # Project and deployment information
+  - name: projectId
+    description: "Google Cloud Project ID used for deployment"
+    value: $(ref.projectId)
+
+  - name: region
+    description: "Google Cloud region for deployed resources"
+    value: $(ref.region)
+
+  - name: randomSuffix
+    description: "Random suffix used for unique resource naming"
+    value: $(ref.random-suffix.value)
+
+  # Storage bucket information
+  - name: inputBucketName
+    description: "Cloud Storage bucket name for input prompts and metadata"
+    value: $(ref.music-prompts-bucket.name)
+
+  - name: outputBucketName
+    description: "Cloud Storage bucket name for generated music files"
+    value: $(ref.music-output-bucket.name)
+
+  - name: inputBucketUrl
+    description: "GS URL for input bucket (for gsutil commands)"
+    value: "gs://$(ref.music-prompts-bucket.name)"
+
+  - name: outputBucketUrl
+    description: "GS URL for output bucket (for gsutil commands)"
+    value: "gs://$(ref.music-output-bucket.name)"
+
+  # Cloud Function information
+  - name: musicGeneratorFunctionName
+    description: "Name of the music generator Cloud Function"
+    value: $(ref.music-generator-function.name)
+
+  - name: musicApiFunctionName
+    description: "Name of the music API Cloud Function"
+    value: $(ref.music-api-function.name)
+
+  - name: musicApiUrl
+    description: "HTTP trigger URL for the music generation API"
+    value: $(ref.music-api-function.serviceConfig.uri)
+
+  # Service account information
+  - name: serviceAccountEmail
+    description: "Email of the service account used by Cloud Functions"
+    value: $(ref.music-generator-service-account.email)
+
+  # Monitoring information
+  - name: notificationChannelName
+    description: "Name of the email notification channel for alerts"
+    value: $(ref.email-notification-channel.name)
+
+  # Usage instructions
+  - name: testCommand
+    description: "Sample curl command to test the music generation API"
+    value: |
+      curl -X POST $(ref.music-api-function.serviceConfig.uri) \
+        -H "Content-Type: application/json" \
+        -d '{
+          "prompt": "Peaceful ambient sounds for focus and productivity",
+          "style": "ambient",
+          "duration_seconds": 30,
+          "tempo": "slow"
+        }'
+
+  - name: gsutilCommands
+    description: "Useful gsutil commands for monitoring the system"
+    value: |
+      # List input prompts:
+      gsutil ls gs://$(ref.music-prompts-bucket.name)/requests/
+      
+      # List generated music:
+      gsutil ls gs://$(ref.music-output-bucket.name)/audio/
+      
+      # View metadata:
+      gsutil ls gs://$(ref.music-output-bucket.name)/metadata/
+
+# Schema validation and metadata
+schema:
+  required:
+    - projectId
+    - region
+  properties:
+    projectId:
+      type: string
+      pattern: "^[a-z][-a-z0-9]{4,28}[a-z0-9]$"
+      description: "Must be a valid Google Cloud Project ID"
+    region:
+      type: string
+      description: "Must be a valid Google Cloud region where Vertex AI is available"
+    randomSuffix:
+      type: string
+      pattern: "^[a-f0-9]{6}$"
+      description: "Must be a 6-character hexadecimal string"
+    enableVersioning:
+      type: boolean
+    functionMemoryMb:
+      type: integer
+      minimum: 256
+      maximum: 2048
+    functionTimeoutSeconds:
+      type: integer
+      minimum: 60
+      maximum: 540
+
+# Additional metadata for deployment management
+metadata:
+  version: "1.0"
+  author: "Google Cloud Recipe Generator"
+  created: "2025-01-16"
+  description: |
+    This Infrastructure Manager configuration deploys a complete serverless music generation
+    system on Google Cloud Platform. The system uses Vertex AI's Lyria 2 model for high-fidelity
+    audio synthesis, Cloud Storage for scalable file management, and Cloud Functions for API
+    orchestration. The configuration includes comprehensive monitoring, security best practices,
+    and cost optimization features.
+  
+  tags:
+    - "vertex-ai"
+    - "cloud-storage"
+    - "cloud-functions"
+    - "music-generation"
+    - "serverless"
+    - "ai-content-creation"
+  
+  cost_estimate: "$15-25 for initial testing and development"
+  deployment_time: "5-10 minutes"
+  
+  # Security considerations
+  security_features:
+    - "Uniform bucket-level access for Cloud Storage"
+    - "Service accounts with minimal required permissions"
+    - "Private Cloud Functions with controlled ingress"
+    - "Public access prevention on storage buckets"
+    - "CORS configuration for web client integration"
+  
+  # Best practices implemented
+  best_practices:
+    - "Lifecycle policies for automatic cost optimization"
+    - "Versioning enabled for data protection"
+    - "Comprehensive monitoring and alerting"
+    - "Resource naming with random suffixes"
+    - "Proper resource dependencies and ordering"
+    - "Environment-specific configuration through parameters"

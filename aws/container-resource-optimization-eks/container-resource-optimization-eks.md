@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: EKS, CloudWatch, Cost Explorer, VPA
 estimated-time: 150 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers, cost-optimization, kubernetes, vpa, finops, resource-management
 recipe-generator-version: 1.3
@@ -86,7 +86,7 @@ graph TB
 1. AWS account with EKS cluster administrator permissions
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. kubectl installed and configured for EKS cluster access
-4. Existing EKS cluster with worker nodes (minimum 2 nodes)
+4. Existing EKS cluster with worker nodes (minimum 2 nodes) running Kubernetes 1.24 or later
 5. Basic understanding of Kubernetes resource management concepts
 6. Estimated cost: $10-50/month for additional CloudWatch metrics and logging
 
@@ -120,11 +120,13 @@ kubectl cluster-info
 # Create namespace for cost optimization workloads
 kubectl create namespace cost-optimization
 
-# Enable Container Insights for the cluster
-aws eks put-cluster-logging \
+# Enable control plane logging for the cluster
+aws eks update-cluster-config \
     --region $AWS_REGION \
     --name $CLUSTER_NAME \
-    --logging '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}'
+    --logging '{"enable":[{"types":["api","audit","authenticator","controllerManager","scheduler"]}]}'
+
+echo "✅ AWS environment configured"
 ```
 
 ## Steps
@@ -137,8 +139,9 @@ aws eks put-cluster-logging \
    # Check if Metrics Server is already installed
    kubectl get deployment metrics-server -n kube-system
    
-   # If not installed, deploy it
-   kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+   # If not installed, deploy it using the latest version
+   kubectl apply -f https://github.com/kubernetes-sigs/metrics-server\
+/releases/latest/download/components.yaml
    
    # Wait for Metrics Server to be ready
    kubectl wait --for=condition=available --timeout=300s \
@@ -151,7 +154,7 @@ aws eks put-cluster-logging \
 
 2. **Install Vertical Pod Autoscaler (VPA)**:
 
-   VPA consists of three components that work together to analyze and optimize resource allocation, enabling automated cost optimization through intelligent resource right-sizing. The VPA Recommender analyzes historical usage patterns and generates resource recommendations, the VPA Updater applies those recommendations by evicting and recreating pods with optimized resource allocations, and the VPA Admission Controller ensures new pods receive optimized resource settings automatically. This comprehensive approach addresses both existing workload optimization and prevents future resource waste.
+   VPA consists of three components that work together to analyze and optimize resource allocation, enabling automated cost optimization through intelligent resource right-sizing. The VPA Recommender analyzes historical usage patterns and generates resource recommendations, the VPA Updater applies those recommendations by evicting and recreating pods with optimized resource allocations, and the VPA Admission Controller ensures new pods receive optimized resource settings automatically.
 
    ```bash
    # Clone the VPA repository
@@ -171,7 +174,7 @@ aws eks put-cluster-logging \
 
 3. **Deploy Sample Application for Testing**:
 
-   This step creates a test workload with intentionally suboptimal resource settings to demonstrate VPA's optimization capabilities. The application represents a common scenario where development teams set conservative resource requests and limits based on initial estimates rather than actual usage patterns. This realistic test case allows you to observe how VPA identifies and corrects resource waste, providing measurable cost optimization results.
+   This step creates a test workload with intentionally suboptimal resource settings to demonstrate VPA's optimization capabilities. The application represents a common scenario where development teams set conservative resource requests and limits based on initial estimates rather than actual usage patterns.
 
    ```bash
    # Create a test application with suboptimal resource settings
@@ -193,7 +196,7 @@ aws eks put-cluster-logging \
        spec:
          containers:
          - name: app
-           image: nginx:1.20
+           image: nginx:1.21
            ports:
            - containerPort: 80
            resources:
@@ -203,7 +206,6 @@ aws eks put-cluster-logging \
              limits:
                cpu: 1000m
                memory: 1024Mi
-           # Add some load generation
            command: ["/bin/sh"]
            args: ["-c", "while true; do echo 'Load test'; sleep 30; done & nginx -g 'daemon off;'"]
    ---
@@ -231,7 +233,7 @@ aws eks put-cluster-logging \
 
 4. **Create VPA Configuration for Resource Optimization**:
 
-   VPA policies define how resource optimization should be applied to specific workloads, establishing the boundaries and behavior for automated cost optimization. This configuration starts in "Off" mode to allow you to review recommendations before enabling automatic updates, following AWS cost optimization best practices that emphasize validation before implementation. The policy includes safety boundaries (minAllowed and maxAllowed) to prevent VPA from making recommendations that could negatively impact application performance or availability.
+   VPA policies define how resource optimization should be applied to specific workloads, establishing the boundaries and behavior for automated cost optimization. This configuration starts in "Off" mode to allow you to review recommendations before enabling automatic updates, following AWS cost optimization best practices that emphasize validation before implementation.
 
    ```bash
    # Create VPA policy for the test application
@@ -247,7 +249,7 @@ aws eks put-cluster-logging \
        kind: Deployment
        name: resource-test-app
      updatePolicy:
-       updateMode: "Off"  # Start with recommendation mode only
+       updateMode: "Off"
      resourcePolicy:
        containerPolicies:
        - containerName: app
@@ -265,60 +267,59 @@ aws eks put-cluster-logging \
 
    > **Warning**: Starting with `updateMode: "Off"` is recommended for production environments. This allows you to review VPA recommendations before enabling automatic resource updates that could impact running applications.
 
-5. **Install CloudWatch Container Insights**:
+5. **Install CloudWatch Container Insights using EKS Add-on**:
 
-   CloudWatch Container Insights provides comprehensive monitoring and visualization of containerized applications, enabling data-driven cost optimization decisions. It collects metrics at the cluster, node, pod, and task level, providing the granular visibility needed to track resource utilization patterns and measure the business impact of optimization efforts. This integration with AWS's native monitoring platform enables correlation between resource usage and cost, supporting both technical optimization and financial reporting requirements.
+   CloudWatch Container Insights provides comprehensive monitoring and visualization of containerized applications, enabling data-driven cost optimization decisions. The AWS-managed EKS add-on provides the most current and secure method for installing Container Insights, automatically managing the CloudWatch agent and Fluent Bit components for optimal performance.
 
    ```bash
-   # Create CloudWatch agent configuration
-   cat <<EOF | kubectl apply -f -
-   apiVersion: v1
-   kind: ConfigMap
-   metadata:
-     name: cwagentconfig
-     namespace: amazon-cloudwatch
-   data:
-     cwagentconfig.json: |
+   # Create IAM role for CloudWatch Observability add-on
+   cat <<EOF > cloudwatch-observability-trust-policy.json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
        {
-         "logs": {
-           "metrics_collected": {
-             "kubernetes": {
-               "metrics_collection_interval": 60,
-               "resources": [
-                 "namespace",
-                 "pod",
-                 "container",
-                 "service"
-               ]
-             }
-           },
-           "force_flush_interval": 5
-         }
+         "Effect": "Allow",
+         "Principal": {
+           "Service": "pods.eks.amazonaws.com"
+         },
+         "Action": [
+           "sts:AssumeRole",
+           "sts:TagSession"
+         ]
        }
-   ---
-   apiVersion: v1
-   kind: Namespace
-   metadata:
-     name: amazon-cloudwatch
+     ]
+   }
    EOF
    
-   # Deploy CloudWatch agent
-   kubectl apply -f https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/cloudwatch-namespace.yaml
+   # Create the IAM role
+   aws iam create-role \
+       --role-name CloudWatchObservabilityRole-${RANDOM_SUFFIX} \
+       --assume-role-policy-document file://cloudwatch-observability-trust-policy.json
    
-   kubectl apply -f https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/cwagent/cwagent-serviceaccount.yaml
+   # Attach required policy
+   aws iam attach-role-policy \
+       --role-name CloudWatchObservabilityRole-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
    
-   kubectl apply -f https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/cwagent/cwagent-configmap.yaml
+   # Install the CloudWatch Observability EKS add-on
+   aws eks create-addon \
+       --cluster-name $CLUSTER_NAME \
+       --addon-name amazon-cloudwatch-observability \
+       --service-account-role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/CloudWatchObservabilityRole-${RANDOM_SUFFIX}
    
-   kubectl apply -f https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/cwagent/cwagent-daemonset.yaml
+   # Wait for add-on to be active
+   aws eks wait addon-active \
+       --cluster-name $CLUSTER_NAME \
+       --addon-name amazon-cloudwatch-observability
    
-   echo "✅ CloudWatch Container Insights deployed"
+   echo "✅ CloudWatch Container Insights deployed via EKS add-on"
    ```
 
-   Container Insights is now collecting detailed metrics from your EKS cluster and sending them to CloudWatch. This provides the foundation for cost analysis and enables integration with AWS Cost Explorer for comprehensive visibility into both resource utilization and cost implications. The detailed metrics enable you to track the effectiveness of VPA optimizations and demonstrate ROI to stakeholders.
+   Container Insights is now collecting detailed metrics from your EKS cluster using the latest AWS-managed components. This provides the foundation for cost analysis and enables integration with AWS Cost Explorer for comprehensive visibility into both resource utilization and cost implications.
 
 6. **Create Cost Monitoring Dashboard**:
 
-   CloudWatch dashboards provide visual representation of resource utilization patterns and help identify optimization opportunities through real-time visibility into cost-related metrics. This dashboard compares actual usage against reserved capacity to highlight waste, enabling proactive cost management and demonstrating the business value of optimization efforts. The visualizations support both technical teams tracking resource efficiency and financial stakeholders monitoring cost optimization progress.
+   CloudWatch dashboards provide visual representation of resource utilization patterns and help identify optimization opportunities through real-time visibility into cost-related metrics. This dashboard compares actual usage against reserved capacity to highlight waste, enabling proactive cost management.
 
    ```bash
    # Create CloudWatch dashboard for cost monitoring
@@ -328,6 +329,10 @@ aws eks put-cluster-logging \
          "widgets": [
            {
              "type": "metric",
+             "x": 0,
+             "y": 0,
+             "width": 12,
+             "height": 6,
              "properties": {
                "metrics": [
                  ["ContainerInsights", "pod_cpu_utilization", "Namespace", "cost-optimization"],
@@ -338,7 +343,30 @@ aws eks put-cluster-logging \
                "period": 300,
                "stat": "Average",
                "region": "'$AWS_REGION'",
-               "title": "Resource Utilization vs Reserved Capacity"
+               "title": "Resource Utilization vs Reserved Capacity",
+               "yAxis": {
+                 "left": {
+                   "min": 0,
+                   "max": 100
+                 }
+               }
+             }
+           },
+           {
+             "type": "metric",
+             "x": 0,
+             "y": 6,
+             "width": 12,
+             "height": 6,
+             "properties": {
+               "metrics": [
+                 ["ContainerInsights", "node_cpu_utilization", "ClusterName", "'$CLUSTER_NAME'"],
+                 [".", "node_memory_utilization", ".", "."]
+               ],
+               "period": 300,
+               "stat": "Average",
+               "region": "'$AWS_REGION'",
+               "title": "Node Resource Utilization"
              }
            }
          ]
@@ -347,11 +375,11 @@ aws eks put-cluster-logging \
    echo "✅ Cost monitoring dashboard created"
    ```
 
-   The dashboard is now available in CloudWatch and provides real-time visibility into resource utilization versus reserved capacity. This visualization enables you to identify underutilized resources and track the effectiveness of VPA optimizations, supporting both technical decision-making and business reporting on cost optimization initiatives.
+   The dashboard is now available in CloudWatch and provides real-time visibility into resource utilization versus reserved capacity. This visualization enables you to identify underutilized resources and track the effectiveness of VPA optimizations.
 
 7. **Set Up Automated Cost Alerts**:
 
-   Proactive alerting helps identify resource waste as it occurs, enabling rapid response to optimization opportunities before they accumulate into significant cost impacts. These alerts trigger when resource utilization falls below efficiency thresholds, supporting continuous cost optimization practices recommended in the [AWS Cost Optimization Framework](https://docs.aws.amazon.com/eks/latest/best-practices/cost-opt-framework.html). The automated notification system ensures optimization opportunities are addressed promptly, maintaining cost efficiency as workloads evolve.
+   Proactive alerting helps identify resource waste as it occurs, enabling rapid response to optimization opportunities before they accumulate into significant cost impacts. These alerts trigger when resource utilization falls below efficiency thresholds, supporting continuous cost optimization practices recommended in the [AWS Cost Optimization Framework](https://docs.aws.amazon.com/eks/latest/best-practices/cost-opt.html).
 
    ```bash
    # Create SNS topic for cost alerts
@@ -377,11 +405,11 @@ aws eks put-cluster-logging \
    echo "Topic ARN: $TOPIC_ARN"
    ```
 
-   The cost alerting system is now active and will notify you when resource utilization falls below efficiency thresholds. This proactive monitoring enables rapid response to optimization opportunities and supports continuous cost management practices that are essential for maintaining efficient EKS operations.
+   The cost alerting system is now active and will notify you when resource utilization falls below efficiency thresholds. This proactive monitoring enables rapid response to optimization opportunities and supports continuous cost management practices.
 
 8. **Generate Resource Optimization Reports**:
 
-   Regular reporting enables tracking of optimization progress and demonstrates the business value of resource right-sizing efforts to both technical teams and financial stakeholders. This script creates comprehensive VPA recommendation reports that quantify potential cost savings and track optimization effectiveness over time. The reports support compliance with [AWS Cost Optimization best practices](https://docs.aws.amazon.com/eks/latest/best-practices/cost-opt.html) by providing measurable evidence of resource efficiency improvements.
+   Regular reporting enables tracking of optimization progress and demonstrates the business value of resource right-sizing efforts to both technical teams and financial stakeholders. This script creates comprehensive VPA recommendation reports that quantify potential cost savings and track optimization effectiveness over time.
 
    ```bash
    # Create script to generate VPA recommendations
@@ -394,7 +422,7 @@ aws eks put-cluster-logging \
    
    # Get VPA recommendations
    kubectl get vpa -n cost-optimization -o custom-columns=\
-   "NAME:.metadata.name,TARGET:.spec.targetRef.name,CPU_REQUEST:.status.recommendation.containerRecommendations[0].target.cpu,MEMORY_REQUEST:.status.recommendation.containerRecommendations[0].target.memory"
+"NAME:.metadata.name,TARGET:.spec.targetRef.name,CPU_REQUEST:.status.recommendation.containerRecommendations[0].target.cpu,MEMORY_REQUEST:.status.recommendation.containerRecommendations[0].target.memory"
    
    echo ""
    echo "=== Current Resource Usage ==="
@@ -407,7 +435,6 @@ aws eks put-cluster-logging \
    
    chmod +x generate-vpa-recommendations.sh
    
-   # Run the report (after allowing time for data collection)
    echo "✅ VPA report script created"
    echo "Run './generate-vpa-recommendations.sh' after 10-15 minutes to see recommendations"
    ```
@@ -416,10 +443,10 @@ aws eks put-cluster-logging \
 
 9. **Implement Automated Right-Sizing**:
 
-   Once you've validated VPA recommendations in "Off" mode, you can enable automatic resource updates to implement continuous cost optimization. This configuration implements aggressive right-sizing with appropriate safety boundaries, automating the resource optimization process to ensure ongoing cost efficiency as workload patterns evolve. The automatic updates eliminate the need for manual intervention while maintaining safety controls to prevent performance degradation.
+   Once you've validated VPA recommendations in "Off" mode, you can enable automatic resource updates to implement continuous cost optimization. This configuration implements right-sizing with appropriate safety boundaries, automating the resource optimization process to ensure ongoing cost efficiency as workload patterns evolve.
 
    ```bash
-   # Create a more aggressive VPA configuration for automated updates
+   # Create automated VPA configuration
    cat <<EOF | kubectl apply -f -
    apiVersion: autoscaling.k8s.io/v1
    kind: VerticalPodAutoscaler
@@ -432,7 +459,7 @@ aws eks put-cluster-logging \
        kind: Deployment
        name: resource-test-app
      updatePolicy:
-       updateMode: "Auto"  # Enable automatic updates
+       updateMode: "Auto"
      resourcePolicy:
        containerPolicies:
        - containerName: app
@@ -440,19 +467,19 @@ aws eks put-cluster-logging \
            cpu: 50m
            memory: 64Mi
          maxAllowed:
-           cpu: 500m  # Reduced from original
-           memory: 512Mi  # Reduced from original
+           cpu: 500m
+           memory: 512Mi
          controlledResources: ["cpu", "memory"]
    EOF
    
    echo "✅ Automated VPA configuration deployed"
    ```
 
-   The automated VPA configuration is now active and will continuously optimize resource allocations based on actual usage patterns. This enables ongoing cost optimization without manual intervention, automatically adjusting resource requests as workload patterns change and ensuring sustained cost efficiency over time.
+   The automated VPA configuration is now active and will continuously optimize resource allocations based on actual usage patterns. This enables ongoing cost optimization without manual intervention, automatically adjusting resource requests as workload patterns change.
 
 10. **Create Cost Optimization Automation**:
 
-    Advanced automation can analyze metrics and trigger optimization actions based on predefined thresholds, enabling enterprise-scale cost optimization that operates continuously without manual intervention. This Lambda function demonstrates integration with CloudWatch metrics for automated cost optimization decisions, supporting the advanced automation practices outlined in [AWS Cost Management best practices](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-what-is.html). The automation layer provides intelligent decision-making capabilities that can scale across multiple clusters and respond to changing workload patterns.
+    Advanced automation can analyze metrics and trigger optimization actions based on predefined thresholds, enabling enterprise-scale cost optimization that operates continuously without manual intervention. This Lambda function demonstrates integration with CloudWatch metrics for automated cost optimization decisions.
 
     ```bash
     # Create Lambda function for cost optimization automation
@@ -462,7 +489,6 @@ aws eks put-cluster-logging \
     from datetime import datetime, timedelta
     
     def lambda_handler(event, context):
-        # Get EKS cluster metrics
         cloudwatch = boto3.client('cloudwatch')
         
         # Query resource utilization metrics
@@ -485,8 +511,7 @@ aws eks put-cluster-logging \
         if response['Datapoints']:
             avg_utilization = sum(dp['Average'] for dp in response['Datapoints']) / len(response['Datapoints'])
             
-            if avg_utilization < 30:  # Low utilization threshold
-                # Send SNS notification
+            if avg_utilization < 30:
                 sns = boto3.client('sns')
                 sns.publish(
                     TopicArn='${TOPIC_ARN}',
@@ -536,7 +561,7 @@ aws eks put-cluster-logging \
    kubectl top pods -n cost-optimization
    
    # View cost dashboard
-   echo "View dashboard at: https://console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=EKS-Cost-Optimization-${RANDOM_SUFFIX}"
+   echo "Dashboard URL: https://console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=EKS-Cost-Optimization-${RANDOM_SUFFIX}"
    ```
 
 4. **Test Automated Scaling**:
@@ -583,14 +608,32 @@ aws eks put-cluster-logging \
    aws cloudwatch delete-alarms \
        --alarm-names "EKS-High-Resource-Waste-${RANDOM_SUFFIX}"
    
+   # Delete SNS topic
+   aws sns delete-topic --topic-arn $TOPIC_ARN
+   
    echo "✅ CloudWatch resources removed"
    ```
 
 4. **Clean Up Container Insights**:
 
    ```bash
-   # Remove CloudWatch agent
-   kubectl delete namespace amazon-cloudwatch
+   # Remove CloudWatch EKS add-on
+   aws eks delete-addon \
+       --cluster-name $CLUSTER_NAME \
+       --addon-name amazon-cloudwatch-observability
+   
+   # Wait for add-on deletion
+   aws eks wait addon-deleted \
+       --cluster-name $CLUSTER_NAME \
+       --addon-name amazon-cloudwatch-observability
+   
+   # Delete IAM role
+   aws iam detach-role-policy \
+       --role-name CloudWatchObservabilityRole-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+   
+   aws iam delete-role \
+       --role-name CloudWatchObservabilityRole-${RANDOM_SUFFIX}
    
    echo "✅ Container Insights removed"
    ```
@@ -605,6 +648,7 @@ aws eks put-cluster-logging \
    rm -rf autoscaler/
    rm -f generate-vpa-recommendations.sh
    rm -f cost-optimization-lambda.py
+   rm -f cloudwatch-observability-trust-policy.json
    
    echo "✅ All resources cleaned up"
    ```
@@ -619,6 +663,8 @@ Key considerations for production implementation include setting appropriate res
 
 The integration with AWS Cost Explorer and [CloudWatch Container Insights](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html) enables comprehensive visibility into both resource utilization and cost implications. This visibility is essential for making informed decisions about resource allocation and for demonstrating the business value of optimization efforts to stakeholders, supporting both technical decision-making and financial reporting requirements.
 
+> **Tip**: Use the CloudWatch Observability EKS add-on for simplified management and automatic updates of monitoring components. This AWS-managed approach reduces operational overhead and ensures you're always using the latest monitoring capabilities.
+
 ## Challenge
 
 Extend this solution by implementing these enhancements:
@@ -629,10 +675,17 @@ Extend this solution by implementing these enhancements:
 
 3. **Cost-Aware Scheduling**: Implement custom Kubernetes schedulers that consider both resource requirements and cost implications when placing pods on nodes with different instance types.
 
-4. **Automated Node Right-Sizing**: Extend the solution to automatically adjust node group instance types based on aggregate container resource requirements and cost optimization opportunities.
+4. **Automated Node Right-Sizing**: Extend the solution to automatically adjust node group instance types based on aggregate container resource requirements and cost optimization opportunities using Karpenter.
 
 5. **Advanced Cost Allocation**: Implement detailed cost allocation and chargeback mechanisms using Kubernetes labels, namespaces, and AWS Cost Categories to track resource optimization impact by team or application.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -4,12 +4,12 @@ id: a7b4c9d2
 category: media-services
 difficulty: 300
 subject: gcp
-services: Cloud Media CDN, Live Stream API, Cloud Functions, BigQuery
+services: Live Stream API, Media CDN, Cloud Functions, BigQuery
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: streaming, analytics, media, cdn, real-time, video-processing
 recipe-generator-version: 1.3
@@ -77,7 +77,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and appropriate permissions for Live Stream API, Media CDN, Cloud Functions, and BigQuery
-2. Google Cloud CLI (gcloud) installed and authenticated (version 450.0.0 or later)
+2. Google Cloud CLI (gcloud) installed and authenticated (version 450.0.0 or later)  
 3. Basic understanding of video streaming protocols (HLS, DASH, RTMP)
 4. Video encoder software (OBS Studio, FFmpeg, or similar) for testing live streams
 5. Estimated cost: $50-100 for testing (includes transcoding, CDN egress, and compute resources)
@@ -213,6 +213,7 @@ echo "✅ APIs enabled for streaming analytics pipeline"
    cat > main.py << 'EOF'
    import json
    import logging
+   import os
    from google.cloud import bigquery
    from google.cloud import pubsub_v1
    from datetime import datetime
@@ -388,19 +389,20 @@ echo "✅ APIs enabled for streaming analytics pipeline"
 
    ```bash
    # Create edge cache origin for Cloud Storage
-   gcloud network-services edge-cache-origins create streaming-origin-${RANDOM_SUFFIX} \
+   gcloud network-services edge-cache-origins create \
+       streaming-origin-${RANDOM_SUFFIX} \
        --origin-address=${BUCKET_NAME}.storage.googleapis.com \
        --port=443 \
        --protocol=HTTPS \
        --description="Origin for streaming content"
    
    # Create edge cache service
-   gcloud network-services edge-cache-services create streaming-service-${RANDOM_SUFFIX} \
+   gcloud network-services edge-cache-services create \
+       streaming-service-${RANDOM_SUFFIX} \
        --description="Media CDN for live streaming" \
-       --disable-quic \
-       --edge-ssl-certificates=projects/${PROJECT_ID}/global/sslCertificates/streaming-cert-${RANDOM_SUFFIX} || true
+       --disable-quic
    
-   # Configure route for streaming content
+   # Configure route rules for streaming content
    cat > route-config.yaml << EOF
    hostRule:
      hosts:
@@ -422,8 +424,10 @@ echo "✅ APIs enabled for streaming analytics pipeline"
          maxTtl: "300s"
    EOF
    
-   gcloud network-services edge-cache-services update streaming-service-${RANDOM_SUFFIX} \
-       --config-file=route-config.yaml || true
+   # Update edge cache service with routing configuration
+   gcloud network-services edge-cache-services update \
+       streaming-service-${RANDOM_SUFFIX} \
+       --config-file=route-config.yaml
    
    echo "✅ Media CDN configured for global streaming distribution"
    ```
@@ -562,7 +566,8 @@ echo "✅ APIs enabled for streaming analytics pipeline"
    curl -I "https://storage.googleapis.com/${BUCKET_NAME}/live-stream/manifest.m3u8"
    
    # Verify CDN edge cache configuration
-   gcloud network-services edge-cache-services describe streaming-service-${RANDOM_SUFFIX} \
+   gcloud network-services edge-cache-services describe \
+       streaming-service-${RANDOM_SUFFIX} \
        --format="table(name,hostRule.hosts,routeRules[0].origin)"
    ```
 
@@ -621,11 +626,13 @@ echo "✅ APIs enabled for streaming analytics pipeline"
 
    ```bash
    # Delete CDN service and origin
-   gcloud network-services edge-cache-services delete streaming-service-${RANDOM_SUFFIX} \
-       --quiet || true
+   gcloud network-services edge-cache-services delete \
+       streaming-service-${RANDOM_SUFFIX} \
+       --quiet
    
-   gcloud network-services edge-cache-origins delete streaming-origin-${RANDOM_SUFFIX} \
-       --quiet || true
+   gcloud network-services edge-cache-origins delete \
+       streaming-origin-${RANDOM_SUFFIX} \
+       --quiet
    
    echo "✅ Media CDN configuration removed"
    ```
@@ -639,7 +646,8 @@ echo "✅ APIs enabled for streaming analytics pipeline"
        --quiet
    
    # Delete Pub/Sub resources
-   gcloud pubsub subscriptions delete ${PUBSUB_TOPIC}-bq-subscription --quiet
+   gcloud pubsub subscriptions delete ${PUBSUB_TOPIC}-bq-subscription \
+       --quiet
    gcloud pubsub topics delete ${PUBSUB_TOPIC} --quiet
    
    # Delete BigQuery dataset
@@ -688,4 +696,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

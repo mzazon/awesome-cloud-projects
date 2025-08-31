@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure IoT Operations, Azure Event Hubs, Azure Stream Analytics, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: iot, manufacturing, edge-computing, analytics, predictive-maintenance, industrial-automation, smart-factory
 recipe-generator-version: 1.3
@@ -125,8 +125,8 @@ echo "✅ Log Analytics workspace ready for IoT telemetry monitoring"
    ```bash
    # Create Event Hubs namespace with auto-scaling capabilities
    az eventhubs namespace create \
-       --resource-group ${RESOURCE_GROUP} \
        --name ${EVENT_HUBS_NAMESPACE} \
+       --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --sku Standard \
        --enable-auto-inflate \
@@ -135,19 +135,19 @@ echo "✅ Log Analytics workspace ready for IoT telemetry monitoring"
    
    # Create event hub for manufacturing telemetry with partitions for parallel processing
    az eventhubs eventhub create \
-       --resource-group ${RESOURCE_GROUP} \
-       --namespace-name ${EVENT_HUBS_NAMESPACE} \
        --name ${EVENT_HUB_NAME} \
+       --namespace-name ${EVENT_HUBS_NAMESPACE} \
+       --resource-group ${RESOURCE_GROUP} \
        --partition-count 4 \
        --message-retention 3 \
        --cleanup-policy Delete
    
    # Create shared access policy for IoT Operations integration
    az eventhubs eventhub authorization-rule create \
-       --resource-group ${RESOURCE_GROUP} \
+       --name IoTOperationsPolicy \
        --namespace-name ${EVENT_HUBS_NAMESPACE} \
        --eventhub-name ${EVENT_HUB_NAME} \
-       --name IoTOperationsPolicy \
+       --resource-group ${RESOURCE_GROUP} \
        --rights Send Listen
    
    echo "✅ Event Hubs telemetry ingestion layer configured"
@@ -162,8 +162,8 @@ echo "✅ Log Analytics workspace ready for IoT telemetry monitoring"
    ```bash
    # Create Stream Analytics job for manufacturing analytics
    az stream-analytics job create \
+       --job-name ${STREAM_ANALYTICS_JOB} \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${STREAM_ANALYTICS_JOB} \
        --location ${LOCATION} \
        --output-error-policy Stop \
        --events-out-of-order-policy Adjust \
@@ -699,4 +699,9 @@ Extend this manufacturing analytics solution by implementing these advanced capa
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

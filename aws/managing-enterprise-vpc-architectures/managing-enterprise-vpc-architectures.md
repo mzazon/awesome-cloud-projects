@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: transit-gateway, vpc, route-53, cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: networking, transit-gateway, vpc, route-tables, multi-region, enterprise-architecture
 recipe-generator-version: 1.3
@@ -83,10 +83,10 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for EC2, VPC, and Transit Gateway operations
+1. AWS account with appropriate permissions for EC2, VPC, Transit Gateway, IAM, and CloudWatch operations
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of VPC networking concepts, CIDR blocks, and routing
-4. Familiarity with AWS networking services and multi-region deployments
+4. Familiarity with AWS networking services and multi-region deployments  
 5. Estimated cost: $150-200/month for Transit Gateway attachments and data processing charges
 
 > **Note**: Transit Gateway charges $0.05 per hour per attachment plus $0.02 per GB of data processed. Cross-region peering incurs additional data transfer costs.
@@ -115,22 +115,22 @@ export SHARED_VPC_NAME="shared-vpc-${RANDOM_SUFFIX}"
 # Create VPCs for the architecture
 aws ec2 create-vpc \
     --cidr-block 10.0.0.0/16 \
-    --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${PROD_VPC_NAME}}]" \
+    --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${PROD_VPC_NAME}},{Key=Environment,Value=production}]" \
     --query 'Vpc.VpcId' --output text > /tmp/prod-vpc-id
 
 aws ec2 create-vpc \
     --cidr-block 10.1.0.0/16 \
-    --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${DEV_VPC_NAME}}]" \
+    --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${DEV_VPC_NAME}},{Key=Environment,Value=development}]" \
     --query 'Vpc.VpcId' --output text > /tmp/dev-vpc-id
 
 aws ec2 create-vpc \
     --cidr-block 10.2.0.0/16 \
-    --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${TEST_VPC_NAME}}]" \
+    --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${TEST_VPC_NAME}},{Key=Environment,Value=testing}]" \
     --query 'Vpc.VpcId' --output text > /tmp/test-vpc-id
 
 aws ec2 create-vpc \
     --cidr-block 10.3.0.0/16 \
-    --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${SHARED_VPC_NAME}}]" \
+    --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${SHARED_VPC_NAME}},{Key=Environment,Value=shared}]" \
     --query 'Vpc.VpcId' --output text > /tmp/shared-vpc-id
 
 # Store VPC IDs in environment variables
@@ -173,6 +173,10 @@ export PROD_SUBNET_ID=$(cat /tmp/prod-subnet-id)
 export DEV_SUBNET_ID=$(cat /tmp/dev-subnet-id)
 export TEST_SUBNET_ID=$(cat /tmp/test-subnet-id)
 export SHARED_SUBNET_ID=$(cat /tmp/shared-subnet-id)
+
+# Create CloudWatch Log Group for VPC Flow Logs (required before enabling flow logs)
+aws logs create-log-group \
+    --log-group-name /aws/vpc/flowlogs
 
 echo "✅ Created VPCs and subnets for multi-VPC architecture"
 ```
@@ -245,7 +249,7 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
        --transit-gateway-id $TGW_ID \
        --vpc-id $PROD_VPC_ID \
        --subnet-ids $PROD_SUBNET_ID \
-       --tag-specifications "ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=prod-attachment}]" \
+       --tag-specifications "ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=prod-attachment},{Key=Environment,Value=production}]" \
        --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' --output text > /tmp/prod-attachment-id
    
    # Attach Development VPC
@@ -253,7 +257,7 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
        --transit-gateway-id $TGW_ID \
        --vpc-id $DEV_VPC_ID \
        --subnet-ids $DEV_SUBNET_ID \
-       --tag-specifications "ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=dev-attachment}]" \
+       --tag-specifications "ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=dev-attachment},{Key=Environment,Value=development}]" \
        --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' --output text > /tmp/dev-attachment-id
    
    # Attach Test VPC
@@ -261,7 +265,7 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
        --transit-gateway-id $TGW_ID \
        --vpc-id $TEST_VPC_ID \
        --subnet-ids $TEST_SUBNET_ID \
-       --tag-specifications "ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=test-attachment}]" \
+       --tag-specifications "ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=test-attachment},{Key=Environment,Value=testing}]" \
        --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' --output text > /tmp/test-attachment-id
    
    # Attach Shared Services VPC
@@ -269,7 +273,7 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
        --transit-gateway-id $TGW_ID \
        --vpc-id $SHARED_VPC_ID \
        --subnet-ids $SHARED_SUBNET_ID \
-       --tag-specifications "ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=shared-attachment}]" \
+       --tag-specifications "ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=shared-attachment},{Key=Environment,Value=shared}]" \
        --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' --output text > /tmp/shared-attachment-id
    
    # Store attachment IDs
@@ -388,12 +392,12 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
    # Create second Transit Gateway in US-West-2 for demonstration
    export DR_REGION="us-west-2"
    
-   # Create DR Transit Gateway
+   # Create DR Transit Gateway  
    aws ec2 create-transit-gateway \
        --region $DR_REGION \
        --description "Disaster Recovery Transit Gateway" \
        --options AmazonSideAsn=64513,AutoAcceptSharedAttachments=disable,DefaultRouteTableAssociation=enable,DefaultRouteTablePropagation=enable,VpnEcmpSupport=enable,DnsSupport=enable \
-       --tag-specifications "ResourceType=transit-gateway,Tags=[{Key=Name,Value=dr-tgw-${RANDOM_SUFFIX}}]" \
+       --tag-specifications "ResourceType=transit-gateway,Tags=[{Key=Name,Value=dr-tgw-${RANDOM_SUFFIX}},{Key=Environment,Value=disaster-recovery}]" \
        --query 'TransitGateway.TransitGatewayId' --output text > /tmp/dr-tgw-id
    
    export DR_TGW_ID=$(cat /tmp/dr-tgw-id)
@@ -424,7 +428,59 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
 
    Cross-region connectivity is now established, creating a global network backbone that supports disaster recovery scenarios and multi-region application deployments. The peering connection provides encrypted, high-bandwidth connectivity that can be selectively enabled through routing policies based on business requirements.
 
-8. **Configure Network Monitoring and Logging**:
+8. **Create IAM Role for VPC Flow Logs**:
+
+   VPC Flow Logs require an IAM role with permissions to write to CloudWatch Logs. This role enables the VPC Flow Logs service to deliver log data securely while following the principle of least privilege. The service-linked role includes only the necessary permissions for log delivery and follows AWS security best practices.
+
+   ```bash
+   # Create IAM role for VPC Flow Logs
+   aws iam create-role \
+       --role-name VPCFlowLogsRole \
+       --assume-role-policy-document '{
+           "Version": "2012-10-17",
+           "Statement": [
+               {
+                   "Effect": "Allow",
+                   "Principal": {
+                       "Service": "vpc-flow-logs.amazonaws.com"
+                   },
+                   "Action": "sts:AssumeRole",
+                   "Condition": {
+                       "StringEquals": {
+                           "aws:SourceAccount": "'$AWS_ACCOUNT_ID'"
+                       }
+                   }
+               }
+           ]
+       }'
+
+   # Create and attach policy for VPC Flow Logs
+   aws iam put-role-policy \
+       --role-name VPCFlowLogsRole \
+       --policy-name VPCFlowLogsDelivery \
+       --policy-document '{
+           "Version": "2012-10-17",
+           "Statement": [
+               {
+                   "Effect": "Allow",
+                   "Action": [
+                       "logs:CreateLogGroup",
+                       "logs:CreateLogStream",
+                       "logs:PutLogEvents",
+                       "logs:DescribeLogGroups",
+                       "logs:DescribeLogStreams"
+                   ],
+                   "Resource": "*"
+               }
+           ]
+       }'
+
+   echo "✅ Created IAM role for VPC Flow Logs"
+   ```
+
+   The IAM role now provides VPC Flow Logs with the minimum necessary permissions to deliver log data to CloudWatch Logs. This configuration follows AWS security best practices by including source account conditions to prevent the confused deputy problem.
+
+9. **Configure Network Monitoring and Logging**:
 
    Comprehensive network monitoring provides visibility into traffic patterns, security events, and performance metrics essential for maintaining secure and reliable multi-VPC architectures. VPC Flow Logs capture detailed network traffic metadata that supports security analysis, troubleshooting, and compliance reporting. CloudWatch alarms enable proactive monitoring of Transit Gateway utilization to prevent performance degradation and unexpected cost increases.
 
@@ -437,7 +493,7 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
            --traffic-type ALL \
            --log-destination-type cloud-watch-logs \
            --log-group-name /aws/vpc/flowlogs \
-           --deliver-logs-permission-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/flowlogsRole"
+           --deliver-logs-permission-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/VPCFlowLogsRole"
    done
    
    # Create CloudWatch Log Group for Transit Gateway monitoring
@@ -461,55 +517,55 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
 
    Network observability is now established across all VPCs and the Transit Gateway. Flow logs will capture all network traffic metadata for security analysis and troubleshooting, while CloudWatch alarms provide proactive monitoring of network utilization. This monitoring foundation supports both operational excellence and security compliance requirements.
 
-9. **Update VPC Route Tables to Use Transit Gateway**:
+10. **Update VPC Route Tables to Use Transit Gateway**:
 
-   VPC route table configuration completes the network path by directing traffic from within each VPC to the Transit Gateway for inter-VPC communication. These routes define which traffic should be sent through the Transit Gateway versus staying local to the VPC. The shared services VPC receives broader routing (10.0.0.0/8) to enable its centralized functions, while other VPCs get specific routes only to shared services, maintaining strict access controls.
+    VPC route table configuration completes the network path by directing traffic from within each VPC to the Transit Gateway for inter-VPC communication. These routes define which traffic should be sent through the Transit Gateway versus staying local to the VPC. The shared services VPC receives broader routing (10.0.0.0/8) to enable its centralized functions, while other VPCs get specific routes only to shared services, maintaining strict access controls.
 
-   ```bash
-   # Get default route table IDs for each VPC
-   export PROD_RT_VPC_ID=$(aws ec2 describe-route-tables \
-       --filters "Name=vpc-id,Values=$PROD_VPC_ID" \
-       --query 'RouteTables[0].RouteTableId' --output text)
-   
-   export DEV_RT_VPC_ID=$(aws ec2 describe-route-tables \
-       --filters "Name=vpc-id,Values=$DEV_VPC_ID" \
-       --query 'RouteTables[0].RouteTableId' --output text)
-   
-   export TEST_RT_VPC_ID=$(aws ec2 describe-route-tables \
-       --filters "Name=vpc-id,Values=$TEST_VPC_ID" \
-       --query 'RouteTables[0].RouteTableId' --output text)
-   
-   export SHARED_RT_VPC_ID=$(aws ec2 describe-route-tables \
-       --filters "Name=vpc-id,Values=$SHARED_VPC_ID" \
-       --query 'RouteTables[0].RouteTableId' --output text)
-   
-   # Add routes to Transit Gateway from each VPC
-   aws ec2 create-route \
-       --route-table-id $PROD_RT_VPC_ID \
-       --destination-cidr-block 10.3.0.0/16 \
-       --transit-gateway-id $TGW_ID
-   
-   aws ec2 create-route \
-       --route-table-id $DEV_RT_VPC_ID \
-       --destination-cidr-block 10.3.0.0/16 \
-       --transit-gateway-id $TGW_ID
-   
-   aws ec2 create-route \
-       --route-table-id $TEST_RT_VPC_ID \
-       --destination-cidr-block 10.3.0.0/16 \
-       --transit-gateway-id $TGW_ID
-   
-   aws ec2 create-route \
-       --route-table-id $SHARED_RT_VPC_ID \
-       --destination-cidr-block 10.0.0.0/8 \
-       --transit-gateway-id $TGW_ID
-   
-   echo "✅ Updated VPC route tables to use Transit Gateway"
-   ```
+    ```bash
+    # Get default route table IDs for each VPC
+    export PROD_RT_VPC_ID=$(aws ec2 describe-route-tables \
+        --filters "Name=vpc-id,Values=$PROD_VPC_ID" "Name=association.main,Values=true" \
+        --query 'RouteTables[0].RouteTableId' --output text)
+    
+    export DEV_RT_VPC_ID=$(aws ec2 describe-route-tables \
+        --filters "Name=vpc-id,Values=$DEV_VPC_ID" "Name=association.main,Values=true" \
+        --query 'RouteTables[0].RouteTableId' --output text)
+    
+    export TEST_RT_VPC_ID=$(aws ec2 describe-route-tables \
+        --filters "Name=vpc-id,Values=$TEST_VPC_ID" "Name=association.main,Values=true" \
+        --query 'RouteTables[0].RouteTableId' --output text)
+    
+    export SHARED_RT_VPC_ID=$(aws ec2 describe-route-tables \
+        --filters "Name=vpc-id,Values=$SHARED_VPC_ID" "Name=association.main,Values=true" \
+        --query 'RouteTables[0].RouteTableId' --output text)
+    
+    # Add routes to Transit Gateway from each VPC
+    aws ec2 create-route \
+        --route-table-id $PROD_RT_VPC_ID \
+        --destination-cidr-block 10.3.0.0/16 \
+        --transit-gateway-id $TGW_ID
+    
+    aws ec2 create-route \
+        --route-table-id $DEV_RT_VPC_ID \
+        --destination-cidr-block 10.3.0.0/16 \
+        --transit-gateway-id $TGW_ID
+    
+    aws ec2 create-route \
+        --route-table-id $TEST_RT_VPC_ID \
+        --destination-cidr-block 10.3.0.0/16 \
+        --transit-gateway-id $TGW_ID
+    
+    aws ec2 create-route \
+        --route-table-id $SHARED_RT_VPC_ID \
+        --destination-cidr-block 10.0.0.0/8 \
+        --transit-gateway-id $TGW_ID
+    
+    echo "✅ Updated VPC route tables to use Transit Gateway"
+    ```
 
-   Traffic routing is now configured to flow through the Transit Gateway according to our network segmentation policies. Resources in production and development environments can reach shared services, while the shared services VPC can initiate connections to all environments for centralized management functions. The asymmetric routing configuration enforces our security boundaries.
+    Traffic routing is now configured to flow through the Transit Gateway according to our network segmentation policies. Resources in production and development environments can reach shared services, while the shared services VPC can initiate connections to all environments for centralized management functions. The asymmetric routing configuration enforces our security boundaries.
 
-10. **Create Network Security Groups for Transit Gateway Traffic**:
+11. **Create Network Security Groups for Transit Gateway Traffic**:
 
     Security groups provide the final layer of access control by implementing stateful firewall rules at the instance level. While Transit Gateway route tables control which networks can communicate, security groups determine which specific protocols and ports are allowed for individual resources. This defense-in-depth approach ensures that even if routing allows connectivity, applications must still explicitly permit traffic through appropriate security group rules.
 
@@ -519,7 +575,7 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
         --group-name "prod-tgw-sg" \
         --description "Security group for production Transit Gateway traffic" \
         --vpc-id $PROD_VPC_ID \
-        --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=prod-tgw-sg}]" \
+        --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=prod-tgw-sg},{Key=Environment,Value=production}]" \
         --query 'GroupId' --output text > /tmp/prod-sg-id
     
     export PROD_SG_ID=$(cat /tmp/prod-sg-id)
@@ -548,7 +604,7 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
         --group-name "dev-tgw-sg" \
         --description "Security group for development Transit Gateway traffic" \
         --vpc-id $DEV_VPC_ID \
-        --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=dev-tgw-sg}]" \
+        --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=dev-tgw-sg},{Key=Environment,Value=development}]" \
         --query 'GroupId' --output text > /tmp/dev-sg-id
     
     export DEV_SG_ID=$(cat /tmp/dev-sg-id)
@@ -630,9 +686,11 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
 
    ```bash
    # Check peering attachment status
-   aws ec2 describe-transit-gateway-peering-attachments \
-       --transit-gateway-attachment-ids $PEERING_ATTACHMENT_ID \
-       --query 'TransitGatewayPeeringAttachments[0].State'
+   if [ ! -z "$PEERING_ATTACHMENT_ID" ]; then
+       aws ec2 describe-transit-gateway-peering-attachments \
+           --transit-gateway-attachment-ids $PEERING_ATTACHMENT_ID \
+           --query 'TransitGatewayPeeringAttachments[0].State'
+   fi
    ```
 
    Expected output: `"available"`
@@ -734,7 +792,7 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
    echo "✅ Deleted VPCs and associated resources"
    ```
 
-7. **Remove CloudWatch Resources**:
+7. **Remove CloudWatch Resources and IAM Role**:
 
    ```bash
    # Delete CloudWatch alarms
@@ -748,23 +806,31 @@ echo "✅ Created VPCs and subnets for multi-VPC architecture"
    aws logs delete-log-group \
        --log-group-name /aws/vpc/flowlogs
    
+   # Delete IAM role and policy
+   aws iam delete-role-policy \
+       --role-name VPCFlowLogsRole \
+       --policy-name VPCFlowLogsDelivery
+   
+   aws iam delete-role \
+       --role-name VPCFlowLogsRole
+   
    # Clean up temporary files
    rm -f /tmp/*-vpc-id /tmp/*-subnet-id /tmp/*-rt-id /tmp/*-attachment-id /tmp/*-sg-id /tmp/tgw-id /tmp/dr-tgw-id /tmp/peering-attachment-id
    
-   echo "✅ Cleaned up monitoring resources and temporary files"
+   echo "✅ Cleaned up monitoring resources, IAM role, and temporary files"
    ```
 
 ## Discussion
 
-AWS Transit Gateway revolutionizes multi-VPC networking by providing a centralized hub that eliminates the complexity of managing multiple VPC peering connections. The hub-and-spoke model significantly simplifies network architecture while providing granular control through custom route tables and network segmentation policies. This architecture enables organizations to scale their AWS infrastructure efficiently while maintaining strict security boundaries between different environments and applications.
+AWS Transit Gateway revolutionizes multi-VPC networking by providing a centralized hub that eliminates the complexity of managing multiple VPC peering connections. The hub-and-spoke model significantly simplifies network architecture while providing granular control through custom route tables and network segmentation policies. This architecture enables organizations to scale their AWS infrastructure efficiently while maintaining strict security boundaries between different environments and applications. Following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html), this design prioritizes security, reliability, and operational excellence.
 
 The custom route table approach demonstrated in this recipe provides powerful network segmentation capabilities. By creating separate route tables for production, development, and shared services, we implement a zero-trust network model where traffic flows are explicitly controlled rather than implicitly allowed. The blackhole routes prevent unwanted communication between environments, while selective route propagation ensures that only authorized traffic can flow between VPCs. This approach is particularly valuable for organizations subject to compliance requirements like PCI DSS, HIPAA, or SOC 2.
 
 > **Tip**: Use AWS Config rules to continuously monitor Transit Gateway route table configurations and automatically detect unauthorized routing changes. This provides an additional compliance control layer for sensitive environments.
 
-Cross-region peering capabilities extend this architecture to support disaster recovery and geographic distribution scenarios. The ability to connect Transit Gateways across regions enables seamless failover and data replication strategies while maintaining consistent network policies. However, organizations should carefully consider the cost implications of cross-region data transfer and implement appropriate monitoring to track bandwidth usage and associated charges.
+Cross-region peering capabilities extend this architecture to support disaster recovery and geographic distribution scenarios. The ability to connect Transit Gateways across regions enables seamless failover and data replication strategies while maintaining consistent network policies. However, organizations should carefully consider the cost implications of cross-region data transfer and implement appropriate monitoring to track bandwidth usage and associated charges. For more details on cross-region peering, see the [AWS Transit Gateway documentation](https://docs.aws.amazon.com/vpc/latest/tgw/tgw-peering.html).
 
-The integration with CloudWatch and VPC Flow Logs provides comprehensive visibility into network traffic patterns and potential security issues. This monitoring capability is essential for detecting anomalous behavior, troubleshooting connectivity issues, and ensuring compliance with internal security policies. Organizations should establish baseline metrics and automated alerting to proactively identify and respond to network issues before they impact business operations.
+The integration with CloudWatch and VPC Flow Logs provides comprehensive visibility into network traffic patterns and potential security issues. VPC Flow Logs capture detailed metadata about network connections, enabling security teams to identify anomalous behavior and troubleshoot connectivity issues. Organizations should establish baseline metrics and automated alerting to proactively identify and respond to network issues before they impact business operations. The [VPC Flow Logs documentation](https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html) provides comprehensive guidance on log analysis and security monitoring.
 
 > **Warning**: Transit Gateway charges can accumulate quickly in large deployments. Monitor your usage regularly and consider implementing automated cost controls to prevent unexpected charges.
 
@@ -784,4 +850,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

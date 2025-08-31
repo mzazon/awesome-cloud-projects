@@ -4,12 +4,12 @@ id: a3f7e2d8
 category: gaming
 difficulty: 200
 subject: azure
-services: Azure PlayFab, Azure Spatial Anchors, Azure Mixed Reality, Azure Functions
+services: PlayFab, Spatial Anchors, Functions, Event Grid
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: gaming, ar, mixed-reality, multiplayer, spatial-anchors, playfab, location-based
 recipe-generator-version: 1.3
@@ -51,9 +51,9 @@ graph TB
         EVENTS[Event Triggers]
     end
     
-    subgraph "Mixed Reality Services"
-        MR[Azure Mixed Reality]
-        RENDER[Rendering Pipeline]
+    subgraph "Event Grid"
+        EG[Event Grid]
+        SUB[Event Subscriptions]
     end
     
     MOBILE --> AUTH
@@ -68,23 +68,21 @@ graph TB
     TABLET --> ASA
     ASA --> STORAGE
     
-    MOBILE --> MR
-    TABLET --> MR
-    MR --> RENDER
-    
     FUNC --> ASA
-    EVENTS --> LOBBY
+    EVENTS --> EG
+    EG --> SUB
+    SUB --> LOBBY
     
     style ASA fill:#FF6B6B
     style LOBBY fill:#4ECDC4
     style FUNC fill:#45B7D1
-    style MR fill:#96CEB4
+    style EG fill:#96CEB4
 ```
 
 ## Prerequisites
 
-1. Azure account with appropriate permissions for PlayFab, Spatial Anchors, Functions, and Mixed Reality services
-2. Azure CLI v2 installed and configured (or Azure CloudShell)
+1. Azure account with appropriate permissions for PlayFab, Spatial Anchors, Functions, and Event Grid services
+2. Azure CLI v2.46.0 or later installed and configured (or Azure CloudShell)
 3. Unity 2022.3 LTS or later with AR Foundation and Mixed Reality Toolkit (MRTK)
 4. Mobile development environment (Android SDK or Xcode)
 5. Basic knowledge of C# programming and Unity development
@@ -118,7 +116,7 @@ export PLAYFAB_TITLE_ID="YOUR_PLAYFAB_TITLE_ID"
 export PLAYFAB_SECRET_KEY="YOUR_PLAYFAB_SECRET_KEY"
 
 # Create Azure Spatial Anchors account
-az spatialanchors-account create \
+az spatial-anchors-account create \
     --name "sa-${RANDOM_SUFFIX}" \
     --resource-group ${RESOURCE_GROUP} \
     --location ${LOCATION}
@@ -126,12 +124,12 @@ az spatialanchors-account create \
 echo "✅ Spatial Anchors account created"
 
 # Get Spatial Anchors connection details
-export ASA_ACCOUNT_ID=$(az spatialanchors-account show \
+export ASA_ACCOUNT_ID=$(az spatial-anchors-account show \
     --name "sa-${RANDOM_SUFFIX}" \
     --resource-group ${RESOURCE_GROUP} \
     --query accountId --output tsv)
 
-export ASA_ACCOUNT_DOMAIN=$(az spatialanchors-account show \
+export ASA_ACCOUNT_DOMAIN=$(az spatial-anchors-account show \
     --name "sa-${RANDOM_SUFFIX}" \
     --resource-group ${RESOURCE_GROUP} \
     --query accountDomain --output tsv)
@@ -141,7 +139,34 @@ echo "✅ Spatial Anchors configuration retrieved"
 
 ## Steps
 
-1. **Create Azure Functions for Location Processing**:
+1. **Create Storage Account for Function Dependencies**:
+
+   Azure Functions requires a storage account for its runtime operations and state management. This storage account will also serve as a foundation for sharing data between PlayFab and Azure Spatial Anchors, enabling persistent storage of anchor metadata and player progression data that survives across gaming sessions.
+
+   ```bash
+   # Create storage account for function dependencies
+   az storage account create \
+       --name "st${RANDOM_SUFFIX}" \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --sku Standard_LRS \
+       --kind StorageV2
+   
+   # Configure CORS for PlayFab integration
+   az storage cors add \
+       --account-name "st${RANDOM_SUFFIX}" \
+       --services b \
+       --methods GET POST PUT DELETE \
+       --origins "https://*.playfab.com" \
+       --allowed-headers "*" \
+       --max-age 3600
+   
+   echo "✅ Storage configured for PlayFab integration"
+   ```
+
+   The storage account now provides the foundation for sharing data between PlayFab and Azure Spatial Anchors, enabling persistent storage of anchor metadata and player progression data across gaming sessions.
+
+2. **Create Azure Functions for Location Processing**:
 
    Azure Functions provides serverless compute capabilities that integrate seamlessly with PlayFab's CloudScript system. By creating functions that process spatial anchor data and coordinate multiplayer events, we establish a scalable backend that can handle real-time location-based interactions. This serverless approach eliminates infrastructure management while providing automatic scaling for peak gaming sessions.
 
@@ -169,33 +194,6 @@ echo "✅ Spatial Anchors configuration retrieved"
    ```
 
    The Function App now serves as the central processing hub for location-based gaming events. This configuration enables automatic scaling during multiplayer sessions and provides the foundation for advanced features like proximity-based matchmaking and location-triggered game events.
-
-2. **Configure PlayFab Integration with Spatial Anchors**:
-
-   PlayFab's CloudScript system enables server-side game logic that can securely interact with Azure services. By configuring PlayFab to work with our Azure Functions, we create a trusted environment where spatial anchor data can be validated and synchronized across multiple players. This integration ensures that virtual objects maintain their intended positions while preventing cheating and maintaining game balance.
-
-   ```bash
-   # Create storage account for function dependencies
-   az storage account create \
-       --name "st${RANDOM_SUFFIX}" \
-       --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --sku Standard_LRS \
-       --kind StorageV2
-   
-   # Configure CORS for PlayFab integration
-   az storage cors add \
-       --account-name "st${RANDOM_SUFFIX}" \
-       --services b \
-       --methods GET POST PUT DELETE \
-       --origins "https://*.playfab.com" \
-       --allowed-headers "*" \
-       --max-age 3600
-   
-   echo "✅ Storage configured for PlayFab integration"
-   ```
-
-   The storage account now provides the foundation for sharing data between PlayFab and Azure Spatial Anchors, enabling persistent storage of anchor metadata and player progression data that survives across gaming sessions.
 
 3. **Set Up Mixed Reality Authentication**:
 
@@ -261,7 +259,6 @@ echo "✅ Spatial Anchors configuration retrieved"
    cat > anchor-manager.cs << 'EOF'
    using Microsoft.Azure.Functions.Worker;
    using Microsoft.Azure.Functions.Worker.Http;
-   using Microsoft.Azure.SpatialAnchors;
    using System.Text.Json;
    
    namespace ARGamingFunctions
@@ -272,10 +269,8 @@ echo "✅ Spatial Anchors configuration retrieved"
            public async Task<HttpResponseData> CreateAnchor(
                [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
            {
-               // Spatial anchor creation logic
                var anchorData = await JsonSerializer.DeserializeAsync<AnchorRequest>(req.Body);
                
-               // Validate anchor location and create persistent anchor
                var anchorId = await CreateSpatialAnchor(anchorData);
                
                return CreateResponse(req, new { AnchorId = anchorId, Status = "Created" });
@@ -283,7 +278,6 @@ echo "✅ Spatial Anchors configuration retrieved"
            
            private async Task<string> CreateSpatialAnchor(AnchorRequest request)
            {
-               // Implementation for spatial anchor creation
                return Guid.NewGuid().ToString();
            }
            
@@ -343,7 +337,7 @@ echo "✅ Spatial Anchors configuration retrieved"
        "SpatialAnchorsSettings": {
            "AccountId": "${ASA_ACCOUNT_ID}",
            "AccountDomain": "${ASA_ACCOUNT_DOMAIN}",
-           "AccountKey": "$(az spatialanchors-account keys show --name sa-${RANDOM_SUFFIX} --resource-group ${RESOURCE_GROUP} --query primaryKey --output tsv)"
+           "AccountKey": "$(az spatial-anchors-account keys show --name sa-${RANDOM_SUFFIX} --resource-group ${RESOURCE_GROUP} --query primaryKey --output tsv)"
        },
        "FunctionEndpoints": {
            "CreateAnchor": "https://func-ar-gaming-${RANDOM_SUFFIX}.azurewebsites.net/api/CreateAnchor",
@@ -423,7 +417,7 @@ echo "✅ Spatial Anchors configuration retrieved"
 
    ```bash
    # Verify spatial anchors account status
-   az spatialanchors-account show \
+   az spatial-anchors-account show \
        --name "sa-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
        --query '{accountId:accountId,domain:accountDomain,provisioningState:provisioningState}'
@@ -496,7 +490,7 @@ echo "✅ Spatial Anchors configuration retrieved"
 
    ```bash
    # Delete Spatial Anchors account
-   az spatialanchors-account delete \
+   az spatial-anchors-account delete \
        --name "sa-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP}
    
@@ -551,4 +545,9 @@ Extend this location-based AR gaming platform by implementing these enhancements
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

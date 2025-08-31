@@ -4,12 +4,12 @@ id: f3a4b8c2
 category: cloud-financial-management
 difficulty: 200
 subject: gcp
-services: Policy Simulator, Cloud Asset Inventory, Cloud Billing, Cloud Functions
+services: Cloud Asset Inventory, Organization Policy, Cloud Billing, Cloud Functions
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-allocation, resource-tagging, governance, policy-enforcement, billing-analytics
 recipe-generator-version: 1.3
@@ -23,26 +23,27 @@ Enterprise organizations struggle with accurately tracking cloud spending across
 
 ## Solution
 
-Build an automated system that enforces consistent resource tagging policies using Google Cloud's Policy Simulator and Cloud Asset Inventory services. This solution automatically tracks resource usage, validates tagging compliance, and generates detailed cost allocation reports through Cloud Billing integration, enabling accurate financial accountability and cost transparency across teams.
+Build an automated system that enforces consistent resource tagging policies using Google Cloud's Organization Policy and Cloud Asset Inventory services. This solution automatically tracks resource usage, validates tagging compliance, and generates detailed cost allocation reports through Cloud Billing integration, enabling accurate financial accountability and cost transparency across teams.
 
 ## Architecture Diagram
 
 ```mermaid
 graph TB
     subgraph "Governance Layer"
-        PS[Policy Simulator]
-        OPC[Organization Policy Constraints]
+        OP[Organization Policy]
+        CC[Custom Constraints]
     end
     
     subgraph "Asset Management"
         CAI[Cloud Asset Inventory]
         CF[Cloud Functions]
+        PS[Pub/Sub Topics]
     end
     
     subgraph "Billing & Analytics"
         CB[Cloud Billing Export]
         BQ[BigQuery]
-        DS[Looker Studio]
+        LS[Looker Studio]
     end
     
     subgraph "Resources"
@@ -51,21 +52,22 @@ graph TB
         GKE[GKE Clusters]
     end
     
-    PS --> OPC
-    CAI --> CF
+    OP --> CC
+    CC --> GCE
+    CC --> GCS
+    CC --> GKE
+    
+    CAI --> PS
+    PS --> CF
     CF --> BQ
     CB --> BQ
-    BQ --> DS
-    
-    OPC -.-> GCE
-    OPC -.-> GCS
-    OPC -.-> GKE
+    BQ --> LS
     
     CAI -.-> GCE
     CAI -.-> GCS
     CAI -.-> GKE
     
-    style PS fill:#4285F4
+    style OP fill:#4285F4
     style CAI fill:#34A853
     style CB fill:#EA4335
     style BQ fill:#FBBC04
@@ -74,8 +76,8 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with Billing enabled and appropriate IAM permissions
-2. Organization-level access for creating organization policies
-3. gcloud CLI v2 installed and configured (or Google Cloud Shell)
+2. Organization-level access for creating organization policies (Organization Policy Administrator role)
+3. gcloud CLI installed and configured (or Google Cloud Shell)
 4. Basic understanding of Google Cloud resource hierarchy and IAM
 5. Estimated cost: $5-15 per month for BigQuery storage and Cloud Functions execution
 
@@ -104,12 +106,12 @@ gcloud config set compute/zone ${ZONE}
 
 # Enable required APIs
 gcloud services enable cloudasset.googleapis.com \
-    policysimulator.googleapis.com \
+    orgpolicy.googleapis.com \
     cloudfunctions.googleapis.com \
     cloudbuild.googleapis.com \
     bigquery.googleapis.com \
     cloudbilling.googleapis.com \
-    orgpolicy.googleapis.com
+    pubsub.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Organization ID: ${ORGANIZATION_ID}"
@@ -151,68 +153,48 @@ echo "✅ Organization ID: ${ORGANIZATION_ID}"
 
    The constraint is now active and will block resource creation that doesn't include all four required labels. This establishes the foundation for consistent cost allocation tracking across your organization's cloud infrastructure.
 
-2. **Configure Policy Simulator for Tag Validation**:
+2. **Create Organization Policy to Enforce Custom Constraint**:
 
-   Policy Simulator enables you to test and validate IAM and organization policy changes before applying them to production resources. This critical capability prevents accidental lockouts while ensuring your tagging policies work as intended across different resource types and deployment scenarios.
+   After creating the custom constraint, we need to create an organization policy that enforces it. Organization policies can be applied at the organization, folder, or project level, providing flexible governance control across your cloud resources.
 
    ```bash
-   # Test the mandatory tagging policy simulation
-   cat > policy-test.json <<EOF
-   {
-     "policy": {
-       "bindings": [
-         {
-           "role": "roles/compute.instanceAdmin.v1",
-           "members": ["user:test@example.com"]
-         }
-       ]
-     },
-     "fullResourceName": "//compute.googleapis.com/projects/${PROJECT_ID}/zones/${ZONE}/instances/test-instance"
-   }
+   # Create organization policy to enforce the custom constraint
+   cat > mandatory-tags-policy.yaml <<EOF
+   name: organizations/${ORGANIZATION_ID}/policies/custom.mandatoryResourceTags
+   spec:
+     rules:
+     - enforce: true
    EOF
    
-   # Simulate policy enforcement
-   gcloud alpha policy-intelligence simulate-iam-policy \
-       --policy-file=policy-test.json \
-       --access-tuple="member=user:test@example.com,permission=compute.instances.create"
+   # Apply the organization policy
+   gcloud org-policies set-policy mandatory-tags-policy.yaml
    
-   echo "✅ Policy simulation configured"
+   # Verify the policy was created
+   gcloud org-policies list --organization=${ORGANIZATION_ID} \
+       --filter="name:custom.mandatoryResourceTags"
+   
+   echo "✅ Organization policy enforced for mandatory tagging"
    ```
 
-   Policy Simulator confirms that your tagging constraints will function correctly without disrupting legitimate resource operations, providing confidence in your governance implementation.
+   The organization policy is now active and will enforce the custom constraint across all specified resource types within your organization.
 
 3. **Set up Cloud Asset Inventory for Resource Tracking**:
 
    Cloud Asset Inventory provides comprehensive visibility into all Google Cloud resources, their metadata, and policy configurations. By configuring asset feeds, we establish real-time monitoring of resource changes and tag compliance across your entire cloud infrastructure.
 
    ```bash
-   # Create Cloud Asset Inventory feed for resource monitoring
-   cat > asset-feed-config.json <<EOF
-   {
-     "name": "projects/${PROJECT_ID}/feeds/resource-compliance-feed",
-     "assetTypes": [
-       "compute.googleapis.com/Instance",
-       "storage.googleapis.com/Bucket",
-       "container.googleapis.com/Cluster"
-     ],
-     "contentType": "RESOURCE",
-     "feedOutputConfig": {
-       "pubsubDestination": {
-         "topic": "projects/${PROJECT_ID}/topics/asset-changes"
-       }
-     }
-   }
-   EOF
-   
    # Create Pub/Sub topic for asset changes
    gcloud pubsub topics create asset-changes
    
-   # Create the asset feed
+   # Create the asset feed for organization-level monitoring
    gcloud asset feeds create resource-compliance-feed \
        --organization=${ORGANIZATION_ID} \
        --asset-types=compute.googleapis.com/Instance,storage.googleapis.com/Bucket,container.googleapis.com/Cluster \
        --content-type=resource \
        --pubsub-topic=projects/${PROJECT_ID}/topics/asset-changes
+   
+   # Verify the feed was created
+   gcloud asset feeds list --organization=${ORGANIZATION_ID}
    
    echo "✅ Asset inventory feed configured"
    ```
@@ -258,6 +240,7 @@ echo "✅ Organization ID: ${ORGANIZATION_ID}"
    from google.cloud import bigquery
    from google.cloud import asset_v1
    import functions_framework
+   from datetime import datetime
    
    client = bigquery.Client()
    
@@ -265,44 +248,52 @@ echo "✅ Organization ID: ${ORGANIZATION_ID}"
    def process_asset_change(cloud_event):
        """Process asset change notifications for tag compliance."""
        
-       # Decode Pub/Sub message
-       message_data = base64.b64decode(cloud_event.data["message"]["data"])
-       asset_data = json.loads(message_data)
-       
-       # Extract resource information
-       resource_name = asset_data.get("name", "")
-       resource_type = asset_data.get("assetType", "")
-       labels = asset_data.get("resource", {}).get("data", {}).get("labels", {})
-       
-       # Check tag compliance
-       required_tags = ["department", "cost_center", "environment", "project_code"]
-       compliant = all(tag in labels for tag in required_tags)
-       
-       # Insert compliance record
-       table_id = "${PROJECT_ID}.${DATASET_NAME}.tag_compliance"
-       row = {
-           "resource_name": resource_name,
-           "resource_type": resource_type,
-           "labels": json.dumps(labels),
-           "compliant": compliant,
-           "timestamp": "CURRENT_TIMESTAMP()",
-           "cost_center": labels.get("cost_center", ""),
-           "department": labels.get("department", ""),
-           "environment": labels.get("environment", ""),
-           "project_code": labels.get("project_code", "")
-       }
-       
-       table = client.get_table(table_id)
-       client.insert_rows_json(table, [row])
-       
-       print(f"Processed asset: {resource_name}, Compliant: {compliant}")
+       try:
+           # Decode Pub/Sub message
+           message_data = base64.b64decode(cloud_event.data["message"]["data"])
+           asset_data = json.loads(message_data)
+           
+           # Extract resource information
+           resource_name = asset_data.get("name", "")
+           resource_type = asset_data.get("assetType", "")
+           
+           # Handle both creation and update events
+           resource_data = asset_data.get("resource", {}).get("data", {})
+           labels = resource_data.get("labels", {})
+           
+           # Check tag compliance
+           required_tags = ["department", "cost_center", "environment", "project_code"]
+           compliant = all(tag in labels for tag in required_tags)
+           
+           # Insert compliance record
+           table_id = "${PROJECT_ID}.${DATASET_NAME}.tag_compliance"
+           row = {
+               "resource_name": resource_name,
+               "resource_type": resource_type,
+               "labels": json.dumps(labels),
+               "compliant": compliant,
+               "timestamp": datetime.utcnow().isoformat(),
+               "cost_center": labels.get("cost_center", ""),
+               "department": labels.get("department", ""),
+               "environment": labels.get("environment", ""),
+               "project_code": labels.get("project_code", "")
+           }
+           
+           table = client.get_table(table_id)
+           client.insert_rows_json(table, [row])
+           
+           print(f"Processed asset: {resource_name}, Compliant: {compliant}")
+           
+       except Exception as e:
+           print(f"Error processing asset change: {str(e)}")
+           raise
    EOF
    
    # Create requirements.txt
    cat > cloud-function/requirements.txt <<EOF
-   google-cloud-bigquery>=3.0.0
-   google-cloud-asset>=3.0.0
-   functions-framework>=3.0.0
+   google-cloud-bigquery>=3.11.4
+   google-cloud-asset>=3.20.1
+   functions-framework>=3.5.0
    EOF
    
    # Deploy the Cloud Function
@@ -336,7 +327,7 @@ echo "✅ Organization ID: ${ORGANIZATION_ID}"
    BILLING_ACCOUNT=$(gcloud billing accounts list \
        --format="value(name)" --limit=1)
    
-   # Configure billing export (Note: This typically requires billing admin permissions)
+   # Configure billing export (requires manual setup in Console)
    echo "Configure billing export in the Cloud Console:"
    echo "1. Go to Cloud Billing > Billing export"
    echo "2. Enable BigQuery export to dataset: ${DATASET_NAME}"
@@ -364,18 +355,20 @@ echo "✅ Organization ID: ${ORGANIZATION_ID}"
      sku.description as sku_description,
      SUM(cost) as total_cost,
      currency,
-     labels.value as department,
-     tags.value as cost_center,
+     -- Extract labels from billing export
+     (SELECT value FROM UNNEST(labels) WHERE key = 'department') as department,
+     (SELECT value FROM UNNEST(labels) WHERE key = 'cost_center') as cost_center,
+     (SELECT value FROM UNNEST(labels) WHERE key = 'environment') as environment,
+     (SELECT value FROM UNNEST(labels) WHERE key = 'project_code') as project_code,
      location.location as region,
      COUNT(*) as resource_count
    FROM \`${PROJECT_ID}.${DATASET_NAME}.gcp_billing_export_v1_*\`
    WHERE
      DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-     AND labels.key = 'department'
-     AND tags.key = 'cost_center'
+     AND cost > 0
    GROUP BY
      billing_date, project_id, service_name, sku_description,
-     currency, department, cost_center, region
+     currency, department, cost_center, environment, project_code, region
    ORDER BY
      billing_date DESC, total_cost DESC;
    EOF
@@ -433,44 +426,50 @@ echo "✅ Organization ID: ${ORGANIZATION_ID}"
        
        client = bigquery.Client()
        
-       # Query cost allocation data
-       query = f"""
-       SELECT *
-       FROM \`${PROJECT_ID}.${DATASET_NAME}.cost_allocation_summary\`
-       WHERE billing_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-       ORDER BY total_cost DESC
-       """
-       
-       df = client.query(query).to_dataframe()
-       
-       # Generate report summary
-       total_cost = df['total_cost'].sum()
-       top_departments = df.groupby('department')['total_cost'].sum().head(5)
-       
-       report = {
-           'report_date': datetime.now().isoformat(),
-           'total_weekly_cost': float(total_cost),
-           'currency': df['currency'].iloc[0] if not df.empty else 'USD',
-           'top_departments': top_departments.to_dict(),
-           'resource_count': len(df),
-           'compliance_summary': 'See compliance dashboard for details'
-       }
-       
-       # Store report in Cloud Storage
-       storage_client = storage.Client()
-       bucket = storage_client.bucket('${BUCKET_NAME}')
-       blob = bucket.blob(f"reports/cost-allocation-{datetime.now().strftime('%Y-%m-%d')}.json")
-       blob.upload_from_string(json.dumps(report, indent=2))
-       
-       return json.dumps(report, indent=2)
+       try:
+           # Query cost allocation data
+           query = f"""
+           SELECT *
+           FROM \`${PROJECT_ID}.${DATASET_NAME}.cost_allocation_summary\`
+           WHERE billing_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+           ORDER BY total_cost DESC
+           """
+           
+           df = client.query(query).to_dataframe()
+           
+           # Generate report summary
+           total_cost = df['total_cost'].sum() if not df.empty else 0
+           top_departments = df.groupby('department')['total_cost'].sum().head(5) if not df.empty else {}
+           
+           report = {
+               'report_date': datetime.now().isoformat(),
+               'total_weekly_cost': float(total_cost),
+               'currency': df['currency'].iloc[0] if not df.empty else 'USD',
+               'top_departments': top_departments.to_dict() if hasattr(top_departments, 'to_dict') else {},
+               'resource_count': len(df),
+               'compliance_summary': 'See compliance dashboard for details'
+           }
+           
+           # Store report in Cloud Storage
+           storage_client = storage.Client()
+           bucket = storage_client.bucket('${BUCKET_NAME}')
+           blob = bucket.blob(f"reports/cost-allocation-{datetime.now().strftime('%Y-%m-%d')}.json")
+           blob.upload_from_string(json.dumps(report, indent=2))
+           
+           return json.dumps(report, indent=2)
+           
+       except Exception as e:
+           error_msg = f"Error generating report: {str(e)}"
+           print(error_msg)
+           return json.dumps({"error": error_msg}), 500
    EOF
    
    # Create requirements.txt for reporting function
    cat > reporting-function/requirements.txt <<EOF
-   google-cloud-bigquery>=3.0.0
-   google-cloud-storage>=2.0.0
-   pandas>=1.5.0
-   functions-framework>=3.0.0
+   google-cloud-bigquery>=3.11.4
+   google-cloud-storage>=2.14.0
+   pandas>=2.1.0
+   functions-framework>=3.5.0
    EOF
    
    # Deploy reporting function
@@ -605,24 +604,28 @@ echo "✅ Organization ID: ${ORGANIZATION_ID}"
 5. **Remove organization policy (optional)**:
 
    ```bash
+   # Remove organization policy
+   gcloud org-policies delete \
+       organizations/${ORGANIZATION_ID}/policies/custom.mandatoryResourceTags
+   
    # Remove custom constraint (use with caution in production)
    gcloud org-policies delete-custom-constraint \
        organizations/${ORGANIZATION_ID}/customConstraints/custom.mandatoryResourceTags
    
-   echo "✅ Organization policy constraint removed"
+   echo "✅ Organization policy and constraint removed"
    ```
 
 ## Discussion
 
 This intelligent resource tagging and cost allocation system addresses one of the most challenging aspects of cloud financial management: accurately attributing costs to business units and projects. By combining Google Cloud's governance tools with automated analytics, organizations gain unprecedented visibility into their cloud spending patterns while ensuring consistent tagging practices across all resources.
 
-The solution leverages [Policy Simulator](https://cloud.google.com/policy-intelligence/docs/iam-simulator-overview) to validate governance policies before implementation, preventing accidental resource lockouts. [Cloud Asset Inventory](https://cloud.google.com/asset-inventory/docs/overview) provides comprehensive resource tracking with real-time change notifications, enabling immediate compliance monitoring. The integration with [Cloud Billing export](https://cloud.google.com/billing/docs/how-to/export-data-bigquery-tables/standard-usage) creates a unified view of costs and resource metadata in BigQuery.
+The solution leverages [Organization Policy](https://cloud.google.com/resource-manager/docs/organization-policy/overview) to create custom constraints that enforce mandatory tagging before resource creation. [Cloud Asset Inventory](https://cloud.google.com/asset-inventory/docs/overview) provides comprehensive resource tracking with real-time change notifications, enabling immediate compliance monitoring. The integration with [Cloud Billing export](https://cloud.google.com/billing/docs/how-to/export-data-bigquery) creates a unified view of costs and resource metadata in BigQuery.
 
-The automated reporting system transforms raw data into actionable insights for finance teams. By correlating billing data with resource tags, organizations can implement accurate chargeback models and identify cost optimization opportunities. The [organization policy constraints](https://cloud.google.com/resource-manager/docs/tags/tags-overview) ensure consistent tagging from resource creation, eliminating the common problem of retroactive tag application.
+The automated reporting system transforms raw data into actionable insights for finance teams. By correlating billing data with resource tags, organizations can implement accurate chargeback models and identify cost optimization opportunities. The custom organization policy constraints ensure consistent tagging from resource creation, eliminating the common problem of retroactive tag application.
 
 Performance considerations include BigQuery query optimization for large datasets and Cloud Functions memory allocation for processing high-volume asset changes. Cost optimization opportunities emerge through identifying untagged or mistagged resources, enabling targeted remediation efforts. The system scales automatically with Google Cloud's serverless architecture, handling organizations of any size without manual infrastructure management.
 
-> **Tip**: Implement gradual rollout of organization policies by starting with warning mode before enforcing blocking constraints. Use [Cloud Asset Inventory's search capabilities](https://cloud.google.com/asset-inventory/docs/search-resources) to identify existing resources that need tag remediation before policy enforcement.
+> **Tip**: Implement gradual rollout of organization policies by starting with warning mode before enforcing blocking constraints. Use [Cloud Asset Inventory's search capabilities](https://cloud.google.com/asset-inventory/docs/searching-resources) to identify existing resources that need tag remediation before policy enforcement.
 
 ## Challenge
 
@@ -636,8 +639,13 @@ Extend this solution by implementing these enhancements:
 
 4. **Dynamic Tagging Recommendations**: Build an AI-powered system that analyzes resource usage patterns and automatically suggests optimal tag values for cost optimization and better resource organization.
 
-5. **Compliance Automation**: Develop automated remediation workflows that apply missing tags based on resource metadata, deployment patterns, and organizational rules using Cloud Workflows and IAM policy intelligence.
+5. **Compliance Automation**: Develop automated remediation workflows that apply missing tags based on resource metadata, deployment patterns, and organizational rules using Cloud Workflows and Resource Manager APIs.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

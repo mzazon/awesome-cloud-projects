@@ -4,12 +4,12 @@ id: 25c2d1f2
 category: networking
 difficulty: 400
 subject: aws
-services: global,accelerator,dynamodb,lambda,application,load,balancer
-estimated-time: 60 minutes
-recipe-version: 1.1
+services: GlobalAccelerator, DynamoDB, Lambda, ApplicationLoadBalancer
+estimated-time: 90 minutes
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: networking,global-accelerator,dynamodb,lambda,multi-region,active-active,disaster-recovery,high-availability
 recipe-generator-version: 1.3
@@ -100,7 +100,7 @@ graph TB
 3. Understanding of multi-region architectures and data consistency models
 4. Familiarity with Lambda functions, ALB configuration, and DynamoDB operations
 5. Basic knowledge of DNS and network traffic routing concepts
-6. Estimated cost: $50-100/month for basic usage (Global Accelerator $18/month + ALB $16.20/month/region + DynamoDB and Lambda minimal costs)
+6. Estimated cost: $75-150/month for basic usage (Global Accelerator $18/month + ALB $16.20/month/region + DynamoDB and Lambda minimal costs)
 
 > **Note**: Global Accelerator charges for fixed fees per accelerator and data transfer costs. DynamoDB Global Tables incur cross-region replication charges. Review [Global Accelerator pricing](https://aws.amazon.com/global-accelerator/pricing/) and [DynamoDB pricing](https://aws.amazon.com/dynamodb/pricing/) to understand costs.
 
@@ -109,22 +109,25 @@ graph TB
 Set up environment variables and create foundational resources:
 
 ```bash
+# Set AWS environment variables
+export AWS_REGION=$(aws configure get region)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+    --query Account --output text)
+
 # Set primary environment variables
 export PRIMARY_REGION="us-east-1"
 export SECONDARY_REGION_EU="eu-west-1"
 export SECONDARY_REGION_ASIA="ap-southeast-1"
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-	--query Account --output text)
 
-# Generate unique names to avoid conflicts
-RANDOM_STRING=$(aws secretsmanager get-random-password \
-	--exclude-punctuation --exclude-uppercase \
-	--password-length 6 --require-each-included-type \
-	--output text --query RandomPassword)
+# Generate unique identifiers for resources
+RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
+    --exclude-punctuation --exclude-uppercase \
+    --password-length 6 --require-each-included-type \
+    --output text --query RandomPassword)
 
-export APP_NAME="global-app-${RANDOM_STRING}"
-export TABLE_NAME="GlobalUserData-${RANDOM_STRING}"
-export ACCELERATOR_NAME="GlobalAccelerator-${RANDOM_STRING}"
+export APP_NAME="global-app-${RANDOM_SUFFIX}"
+export TABLE_NAME="GlobalUserData-${RANDOM_SUFFIX}"
+export ACCELERATOR_NAME="GlobalAccelerator-${RANDOM_SUFFIX}"
 
 echo "Application Name: $APP_NAME"
 echo "Table Name: $TABLE_NAME"
@@ -155,9 +158,9 @@ EOF
 
 # Create Lambda execution role
 LAMBDA_ROLE_ARN=$(aws iam create-role \
-	--role-name GlobalAppLambdaRole-${RANDOM_STRING} \
-	--assume-role-policy-document file://lambda-trust-policy.json \
-	--query 'Role.Arn' --output text)
+    --role-name GlobalAppLambdaRole-${RANDOM_SUFFIX} \
+    --assume-role-policy-document file://lambda-trust-policy.json \
+    --query 'Role.Arn' --output text)
 
 # Create policy for DynamoDB Global Table access
 cat > lambda-dynamodb-policy.json << EOF
@@ -194,9 +197,9 @@ EOF
 
 # Attach policies to Lambda role
 aws iam put-role-policy \
-	--role-name GlobalAppLambdaRole-${RANDOM_STRING} \
-	--policy-name DynamoDBGlobalAccess \
-	--policy-document file://lambda-dynamodb-policy.json
+    --role-name GlobalAppLambdaRole-${RANDOM_SUFFIX} \
+    --policy-name DynamoDBGlobalAccess \
+    --policy-document file://lambda-dynamodb-policy.json
 
 export LAMBDA_ROLE_ARN
 echo "✅ Lambda IAM role created: $LAMBDA_ROLE_ARN"
@@ -207,94 +210,66 @@ sleep 15
 
 ## Steps
 
-1. **Create DynamoDB table in the primary region and configure Global Tables**:
+1. **Create DynamoDB table in the primary region**:
 
    DynamoDB Global Tables enable active-active replication across multiple AWS regions, providing eventually consistent data access with sub-second replication latency. This foundational step establishes the data layer that supports our multi-region architecture, ensuring users can read and write data from any region while maintaining consistency through DynamoDB's conflict resolution mechanisms.
 
    ```bash
-   # Create DynamoDB table in primary region
+   # Create DynamoDB table in primary region with streams enabled
    aws dynamodb create-table \
-   	--region $PRIMARY_REGION \
-   	--table-name $TABLE_NAME \
-   	--attribute-definitions \
-   		AttributeName=userId,AttributeType=S \
-   		AttributeName=timestamp,AttributeType=N \
-   	--key-schema \
-   		AttributeName=userId,KeyType=HASH \
-   		AttributeName=timestamp,KeyType=RANGE \
-   	--billing-mode PAY_PER_REQUEST \
-   	--stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES
+       --region $PRIMARY_REGION \
+       --table-name $TABLE_NAME \
+       --attribute-definitions \
+           AttributeName=userId,AttributeType=S \
+           AttributeName=timestamp,AttributeType=N \
+       --key-schema \
+           AttributeName=userId,KeyType=HASH \
+           AttributeName=timestamp,KeyType=RANGE \
+       --billing-mode PAY_PER_REQUEST \
+       --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES
 
    # Wait for table to be active
    echo "Waiting for primary table to be active..."
    aws dynamodb wait table-exists \
-   	--region $PRIMARY_REGION \
-   	--table-name $TABLE_NAME
+       --region $PRIMARY_REGION \
+       --table-name $TABLE_NAME
 
-   # Create replica tables in secondary regions
-   aws dynamodb create-table \
-   	--region $SECONDARY_REGION_EU \
-   	--table-name $TABLE_NAME \
-   	--attribute-definitions \
-   		AttributeName=userId,AttributeType=S \
-   		AttributeName=timestamp,AttributeType=N \
-   	--key-schema \
-   		AttributeName=userId,KeyType=HASH \
-   		AttributeName=timestamp,KeyType=RANGE \
-   	--billing-mode PAY_PER_REQUEST \
-   	--stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES
-
-   aws dynamodb create-table \
-   	--region $SECONDARY_REGION_ASIA \
-   	--table-name $TABLE_NAME \
-   	--attribute-definitions \
-   		AttributeName=userId,AttributeType=S \
-   		AttributeName=timestamp,AttributeType=N \
-   	--key-schema \
-   		AttributeName=userId,KeyType=HASH \
-   		AttributeName=timestamp,KeyType=RANGE \
-   	--billing-mode PAY_PER_REQUEST \
-   	--stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES
-
-   # Wait for replica tables to be active
-   echo "Waiting for replica tables to be active..."
-   aws dynamodb wait table-exists \
-   	--region $SECONDARY_REGION_EU \
-   	--table-name $TABLE_NAME
-   aws dynamodb wait table-exists \
-   	--region $SECONDARY_REGION_ASIA \
-   	--table-name $TABLE_NAME
-
-   echo "✅ DynamoDB tables created in all regions"
+   echo "✅ DynamoDB table created in primary region"
    ```
 
-   The tables are now created with DynamoDB Streams enabled, which is required for Global Tables replication. The composite key design (userId + timestamp) supports efficient queries while allowing multiple records per user, enabling audit trails and data versioning that are essential for multi-region conflict resolution.
+   The table is now created with DynamoDB Streams enabled, which is required for Global Tables replication. The composite key design (userId + timestamp) supports efficient queries while allowing multiple records per user, enabling audit trails and data versioning that are essential for multi-region conflict resolution.
 
 2. **Configure DynamoDB Global Tables for multi-region replication**:
 
-   This step activates the Global Tables feature, which establishes automatic bi-directional replication between all regional tables. DynamoDB Global Tables use a last-writer-wins conflict resolution strategy and maintain eventual consistency across regions, typically propagating changes within one second. This creates the foundation for our active-active architecture where users can write to any region.
+   This step activates the Global Tables v2 feature using the modern update-table approach, which establishes automatic bi-directional replication between all regional tables. DynamoDB Global Tables use a last-writer-wins conflict resolution strategy and maintain eventual consistency across regions, typically propagating changes within one second. This creates the foundation for our active-active architecture where users can write to any region.
 
    ```bash
-   # Create Global Table (this enables replication)
-   aws dynamodb create-global-table \
-   	--region $PRIMARY_REGION \
-   	--global-table-name $TABLE_NAME \
-   	--replication-group RegionName=$PRIMARY_REGION RegionName=$SECONDARY_REGION_EU RegionName=$SECONDARY_REGION_ASIA
+   # Add EU region replica using Global Tables v2
+   aws dynamodb update-table \
+       --region $PRIMARY_REGION \
+       --table-name $TABLE_NAME \
+       --replica-updates Create='{RegionName='$SECONDARY_REGION_EU'}'
+
+   # Add Asia region replica using Global Tables v2  
+   aws dynamodb update-table \
+       --region $PRIMARY_REGION \
+       --table-name $TABLE_NAME \
+       --replica-updates Create='{RegionName='$SECONDARY_REGION_ASIA'}'
 
    echo "Waiting for Global Table setup to complete..."
-   sleep 30
+   sleep 60
 
    # Verify Global Table status
-   aws dynamodb describe-global-table \
-   	--region $PRIMARY_REGION \
-   	--global-table-name $TABLE_NAME \
-   	--query 'GlobalTableDescription.ReplicationGroup[*].{Region:RegionName,Status:ReplicaStatus}' \
-   	--output table
+   aws dynamodb describe-table \
+       --region $PRIMARY_REGION \
+       --table-name $TABLE_NAME \
+       --query 'Table.{TableName:TableName,GlobalTableVersion:GlobalTableVersion,Replicas:Replicas[*].{Region:RegionName,Status:ReplicaStatus}}' \
+       --output table
 
    echo "✅ DynamoDB Global Table configured"
    ```
 
-   The Global Table is now operational, automatically synchronizing data changes between regions. Each regional table maintains its own read and write capacity, enabling independent scaling while participating in the global replication network. This eliminates the traditional primary-secondary database pattern and supports true active-active operations.
+   The Global Table is now operational using the current v2 format, automatically synchronizing data changes between regions. Each regional table maintains its own read and write capacity, enabling independent scaling while participating in the global replication network. This eliminates the traditional primary-secondary database pattern and supports true active-active operations.
 
 > **Note**: DynamoDB Global Tables provide eventually consistent reads across regions. For strongly consistent reads, use the `ConsistentRead=true` parameter, but note that this only provides consistency within the local region. See [DynamoDB Global Tables documentation](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GlobalTables.html) for detailed consistency patterns.
 
@@ -532,39 +507,39 @@ EOF
    ```bash
    # Deploy Lambda function in primary region (US East)
    LAMBDA_FUNCTION_ARN_US=$(aws lambda create-function \
-   	--region $PRIMARY_REGION \
-   	--function-name ${APP_NAME}-us \
-   	--runtime python3.11 \
-   	--role $LAMBDA_ROLE_ARN \
-   	--handler app_function.lambda_handler \
-   	--zip-file fileb://lambda-function.zip \
-   	--timeout 30 \
-   	--environment Variables="{TABLE_NAME=${TABLE_NAME}}" \
-   	--query 'FunctionArn' --output text)
+       --region $PRIMARY_REGION \
+       --function-name ${APP_NAME}-us \
+       --runtime python3.12 \
+       --role $LAMBDA_ROLE_ARN \
+       --handler app_function.lambda_handler \
+       --zip-file fileb://lambda-function.zip \
+       --timeout 30 \
+       --environment Variables="{TABLE_NAME=${TABLE_NAME}}" \
+       --query 'FunctionArn' --output text)
 
    # Deploy Lambda function in EU region
    LAMBDA_FUNCTION_ARN_EU=$(aws lambda create-function \
-   	--region $SECONDARY_REGION_EU \
-   	--function-name ${APP_NAME}-eu \
-   	--runtime python3.11 \
-   	--role $LAMBDA_ROLE_ARN \
-   	--handler app_function.lambda_handler \
-   	--zip-file fileb://lambda-function.zip \
-   	--timeout 30 \
-   	--environment Variables="{TABLE_NAME=${TABLE_NAME}}" \
-   	--query 'FunctionArn' --output text)
+       --region $SECONDARY_REGION_EU \
+       --function-name ${APP_NAME}-eu \
+       --runtime python3.12 \
+       --role $LAMBDA_ROLE_ARN \
+       --handler app_function.lambda_handler \
+       --zip-file fileb://lambda-function.zip \
+       --timeout 30 \
+       --environment Variables="{TABLE_NAME=${TABLE_NAME}}" \
+       --query 'FunctionArn' --output text)
 
    # Deploy Lambda function in Asia region
    LAMBDA_FUNCTION_ARN_ASIA=$(aws lambda create-function \
-   	--region $SECONDARY_REGION_ASIA \
-   	--function-name ${APP_NAME}-asia \
-   	--runtime python3.11 \
-   	--role $LAMBDA_ROLE_ARN \
-   	--handler app_function.lambda_handler \
-   	--zip-file fileb://lambda-function.zip \
-   	--timeout 30 \
-   	--environment Variables="{TABLE_NAME=${TABLE_NAME}}" \
-   	--query 'FunctionArn' --output text)
+       --region $SECONDARY_REGION_ASIA \
+       --function-name ${APP_NAME}-asia \
+       --runtime python3.12 \
+       --role $LAMBDA_ROLE_ARN \
+       --handler app_function.lambda_handler \
+       --zip-file fileb://lambda-function.zip \
+       --timeout 30 \
+       --environment Variables="{TABLE_NAME=${TABLE_NAME}}" \
+       --query 'FunctionArn' --output text)
 
    export LAMBDA_FUNCTION_ARN_US
    export LAMBDA_FUNCTION_ARN_EU
@@ -585,61 +560,61 @@ EOF
    ```bash
    # Get default VPC and subnets for each region
    US_VPC_ID=$(aws ec2 describe-vpcs \
-   	--region $PRIMARY_REGION \
-   	--filters "Name=is-default,Values=true" \
-   	--query 'Vpcs[0].VpcId' --output text)
+       --region $PRIMARY_REGION \
+       --filters "Name=is-default,Values=true" \
+       --query 'Vpcs[0].VpcId' --output text)
 
    US_SUBNET_IDS=$(aws ec2 describe-subnets \
-   	--region $PRIMARY_REGION \
-   	--filters "Name=vpc-id,Values=${US_VPC_ID}" \
-   	--query 'Subnets[0:2].SubnetId' --output text)
+       --region $PRIMARY_REGION \
+       --filters "Name=vpc-id,Values=${US_VPC_ID}" \
+       --query 'Subnets[0:2].SubnetId' --output text)
 
    EU_VPC_ID=$(aws ec2 describe-vpcs \
-   	--region $SECONDARY_REGION_EU \
-   	--filters "Name=is-default,Values=true" \
-   	--query 'Vpcs[0].VpcId' --output text)
+       --region $SECONDARY_REGION_EU \
+       --filters "Name=is-default,Values=true" \
+       --query 'Vpcs[0].VpcId' --output text)
 
    EU_SUBNET_IDS=$(aws ec2 describe-subnets \
-   	--region $SECONDARY_REGION_EU \
-   	--filters "Name=vpc-id,Values=${EU_VPC_ID}" \
-   	--query 'Subnets[0:2].SubnetId' --output text)
+       --region $SECONDARY_REGION_EU \
+       --filters "Name=vpc-id,Values=${EU_VPC_ID}" \
+       --query 'Subnets[0:2].SubnetId' --output text)
 
    ASIA_VPC_ID=$(aws ec2 describe-vpcs \
-   	--region $SECONDARY_REGION_ASIA \
-   	--filters "Name=is-default,Values=true" \
-   	--query 'Vpcs[0].VpcId' --output text)
+       --region $SECONDARY_REGION_ASIA \
+       --filters "Name=is-default,Values=true" \
+       --query 'Vpcs[0].VpcId' --output text)
 
    ASIA_SUBNET_IDS=$(aws ec2 describe-subnets \
-   	--region $SECONDARY_REGION_ASIA \
-   	--filters "Name=vpc-id,Values=${ASIA_VPC_ID}" \
-   	--query 'Subnets[0:2].SubnetId' --output text)
+       --region $SECONDARY_REGION_ASIA \
+       --filters "Name=vpc-id,Values=${ASIA_VPC_ID}" \
+       --query 'Subnets[0:2].SubnetId' --output text)
 
    # Create ALB in US region
    US_ALB_ARN=$(aws elbv2 create-load-balancer \
-   	--region $PRIMARY_REGION \
-   	--name ${APP_NAME}-us-alb \
-   	--subnets $US_SUBNET_IDS \
-   	--type application \
-   	--scheme internet-facing \
-   	--query 'LoadBalancers[0].LoadBalancerArn' --output text)
+       --region $PRIMARY_REGION \
+       --name ${APP_NAME}-us-alb \
+       --subnets $US_SUBNET_IDS \
+       --type application \
+       --scheme internet-facing \
+       --query 'LoadBalancers[0].LoadBalancerArn' --output text)
 
    # Create ALB in EU region
    EU_ALB_ARN=$(aws elbv2 create-load-balancer \
-   	--region $SECONDARY_REGION_EU \
-   	--name ${APP_NAME}-eu-alb \
-   	--subnets $EU_SUBNET_IDS \
-   	--type application \
-   	--scheme internet-facing \
-   	--query 'LoadBalancers[0].LoadBalancerArn' --output text)
+       --region $SECONDARY_REGION_EU \
+       --name ${APP_NAME}-eu-alb \
+       --subnets $EU_SUBNET_IDS \
+       --type application \
+       --scheme internet-facing \
+       --query 'LoadBalancers[0].LoadBalancerArn' --output text)
 
    # Create ALB in Asia region
    ASIA_ALB_ARN=$(aws elbv2 create-load-balancer \
-   	--region $SECONDARY_REGION_ASIA \
-   	--name ${APP_NAME}-asia-alb \
-   	--subnets $ASIA_SUBNET_IDS \
-   	--type application \
-   	--scheme internet-facing \
-   	--query 'LoadBalancers[0].LoadBalancerArn' --output text)
+       --region $SECONDARY_REGION_ASIA \
+       --name ${APP_NAME}-asia-alb \
+       --subnets $ASIA_SUBNET_IDS \
+       --type application \
+       --scheme internet-facing \
+       --query 'LoadBalancers[0].LoadBalancerArn' --output text)
 
    echo "✅ Application Load Balancers created"
    echo "US ALB: $US_ALB_ARN"
@@ -660,65 +635,65 @@ EOF
    ```bash
    # Create target group for US Lambda
    US_TG_ARN=$(aws elbv2 create-target-group \
-   	--region $PRIMARY_REGION \
-   	--name ${APP_NAME}-us-tg \
-   	--target-type lambda \
-   	--query 'TargetGroups[0].TargetGroupArn' --output text)
+       --region $PRIMARY_REGION \
+       --name ${APP_NAME}-us-tg \
+       --target-type lambda \
+       --query 'TargetGroups[0].TargetGroupArn' --output text)
 
    # Create target group for EU Lambda
    EU_TG_ARN=$(aws elbv2 create-target-group \
-   	--region $SECONDARY_REGION_EU \
-   	--name ${APP_NAME}-eu-tg \
-   	--target-type lambda \
-   	--query 'TargetGroups[0].TargetGroupArn' --output text)
+       --region $SECONDARY_REGION_EU \
+       --name ${APP_NAME}-eu-tg \
+       --target-type lambda \
+       --query 'TargetGroups[0].TargetGroupArn' --output text)
 
    # Create target group for Asia Lambda
    ASIA_TG_ARN=$(aws elbv2 create-target-group \
-   	--region $SECONDARY_REGION_ASIA \
-   	--name ${APP_NAME}-asia-tg \
-   	--target-type lambda \
-   	--query 'TargetGroups[0].TargetGroupArn' --output text)
+       --region $SECONDARY_REGION_ASIA \
+       --name ${APP_NAME}-asia-tg \
+       --target-type lambda \
+       --query 'TargetGroups[0].TargetGroupArn' --output text)
 
    # Register Lambda functions as targets
    aws elbv2 register-targets \
-   	--region $PRIMARY_REGION \
-   	--target-group-arn $US_TG_ARN \
-   	--targets Id=$LAMBDA_FUNCTION_ARN_US
+       --region $PRIMARY_REGION \
+       --target-group-arn $US_TG_ARN \
+       --targets Id=$LAMBDA_FUNCTION_ARN_US
 
    aws elbv2 register-targets \
-   	--region $SECONDARY_REGION_EU \
-   	--target-group-arn $EU_TG_ARN \
-   	--targets Id=$LAMBDA_FUNCTION_ARN_EU
+       --region $SECONDARY_REGION_EU \
+       --target-group-arn $EU_TG_ARN \
+       --targets Id=$LAMBDA_FUNCTION_ARN_EU
 
    aws elbv2 register-targets \
-   	--region $SECONDARY_REGION_ASIA \
-   	--target-group-arn $ASIA_TG_ARN \
-   	--targets Id=$LAMBDA_FUNCTION_ARN_ASIA
+       --region $SECONDARY_REGION_ASIA \
+       --target-group-arn $ASIA_TG_ARN \
+       --targets Id=$LAMBDA_FUNCTION_ARN_ASIA
 
    # Add Lambda permissions for ALB to invoke functions
    aws lambda add-permission \
-   	--region $PRIMARY_REGION \
-   	--function-name ${APP_NAME}-us \
-   	--statement-id allow-alb-invoke \
-   	--action lambda:InvokeFunction \
-   	--principal elasticloadbalancing.amazonaws.com \
-   	--source-arn $US_TG_ARN
+       --region $PRIMARY_REGION \
+       --function-name ${APP_NAME}-us \
+       --statement-id allow-alb-invoke \
+       --action lambda:InvokeFunction \
+       --principal elasticloadbalancing.amazonaws.com \
+       --source-arn $US_TG_ARN
 
    aws lambda add-permission \
-   	--region $SECONDARY_REGION_EU \
-   	--function-name ${APP_NAME}-eu \
-   	--statement-id allow-alb-invoke \
-   	--action lambda:InvokeFunction \
-   	--principal elasticloadbalancing.amazonaws.com \
-   	--source-arn $EU_TG_ARN
+       --region $SECONDARY_REGION_EU \
+       --function-name ${APP_NAME}-eu \
+       --statement-id allow-alb-invoke \
+       --action lambda:InvokeFunction \
+       --principal elasticloadbalancing.amazonaws.com \
+       --source-arn $EU_TG_ARN
 
    aws lambda add-permission \
-   	--region $SECONDARY_REGION_ASIA \
-   	--function-name ${APP_NAME}-asia \
-   	--statement-id allow-alb-invoke \
-   	--action lambda:InvokeFunction \
-   	--principal elasticloadbalancing.amazonaws.com \
-   	--source-arn $ASIA_TG_ARN
+       --region $SECONDARY_REGION_ASIA \
+       --function-name ${APP_NAME}-asia \
+       --statement-id allow-alb-invoke \
+       --action lambda:InvokeFunction \
+       --principal elasticloadbalancing.amazonaws.com \
+       --source-arn $ASIA_TG_ARN
 
    echo "✅ Target groups created and Lambda functions registered"
    ```
@@ -732,27 +707,27 @@ EOF
    ```bash
    # Create listener for US ALB
    aws elbv2 create-listener \
-   	--region $PRIMARY_REGION \
-   	--load-balancer-arn $US_ALB_ARN \
-   	--protocol HTTP \
-   	--port 80 \
-   	--default-actions Type=forward,TargetGroupArn=$US_TG_ARN
+       --region $PRIMARY_REGION \
+       --load-balancer-arn $US_ALB_ARN \
+       --protocol HTTP \
+       --port 80 \
+       --default-actions Type=forward,TargetGroupArn=$US_TG_ARN
 
    # Create listener for EU ALB
    aws elbv2 create-listener \
-   	--region $SECONDARY_REGION_EU \
-   	--load-balancer-arn $EU_ALB_ARN \
-   	--protocol HTTP \
-   	--port 80 \
-   	--default-actions Type=forward,TargetGroupArn=$EU_TG_ARN
+       --region $SECONDARY_REGION_EU \
+       --load-balancer-arn $EU_ALB_ARN \
+       --protocol HTTP \
+       --port 80 \
+       --default-actions Type=forward,TargetGroupArn=$EU_TG_ARN
 
    # Create listener for Asia ALB
    aws elbv2 create-listener \
-   	--region $SECONDARY_REGION_ASIA \
-   	--load-balancer-arn $ASIA_ALB_ARN \
-   	--protocol HTTP \
-   	--port 80 \
-   	--default-actions Type=forward,TargetGroupArn=$ASIA_TG_ARN
+       --region $SECONDARY_REGION_ASIA \
+       --load-balancer-arn $ASIA_ALB_ARN \
+       --protocol HTTP \
+       --port 80 \
+       --default-actions Type=forward,TargetGroupArn=$ASIA_TG_ARN
 
    echo "✅ ALB listeners configured"
    ```
@@ -766,17 +741,17 @@ EOF
    ```bash
    # Global Accelerator must be created in us-west-2 region
    ACCELERATOR_ARN=$(aws globalaccelerator create-accelerator \
-   	--region us-west-2 \
-   	--name $ACCELERATOR_NAME \
-   	--ip-address-type IPV4 \
-   	--enabled \
-   	--query 'Accelerator.AcceleratorArn' --output text)
+       --region us-west-2 \
+       --name $ACCELERATOR_NAME \
+       --ip-address-type IPV4 \
+       --enabled \
+       --query 'Accelerator.AcceleratorArn' --output text)
 
    # Get static IP addresses
    STATIC_IPS=$(aws globalaccelerator describe-accelerator \
-   	--region us-west-2 \
-   	--accelerator-arn $ACCELERATOR_ARN \
-   	--query 'Accelerator.IpSets[0].IpAddresses' --output text)
+       --region us-west-2 \
+       --accelerator-arn $ACCELERATOR_ARN \
+       --query 'Accelerator.IpSets[0].IpAddresses' --output text)
 
    export ACCELERATOR_ARN
    export STATIC_IPS
@@ -790,11 +765,11 @@ EOF
 
    # Create listener
    LISTENER_ARN=$(aws globalaccelerator create-listener \
-   	--region us-west-2 \
-   	--accelerator-arn $ACCELERATOR_ARN \
-   	--protocol TCP \
-   	--port-ranges FromPort=80,ToPort=80 \
-   	--query 'Listener.ListenerArn' --output text)
+       --region us-west-2 \
+       --accelerator-arn $ACCELERATOR_ARN \
+       --protocol TCP \
+       --port-ranges FromPort=80,ToPort=80 \
+       --query 'Listener.ListenerArn' --output text)
 
    export LISTENER_ARN
    echo "✅ Global Accelerator listener created: $LISTENER_ARN"
@@ -809,55 +784,55 @@ EOF
    ```bash
    # Get ALB ARNs for endpoints
    US_ALB_ARN_FULL=$(aws elbv2 describe-load-balancers \
-   	--region $PRIMARY_REGION \
-   	--load-balancer-arns $US_ALB_ARN \
-   	--query 'LoadBalancers[0].LoadBalancerArn' --output text)
+       --region $PRIMARY_REGION \
+       --load-balancer-arns $US_ALB_ARN \
+       --query 'LoadBalancers[0].LoadBalancerArn' --output text)
 
    EU_ALB_ARN_FULL=$(aws elbv2 describe-load-balancers \
-   	--region $SECONDARY_REGION_EU \
-   	--load-balancer-arns $EU_ALB_ARN \
-   	--query 'LoadBalancers[0].LoadBalancerArn' --output text)
+       --region $SECONDARY_REGION_EU \
+       --load-balancer-arns $EU_ALB_ARN \
+       --query 'LoadBalancers[0].LoadBalancerArn' --output text)
 
    ASIA_ALB_ARN_FULL=$(aws elbv2 describe-load-balancers \
-   	--region $SECONDARY_REGION_ASIA \
-   	--load-balancer-arns $ASIA_ALB_ARN \
-   	--query 'LoadBalancers[0].LoadBalancerArn' --output text)
+       --region $SECONDARY_REGION_ASIA \
+       --load-balancer-arns $ASIA_ALB_ARN \
+       --query 'LoadBalancers[0].LoadBalancerArn' --output text)
 
    # Create endpoint group for US region (primary)
    US_ENDPOINT_GROUP_ARN=$(aws globalaccelerator create-endpoint-group \
-   	--region us-west-2 \
-   	--listener-arn $LISTENER_ARN \
-   	--endpoint-group-region $PRIMARY_REGION \
-   	--endpoint-configurations EndpointId=$US_ALB_ARN_FULL,Weight=100,ClientIPPreservationEnabled=false \
-   	--traffic-dial-percentage 100 \
-   	--health-check-interval-seconds 30 \
-   	--healthy-threshold-count 3 \
-   	--unhealthy-threshold-count 3 \
-   	--query 'EndpointGroup.EndpointGroupArn' --output text)
+       --region us-west-2 \
+       --listener-arn $LISTENER_ARN \
+       --endpoint-group-region $PRIMARY_REGION \
+       --endpoint-configurations EndpointId=$US_ALB_ARN_FULL,Weight=100,ClientIPPreservationEnabled=false \
+       --traffic-dial-percentage 100 \
+       --health-check-interval-seconds 30 \
+       --healthy-threshold-count 3 \
+       --unhealthy-threshold-count 3 \
+       --query 'EndpointGroup.EndpointGroupArn' --output text)
 
    # Create endpoint group for EU region
    EU_ENDPOINT_GROUP_ARN=$(aws globalaccelerator create-endpoint-group \
-   	--region us-west-2 \
-   	--listener-arn $LISTENER_ARN \
-   	--endpoint-group-region $SECONDARY_REGION_EU \
-   	--endpoint-configurations EndpointId=$EU_ALB_ARN_FULL,Weight=100,ClientIPPreservationEnabled=false \
-   	--traffic-dial-percentage 100 \
-   	--health-check-interval-seconds 30 \
-   	--healthy-threshold-count 3 \
-   	--unhealthy-threshold-count 3 \
-   	--query 'EndpointGroup.EndpointGroupArn' --output text)
+       --region us-west-2 \
+       --listener-arn $LISTENER_ARN \
+       --endpoint-group-region $SECONDARY_REGION_EU \
+       --endpoint-configurations EndpointId=$EU_ALB_ARN_FULL,Weight=100,ClientIPPreservationEnabled=false \
+       --traffic-dial-percentage 100 \
+       --health-check-interval-seconds 30 \
+       --healthy-threshold-count 3 \
+       --unhealthy-threshold-count 3 \
+       --query 'EndpointGroup.EndpointGroupArn' --output text)
 
    # Create endpoint group for Asia region
    ASIA_ENDPOINT_GROUP_ARN=$(aws globalaccelerator create-endpoint-group \
-   	--region us-west-2 \
-   	--listener-arn $LISTENER_ARN \
-   	--endpoint-group-region $SECONDARY_REGION_ASIA \
-   	--endpoint-configurations EndpointId=$ASIA_ALB_ARN_FULL,Weight=100,ClientIPPreservationEnabled=false \
-   	--traffic-dial-percentage 100 \
-   	--health-check-interval-seconds 30 \
-   	--healthy-threshold-count 3 \
-   	--unhealthy-threshold-count 3 \
-   	--query 'EndpointGroup.EndpointGroupArn' --output text)
+       --region us-west-2 \
+       --listener-arn $LISTENER_ARN \
+       --endpoint-group-region $SECONDARY_REGION_ASIA \
+       --endpoint-configurations EndpointId=$ASIA_ALB_ARN_FULL,Weight=100,ClientIPPreservationEnabled=false \
+       --traffic-dial-percentage 100 \
+       --health-check-interval-seconds 30 \
+       --healthy-threshold-count 3 \
+       --unhealthy-threshold-count 3 \
+       --query 'EndpointGroup.EndpointGroupArn' --output text)
 
    echo "✅ Regional endpoints added to Global Accelerator"
    echo "US Endpoint Group: $US_ENDPOINT_GROUP_ARN"
@@ -1000,22 +975,22 @@ EOF
    ```bash
    # Check endpoint health status
    aws globalaccelerator describe-endpoint-group \
-   	--region us-west-2 \
-   	--endpoint-group-arn $US_ENDPOINT_GROUP_ARN \
-   	--query 'EndpointGroup.EndpointDescriptions[*].{Endpoint:EndpointId,Health:HealthState,Weight:Weight}' \
-   	--output table
+       --region us-west-2 \
+       --endpoint-group-arn $US_ENDPOINT_GROUP_ARN \
+       --query 'EndpointGroup.EndpointDescriptions[*].{Endpoint:EndpointId,Health:HealthState,Weight:Weight}' \
+       --output table
 
    aws globalaccelerator describe-endpoint-group \
-   	--region us-west-2 \
-   	--endpoint-group-arn $EU_ENDPOINT_GROUP_ARN \
-   	--query 'EndpointGroup.EndpointDescriptions[*].{Endpoint:EndpointId,Health:HealthState,Weight:Weight}' \
-   	--output table
+       --region us-west-2 \
+       --endpoint-group-arn $EU_ENDPOINT_GROUP_ARN \
+       --query 'EndpointGroup.EndpointDescriptions[*].{Endpoint:EndpointId,Health:HealthState,Weight:Weight}' \
+       --output table
 
    aws globalaccelerator describe-endpoint-group \
-   	--region us-west-2 \
-   	--endpoint-group-arn $ASIA_ENDPOINT_GROUP_ARN \
-   	--query 'EndpointGroup.EndpointDescriptions[*].{Endpoint:EndpointId,Health:HealthState,Weight:Weight}' \
-   	--output table
+       --region us-west-2 \
+       --endpoint-group-arn $ASIA_ENDPOINT_GROUP_ARN \
+       --query 'EndpointGroup.EndpointDescriptions[*].{Endpoint:EndpointId,Health:HealthState,Weight:Weight}' \
+       --output table
    ```
 
 4. Test performance using the Global Accelerator Speed Comparison Tool:
@@ -1031,33 +1006,33 @@ EOF
    ```bash
    # Delete endpoint groups
    aws globalaccelerator delete-endpoint-group \
-   	--region us-west-2 \
-   	--endpoint-group-arn $US_ENDPOINT_GROUP_ARN
+       --region us-west-2 \
+       --endpoint-group-arn $US_ENDPOINT_GROUP_ARN
 
    aws globalaccelerator delete-endpoint-group \
-   	--region us-west-2 \
-   	--endpoint-group-arn $EU_ENDPOINT_GROUP_ARN
+       --region us-west-2 \
+       --endpoint-group-arn $EU_ENDPOINT_GROUP_ARN
 
    aws globalaccelerator delete-endpoint-group \
-   	--region us-west-2 \
-   	--endpoint-group-arn $ASIA_ENDPOINT_GROUP_ARN
+       --region us-west-2 \
+       --endpoint-group-arn $ASIA_ENDPOINT_GROUP_ARN
 
    # Delete listener
    aws globalaccelerator delete-listener \
-   	--region us-west-2 \
-   	--listener-arn $LISTENER_ARN
+       --region us-west-2 \
+       --listener-arn $LISTENER_ARN
 
    # Delete accelerator
    aws globalaccelerator update-accelerator \
-   	--region us-west-2 \
-   	--accelerator-arn $ACCELERATOR_ARN \
-   	--enabled false
+       --region us-west-2 \
+       --accelerator-arn $ACCELERATOR_ARN \
+       --enabled false
 
    sleep 30
 
    aws globalaccelerator delete-accelerator \
-   	--region us-west-2 \
-   	--accelerator-arn $ACCELERATOR_ARN
+       --region us-west-2 \
+       --accelerator-arn $ACCELERATOR_ARN
 
    echo "✅ Global Accelerator resources deleted"
    ```
@@ -1067,32 +1042,32 @@ EOF
    ```bash
    # Delete ALBs in all regions
    aws elbv2 delete-load-balancer \
-   	--region $PRIMARY_REGION \
-   	--load-balancer-arn $US_ALB_ARN
+       --region $PRIMARY_REGION \
+       --load-balancer-arn $US_ALB_ARN
 
    aws elbv2 delete-load-balancer \
-   	--region $SECONDARY_REGION_EU \
-   	--load-balancer-arn $EU_ALB_ARN
+       --region $SECONDARY_REGION_EU \
+       --load-balancer-arn $EU_ALB_ARN
 
    aws elbv2 delete-load-balancer \
-   	--region $SECONDARY_REGION_ASIA \
-   	--load-balancer-arn $ASIA_ALB_ARN
+       --region $SECONDARY_REGION_ASIA \
+       --load-balancer-arn $ASIA_ALB_ARN
 
    # Wait for ALBs to be deleted before deleting target groups
    sleep 60
 
    # Delete target groups
    aws elbv2 delete-target-group \
-   	--region $PRIMARY_REGION \
-   	--target-group-arn $US_TG_ARN
+       --region $PRIMARY_REGION \
+       --target-group-arn $US_TG_ARN
 
    aws elbv2 delete-target-group \
-   	--region $SECONDARY_REGION_EU \
-   	--target-group-arn $EU_TG_ARN
+       --region $SECONDARY_REGION_EU \
+       --target-group-arn $EU_TG_ARN
 
    aws elbv2 delete-target-group \
-   	--region $SECONDARY_REGION_ASIA \
-   	--target-group-arn $ASIA_TG_ARN
+       --region $SECONDARY_REGION_ASIA \
+       --target-group-arn $ASIA_TG_ARN
 
    echo "✅ Load balancers and target groups deleted"
    ```
@@ -1101,16 +1076,16 @@ EOF
 
    ```bash
    aws lambda delete-function \
-   	--region $PRIMARY_REGION \
-   	--function-name ${APP_NAME}-us
+       --region $PRIMARY_REGION \
+       --function-name ${APP_NAME}-us
 
    aws lambda delete-function \
-   	--region $SECONDARY_REGION_EU \
-   	--function-name ${APP_NAME}-eu
+       --region $SECONDARY_REGION_EU \
+       --function-name ${APP_NAME}-eu
 
    aws lambda delete-function \
-   	--region $SECONDARY_REGION_ASIA \
-   	--function-name ${APP_NAME}-asia
+       --region $SECONDARY_REGION_ASIA \
+       --function-name ${APP_NAME}-asia
 
    echo "✅ Lambda functions deleted"
    ```
@@ -1118,23 +1093,24 @@ EOF
 4. Delete DynamoDB Global Table:
 
    ```bash
-   # Delete Global Table (this removes replication)
-   aws dynamodb delete-global-table \
-   	--region $PRIMARY_REGION \
-   	--global-table-name $TABLE_NAME
+   # Remove replicas from Global Table
+   aws dynamodb update-table \
+       --region $PRIMARY_REGION \
+       --table-name $TABLE_NAME \
+       --replica-updates Delete='{RegionName='$SECONDARY_REGION_EU'}'
 
-   # Delete individual tables
-   aws dynamodb delete-table \
-   	--region $PRIMARY_REGION \
-   	--table-name $TABLE_NAME
+   aws dynamodb update-table \
+       --region $PRIMARY_REGION \
+       --table-name $TABLE_NAME \
+       --replica-updates Delete='{RegionName='$SECONDARY_REGION_ASIA'}'
 
-   aws dynamodb delete-table \
-   	--region $SECONDARY_REGION_EU \
-   	--table-name $TABLE_NAME
+   # Wait for replica removal
+   sleep 30
 
+   # Delete primary table
    aws dynamodb delete-table \
-   	--region $SECONDARY_REGION_ASIA \
-   	--table-name $TABLE_NAME
+       --region $PRIMARY_REGION \
+       --table-name $TABLE_NAME
 
    echo "✅ DynamoDB Global Table and regional tables deleted"
    ```
@@ -1143,11 +1119,11 @@ EOF
 
    ```bash
    aws iam delete-role-policy \
-   	--role-name GlobalAppLambdaRole-${RANDOM_STRING} \
-   	--policy-name DynamoDBGlobalAccess
+       --role-name GlobalAppLambdaRole-${RANDOM_SUFFIX} \
+       --policy-name DynamoDBGlobalAccess
 
    aws iam delete-role \
-   	--role-name GlobalAppLambdaRole-${RANDOM_STRING}
+       --role-name GlobalAppLambdaRole-${RANDOM_SUFFIX}
 
    # Clean up local files
    rm -f lambda-trust-policy.json
@@ -1167,12 +1143,21 @@ The combination of Global Accelerator with [DynamoDB Global Tables](https://docs
 
 The serverless compute layer using Lambda functions provides automatic scaling and fault isolation across regions. Each regional Lambda deployment operates independently, processing requests locally and interacting with the local DynamoDB replica, which minimizes cross-region latency for data operations. The Application Load Balancer integration enables advanced routing capabilities, health checking, and the ability to support both HTTP and HTTPS traffic with SSL termination. This architecture pattern supports blue-green deployments and canary releases at the regional level by adjusting traffic weights in Global Accelerator endpoint groups.
 
+This recipe demonstrates AWS Well-Architected Framework principles including operational excellence through automated deployment, security through IAM roles and least privilege access, reliability through multi-region fault tolerance, and performance efficiency through global traffic optimization. The solution follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) guidelines for building resilient, secure, and efficient cloud architectures.
+
 > **Warning**: Be aware of the eventual consistency model in DynamoDB Global Tables. While updates propagate quickly, there may be brief periods where different regions return different data versions. Design your application logic to handle this gracefully, especially for critical operations that require strong consistency.
 
 ## Challenge
 
-Enhance this multi-region architecture by implementing advanced monitoring with CloudWatch cross-region dashboards and automated failover policies, adding API Gateway with custom authorizers for enhanced security, implementing disaster recovery automation using AWS Lambda and CloudFormation StackSets, and creating a mobile application using AWS Amplify that automatically connects to the nearest region. Additionally, explore implementing conflict resolution strategies for business-critical data updates and create a comprehensive testing framework for simulating regional failures and measuring recovery times.
+Enhance this multi-region architecture by implementing advanced monitoring with CloudWatch cross-region dashboards and automated failover policies, adding API Gateway with custom authorizers for enhanced security, implementing disaster recovery automation using AWS Lambda and CloudFormation StackSets, creating a mobile application using AWS Amplify that automatically connects to the nearest region, and exploring conflict resolution strategies for business-critical data updates. Additionally, create a comprehensive testing framework for simulating regional failures and measuring recovery times.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

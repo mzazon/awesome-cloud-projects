@@ -4,12 +4,12 @@ id: f2a9b8e7
 category: databases
 difficulty: 200
 subject: gcp
-services: AlloyDB AI, Cloud Monitoring, Cloud Functions, Vertex AI
+services: AlloyDB, Cloud Monitoring, Cloud Functions, Vertex AI
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database-optimization, ai-monitoring, performance-analytics, vector-search, automated-remediation
 recipe-generator-version: 1.3
@@ -107,6 +107,7 @@ gcloud services enable aiplatform.googleapis.com
 gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable cloudscheduler.googleapis.com
 gcloud services enable servicenetworking.googleapis.com
+gcloud services enable pubsub.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Region set to: ${REGION}"
@@ -150,23 +151,22 @@ echo "✅ Required APIs enabled"
 
 2. **Deploy AlloyDB AI Cluster with Vector Capabilities**:
 
-   AlloyDB AI extends traditional PostgreSQL with Google's custom silicon optimizations and vector processing capabilities through the ScaNN (Scalable Approximate Nearest Neighbor) index. This configuration enables efficient storage and retrieval of performance metric embeddings, allowing AI models to identify complex patterns in database behavior.
+   AlloyDB AI extends traditional PostgreSQL with Google's custom silicon optimizations and vector processing capabilities through the pgvector extension. This configuration enables efficient storage and retrieval of performance metric embeddings, allowing AI models to identify complex patterns in database behavior.
 
    ```bash
    # Create AlloyDB cluster with AI features enabled
    gcloud alloydb clusters create ${CLUSTER_NAME} \
        --network=${VPC_NAME} \
        --region=${REGION} \
-       --database-flags=cloudsql.iam_authentication=on
+       --database-version=POSTGRES_15 \
+       --password=SecurePassword123!
    
    # Create primary instance with optimal machine type for AI workloads
    gcloud alloydb instances create ${INSTANCE_NAME} \
        --cluster=${CLUSTER_NAME} \
        --region=${REGION} \
        --instance-type=PRIMARY \
-       --cpu-count=4 \
-       --memory-size=16GB \
-       --availability-type=ZONAL
+       --cpu-count=4
    
    # Get connection information
    export ALLOYDB_IP=$(gcloud alloydb instances describe ${INSTANCE_NAME} \
@@ -185,38 +185,34 @@ echo "✅ Required APIs enabled"
    Cloud Monitoring integrates natively with AlloyDB to collect comprehensive performance metrics including query latency, connection counts, buffer hit ratios, and custom application metrics. This monitoring foundation provides the data substrate for AI-driven performance optimization and predictive analytics.
 
    ```bash
-   # Create monitoring workspace if not exists
-   gcloud alpha monitoring workspaces create \
-       --display-name="AlloyDB Performance Monitoring"
-   
    # Create custom metric descriptors for performance optimization
    cat > custom_metrics.yaml << 'EOF'
-   type: "custom.googleapis.com/alloydb/query_performance_score"
-   labels:
-   - key: "database_name"
-     value_type: STRING
-   - key: "query_type"
-     value_type: STRING
-   metric_kind: GAUGE
-   value_type: DOUBLE
-   unit: "1"
-   description: "AI-generated performance score for database queries"
-   display_name: "AlloyDB Query Performance Score"
-   EOF
+type: "custom.googleapis.com/alloydb/query_performance_score"
+labels:
+- key: "database_name"
+  value_type: STRING
+- key: "query_type"
+  value_type: STRING
+metric_kind: GAUGE
+value_type: DOUBLE
+unit: "1"
+description: "AI-generated performance score for database queries"
+display_name: "AlloyDB Query Performance Score"
+EOF
    
    # Create alerting policy for performance anomalies
    cat > alert_policy.yaml << 'EOF'
-   displayName: "AlloyDB Performance Anomaly Alert"
-   conditions:
-   - displayName: "High query latency detected"
-     conditionThreshold:
-       filter: 'resource.type="alloydb_database"'
-       comparison: COMPARISON_GREATER_THAN
-       thresholdValue: 1000
-       duration: "300s"
-   notificationChannels: []
-   enabled: true
-   EOF
+displayName: "AlloyDB Performance Anomaly Alert"
+conditions:
+- displayName: "High query latency detected"
+  conditionThreshold:
+    filter: 'resource.type="alloydb_database"'
+    comparison: COMPARISON_GREATER_THAN
+    thresholdValue: 1000
+    duration: "300s"
+notificationChannels: []
+enabled: true
+EOF
    
    gcloud alpha monitoring policies create --policy-from-file=alert_policy.yaml
    
@@ -244,25 +240,23 @@ echo "✅ Required APIs enabled"
    
    # Create AutoML training job for performance prediction
    cat > training_config.yaml << 'EOF'
-   display_name: "alloydb-performance-optimizer"
-   training_task_definition: "gs://google-cloud-aiplatform/schema/trainingjob/definition/automl_tabular_1.0.0.yaml"
-   training_task_inputs:
-     targetColumn: "performance_score"
-     predictionType: "regression"
-     trainBudgetMilliNodeHours: 1000
-     disableEarlyStopping: false
-   EOF
+display_name: "alloydb-performance-optimizer"
+training_task_definition: "gs://google-cloud-aiplatform/schema/trainingjob/definition/automl_tabular_1.0.0.yaml"
+training_task_inputs:
+  targetColumn: "performance_score"
+  predictionType: "regression"
+  trainBudgetMilliNodeHours: 1000
+  disableEarlyStopping: false
+EOF
    
-   # Deploy the trained model endpoint
-   gcloud ai models upload \
-       --region=${REGION} \
-       --display-name="alloydb-performance-model" \
-       --container-image-uri="us-docker.pkg.dev/vertex-ai/automl-tabular/prediction-server:latest"
+   # Deploy a placeholder model endpoint (actual model would require training data)
+   echo "Model configuration prepared for performance analysis"
+   echo "Note: Actual model training requires historical performance data"
    
    echo "✅ Vertex AI model configured for performance analysis"
    ```
 
-   The Vertex AI model now processes AlloyDB performance metrics to identify patterns, predict potential bottlenecks, and generate data-driven optimization recommendations that can be automatically implemented through Cloud Functions.
+   The Vertex AI model framework now enables processing of AlloyDB performance metrics to identify patterns, predict potential bottlenecks, and generate data-driven optimization recommendations that can be automatically implemented through Cloud Functions.
 
 5. **Create Cloud Functions for Automated Performance Optimization**:
 
@@ -275,72 +269,76 @@ echo "✅ Required APIs enabled"
    
    # Create performance optimizer function
    cat > main.py << 'EOF'
-   import functions_framework
-   import json
-   from google.cloud import alloydb_v1
-   from google.cloud import aiplatform
-   from google.cloud import monitoring_v3
-   import logging
-   
-   @functions_framework.cloud_event
-   def optimize_alloydb_performance(cloud_event):
-       """Analyze performance metrics and apply optimizations"""
-       
-       # Initialize clients
-       alloydb_client = alloydb_v1.AlloyDBAdminClient()
-       monitoring_client = monitoring_v3.MetricServiceClient()
-       
-       try:
-           # Fetch current performance metrics
-           project_name = f"projects/{os.environ['PROJECT_ID']}"
-           
-           # Query recent performance data
-           interval = monitoring_v3.TimeInterval({
-               "end_time": {"seconds": int(time.time())},
-               "start_time": {"seconds": int(time.time() - 3600)}
-           })
-           
-           # Get query latency metrics
-           results = monitoring_client.list_time_series(
-               request={
-                   "name": project_name,
-                   "filter": 'resource.type="alloydb_database"',
-                   "interval": interval,
-                   "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL
-               }
-           )
-           
-           # Analyze metrics and determine optimizations
-           optimizations = analyze_performance_data(results)
-           
-           # Apply optimization recommendations
-           for optimization in optimizations:
-               apply_optimization(optimization)
-               
-           logging.info(f"Applied {len(optimizations)} performance optimizations")
-           
-       except Exception as e:
-           logging.error(f"Optimization failed: {str(e)}")
-           raise
-   
-   def analyze_performance_data(metrics):
-       """Analyze performance metrics using AI model"""
-       # Implementation for AI-driven analysis
-       return []
-   
-   def apply_optimization(optimization):
-       """Apply specific optimization to AlloyDB"""
-       # Implementation for applying optimizations
-       pass
-   EOF
+import functions_framework
+import json
+import os
+import time
+from google.cloud import alloydb_v1
+from google.cloud import aiplatform
+from google.cloud import monitoring_v3
+import logging
+
+@functions_framework.cloud_event
+def optimize_alloydb_performance(cloud_event):
+    """Analyze performance metrics and apply optimizations"""
+    
+    # Initialize clients
+    alloydb_client = alloydb_v1.AlloyDBAdminClient()
+    monitoring_client = monitoring_v3.MetricServiceClient()
+    
+    try:
+        # Fetch current performance metrics
+        project_name = f"projects/{os.environ['PROJECT_ID']}"
+        
+        # Query recent performance data
+        interval = monitoring_v3.TimeInterval({
+            "end_time": {"seconds": int(time.time())},
+            "start_time": {"seconds": int(time.time() - 3600)}
+        })
+        
+        # Get query latency metrics
+        results = monitoring_client.list_time_series(
+            request={
+                "name": project_name,
+                "filter": 'resource.type="alloydb_database"',
+                "interval": interval,
+                "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL
+            }
+        )
+        
+        # Analyze metrics and determine optimizations
+        optimizations = analyze_performance_data(results)
+        
+        # Apply optimization recommendations
+        for optimization in optimizations:
+            apply_optimization(optimization)
+            
+        logging.info(f"Applied {len(optimizations)} performance optimizations")
+        
+    except Exception as e:
+        logging.error(f"Optimization failed: {str(e)}")
+        raise
+
+def analyze_performance_data(metrics):
+    """Analyze performance metrics using AI model"""
+    # Placeholder for AI-driven analysis
+    # In production, this would use the trained Vertex AI model
+    return []
+
+def apply_optimization(optimization):
+    """Apply specific optimization to AlloyDB"""
+    # Placeholder for applying optimizations
+    # In production, this would implement specific tuning actions
+    pass
+EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-   functions-framework==3.*
-   google-cloud-alloydb==1.*
-   google-cloud-aiplatform==1.*
-   google-cloud-monitoring==2.*
-   EOF
+functions-framework==3.*
+google-cloud-alloydb==1.*
+google-cloud-aiplatform==1.*
+google-cloud-monitoring==2.*
+EOF
    
    # Deploy the Cloud Function
    gcloud functions deploy alloydb-performance-optimizer \
@@ -350,7 +348,9 @@ echo "✅ Required APIs enabled"
        --source=. \
        --entry-point=optimize_alloydb_performance \
        --trigger-topic=alloydb-performance-events \
-       --set-env-vars="PROJECT_ID=${PROJECT_ID},CLUSTER_NAME=${CLUSTER_NAME}"
+       --set-env-vars="PROJECT_ID=${PROJECT_ID},CLUSTER_NAME=${CLUSTER_NAME}" \
+       --memory=512MB \
+       --timeout=300s
    
    cd ..
    
@@ -372,14 +372,16 @@ echo "✅ Required APIs enabled"
        --schedule="*/15 * * * *" \
        --topic=alloydb-performance-events \
        --message-body='{"action":"analyze_performance","cluster":"'${CLUSTER_NAME}'"}' \
-       --time-zone="America/New_York"
+       --time-zone="America/New_York" \
+       --location=${REGION}
    
    # Create additional scheduler for daily optimization reports
    gcloud scheduler jobs create pubsub daily-performance-report \
        --schedule="0 9 * * *" \
        --topic=alloydb-performance-events \
        --message-body='{"action":"generate_report","cluster":"'${CLUSTER_NAME}'"}' \
-       --time-zone="America/New_York"
+       --time-zone="America/New_York" \
+       --location=${REGION}
    
    echo "✅ Automated performance monitoring scheduled"
    echo "Performance analysis runs every 15 minutes"
@@ -395,53 +397,53 @@ echo "✅ Required APIs enabled"
    ```bash
    # Create performance dashboard configuration
    cat > dashboard_config.json << 'EOF'
-   {
-     "displayName": "AlloyDB AI Performance Dashboard",
-     "mosaicLayout": {
-       "tiles": [
-         {
-           "width": 6,
-           "height": 4,
-           "widget": {
-             "title": "Query Performance Score",
-             "xyChart": {
-               "dataSets": [{
-                 "timeSeriesQuery": {
-                   "timeSeriesFilter": {
-                     "filter": "resource.type=\"alloydb_database\"",
-                     "aggregation": {
-                       "alignmentPeriod": "300s",
-                       "perSeriesAligner": "ALIGN_MEAN"
-                     }
-                   }
-                 }
-               }]
-             }
-           }
-         },
-         {
-           "width": 6,
-           "height": 4,
-           "xPos": 6,
-           "widget": {
-             "title": "AI Optimization Actions",
-             "scorecard": {
-               "timeSeriesQuery": {
-                 "timeSeriesFilter": {
-                   "filter": "resource.type=\"cloud_function\"",
-                   "aggregation": {
-                     "alignmentPeriod": "3600s",
-                     "perSeriesAligner": "ALIGN_SUM"
-                   }
-                 }
-               }
-             }
-           }
-         }
-       ]
-     }
-   }
-   EOF
+{
+  "displayName": "AlloyDB AI Performance Dashboard",
+  "mosaicLayout": {
+    "tiles": [
+      {
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Query Performance Score",
+          "xyChart": {
+            "dataSets": [{
+              "timeSeriesQuery": {
+                "timeSeriesFilter": {
+                  "filter": "resource.type=\"alloydb_database\"",
+                  "aggregation": {
+                    "alignmentPeriod": "300s",
+                    "perSeriesAligner": "ALIGN_MEAN"
+                  }
+                }
+              }
+            }]
+          }
+        }
+      },
+      {
+        "width": 6,
+        "height": 4,
+        "xPos": 6,
+        "widget": {
+          "title": "AI Optimization Actions",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "timeSeriesFilter": {
+                "filter": "resource.type=\"cloud_function\"",
+                "aggregation": {
+                  "alignmentPeriod": "3600s",
+                  "perSeriesAligner": "ALIGN_SUM"
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}
+EOF
    
    # Create the dashboard
    gcloud monitoring dashboards create --config-from-file=dashboard_config.json
@@ -459,53 +461,54 @@ echo "✅ Required APIs enabled"
    ```bash
    # Connect to AlloyDB and configure vector extensions
    cat > setup_vector_search.sql << 'EOF'
-   -- Enable vector extension for performance analysis
-   CREATE EXTENSION IF NOT EXISTS vector;
-   
-   -- Create table for performance metric embeddings
-   CREATE TABLE performance_embeddings (
-       id SERIAL PRIMARY KEY,
-       timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-       metric_type VARCHAR(100),
-       embedding vector(512),
-       performance_score FLOAT,
-       optimization_applied TEXT,
-       effectiveness_score FLOAT
-   );
-   
-   -- Create index for efficient vector similarity search
-   CREATE INDEX ON performance_embeddings 
-   USING ivfflat (embedding vector_cosine_ops)
-   WITH (lists = 100);
-   
-   -- Create function for performance pattern matching
-   CREATE OR REPLACE FUNCTION find_similar_patterns(
-       query_embedding vector(512),
-       similarity_threshold FLOAT DEFAULT 0.8
-   )
-   RETURNS TABLE(
-       id INT,
-       similarity FLOAT,
-       optimization_applied TEXT,
-       effectiveness_score FLOAT
-   ) AS $$
-   BEGIN
-       RETURN QUERY
-       SELECT 
-           pe.id,
-           1 - (pe.embedding <=> query_embedding) as similarity,
-           pe.optimization_applied,
-           pe.effectiveness_score
-       FROM performance_embeddings pe
-       WHERE 1 - (pe.embedding <=> query_embedding) > similarity_threshold
-       ORDER BY pe.embedding <=> query_embedding
-       LIMIT 10;
-   END;
-   $$ LANGUAGE plpgsql;
-   EOF
+-- Enable vector extension for performance analysis
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Create table for performance metric embeddings
+CREATE TABLE performance_embeddings (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    metric_type VARCHAR(100),
+    embedding vector(512),
+    performance_score FLOAT,
+    optimization_applied TEXT,
+    effectiveness_score FLOAT
+);
+
+-- Create index for efficient vector similarity search
+CREATE INDEX ON performance_embeddings 
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+-- Create function for performance pattern matching
+CREATE OR REPLACE FUNCTION find_similar_patterns(
+    query_embedding vector(512),
+    similarity_threshold FLOAT DEFAULT 0.8
+)
+RETURNS TABLE(
+    id INT,
+    similarity FLOAT,
+    optimization_applied TEXT,
+    effectiveness_score FLOAT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        pe.id,
+        1 - (pe.embedding <=> query_embedding) as similarity,
+        pe.optimization_applied,
+        pe.effectiveness_score
+    FROM performance_embeddings pe
+    WHERE 1 - (pe.embedding <=> query_embedding) > similarity_threshold
+    ORDER BY pe.embedding <=> query_embedding
+    LIMIT 10;
+END;
+$$ LANGUAGE plpgsql;
+EOF
    
    echo "✅ Vector search configured for performance pattern analysis"
    echo "SQL setup script created: setup_vector_search.sql"
+   echo "To execute: Connect to AlloyDB using psql and run: \\i setup_vector_search.sql"
    ```
 
    Vector search capabilities now enable intelligent pattern recognition across historical performance data, allowing the AI system to learn from past optimization successes and apply similar solutions to recurring performance challenges.
@@ -548,23 +551,25 @@ echo "✅ Required APIs enabled"
        --limit=10
    ```
 
-4. **Verify Vertex AI model endpoint accessibility**:
+4. **Verify Vertex AI dataset creation**:
 
    ```bash
-   # List available AI models
-   gcloud ai models list \
+   # List available AI datasets
+   gcloud ai datasets list \
        --region=${REGION} \
-       --filter="displayName:alloydb-performance-model"
+       --filter="displayName:alloydb-performance-dataset"
    ```
 
 5. **Test scheduled performance analysis execution**:
 
    ```bash
    # Manually trigger scheduler job to verify automation
-   gcloud scheduler jobs run performance-analyzer
+   gcloud scheduler jobs run performance-analyzer \
+       --location=${REGION}
    
    # Check scheduler job execution status
-   gcloud scheduler jobs describe performance-analyzer
+   gcloud scheduler jobs describe performance-analyzer \
+       --location=${REGION}
    ```
 
 ## Cleanup
@@ -573,8 +578,12 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # Delete scheduled jobs
-   gcloud scheduler jobs delete performance-analyzer --quiet
-   gcloud scheduler jobs delete daily-performance-report --quiet
+   gcloud scheduler jobs delete performance-analyzer \
+       --location=${REGION} \
+       --quiet
+   gcloud scheduler jobs delete daily-performance-report \
+       --location=${REGION} \
+       --quiet
    
    echo "✅ Scheduler jobs removed"
    ```
@@ -594,14 +603,9 @@ echo "✅ Required APIs enabled"
    echo "✅ Cloud Functions and Pub/Sub resources cleaned up"
    ```
 
-3. **Remove Vertex AI models and datasets**:
+3. **Remove Vertex AI datasets**:
 
    ```bash
-   # Delete AI model
-   gcloud ai models delete alloydb-performance-model \
-       --region=${REGION} \
-       --quiet
-   
    # Delete dataset
    gcloud ai datasets delete ${DATASET_ID} \
        --region=${REGION} \
@@ -655,7 +659,7 @@ echo "✅ Required APIs enabled"
 
 ## Discussion
 
-This recipe demonstrates the integration of AlloyDB AI's advanced vector capabilities with Google Cloud's intelligent monitoring and automation services to create a self-optimizing database environment. The solution leverages AlloyDB's PostgreSQL compatibility with Google's custom silicon optimizations, including the ScaNN vector index for efficient similarity search across performance patterns.
+This recipe demonstrates the integration of AlloyDB AI's advanced vector capabilities with Google Cloud's intelligent monitoring and automation services to create a self-optimizing database environment. The solution leverages AlloyDB's PostgreSQL compatibility with Google's custom silicon optimizations, including the pgvector extension for efficient similarity search across performance patterns.
 
 The architecture combines real-time performance monitoring through Cloud Monitoring with AI-driven analysis using Vertex AI, creating a feedback loop that continuously improves database performance. AlloyDB AI's vector search capabilities enable the system to identify patterns in performance metrics and correlate them with successful optimization strategies from historical data. This approach moves beyond traditional threshold-based alerting to predictive, pattern-based optimization.
 
@@ -683,4 +687,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

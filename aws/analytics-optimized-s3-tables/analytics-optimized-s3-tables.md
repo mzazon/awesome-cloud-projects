@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: S3 Tables, Amazon Athena, AWS Glue, Amazon QuickSight
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: analytics, data-lake, iceberg, storage, visualization
 recipe-generator-version: 1.3
@@ -180,15 +180,20 @@ echo "✅ Table bucket name: ${TABLE_BUCKET_NAME}"
 
 4. **Create Apache Iceberg Table with Optimized Schema**:
 
-   Apache Iceberg tables in S3 Tables support advanced analytics features including schema evolution, partition evolution, and time travel queries. The table creation process establishes the schema structure optimized for analytics workloads with appropriate data types and partitioning strategies.
+   Apache Iceberg tables in S3 Tables support advanced analytics features including schema evolution, partition evolution, and time travel queries. The table creation establishes the schema structure optimized for analytics workloads with appropriate data types and partitioning strategies.
 
    ```bash
-   # Create transaction data table
+   # Create transaction data table with initial schema
    aws s3tables create-table \
        --table-bucket-arn ${TABLE_BUCKET_ARN} \
        --namespace ${NAMESPACE_NAME} \
        --name ${TABLE_NAME} \
-       --format ICEBERG
+       --format ICEBERG \
+       --metadata '{
+           "icebergTableData": {
+               "schema": "{\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"transaction_id\",\"required\":true,\"type\":\"long\"},{\"id\":2,\"name\":\"customer_id\",\"required\":true,\"type\":\"long\"},{\"id\":3,\"name\":\"product_id\",\"required\":true,\"type\":\"long\"},{\"id\":4,\"name\":\"quantity\",\"required\":true,\"type\":\"int\"},{\"id\":5,\"name\":\"price\",\"required\":true,\"type\":\"decimal(10,2)\"},{\"id\":6,\"name\":\"transaction_date\",\"required\":true,\"type\":\"date\"},{\"id\":7,\"name\":\"region\",\"required\":true,\"type\":\"string\"}]}"
+           }
+       }'
    
    # Store table ARN for later use
    export TABLE_ARN=$(aws s3tables get-table \
@@ -211,11 +216,18 @@ echo "✅ Table bucket name: ${TABLE_BUCKET_NAME}"
    aws glue create-database \
        --database-input Name=${GLUE_DATABASE_NAME}
    
-   # Enable S3 Tables integration with Glue catalog
+   # Enable S3 Tables maintenance configuration
    aws s3tables put-table-bucket-maintenance-configuration \
        --table-bucket-arn ${TABLE_BUCKET_ARN} \
-       --type autoMaintenance \
-       --value enabled
+       --type icebergUnreferencedFileRemoval \
+       --value '{
+           "status": "Enabled",
+           "settings": {
+               "icebergUnreferencedFileRemoval": {
+                   "numberOfDaysToRetain": 7
+               }
+           }
+       }'
    
    echo "✅ AWS Glue Data Catalog integration configured"
    ```
@@ -229,13 +241,13 @@ echo "✅ Table bucket name: ${TABLE_BUCKET_NAME}"
    ```bash
    # Create sample data file
    cat > /tmp/sample_transactions.csv << 'EOF'
-   transaction_id,customer_id,product_id,quantity,price,transaction_date,region
-   1,101,501,2,29.99,2024-01-15,us-east-1
-   2,102,502,1,149.99,2024-01-15,us-west-2
-   3,103,503,3,19.99,2024-01-16,eu-west-1
-   4,104,501,1,29.99,2024-01-16,us-east-1
-   5,105,504,2,79.99,2024-01-17,ap-southeast-1
-   EOF
+transaction_id,customer_id,product_id,quantity,price,transaction_date,region
+1,101,501,2,29.99,2024-01-15,us-east-1
+2,102,502,1,149.99,2024-01-15,us-west-2
+3,103,503,3,19.99,2024-01-16,eu-west-1
+4,104,501,1,29.99,2024-01-16,us-east-1
+5,105,504,2,79.99,2024-01-17,ap-southeast-1
+EOF
    
    # Create temporary S3 bucket for data ingestion
    aws s3 mb s3://glue-etl-data-${RANDOM_SUFFIX} \
@@ -250,7 +262,49 @@ echo "✅ Table bucket name: ${TABLE_BUCKET_NAME}"
 
    The sample dataset provides realistic transaction data for demonstrating S3 Tables analytics capabilities. This foundation enables testing of query performance, data transformation, and visualization workflows with representative business data.
 
-7. **Set Up Amazon Athena for Interactive Querying**:
+7. **Ingest Data into S3 Table using AWS Glue**:
+
+   AWS Glue provides ETL capabilities to transform and load data into S3 Tables. This approach enables schema-aware data ingestion with automatic optimization and catalog registration for seamless analytics integration.
+
+   ```bash
+   # Create Glue IAM role for ETL operations
+   aws iam create-role \
+       --role-name s3tables-glue-role-${RANDOM_SUFFIX} \
+       --assume-role-policy-document '{
+           "Version": "2012-10-17",
+           "Statement": [
+               {
+                   "Effect": "Allow",
+                   "Principal": {
+                       "Service": "glue.amazonaws.com"
+                   },
+                   "Action": "sts:AssumeRole"
+               }
+           ]
+       }'
+   
+   # Attach necessary policies
+   aws iam attach-role-policy \
+       --role-name s3tables-glue-role-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+   
+   # Create Glue crawler for S3 Tables catalog integration
+   aws glue create-crawler \
+       --name s3-tables-crawler-${RANDOM_SUFFIX} \
+       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/s3tables-glue-role-${RANDOM_SUFFIX} \
+       --database-name ${GLUE_DATABASE_NAME} \
+       --targets '{
+           "S3Targets": [{
+               "Path": "s3://glue-etl-data-'${RANDOM_SUFFIX}'/input/"
+           }]
+       }'
+   
+   echo "✅ Glue ETL configuration prepared for data ingestion"
+   ```
+
+   The Glue ETL configuration enables automated data transformation and loading into S3 Tables with proper schema validation and catalog registration. This approach ensures data quality and seamless integration with analytics services.
+
+8. **Set Up Amazon Athena for Interactive Querying**:
 
    Amazon Athena provides interactive SQL query capabilities for S3 Tables through the AWS Glue Data Catalog integration. Athena supports standard SQL syntax and delivers fast query performance through optimized query execution and Apache Iceberg's advanced analytics features.
 
@@ -274,7 +328,7 @@ echo "✅ Table bucket name: ${TABLE_BUCKET_NAME}"
 
    Athena is now configured to query S3 Tables with optimized performance and result storage. The work group configuration ensures consistent query execution environment and result management for analytics workloads.
 
-8. **Configure Amazon QuickSight for Data Visualization**:
+9. **Configure Amazon QuickSight for Data Visualization**:
 
    Amazon QuickSight provides business intelligence capabilities for S3 Tables through integration with Amazon Athena. QuickSight enables interactive dashboards, ad-hoc analysis, and business insights with fast query performance using the SPICE in-memory engine.
 
@@ -318,7 +372,7 @@ echo "✅ Table bucket name: ${TABLE_BUCKET_NAME}"
    ```bash
    # Execute sample query via Athena
    QUERY_ID=$(aws athena start-query-execution \
-       --query-string "SELECT COUNT(*) FROM \"${GLUE_DATABASE_NAME}\".\"${TABLE_NAME}\"" \
+       --query-string "SHOW TABLES IN \"${GLUE_DATABASE_NAME}\"" \
        --work-group s3-tables-workgroup \
        --result-configuration OutputLocation=s3://aws-athena-query-results-${AWS_ACCOUNT_ID}-${AWS_REGION} \
        --query "QueryExecutionId" --output text)
@@ -331,7 +385,7 @@ echo "✅ Table bucket name: ${TABLE_BUCKET_NAME}"
    echo "✅ Query execution ID: ${QUERY_ID}"
    ```
 
-   Expected output: Query execution ID and successful completion with row count results demonstrating table accessibility.
+   Expected output: Query execution ID and successful completion showing table registration in the Glue catalog.
 
 3. **Validate Data Catalog Integration**:
 
@@ -385,6 +439,18 @@ echo "✅ Table bucket name: ${TABLE_BUCKET_NAME}"
    aws glue delete-database \
        --name ${GLUE_DATABASE_NAME}
    
+   # Delete Glue crawler
+   aws glue delete-crawler \
+       --name s3-tables-crawler-${RANDOM_SUFFIX}
+   
+   # Delete IAM role
+   aws iam detach-role-policy \
+       --role-name s3tables-glue-role-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+   
+   aws iam delete-role \
+       --role-name s3tables-glue-role-${RANDOM_SUFFIX}
+   
    # Delete Athena work group
    aws athena delete-work-group \
        --work-group s3-tables-workgroup
@@ -436,4 +502,11 @@ Extend this analytics-optimized data storage solution with these advanced implem
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

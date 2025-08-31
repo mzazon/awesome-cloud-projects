@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Billing API, Cloud Functions, Cloud Monitoring, BigQuery
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-optimization, finops, billing, automation, cloud-functions, monitoring
 recipe-generator-version: 1.3
@@ -80,7 +80,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and appropriate IAM permissions
-2. gcloud CLI v2 installed and configured (or Google Cloud Shell)
+2. gcloud CLI installed and configured (or Google Cloud Shell)
 3. Basic understanding of FinOps principles and cloud cost management
 4. Knowledge of serverless functions and event-driven architecture
 5. Estimated cost: $15-25/month for BigQuery storage, Cloud Functions execution, and monitoring resources
@@ -94,7 +94,6 @@ graph TB
 export PROJECT_ID="cost-optimization-$(date +%s)"
 export REGION="us-central1"
 export ZONE="us-central1-a"
-export BILLING_ACCOUNT_ID="your-billing-account-id"
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -147,24 +146,20 @@ echo "✅ Required APIs enabled"
    Cloud Billing export to BigQuery provides detailed, near real-time cost and usage data that serves as the primary data source for all cost optimization algorithms. This export includes granular information about resource usage, pricing, credits, and labels that enable sophisticated cost attribution and trend analysis.
 
    ```bash
-   # Get the current billing account
-   BILLING_ACCOUNT=$(gcloud beta billing accounts list \
-       --format="value(name)" --limit=1)
+   # Get the current billing account ID
+   BILLING_ACCOUNT_ID=$(gcloud billing accounts list \
+       --format="value(name.basename())" --limit=1)
    
-   # Enable billing export to BigQuery
-   gcloud alpha billing accounts projects link ${PROJECT_ID} \
+   # Link project to billing account if needed
+   gcloud billing projects link ${PROJECT_ID} \
        --billing-account=${BILLING_ACCOUNT_ID}
    
-   # Set up billing export configuration
-   bq mk --transfer_config \
-       --project_id=${PROJECT_ID} \
-       --target_dataset=${DATASET_NAME} \
-       --display_name="Billing Export for Cost Optimization" \
-       --data_source=scheduled_query \
-       --schedule="every 6 hours" \
-       --params='{"query":"SELECT * FROM `PROJECT_ID.DATASET.gcp_billing_export_v1_BILLING_ACCOUNT_ID`"}'
+   # Note: Billing export must be configured via Google Cloud Console
+   # Navigate to Billing > Billing Export in the Console to enable
+   # BigQuery export for your billing account to the dataset created above
    
-   echo "✅ Billing export configured to BigQuery"
+   echo "✅ Project linked to billing account: ${BILLING_ACCOUNT_ID}"
+   echo "🔧 Configure billing export via Console: https://console.cloud.google.com/billing"
    ```
 
    The billing export integration establishes a continuous data pipeline that automatically populates BigQuery with comprehensive cost and usage information. This real-time data foundation enables immediate detection of spending anomalies and supports advanced analytics for resource optimization recommendations.
@@ -270,8 +265,9 @@ google-cloud-bigquery==3.25.0
 google-cloud-monitoring==2.22.2
 EOF
    
-   # Deploy the function
+   # Deploy the function with 2nd gen runtime
    gcloud functions deploy ${FUNCTION_PREFIX}-cost-analysis \
+       --gen2 \
        --runtime=python311 \
        --trigger=http \
        --entry-point=analyze_costs \
@@ -288,7 +284,7 @@ EOF
 
 5. **Deploy Anomaly Detection Function**:
 
-   The anomaly detection function implements machine learning algorithms to identify unusual spending patterns that may indicate security issues, misconfigured resources, or unexpected usage spikes. This proactive monitoring capability enables rapid response to cost anomalies before they significantly impact budgets.
+   The anomaly detection function implements statistical algorithms to identify unusual spending patterns that may indicate security issues, misconfigured resources, or unexpected usage spikes. This proactive monitoring capability enables rapid response to cost anomalies before they significantly impact budgets.
 
    ```bash
    # Create anomaly detection function
@@ -344,10 +340,11 @@ def detect_anomalies(cloud_event):
             dc.daily_cost,
             s.avg_cost,
             s.std_cost,
-            ABS(dc.daily_cost - s.avg_cost) / s.std_cost as z_score
+            ABS(dc.daily_cost - s.avg_cost) / NULLIF(s.std_cost, 0) as z_score
         FROM daily_costs dc
         JOIN stats s ON dc.project_id = s.project_id AND dc.service_name = s.service_name
         WHERE dc.usage_date = CURRENT_DATE()
+        AND s.std_cost > 0
         AND ABS(dc.daily_cost - s.avg_cost) / s.std_cost > 2.0
         ORDER BY z_score DESC
         """
@@ -399,10 +396,11 @@ google-cloud-bigquery==3.25.0
 google-cloud-pubsub==2.26.1
 EOF
    
-   # Deploy anomaly detection function
+   # Deploy anomaly detection function with Pub/Sub trigger
    gcloud functions deploy ${FUNCTION_PREFIX}-anomaly-detection \
+       --gen2 \
        --runtime=python311 \
-       --trigger=topic=cost-optimization-alerts \
+       --trigger-topic=cost-optimization-alerts \
        --entry-point=detect_anomalies \
        --memory=512MB \
        --timeout=540s \
@@ -419,6 +417,10 @@ EOF
    Budget alerts provide proactive spending control by monitoring actual and forecasted costs against predefined thresholds. This integration with Pub/Sub enables automated responses to budget events, creating a comprehensive cost governance framework that balances operational flexibility with financial discipline.
 
    ```bash
+   # Get billing account for budget creation
+   BILLING_ACCOUNT_ID=$(gcloud billing accounts list \
+       --format="value(name.basename())" --limit=1)
+   
    # Create budget with programmatic notifications
    cat > budget-config.json << EOF
 {
@@ -453,14 +455,11 @@ EOF
 EOF
    
    # Create the budget using REST API
-   BILLING_ACCOUNT=$(gcloud beta billing accounts list \
-       --format="value(name.basename())" --limit=1)
-   
    curl -X POST \
        -H "Authorization: Bearer $(gcloud auth print-access-token)" \
        -H "Content-Type: application/json" \
        -d @budget-config.json \
-       "https://billingbudgets.googleapis.com/v1/billingAccounts/${BILLING_ACCOUNT}/budgets"
+       "https://billingbudgets.googleapis.com/v1/billingAccounts/${BILLING_ACCOUNT_ID}/budgets"
    
    echo "✅ Budget created with Pub/Sub notifications"
    ```
@@ -545,7 +544,7 @@ def optimize_resources(request):
         
         # Storage optimizations
         for row in storage_results:
-            if 'Standard' in row.sku_description and row.total_cost > 50:
+            if 'Standard' in str(row.sku_description) and row.total_cost > 50:
                 recommendations.append({
                     'type': 'storage_lifecycle',
                     'resource': row.sku_description,
@@ -584,6 +583,7 @@ EOF
    
    # Deploy optimization function
    gcloud functions deploy ${FUNCTION_PREFIX}-optimization \
+       --gen2 \
        --runtime=python311 \
        --trigger=http \
        --entry-point=optimize_resources \
@@ -605,6 +605,7 @@ EOF
    ```bash
    # Create scheduled job for cost analysis
    gcloud scheduler jobs create http cost-analysis-scheduler \
+       --location=${REGION} \
        --schedule="0 9 * * *" \
        --uri="https://${REGION}-${PROJECT_ID}.cloudfunctions.net/${FUNCTION_PREFIX}-cost-analysis" \
        --http-method=GET \
@@ -612,6 +613,7 @@ EOF
    
    # Create weekly optimization review
    gcloud scheduler jobs create http optimization-scheduler \
+       --location=${REGION} \
        --schedule="0 9 * * 1" \
        --uri="https://${REGION}-${PROJECT_ID}.cloudfunctions.net/${FUNCTION_PREFIX}-optimization" \
        --http-method=GET \
@@ -665,10 +667,11 @@ EOF
 
    ```bash
    # Verify scheduler jobs
-   gcloud scheduler jobs list
+   gcloud scheduler jobs list --location=${REGION}
    
    # Check recent job execution
-   gcloud scheduler jobs describe cost-analysis-scheduler
+   gcloud scheduler jobs describe cost-analysis-scheduler \
+       --location=${REGION}
    ```
 
    Expected output: Active scheduler jobs with proper configuration and execution history.
@@ -679,9 +682,12 @@ EOF
 
    ```bash
    # Delete all deployed functions
-   gcloud functions delete ${FUNCTION_PREFIX}-cost-analysis --quiet
-   gcloud functions delete ${FUNCTION_PREFIX}-anomaly-detection --quiet
-   gcloud functions delete ${FUNCTION_PREFIX}-optimization --quiet
+   gcloud functions delete ${FUNCTION_PREFIX}-cost-analysis \
+       --region=${REGION} --quiet
+   gcloud functions delete ${FUNCTION_PREFIX}-anomaly-detection \
+       --region=${REGION} --quiet
+   gcloud functions delete ${FUNCTION_PREFIX}-optimization \
+       --region=${REGION} --quiet
    
    echo "✅ Cloud Functions deleted"
    ```
@@ -690,8 +696,10 @@ EOF
 
    ```bash
    # Delete scheduled jobs
-   gcloud scheduler jobs delete cost-analysis-scheduler --quiet
-   gcloud scheduler jobs delete optimization-scheduler --quiet
+   gcloud scheduler jobs delete cost-analysis-scheduler \
+       --location=${REGION} --quiet
+   gcloud scheduler jobs delete optimization-scheduler \
+       --location=${REGION} --quiet
    
    echo "✅ Scheduler jobs deleted"
    ```
@@ -721,8 +729,8 @@ EOF
 5. **Remove Budget Configuration**:
 
    ```bash
-   # List and delete budgets (requires manual deletion via Console or API)
-   echo "Note: Budget deletion requires manual action via Google Cloud Console"
+   # Note: Budget deletion requires manual action via Console or API
+   echo "📋 Budget deletion requires manual action via Google Cloud Console"
    echo "Navigate to Billing > Budgets & alerts to remove created budgets"
    
    # Clean up local files
@@ -759,4 +767,9 @@ Extend this cost optimization solution by implementing these advanced enhancemen
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

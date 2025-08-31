@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Cloud Bigtable, Cloud Dataproc, Cloud Scheduler, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: supply-chain, real-time-analytics, iot-data, batch-processing, inventory-optimization
 recipe-generator-version: 1.3
@@ -105,7 +105,10 @@ gcloud services enable monitoring.googleapis.com
 gcloud services enable storage.googleapis.com
 
 # Create Cloud Storage bucket for data processing
-gsutil mb -p ${PROJECT_ID} -c STANDARD -l ${REGION} gs://${BUCKET_NAME}
+gsutil mb -p ${PROJECT_ID} \
+    -c STANDARD \
+    -l ${REGION} \
+    gs://${BUCKET_NAME}
 
 # Create Pub/Sub topic for sensor data ingestion
 gcloud pubsub topics create ${TOPIC_NAME}
@@ -129,8 +132,9 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
        --project=${PROJECT_ID}
    
    # Create table for sensor data with column families
-   echo 'create "sensor_data", "sensor_readings", "device_metadata", "location_data"' | \
-       cbt -project=${PROJECT_ID} -instance=${BIGTABLE_INSTANCE_ID} shell
+   cbt -project=${PROJECT_ID} -instance=${BIGTABLE_INSTANCE_ID} \
+       createtable sensor_data \
+       families=sensor_readings:maxage=30d,device_metadata:maxage=90d,location_data:maxage=90d
    
    echo "✅ Bigtable instance created: ${BIGTABLE_INSTANCE_ID}"
    ```
@@ -150,9 +154,9 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
    cat > main.py << 'EOF'
    import json
    import base64
+   import os
    from datetime import datetime
    from google.cloud import bigtable
-   from google.cloud.bigtable import column_family
    
    def process_sensor_data(event, context):
        """Process sensor data from Pub/Sub and store in Bigtable"""
@@ -165,8 +169,11 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
            return
        
        # Initialize Bigtable client
-       client = bigtable.Client(project=context.resource.split('/')[1])
-       instance = client.instance('${BIGTABLE_INSTANCE_ID}')
+       project_id = os.environ.get('GCP_PROJECT')
+       instance_id = os.environ.get('BIGTABLE_INSTANCE_ID')
+       
+       client = bigtable.Client(project=project_id)
+       instance = client.instance(instance_id)
        table = instance.table('sensor_data')
        
        # Create row key: device_id#timestamp_reversed
@@ -175,12 +182,24 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
        
        # Write data to Bigtable
        row = table.direct_row(row_key)
-       row.set_cell('sensor_readings', 'temperature', sensor_data.get('temperature', 0))
-       row.set_cell('sensor_readings', 'humidity', sensor_data.get('humidity', 0))
-       row.set_cell('sensor_readings', 'inventory_level', sensor_data.get('inventory_level', 0))
-       row.set_cell('device_metadata', 'device_type', sensor_data.get('device_type', ''))
-       row.set_cell('location_data', 'warehouse_id', sensor_data.get('warehouse_id', ''))
-       row.set_cell('location_data', 'zone', sensor_data.get('zone', ''))
+       row.set_cell('sensor_readings', 
+                   'temperature', 
+                   str(sensor_data.get('temperature', 0)))
+       row.set_cell('sensor_readings', 
+                   'humidity', 
+                   str(sensor_data.get('humidity', 0)))
+       row.set_cell('sensor_readings', 
+                   'inventory_level', 
+                   str(sensor_data.get('inventory_level', 0)))
+       row.set_cell('device_metadata', 
+                   'device_type', 
+                   sensor_data.get('device_type', ''))
+       row.set_cell('location_data', 
+                   'warehouse_id', 
+                   sensor_data.get('warehouse_id', ''))
+       row.set_cell('location_data', 
+                   'zone', 
+                   sensor_data.get('zone', ''))
        
        row.commit()
        
@@ -189,19 +208,19 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-   google-cloud-bigtable==2.21.0
-   google-cloud-pubsub==2.18.4
+   google-cloud-bigtable==2.25.0
+   google-cloud-pubsub==2.23.0
    EOF
    
    # Deploy Cloud Function with Pub/Sub trigger
    gcloud functions deploy process-sensor-data \
-       --runtime python39 \
+       --runtime python311 \
        --trigger-topic ${TOPIC_NAME} \
        --source . \
        --entry-point process_sensor_data \
        --memory 256MB \
        --timeout 60s \
-       --env-vars-file <(echo "BIGTABLE_INSTANCE_ID=${BIGTABLE_INSTANCE_ID}")
+       --set-env-vars BIGTABLE_INSTANCE_ID=${BIGTABLE_INSTANCE_ID},GCP_PROJECT=${PROJECT_ID}
    
    cd ..
    echo "✅ Cloud Function deployed for sensor data processing"
@@ -223,22 +242,23 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
        --num-workers=3 \
        --worker-machine-type=n1-standard-2 \
        --worker-boot-disk-size=50GB \
-       --num-preemptible-workers=3 \
+       --num-preemptible-workers=2 \
        --preemptible-worker-boot-disk-size=50GB \
-       --image-version=2.0-debian10 \
+       --image-version=2.1-debian11 \
        --enable-autoscaling \
        --max-workers=8 \
        --secondary-worker-type=preemptible \
-       --initialization-actions=gs://goog-dataproc-initialization-actions-${REGION}/cloud-sql-proxy/cloud-sql-proxy.sh \
        --optional-components=JUPYTER \
-       --enable-ip-alias \
-       --metadata=enable-cloud-sql-hbase-connector=true
+       --enable-ip-alias
    
    # Wait for cluster to be ready
    echo "Waiting for Dataproc cluster to be ready..."
-   gcloud dataproc clusters wait ${DATAPROC_CLUSTER_NAME} \
-       --region=${REGION} \
-       --timeout=600
+   gcloud dataproc operations wait \
+       $(gcloud dataproc clusters list \
+           --region=${REGION} \
+           --filter="clusterName:${DATAPROC_CLUSTER_NAME}" \
+           --format="value(status.operationId)") \
+       --region=${REGION}
    
    echo "✅ Dataproc cluster created: ${DATAPROC_CLUSTER_NAME}"
    ```
@@ -258,13 +278,15 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
    from pyspark.ml.feature import VectorAssembler
    from pyspark.ml.regression import LinearRegression
    from pyspark.ml.evaluation import RegressionEvaluator
+   from datetime import datetime, timedelta
    import sys
    
    def create_spark_session():
        """Create Spark session with Bigtable connector"""
        return SparkSession.builder \
            .appName("SupplyChainAnalytics") \
-           .config("spark.jars.packages", "com.google.cloud.bigtable:bigtable-hbase-2.x-hadoop:2.0.0") \
+           .config("spark.jars.packages", 
+                   "com.google.cloud.bigtable:bigtable-hbase-2.x-hadoop:2.0.0") \
            .getOrCreate()
    
    def read_bigtable_data(spark, project_id, instance_id):
@@ -337,7 +359,8 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
        predictions = model.transform(test_data)
        
        # Evaluate model
-       evaluator = RegressionEvaluator(labelCol="inventory_level", predictionCol="prediction")
+       evaluator = RegressionEvaluator(labelCol="inventory_level", 
+                                      predictionCol="prediction")
        rmse = evaluator.evaluate(predictions)
        
        return model, rmse, predictions
@@ -346,28 +369,39 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
        # Initialize Spark session
        spark = create_spark_session()
        
-       # Read command line arguments
-       project_id = sys.argv[1] if len(sys.argv) > 1 else "your-project-id"
-       instance_id = sys.argv[2] if len(sys.argv) > 2 else "your-instance-id"
+       try:
+           # Read command line arguments
+           project_id = sys.argv[1] if len(sys.argv) > 1 else "your-project-id"
+           instance_id = sys.argv[2] if len(sys.argv) > 2 else "your-instance-id"
+           
+           # Read data from Bigtable
+           sensor_data = read_bigtable_data(spark, project_id, instance_id)
+           
+           # Analyze inventory patterns
+           inventory_analysis = analyze_inventory_patterns(sensor_data)
+           inventory_analysis.show()
+           
+           # Perform demand forecasting
+           model, rmse, predictions = demand_forecasting(sensor_data)
+           
+           print(f"Demand Forecasting Model RMSE: {rmse}")
+           predictions.select("warehouse_id", "zone", "inventory_level", "prediction").show()
+           
+           # Save results to Cloud Storage
+           bucket_name = f"{project_id}-analytics"
+           inventory_analysis.write.mode("overwrite") \
+               .parquet(f"gs://{bucket_name}/inventory_analysis")
+           predictions.write.mode("overwrite") \
+               .parquet(f"gs://{bucket_name}/demand_forecasts")
+           
+           print("✅ Analytics results saved to Cloud Storage")
+           
+       except Exception as e:
+           print(f"Error in analytics job: {str(e)}")
+           raise
        
-       # Read data from Bigtable
-       sensor_data = read_bigtable_data(spark, project_id, instance_id)
-       
-       # Analyze inventory patterns
-       inventory_analysis = analyze_inventory_patterns(sensor_data)
-       inventory_analysis.show()
-       
-       # Perform demand forecasting
-       model, rmse, predictions = demand_forecasting(sensor_data)
-       
-       print(f"Demand Forecasting Model RMSE: {rmse}")
-       predictions.select("warehouse_id", "zone", "inventory_level", "prediction").show()
-       
-       # Save results to Cloud Storage
-       inventory_analysis.write.mode("overwrite").parquet(f"gs://{project_id}-analytics/inventory_analysis")
-       predictions.write.mode("overwrite").parquet(f"gs://{project_id}-analytics/demand_forecasts")
-       
-       spark.stop()
+       finally:
+           spark.stop()
    
    if __name__ == "__main__":
        main()
@@ -395,17 +429,17 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
        --headers="Content-Type=application/json" \
        --oauth-service-account-email="$(gcloud config get-value account)" \
        --oauth-token-scope="https://www.googleapis.com/auth/cloud-platform" \
-       --message-body='{
-         "job": {
-           "placement": {
-             "clusterName": "'${DATAPROC_CLUSTER_NAME}'"
+       --message-body="{
+         \"job\": {
+           \"placement\": {
+             \"clusterName\": \"${DATAPROC_CLUSTER_NAME}\"
            },
-           "pysparkJob": {
-             "mainPythonFileUri": "gs://'${BUCKET_NAME}'/jobs/supply_chain_analytics.py",
-             "args": ["'${PROJECT_ID}'", "'${BIGTABLE_INSTANCE_ID}'"]
+           \"pysparkJob\": {
+             \"mainPythonFileUri\": \"gs://${BUCKET_NAME}/jobs/supply_chain_analytics.py\",
+             \"args\": [\"${PROJECT_ID}\", \"${BIGTABLE_INSTANCE_ID}\"]
            }
          }
-       }'
+       }"
    
    echo "✅ Cloud Scheduler job created for automated analytics"
    ```
@@ -450,7 +484,8 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
    EOF
    
    # Create monitoring dashboard
-   gcloud monitoring dashboards create --config-from-file=monitoring_config.yaml
+   gcloud monitoring dashboards create \
+       --config-from-file=monitoring_config.yaml
    
    # Create alerting policy for inventory levels
    gcloud alpha monitoring policies create \
@@ -479,6 +514,7 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
    from datetime import datetime
    from google.cloud import pubsub_v1
    import time
+   import os
    
    def generate_sensor_data():
        """Generate realistic sensor data for testing"""
@@ -507,12 +543,18 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
            time.sleep(0.1)  # Small delay to simulate realistic data flow
    
    if __name__ == "__main__":
-       publish_test_data("'${PROJECT_ID}'", "'${TOPIC_NAME}'")
+       project_id = os.environ.get('PROJECT_ID')
+       topic_name = os.environ.get('TOPIC_NAME')
+       publish_test_data(project_id, topic_name)
    EOF
    
    # Install required Python packages and run test
    pip3 install google-cloud-pubsub
-   python3 generate_test_data.py
+   PROJECT_ID=${PROJECT_ID} TOPIC_NAME=${TOPIC_NAME} python3 generate_test_data.py
+   
+   # Wait for function processing
+   echo "Waiting for Cloud Function to process messages..."
+   sleep 30
    
    # Verify data in Bigtable
    echo "Checking Bigtable data..."
@@ -566,10 +608,11 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
 
    ```bash
    # Check processed analytics data in Cloud Storage
-   gsutil ls gs://${BUCKET_NAME}/analytics/
+   gsutil ls gs://${BUCKET_NAME}/ | grep analytics
    
    # Review monitoring dashboard metrics
-   gcloud monitoring dashboards list --format="value(displayName)"
+   gcloud monitoring dashboards list \
+       --format="value(displayName)"
    ```
 
    Expected output: Storage bucket should contain analytics results and monitoring dashboard should display supply chain metrics.
@@ -602,7 +645,9 @@ echo "✅ Pub/Sub topic created: ${TOPIC_NAME}"
 
    ```bash
    # Delete Cloud Function
-   gcloud functions delete process-sensor-data --region=${REGION} --quiet
+   gcloud functions delete process-sensor-data \
+       --region=${REGION} \
+       --quiet
    
    # Delete Cloud Scheduler job
    gcloud scheduler jobs delete supply-chain-analytics-job \
@@ -659,4 +704,9 @@ Extend this supply chain analytics platform by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

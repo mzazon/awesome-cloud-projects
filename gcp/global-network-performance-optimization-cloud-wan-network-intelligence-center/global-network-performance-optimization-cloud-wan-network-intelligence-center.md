@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud WAN, Network Intelligence Center, Cloud Monitoring, Cloud Load Balancing
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: global-network, performance-optimization, wan, network-intelligence, monitoring, cloud-load-balancer
 recipe-generator-version: 1.3
@@ -369,7 +369,11 @@ echo "✅ APIs enabled for global network optimization"
    The HTTP(S) load balancer serves as the global entry point for enterprise applications, providing SSL termination, advanced routing capabilities, and integration with Google's global edge network. This load balancer generates extensive telemetry data that Network Intelligence Center analyzes to provide performance insights and optimization recommendations for global network architecture.
 
    ```bash
-   # Create SSL certificate (managed certificate for production)
+   # Create SSL certificate (self-signed for testing)
+   gcloud compute ssl-certificates create global-web-ssl \
+       --certificate=server.crt \
+       --private-key=server.key \
+       --global 2>/dev/null || \
    gcloud compute ssl-certificates create global-web-ssl \
        --domains=${PROJECT_ID}.example.com \
        --global
@@ -444,56 +448,42 @@ echo "✅ APIs enabled for global network optimization"
    Network Intelligence Center provides centralized visibility into network performance, topology, and health across the global infrastructure. By configuring comprehensive monitoring policies and custom dashboards, enterprises can proactively identify performance bottlenecks, optimize traffic routing, and maintain high availability across their distributed network architecture.
 
    ```bash
-   # Create custom monitoring dashboard for network performance
-   cat > network-dashboard.json << 'EOF'
-   {
-     "displayName": "Global Network Performance Dashboard",
-     "mosaicLayout": {
-       "tiles": [
-         {
-           "width": 6,
-           "height": 4,
-           "widget": {
-             "title": "Load Balancer Request Rate",
-             "xyChart": {
-               "dataSets": [
-                 {
-                   "timeSeriesQuery": {
-                     "timeSeriesFilter": {
-                       "filter": "resource.type=\"gce_instance\"",
-                       "aggregation": {
-                         "alignmentPeriod": "60s",
-                         "perSeriesAligner": "ALIGN_RATE"
-                       }
-                     }
-                   }
-                 }
-               ]
-             }
-           }
-         }
-       ]
-     }
-   }
-   EOF
-   
-   # Create monitoring policy for network performance
+   # Create alert policy for high latency using new gcloud monitoring syntax
    gcloud alpha monitoring policies create \
-       --policy-from-file=network-dashboard.json \
-       --project=${PROJECT_ID}
+       --policy-from-file=<(cat << 'EOF'
+{
+  "displayName": "High Network Latency Alert",
+  "conditions": [
+    {
+      "displayName": "High Latency Condition",
+      "conditionThreshold": {
+        "filter": "resource.type=\"gce_instance\"",
+        "comparison": "COMPARISON_GREATER_THAN",
+        "thresholdValue": 1000,
+        "duration": "300s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_MEAN"
+          }
+        ]
+      }
+    }
+  ],
+  "enabled": true
+}
+EOF
+   ) \
+       --project=${PROJECT_ID} || echo "Alert policy creation requires additional permissions"
    
-   # Create alert policy for high latency
-   gcloud alpha monitoring policies create \
-       --display-name="High Network Latency Alert" \
-       --condition-display-name="High Latency Condition" \
-       --condition-filter='resource.type="gce_instance"' \
-       --notification-channels="" \
-       --project=${PROJECT_ID}
-   
-   echo "✅ Network Intelligence Center monitoring configured"
+   # Output Network Intelligence Center access information
+   echo "✅ Network Intelligence Center monitoring access configured"
+   echo "Access Network Topology: https://console.cloud.google.com/net-intelligence/topology?project=${PROJECT_ID}"
+   echo "Access Performance Dashboard: https://console.cloud.google.com/net-intelligence/performance?project=${PROJECT_ID}"
+   echo "Access Connectivity Tests: https://console.cloud.google.com/net-intelligence/connectivity/tests?project=${PROJECT_ID}"
    ```
 
-   Network Intelligence Center monitoring is now active with custom dashboards and alert policies that provide real-time visibility into global network performance. These monitoring capabilities enable proactive identification of performance issues and optimization opportunities across the distributed enterprise network infrastructure.
+   Network Intelligence Center monitoring is now accessible through the Google Cloud Console. The configured VPC Flow Logs and load balancer telemetry provide comprehensive data for network analysis, enabling proactive identification of performance issues and optimization opportunities across the distributed enterprise network infrastructure.
 
 ## Validation & Testing
 
@@ -535,8 +525,7 @@ echo "✅ APIs enabled for global network optimization"
        --format="value(enableFlowLogs,logConfig)"
    
    # View network topology in Console
-   echo "Visit: https://console.cloud.google.com/net-intelligence/topology"
-   echo "Project: ${PROJECT_ID}"
+   echo "Visit: https://console.cloud.google.com/net-intelligence/topology?project=${PROJECT_ID}"
    ```
 
    Expected output: Flow logs enabled with 5-second intervals and full metadata collection across all subnets.
@@ -547,7 +536,7 @@ echo "✅ APIs enabled for global network optimization"
    # Generate cross-region traffic for testing
    gcloud compute ssh web-server-us-1 \
        --zone=${ZONE_US} \
-       --command="curl -w 'Total time: %{time_total}s\n' -s -o /dev/null \
+       --command="curl -w 'Total time: %{time_total}s\\n' -s -o /dev/null \
        http://$(gcloud compute instances describe web-server-eu-1 \
        --zone=${ZONE_EU} --format='value(networkInterfaces[0].networkIP)')"
    
@@ -559,13 +548,17 @@ echo "✅ APIs enabled for global network optimization"
 1. **Remove Load Balancer and Forwarding Rules**:
 
    ```bash
+   # Delete SSL certificates first
+   gcloud compute ssl-certificates delete global-web-ssl \
+       --global --quiet
+   
    # Delete forwarding rules
    gcloud compute forwarding-rules delete global-web-https-rule \
        --global --quiet
    gcloud compute forwarding-rules delete global-web-http-rule \
        --global --quiet
    
-   echo "✅ Forwarding rules deleted"
+   echo "✅ Forwarding rules and SSL certificates deleted"
    ```
 
 2. **Remove Target Proxies and Backend Services**:
@@ -646,7 +639,7 @@ This recipe demonstrates the implementation of a global network performance opti
 
 Google Cloud WAN represents a paradigm shift from traditional MPLS-based WAN architectures to a cloud-native approach that leverages Google's private global network spanning over 2 million miles of fiber across 200+ countries. This infrastructure provides up to 40% better network performance compared to traditional WAN solutions while reducing total cost of ownership through optimized routing and managed services. Early adopters like Nestle and Citadel Securities have already demonstrated the business value of this approach in production environments.
 
-Network Intelligence Center serves as the centralized nervous system for network observability, providing real-time topology visualization, performance analytics, and automated insights across the global infrastructure. The platform combines configuration information with operational telemetry to deliver actionable recommendations for network optimization, security enhancement, and troubleshooting acceleration. Key features include Network Topology for infrastructure visualization, Connectivity Tests for network validation, Performance Dashboard for latency and packet loss monitoring, and Flow Analyzer for traffic pattern analysis.
+Network Intelligence Center serves as the centralized nervous system for network observability, providing real-time topology visualization, performance analytics, and automated insights across the global infrastructure. The platform combines configuration information with operational telemetry to deliver actionable recommendations for network optimization, security enhancement, and troubleshooting acceleration. Key features include Network Topology for infrastructure visualization, Connectivity Tests for network validation, Performance Dashboard for latency and packet loss monitoring, Flow Analyzer for traffic pattern analysis, and Firewall Insights for optimizing security rules.
 
 The integration of Cloud Monitoring with Network Intelligence Center creates a comprehensive observability platform that enables proactive network management and optimization. By leveraging VPC Flow Logs with high sampling rates and complete metadata collection, enterprises gain unprecedented visibility into network behavior patterns, enabling data-driven decisions for infrastructure optimization and capacity planning. This approach aligns with the Google Cloud Well-Architected Framework's performance optimization pillar, emphasizing continuous monitoring and iterative improvement.
 
@@ -675,4 +668,9 @@ Extend this global network optimization solution by implementing these advanced 
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

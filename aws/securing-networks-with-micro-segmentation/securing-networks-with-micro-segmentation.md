@@ -1,21 +1,21 @@
 ---
-title: Securing Networks with Micro-Segmentation using NACLs and Security Groupsexisting_folder_name
+title: Securing Networks with Micro-Segmentation using NACLs and Security Groups
 id: b3e29925
 category: networking
 difficulty: 300
 subject: aws
-services: vpc,security,groups,nacls,cloudwatch
+services: VPC, EC2, CloudWatch, IAM
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: vpc,security,groups,nacls,cloudwatch,security
+tags: vpc, security, groups, nacls, cloudwatch, networking, micro-segmentation
 recipe-generator-version: 1.3
 ---
 
-# Securing Networks with Micro-Segmentation using NACLs and Security Groupsexisting_folder_name
+# Securing Networks with Micro-Segmentation using NACLs and Security Groups
 
 ## Problem
 
@@ -97,7 +97,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for VPC, EC2, RDS, and CloudWatch operations
+1. AWS account with appropriate permissions for VPC, EC2, RDS, CloudWatch, and IAM operations
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of network security principles, CIDR blocks, and multi-tier architectures
 4. Familiarity with security group and NACL rule precedence and evaluation order
@@ -158,7 +158,7 @@ echo "✅ Created VPC infrastructure for micro-segmentation"
 
 1. **Create Subnets for Each Security Zone**:
 
-   Network micro-segmentation begins with subnet-level isolation, where each subnet acts as a distinct security boundary. By creating separate subnets for different functional tiers (DMZ, web, application, database, management, and monitoring), we establish the foundation for implementing zero-trust networking principles. Each subnet will have unique CIDR blocks that enable precise traffic control and prevent unauthorized lateral movement between security zones.
+   Network micro-segmentation begins with subnet-level isolation, where each subnet acts as a distinct security boundary. By creating separate subnets for different functional tiers (DMZ, web, application, database, management, and monitoring), we establish the foundation for implementing zero-trust networking principles. Each subset will have unique CIDR blocks that enable precise traffic control and prevent unauthorized lateral movement between security zones.
 
    ```bash
    # Create DMZ subnet (public-facing)
@@ -376,7 +376,7 @@ echo "✅ Created VPC infrastructure for micro-segmentation"
    aws ec2 create-network-acl-entry \
        --network-acl-id $WEB_NACL_ID \
        --rule-number 130 \
-       --protocol tcp \
+       --protocol udp \
        --port-range From=161,To=161 \
        --cidr-block 10.0.6.0/24 \
        --rule-action allow
@@ -443,7 +443,7 @@ echo "✅ Created VPC infrastructure for micro-segmentation"
    aws ec2 create-network-acl-entry \
        --network-acl-id $APP_NACL_ID \
        --rule-number 120 \
-       --protocol tcp \
+       --protocol udp \
        --port-range From=161,To=161 \
        --cidr-block 10.0.6.0/24 \
        --rule-action allow
@@ -512,7 +512,7 @@ echo "✅ Created VPC infrastructure for micro-segmentation"
    aws ec2 create-network-acl-entry \
        --network-acl-id $DB_NACL_ID \
        --rule-number 120 \
-       --protocol tcp \
+       --protocol udp \
        --port-range From=161,To=161 \
        --cidr-block 10.0.6.0/24 \
        --rule-action allow
@@ -755,8 +755,8 @@ echo "✅ Created VPC infrastructure for micro-segmentation"
     aws cloudwatch put-metric-alarm \
         --alarm-name "VPC-Rejected-Traffic-High" \
         --alarm-description "High number of rejected packets in VPC" \
-        --metric-name PacketsDropped \
-        --namespace AWS/VPC \
+        --metric-name "FlowLogRejectedPackets" \
+        --namespace "AWS/VPC" \
         --statistic Sum \
         --period 300 \
         --threshold 1000 \
@@ -923,13 +923,13 @@ echo "✅ Created VPC infrastructure for micro-segmentation"
 
 Network micro-segmentation represents a fundamental shift from traditional perimeter-based security to a zero-trust model where every network connection must be explicitly authorized. This recipe demonstrates how to implement defense-in-depth using both NACLs and security groups to create multiple layers of network security controls. NACLs operate at the subnet level and provide stateless filtering, while security groups operate at the instance level with stateful filtering, creating complementary security layers that significantly reduce the attack surface.
 
-The layered security approach implemented here follows the principle of least privilege, where each tier only has access to the specific resources and ports required for its function. The DMZ zone is isolated to handle only internet-facing traffic, the web tier can only communicate with the application tier on specific ports, and the database tier is completely isolated except for necessary database connections. This segmentation prevents lateral movement of attackers and contains potential security breaches within specific network zones.
+The layered security approach implemented here follows the AWS Well-Architected Framework's security pillar by implementing the principle of least privilege, where each tier only has access to the specific resources and ports required for its function. The DMZ zone is isolated to handle only internet-facing traffic, the web tier can only communicate with the application tier on specific ports, and the database tier is completely isolated except for necessary database connections. This segmentation prevents lateral movement of attackers and contains potential security breaches within specific network zones, following defense-in-depth principles outlined in the [AWS Well-Architected Security Pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html).
 
-VPC Flow Logs provide essential visibility into network traffic patterns and enable security teams to detect anomalous behavior, unauthorized access attempts, and potential data exfiltration. The integration with CloudWatch allows for real-time monitoring and automated alerting based on traffic patterns, rejected connections, and unusual data volumes. Organizations should establish baseline traffic patterns and implement automated responses to security events to maximize the effectiveness of this monitoring approach.
+VPC Flow Logs provide essential visibility into network traffic patterns and enable security teams to detect anomalous behavior, unauthorized access attempts, and potential data exfiltration. The integration with CloudWatch allows for real-time monitoring and automated alerting based on traffic patterns, rejected connections, and unusual data volumes. Organizations should establish baseline traffic patterns and implement automated responses to security events to maximize the effectiveness of this monitoring approach, as described in the [AWS VPC Flow Logs documentation](https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html).
 
-The use of security group references instead of hard-coded IP addresses creates a more maintainable and scalable security architecture. When instances are launched or terminated, the security group memberships automatically adjust the access controls without requiring manual rule updates. This approach is particularly valuable in dynamic environments where instances frequently scale up or down based on demand.
+The use of security group references instead of hard-coded IP addresses creates a more maintainable and scalable security architecture that aligns with AWS cloud-native principles. When instances are launched or terminated, the security group memberships automatically adjust the access controls without requiring manual rule updates. This approach is particularly valuable in dynamic environments where instances frequently scale up or down based on demand, supporting elastic architectures while maintaining consistent security postures.
 
-> **Tip**: Regularly audit your NACL and security group rules using AWS Config and AWS Security Hub to ensure compliance with your organization's security policies and detect any unauthorized changes.
+> **Tip**: Regularly audit your NACL and security group rules using AWS Config and AWS Security Hub to ensure compliance with your organization's security policies and detect any unauthorized changes. The [AWS Config Rules for VPC Security](https://docs.aws.amazon.com/config/latest/developerguide/vpc-sg-open-only-to-authorized-ports.html) can automate this monitoring process.
 
 ## Challenge
 
@@ -947,4 +947,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

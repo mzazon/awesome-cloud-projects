@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: s3,kms,iam,cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: s3,kms,iam,cloudwatch
 recipe-generator-version: 1.3
@@ -69,16 +69,17 @@ graph LR
 4. Knowledge of KMS key management and encryption concepts
 5. Estimated cost: $0.50-$2.00 per hour for testing (includes S3 storage, KMS requests, and data transfer)
 
-> **Note**: Cross-region replication incurs additional charges for storage in the destination region and data transfer costs between regions.
+> **Note**: Cross-region replication incurs additional charges for storage in the destination region and data transfer costs between regions. As of January 5, 2023, all new objects uploaded to S3 are automatically encrypted with SSE-S3 at no additional cost.
 
 ## Preparation
 
 ```bash
-# Set environment variables for primary region
-export PRIMARY_REGION="us-east-1"
-export SECONDARY_REGION="us-west-2"
+# Set environment variables for AWS regions
+export AWS_REGION=$(aws configure get region)
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
     --query Account --output text)
+export PRIMARY_REGION="us-east-1"
+export SECONDARY_REGION="us-west-2"
 
 # Generate unique identifiers for resources
 RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
@@ -86,18 +87,21 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --password-length 8 --require-each-included-type \
     --output text --query RandomPassword)
 
-# Set resource names
+# Set resource names with consistent naming convention
 export SOURCE_BUCKET="crr-source-${RANDOM_SUFFIX}"
 export DEST_BUCKET="crr-dest-${RANDOM_SUFFIX}"
 export REPLICATION_ROLE="S3ReplicationRole-${RANDOM_SUFFIX}"
 export SOURCE_KMS_ALIAS="alias/s3-crr-source-${RANDOM_SUFFIX}"
 export DEST_KMS_ALIAS="alias/s3-crr-dest-${RANDOM_SUFFIX}"
 
-# Verify regions are different
+# Verify configuration and display resource names
+echo "AWS Account ID: ${AWS_ACCOUNT_ID}"
 echo "Primary Region: ${PRIMARY_REGION}"
 echo "Secondary Region: ${SECONDARY_REGION}"
 echo "Source Bucket: ${SOURCE_BUCKET}"
 echo "Destination Bucket: ${DEST_BUCKET}"
+
+echo "✅ Environment configured for cross-region replication setup"
 ```
 
 ## Steps
@@ -108,8 +112,9 @@ echo "Destination Bucket: ${DEST_BUCKET}"
 
    ```bash
    # Create KMS key in primary region
-   aws kms create-key \
+   SOURCE_KMS_KEY=$(aws kms create-key \
        --region ${PRIMARY_REGION} \
+       --description "S3 Cross-Region Replication Source Key" \
        --policy '{
            "Version": "2012-10-17",
            "Statement": [
@@ -136,13 +141,9 @@ echo "Destination Bucket: ${DEST_BUCKET}"
                }
            ]
        }' \
-       --description "S3 Cross-Region Replication Source Key" \
-       --output text --query 'KeyMetadata.KeyId' > /tmp/source_key_id.txt
+       --output text --query 'KeyMetadata.KeyId')
 
-   SOURCE_KMS_KEY=$(cat /tmp/source_key_id.txt)
    echo "✅ Created source KMS key: ${SOURCE_KMS_KEY}"
-
-   The KMS key policy grants necessary permissions to both account administrators and the S3 service, enabling seamless encryption operations during replication. The key is now ready to encrypt objects in the source bucket and decrypt them during the replication process.
 
    # Create alias for source key
    aws kms create-alias \
@@ -151,14 +152,17 @@ echo "Destination Bucket: ${DEST_BUCKET}"
        --target-key-id ${SOURCE_KMS_KEY}
    ```
 
+   The KMS key policy grants necessary permissions to both account administrators and the S3 service, enabling seamless encryption operations during replication. The key is now ready to encrypt objects in the source bucket and decrypt them during the replication process.
+
 2. **Create KMS key in destination region**:
 
    Creating a separate KMS key in the destination region enables envelope encryption where objects are re-encrypted with region-specific keys during replication. This approach ensures that even if one region's encryption is compromised, the other region maintains independent cryptographic protection. Regional key separation also supports data residency requirements and enables independent key rotation schedules.
 
    ```bash
    # Create KMS key in secondary region
-   aws kms create-key \
+   DEST_KMS_KEY=$(aws kms create-key \
        --region ${SECONDARY_REGION} \
+       --description "S3 Cross-Region Replication Destination Key" \
        --policy '{
            "Version": "2012-10-17",
            "Statement": [
@@ -185,13 +189,9 @@ echo "Destination Bucket: ${DEST_BUCKET}"
                }
            ]
        }' \
-       --description "S3 Cross-Region Replication Destination Key" \
-       --output text --query 'KeyMetadata.KeyId' > /tmp/dest_key_id.txt
+       --output text --query 'KeyMetadata.KeyId')
 
-   DEST_KMS_KEY=$(cat /tmp/dest_key_id.txt)
    echo "✅ Created destination KMS key: ${DEST_KMS_KEY}"
-
-   Both source and destination KMS keys are now established, creating the cryptographic foundation for secure cross-region replication. The dual-key architecture ensures that replicated objects are independently encrypted in each region, providing maximum security isolation.
 
    # Create alias for destination key
    aws kms create-alias \
@@ -199,6 +199,8 @@ echo "Destination Bucket: ${DEST_BUCKET}"
        --alias-name ${DEST_KMS_ALIAS} \
        --target-key-id ${DEST_KMS_KEY}
    ```
+
+   Both source and destination KMS keys are now established, creating the cryptographic foundation for secure cross-region replication. The dual-key architecture ensures that replicated objects are independently encrypted in each region, providing maximum security isolation.
 
 3. **Create source S3 bucket with versioning and encryption**:
 
@@ -321,7 +323,8 @@ EOF
             "Effect": "Allow",
             "Action": [
                 "s3:ListBucket",
-                "s3:GetBucketVersioning"
+                "s3:GetBucketVersioning",
+                "s3:GetReplicationConfiguration"
             ],
             "Resource": [
                 "arn:aws:s3:::${SOURCE_BUCKET}"
@@ -365,6 +368,9 @@ EOF
        --role-name ${REPLICATION_ROLE} \
        --policy-name S3ReplicationPolicy \
        --policy-document file:///tmp/replication-policy.json
+
+   # Wait for role propagation
+   sleep 10
 
    echo "✅ Created replication IAM role: ${REPLICATION_ROLE}"
    ```
@@ -759,7 +765,6 @@ EOF
        --region ${PRIMARY_REGION}
 
    # Clean up temporary files
-   rm -f /tmp/source_key_id.txt /tmp/dest_key_id.txt
    rm -f /tmp/trust-policy.json /tmp/replication-policy.json
    rm -f /tmp/replication-config.json
    rm -f /tmp/source-bucket-policy.json /tmp/dest-bucket-policy.json
@@ -770,30 +775,37 @@ EOF
 
 ## Discussion
 
-S3 Cross-Region Replication with encryption provides a robust solution for data protection and disaster recovery. The implementation combines several key AWS services to create a comprehensive data protection strategy. KMS encryption ensures that data remains protected both at rest and during replication, while IAM roles and bucket policies enforce strict access controls.
+S3 Cross-Region Replication with encryption provides a robust solution for data protection and disaster recovery following AWS Well-Architected Framework principles. The implementation combines several key AWS services to create a comprehensive data protection strategy that addresses operational excellence, security, reliability, performance efficiency, and cost optimization. KMS encryption ensures that data remains protected both at rest and during replication, while IAM roles and bucket policies enforce strict access controls using the principle of least privilege.
 
-The replication configuration uses source selection criteria to specifically target KMS-encrypted objects, ensuring that only properly encrypted data is replicated. The destination bucket uses a separate KMS key, providing additional security through key isolation between regions. This approach follows the principle of defense in depth, where multiple layers of security controls protect the data.
+The replication configuration uses source selection criteria to specifically target KMS-encrypted objects, ensuring that only properly encrypted data is replicated. The destination bucket uses a separate KMS key, providing additional security through key isolation between regions. This approach follows the defense-in-depth principle, where multiple layers of security controls protect the data throughout the replication process.
 
-Monitoring and alerting capabilities through CloudWatch provide operational visibility into the replication process. The metrics help identify potential issues before they impact business operations, while the alarms ensure that administrators are notified of any replication failures or delays that exceed acceptable thresholds.
+Monitoring and alerting capabilities through CloudWatch provide operational visibility into the replication process, supporting the operational excellence pillar. The metrics help identify potential issues before they impact business operations, while the alarms ensure that administrators are notified of any replication failures or delays that exceed acceptable thresholds. For comprehensive monitoring guidance, see the [AWS S3 Monitoring Best Practices](https://docs.aws.amazon.com/AmazonS3/latest/userguide/monitoring-overview.html) documentation.
 
-> **Tip**: Enable S3 Intelligent-Tiering on the destination bucket to automatically optimize storage costs for replicated objects based on access patterns.
+> **Tip**: Enable S3 Intelligent-Tiering on the destination bucket to automatically optimize storage costs for replicated objects based on access patterns. This aligns with the AWS Well-Architected cost optimization pillar by reducing storage costs without manual intervention.
 
-Cost optimization is achieved through the use of Standard-IA storage class for replicated objects, which provides a balance between cost and availability. The bucket key feature reduces KMS costs by minimizing the number of encryption requests per object. Organizations should also consider implementing lifecycle policies to transition older replicated objects to even lower-cost storage classes like Glacier or Deep Archive.
+Cost optimization is achieved through the use of Standard-IA storage class for replicated objects, which provides a balance between cost and availability. The bucket key feature reduces KMS costs by minimizing the number of encryption requests per object. Organizations should also consider implementing lifecycle policies to transition older replicated objects to even lower-cost storage classes like Glacier or Deep Archive, as detailed in the [S3 Storage Classes documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html).
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-destination replication**: Configure replication to multiple regions simultaneously using S3 Multi-Destination Replication rules with different storage classes and encryption keys for each destination.
+1. **Multi-destination replication**: Configure replication to multiple regions simultaneously using S3 Multi-Destination Replication rules with different storage classes and encryption keys for each destination region.
 
-2. **Replication time control**: Implement S3 Replication Time Control (RTC) to ensure objects are replicated within 15 minutes, with compliance reporting for regulatory requirements.
+2. **Replication time control**: Implement S3 Replication Time Control (RTC) to ensure objects are replicated within 15 minutes, with compliance reporting for regulatory requirements and SLA monitoring.
 
-3. **Cross-account replication**: Set up replication between buckets in different AWS accounts, implementing cross-account IAM roles and bucket policies for secure data sharing.
+3. **Cross-account replication**: Set up replication between buckets in different AWS accounts, implementing cross-account IAM roles and bucket policies for secure data sharing while maintaining proper access controls.
 
-4. **Selective replication**: Create advanced replication rules using object tags and prefixes to replicate only specific types of data, such as critical business documents or regulatory compliance data.
+4. **Selective replication**: Create advanced replication rules using object tags and prefixes to replicate only specific types of data, such as critical business documents or regulatory compliance data based on classification.
 
-5. **Automated failover**: Develop a Lambda-based solution that automatically updates application configurations to use the destination bucket during regional outages, including Route 53 health checks and DNS failover.
+5. **Automated failover**: Develop a Lambda-based solution that automatically updates application configurations to use the destination bucket during regional outages, including Route 53 health checks and DNS failover mechanisms.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

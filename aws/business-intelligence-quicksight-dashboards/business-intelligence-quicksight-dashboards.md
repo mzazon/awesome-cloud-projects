@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: QuickSight, S3, IAM, RDS
 estimated-time: 90 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: business-intelligence, dashboards, visualization, analytics
 recipe-generator-version: 1.3
 ---
 
 # Business Intelligence Dashboards with QuickSight
-
 
 ## Problem
 
@@ -146,7 +145,7 @@ echo "✅ Sample data uploaded to S3 bucket: ${S3_BUCKET_NAME}"
 
 2. **Create IAM role for QuickSight data access**:
 
-   IAM roles enable secure, temporary credential delegation without hardcoding secrets in application configurations. This principle of least privilege ensures QuickSight accesses only the specific AWS resources it needs, reducing security attack surfaces while maintaining operational flexibility. Unlike permanent access keys, IAM roles provide rotatable, time-limited credentials that align with security best practices and compliance requirements. The trust relationship specifically allows the QuickSight service to assume this role and access your data sources securely.
+   IAM roles enable secure, temporary credential delegation without hardcoding secrets in application configurations. Following the principle of least privilege, this role ensures QuickSight accesses only the specific AWS resources it needs, reducing security attack surfaces while maintaining operational flexibility. Unlike permanent access keys, IAM roles provide rotatable, time-limited credentials that align with AWS security best practices and compliance requirements. The trust relationship specifically allows the QuickSight service to assume this role and access your data sources securely. This pattern follows the [AWS Well-Architected Framework's security pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html) principles.
 
    ```bash
    # Create trust policy for QuickSight
@@ -257,7 +256,7 @@ echo "✅ Sample data uploaded to S3 bucket: ${S3_BUCKET_NAME}"
        }' \
        --permissions '[
            {
-               "Principal": "arn:aws:quicksight:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':user/default/'$(aws sts get-caller-identity --query UserName --output text)'",
+               "Principal": "arn:aws:quicksight:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':user/default/'$(aws sts get-caller-identity --query Arn --output text | cut -d'/' -f2)'",
                "Actions": [
                    "quicksight:DescribeDataSet",
                    "quicksight:DescribeDataSetPermissions",
@@ -345,7 +344,7 @@ echo "✅ Sample data uploaded to S3 bucket: ${S3_BUCKET_NAME}"
        }' \
        --permissions '[
            {
-               "Principal": "arn:aws:quicksight:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':user/default/'$(aws sts get-caller-identity --query UserName --output text)'",
+               "Principal": "arn:aws:quicksight:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':user/default/'$(aws sts get-caller-identity --query Arn --output text | cut -d'/' -f2)'",
                "Actions": [
                    "quicksight:RestoreAnalysis",
                    "quicksight:UpdateAnalysisPermissions",
@@ -372,25 +371,25 @@ echo "✅ Sample data uploaded to S3 bucket: ${S3_BUCKET_NAME}"
    QuickSight dashboards represent the published, read-only views of your analysis work that are optimized for sharing with business stakeholders. Dashboards provide controlled access to insights without exposing the underlying data modeling or development complexity. They automatically refresh with new data, support responsive design for mobile access, and can be embedded into external applications or shared via email subscriptions. The dashboard creation process publishes a specific version of your analysis, creating a stable view that business users can rely on for consistent reporting while allowing continued development in the source analysis.
 
    ```bash
-   # Create dashboard
+   # Create dashboard from analysis
    aws quicksight create-dashboard \
        --aws-account-id ${AWS_ACCOUNT_ID} \
        --dashboard-id "sales-dashboard-${RANDOM_SUFFIX}" \
        --name "Sales Dashboard" \
        --source-entity '{
-           "SourceTemplate": {
+           "SourceAnalysis": {
+               "Arn": "arn:aws:quicksight:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':analysis/'${ANALYSIS_ID}'",
                "DataSetReferences": [
                    {
                        "DataSetArn": "arn:aws:quicksight:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':dataset/'${DATASET_ID}'",
                        "DataSetPlaceholder": "SalesDataSet"
                    }
-               ],
-               "Arn": "arn:aws:quicksight:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':analysis/'${ANALYSIS_ID}'"
+               ]
            }
        }' \
        --permissions '[
            {
-               "Principal": "arn:aws:quicksight:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':user/default/'$(aws sts get-caller-identity --query UserName --output text)'",
+               "Principal": "arn:aws:quicksight:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':user/default/'$(aws sts get-caller-identity --query Arn --output text | cut -d'/' -f2)'",
                "Actions": [
                    "quicksight:DescribeDashboard",
                    "quicksight:ListDashboardVersions",
@@ -428,7 +427,7 @@ echo "✅ Sample data uploaded to S3 bucket: ${S3_BUCKET_NAME}"
    # Note: This requires the user to exist in your AWS account
    READER_EMAIL="reader@example.com"
    
-   aws quicksight create-user \
+   aws quicksight register-user \
        --aws-account-id ${AWS_ACCOUNT_ID} \
        --namespace default \
        --identity-type IAM \
@@ -491,17 +490,18 @@ echo "✅ Sample data uploaded to S3 bucket: ${S3_BUCKET_NAME}"
 
    ```bash
    # Trigger dataset refresh
+   INGESTION_ID="manual-refresh-$(date +%s)"
    aws quicksight create-ingestion \
        --aws-account-id ${AWS_ACCOUNT_ID} \
        --data-set-id ${DATASET_ID} \
-       --ingestion-id "manual-refresh-$(date +%s)" \
+       --ingestion-id ${INGESTION_ID} \
        --region ${AWS_REGION}
    
    # Check ingestion status
    aws quicksight describe-ingestion \
        --aws-account-id ${AWS_ACCOUNT_ID} \
        --data-set-id ${DATASET_ID} \
-       --ingestion-id "manual-refresh-$(date +%s)" \
+       --ingestion-id ${INGESTION_ID} \
        --region ${AWS_REGION}
    ```
 
@@ -586,7 +586,9 @@ Amazon QuickSight provides a powerful serverless business intelligence solution 
 
 The architecture demonstrated in this recipe showcases QuickSight's flexibility in connecting to multiple data sources. By using both S3 and RDS connections, organizations can build comprehensive analytics solutions that span their entire data ecosystem. The service's ability to handle structured and semi-structured data formats makes it adaptable to various business scenarios, from operational reporting to executive dashboards. QuickSight's [SPICE engine](https://docs.aws.amazon.com/quicksight/latest/user/spice.html) provides sub-second query response times by caching frequently accessed data in memory, enabling interactive analysis even on large datasets.
 
-One of QuickSight's key strengths is its integration with AWS security and identity services. The IAM-based permission model ensures that users can only access data they're authorized to see, while the row-level security features (available in Enterprise edition) provide fine-grained access controls. This security-first approach makes QuickSight suitable for regulated industries and enterprise environments where data governance is critical. The service also supports integration with corporate identity providers, enabling single sign-on and centralized access management.
+One of QuickSight's key strengths is its integration with AWS security and identity services. The IAM-based permission model ensures that users can only access data they're authorized to see, while the row-level security features (available in Enterprise edition) provide fine-grained access controls. This security-first approach makes QuickSight suitable for regulated industries and enterprise environments where data governance is critical. The service also supports integration with corporate identity providers, enabling single sign-on and centralized access management as outlined in the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
+
+Cost optimization is another key consideration with QuickSight's pay-per-user pricing model. The tiered user roles (Admin, Author, Reader) allow organizations to provide appropriate access levels while controlling costs. The serverless architecture means you only pay for actual usage, with no upfront infrastructure investments or maintenance overhead.
 
 > **Tip**: Use QuickSight's [ML Insights feature](https://docs.aws.amazon.com/quicksight/latest/user/ml-data-set-requirements.html) to automatically discover anomalies, forecasts, and key drivers in your data without requiring data science expertise.
 
@@ -594,16 +596,23 @@ One of QuickSight's key strengths is its integration with AWS security and ident
 
 Extend this solution by implementing these enhancements:
 
-1. **Advanced Analytics**: Add calculated fields, parameters, and ML-powered insights to create more sophisticated visualizations that automatically detect trends and anomalies in your business data.
+1. **Advanced Analytics**: Add calculated fields, parameters, and ML-powered insights to create more sophisticated visualizations that automatically detect trends and anomalies in your business data using QuickSight's built-in machine learning capabilities.
 
-2. **Multi-Source Integration**: Connect additional data sources such as Amazon Redshift, Amazon Athena, or external databases to create a unified analytics platform that provides a 360-degree view of your business.
+2. **Multi-Source Integration**: Connect additional data sources such as Amazon Redshift, Amazon Athena, or external databases to create a unified analytics platform that provides a 360-degree view of your business operations and performance metrics.
 
-3. **Embedded Analytics**: Implement QuickSight embedding to integrate dashboards directly into your existing web applications, providing seamless analytics experiences for your customers.
+3. **Embedded Analytics**: Implement QuickSight embedding using the [Amazon QuickSight Embedding SDK](https://github.com/awslabs/amazon-quicksight-embedding-sdk) to integrate dashboards directly into your existing web applications, providing seamless analytics experiences for your customers.
 
-4. **Automated Alerting**: Set up QuickSight anomaly detection and threshold-based alerts to notify stakeholders when key metrics exceed predefined boundaries or show unusual patterns.
+4. **Automated Alerting**: Set up QuickSight anomaly detection and threshold-based alerts to notify stakeholders when key metrics exceed predefined boundaries or show unusual patterns, enabling proactive business decision making.
 
-5. **Enterprise Security**: Implement row-level security, attribute-based access control, and integration with corporate identity providers to ensure data access aligns with organizational policies and compliance requirements.
+5. **Enterprise Security**: Implement row-level security, attribute-based access control, and integration with corporate identity providers to ensure data access aligns with organizational policies and compliance requirements such as GDPR or HIPAA.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

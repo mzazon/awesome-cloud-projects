@@ -6,17 +6,16 @@ difficulty: 200
 subject: aws
 services: rds,aurora,cloudwatch,iam
 estimated-time: 60 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: aurora-serverless,database-scaling,auto-scaling
 recipe-generator-version: 1.3
 ---
 
 # Database Scaling with Aurora Serverless
-
 
 ## Problem
 
@@ -149,7 +148,7 @@ echo "✅ Environment prepared with cluster ID: $CLUSTER_ID"
    aws rds create-db-cluster \
        --db-cluster-identifier $CLUSTER_ID \
        --engine aurora-mysql \
-       --engine-version 8.0.mysql_aurora.3.02.0 \
+       --engine-version 8.0.mysql_aurora.3.09.0 \
        --master-username $DB_USERNAME \
        --master-user-password $DB_PASSWORD \
        --db-subnet-group-name $SUBNET_GROUP_NAME \
@@ -212,7 +211,7 @@ echo "✅ Environment prepared with cluster ID: $CLUSTER_ID"
    echo "✅ Read replica created and available"
    ```
 
-   The read replica is now available to handle read-only queries, providing additional capacity for read-heavy workloads. Applications can connect to the reader endpoint for reporting, analytics, or read-only operations, reducing load on the primary writer instance. The independent scaling capability ensures each instance optimizes resources based on its specific workload patterns. Learn more about [Aurora read scaling](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Managing.Performance.html).
+   The read replica is now available to handle read-only queries, providing additional capacity for read-heavy workloads. Applications can connect to the reader endpoint for reporting, analytics, or read-only operations, reducing load on the primary writer instance. The independent scaling capability ensures each instance optimizes resources based on its specific workload patterns.
 
 5. **Configure CloudWatch Monitoring and Alarms**:
 
@@ -454,15 +453,15 @@ echo "✅ Environment prepared with cluster ID: $CLUSTER_ID"
 
 ## Discussion
 
-Aurora Serverless v2 represents a significant evolution in database scaling technology, offering fine-grained automatic scaling that responds to workload changes in real-time. Unlike traditional provisioned instances that require manual intervention or scheduled scaling, Aurora Serverless v2 can scale in increments as small as 0.5 ACUs, providing precise capacity matching for variable workloads.
+Aurora Serverless v2 represents a significant evolution in database scaling technology, offering fine-grained automatic scaling that responds to workload changes in real-time. Unlike traditional provisioned instances that require manual intervention or scheduled scaling, Aurora Serverless v2 can scale in increments as small as 0.5 ACUs, providing precise capacity matching for variable workloads. This capability is particularly valuable for multitenant databases, distributed databases, development and test systems, and other environments with highly variable and unpredictable workloads.
 
-The key architectural advantage lies in its ability to scale both compute and storage independently. While storage scales automatically based on data growth, compute capacity adjusts based on CPU utilization, connections, and query complexity. This dual-scaling approach ensures optimal performance while minimizing costs, particularly beneficial for applications with unpredictable traffic patterns.
+The key architectural advantage lies in its ability to scale both compute and storage independently. While storage scales automatically based on data growth, compute capacity adjusts based on CPU utilization, connections, and query complexity. This dual-scaling approach ensures optimal performance while minimizing costs, particularly beneficial for applications with unpredictable traffic patterns such as e-commerce sites during sales events or traffic sites experiencing weather-related surges.
 
-Cost optimization with Aurora Serverless v2 requires careful consideration of minimum and maximum capacity settings. Setting the minimum too low may cause performance issues during sudden traffic spikes, while setting it too high negates cost benefits during idle periods. The scaling metrics and CloudWatch alarms implemented in this recipe provide visibility into actual usage patterns, enabling data-driven capacity optimization decisions.
+Cost optimization with Aurora Serverless v2 requires careful consideration of minimum and maximum capacity settings. Setting the minimum too low may cause performance issues during sudden traffic spikes, while setting it too high negates cost benefits during idle periods. The scaling metrics and CloudWatch alarms implemented in this recipe provide visibility into actual usage patterns, enabling data-driven capacity optimization decisions. Aurora Serverless v2 also supports automatic pause and resume functionality for development environments, helping minimize costs during inactive periods.
 
-Performance monitoring through Performance Insights and CloudWatch metrics is crucial for understanding scaling behavior and identifying optimization opportunities. The scaling process typically completes within seconds, but monitoring helps identify patterns and potential bottlenecks that could benefit from application-level optimizations or parameter tuning. For detailed guidance on Aurora Serverless v2 performance optimization, refer to the [Aurora Serverless v2 scaling documentation](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-serverless-v2.setting-capacity.html).
+Performance monitoring through Performance Insights and CloudWatch metrics is crucial for understanding scaling behavior and identifying optimization opportunities. The scaling process typically completes within seconds, but monitoring helps identify patterns and potential bottlenecks that could benefit from application-level optimizations or parameter tuning. For detailed guidance on Aurora Serverless v2 performance optimization, refer to the [Aurora Serverless v2 scaling documentation](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-serverless-v2.setting-capacity.html) and the [AWS Well-Architected Framework database pillar](https://docs.aws.amazon.com/wellarchitected/latest/framework/a-wellarchitected-approach.html).
 
-> **Tip**: Use Aurora Serverless v2's automatic pause feature for development environments by setting a very low minimum capacity (0.5 ACU) to minimize costs during inactive periods.
+> **Warning**: Always test scaling behavior in development environments before implementing in production to understand your application's specific scaling patterns and requirements.
 
 ## Challenge
 
@@ -476,8 +475,15 @@ Extend this solution by implementing these enhancements:
 
 4. **Develop cost optimization dashboards** in QuickSight that analyze ACU usage patterns, identify optimization opportunities, and provide scaling recommendations based on application performance requirements.
 
-5. **Implement automated testing frameworks** that simulate various load patterns to validate scaling behavior and performance characteristics under different scenarios.
+5. **Implement automated testing frameworks** that simulate various load patterns to validate scaling behavior and performance characteristics under different scenarios using tools like AWS CodeBuild and distributed load testing.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,543 @@
+# Infrastructure Manager Configuration for Automated Infrastructure Documentation
+# This configuration deploys a complete automated documentation system using:
+# - Cloud Asset Inventory for resource discovery
+# - Cloud Functions for documentation processing  
+# - Cloud Storage for artifact storage
+# - Cloud Scheduler for automated execution
+# - Pub/Sub for event-driven triggers
+
+# Import required modules
+imports:
+  - path: modules/storage.yaml
+  - path: modules/pubsub.yaml
+  - path: modules/functions.yaml
+  - path: modules/scheduler.yaml
+  - path: modules/iam.yaml
+
+# Configuration parameters
+parameters:
+  # Project and deployment configuration
+  - name: project_id
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  - name: region
+    type: string
+    description: "Primary deployment region"
+    default: "us-central1"
+    allowedValues:
+      - "us-central1"
+      - "us-east1" 
+      - "us-west1"
+      - "europe-west1"
+      - "asia-southeast1"
+  
+  - name: deployment_name
+    type: string
+    description: "Unique deployment identifier"
+    default: "asset-docs"
+    pattern: "^[a-z][a-z0-9-]{3,15}$"
+  
+  # Storage configuration
+  - name: bucket_location
+    type: string
+    description: "Cloud Storage bucket location"
+    default: "US"
+    allowedValues:
+      - "US"
+      - "EU"
+      - "ASIA"
+  
+  - name: storage_class
+    type: string
+    description: "Default storage class for documentation artifacts"
+    default: "STANDARD"
+    allowedValues:
+      - "STANDARD"
+      - "NEARLINE"
+      - "COLDLINE"
+  
+  # Function configuration
+  - name: function_memory
+    type: integer
+    description: "Memory allocation for Cloud Function (MB)"
+    default: 512
+    minimum: 128
+    maximum: 8192
+  
+  - name: function_timeout
+    type: integer
+    description: "Function timeout in seconds"
+    default: 300
+    minimum: 60
+    maximum: 540
+  
+  - name: max_instances
+    type: integer
+    description: "Maximum function instances"
+    default: 10
+    minimum: 1
+    maximum: 100
+  
+  # Scheduler configuration
+  - name: schedule_expression
+    type: string
+    description: "Cron expression for automated documentation generation"
+    default: "0 9 * * *"
+  
+  - name: schedule_timezone
+    type: string
+    description: "Timezone for scheduler execution"
+    default: "UTC"
+  
+  # Monitoring and alerting
+  - name: enable_monitoring
+    type: boolean
+    description: "Enable Cloud Monitoring integration"
+    default: true
+  
+  - name: notification_email
+    type: string
+    description: "Email for monitoring notifications (optional)"
+    default: ""
+
+# Computed values for resource naming
+variables:
+  # Generate unique suffix for resource names
+  - name: resource_suffix
+    value: |
+      {{- printf "%s-%s" .deployment_name (randAlphaNum 6 | lower) -}}
+  
+  # Storage bucket name (globally unique)
+  - name: bucket_name
+    value: |
+      {{- printf "%s-docs-%s" .project_id .resource_suffix -}}
+  
+  # Pub/Sub topic name
+  - name: topic_name
+    value: |
+      {{- printf "%s-trigger" .resource_suffix -}}
+  
+  # Cloud Function name
+  - name: function_name
+    value: |
+      {{- printf "%s-generator" .resource_suffix -}}
+  
+  # Scheduler job name
+  - name: scheduler_name
+    value: |
+      {{- printf "%s-schedule" .resource_suffix -}}
+  
+  # Service account name
+  - name: service_account_name
+    value: |
+      {{- printf "%s-sa" .resource_suffix -}}
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/cloudasset.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/cloudfunctions.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  - name: enable-scheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/cloudscheduler.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/pubsub.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/storage.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Cloud Storage bucket for documentation artifacts
+  - name: documentation-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{ .bucket_name }}
+      project: {{ .project_id }}
+      location: {{ .bucket_location }}
+      storageClass: {{ .storage_class }}
+      # Enable versioning for change tracking
+      versioning:
+        enabled: true
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete versions older than 1 year
+              isLive: false
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30   # Move to NEARLINE after 30 days
+              isLive: true
+      # Uniform bucket-level access for simplified IAM
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Labels for resource management
+      labels:
+        purpose: "infrastructure-documentation"
+        managed-by: "infrastructure-manager"
+        deployment: {{ .deployment_name }}
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Create bucket structure with placeholder objects
+  - name: reports-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: {{ .bucket_name }}
+      name: "reports/.gitkeep"
+      contentType: "text/plain"
+    metadata:
+      dependsOn:
+        - documentation-bucket
+
+  - name: exports-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: {{ .bucket_name }}
+      name: "exports/.gitkeep"
+      contentType: "text/plain"
+    metadata:
+      dependsOn:
+        - documentation-bucket
+
+  - name: templates-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: {{ .bucket_name }}
+      name: "templates/.gitkeep"
+      contentType: "text/plain"
+    metadata:
+      dependsOn:
+        - documentation-bucket
+
+  # Pub/Sub topic for event-driven function triggers
+  - name: asset-inventory-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{ .project_id }}/topics/{{ .topic_name }}
+      labels:
+        purpose: "asset-documentation-trigger"
+        managed-by: "infrastructure-manager"
+        deployment: {{ .deployment_name }}
+      # Message retention for reliability
+      messageRetentionDuration: "86400s"  # 24 hours
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Service account for Cloud Function with least privilege access
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: {{ .service_account_name }}
+      displayName: "Asset Documentation Function Service Account"
+      description: "Service account for automated infrastructure documentation generation"
+      project: {{ .project_id }}
+    metadata:
+      dependsOn: []
+
+  # IAM binding for Cloud Asset Inventory read access
+  - name: asset-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ .project_id }}
+      role: roles/cloudasset.viewer
+      member: serviceAccount:{{ .service_account_name }}@{{ .project_id }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # IAM binding for Cloud Storage object admin access
+  - name: storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ .project_id }}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:{{ .service_account_name }}@{{ .project_id }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # Cloud Function source code (inline for Infrastructure Manager deployment)
+  - name: function-source-archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: {{ .bucket_name }}
+      name: "source/function-source.zip"
+      contentType: "application/zip"
+      # Base64 encoded ZIP file containing the function source
+      # This would contain main.py, requirements.txt, and .env.yaml
+      # For production, use Cloud Build or external source repository
+      sourceCode: |
+        # Function source code would be packaged here
+        # In practice, use Cloud Build or external source management
+        # This is a simplified inline deployment approach
+    metadata:
+      dependsOn:
+        - documentation-bucket
+
+  # Cloud Function for asset documentation generation
+  - name: asset-documentation-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{ .project_id }}/locations/{{ .region }}/functions/{{ .function_name }}
+      description: "Automated infrastructure documentation generator using Cloud Asset Inventory"
+      
+      # Function configuration
+      runtime: "python313"
+      entryPoint: "generate_asset_documentation"
+      timeout: "{{ .function_timeout }}s"
+      availableMemoryMb: {{ .function_memory }}
+      maxInstances: {{ .max_instances }}
+      
+      # Event trigger configuration
+      eventTrigger:
+        eventType: "providers/cloud.pubsub/eventTypes/topic.publish"
+        resource: projects/{{ .project_id }}/topics/{{ .topic_name }}
+        failurePolicy:
+          retry: {}
+      
+      # Environment variables
+      environmentVariables:
+        GCP_PROJECT: {{ .project_id }}
+        STORAGE_BUCKET: {{ .bucket_name }}
+        FUNCTION_REGION: {{ .region }}
+      
+      # Service account configuration
+      serviceAccountEmail: {{ .service_account_name }}@{{ .project_id }}.iam.gserviceaccount.com
+      
+      # Source code location
+      sourceArchiveUrl: gs://{{ .bucket_name }}/source/function-source.zip
+      
+      # Labels for resource management
+      labels:
+        purpose: "infrastructure-documentation"
+        managed-by: "infrastructure-manager"
+        deployment: {{ .deployment_name }}
+        
+      # Network configuration (use default VPC)
+      vpcConnector: ""
+      
+      # Ingress settings (Pub/Sub only)
+      ingressSettings: "ALLOW_INTERNAL_ONLY"
+    
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - asset-inventory-topic
+        - function-service-account
+        - asset-viewer-binding
+        - storage-admin-binding
+        - function-source-archive
+
+  # Cloud Scheduler job for automated execution
+  - name: documentation-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/{{ .project_id }}/locations/{{ .region }}/jobs/{{ .scheduler_name }}
+      description: "Daily automated infrastructure documentation generation"
+      
+      # Schedule configuration
+      schedule: {{ .schedule_expression }}
+      timeZone: {{ .schedule_timezone }}
+      
+      # Pub/Sub target configuration
+      pubsubTarget:
+        topicName: projects/{{ .project_id }}/topics/{{ .topic_name }}
+        data: |
+          {{ `{"trigger": "scheduled", "timestamp": "` }}{{ `{{ .scheduledTime }}` }}{{ `"}` | b64enc }}
+        attributes:
+          source: "cloud-scheduler"
+          deployment: {{ .deployment_name }}
+      
+      # Retry configuration
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: "300s"
+        minBackoffDuration: "5s"
+        maxBackoffDuration: "60s"
+        maxDoublings: 3
+    
+    metadata:
+      dependsOn:
+        - enable-scheduler-api
+        - asset-inventory-topic
+        - asset-documentation-function
+
+  # Cloud Monitoring notification channel (if email provided)
+  {{- if .notification_email }}
+  - name: email-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      displayName: "Asset Documentation Alerts"
+      description: "Email notifications for infrastructure documentation system"
+      type: "email"
+      labels:
+        email_address: {{ .notification_email }}
+      enabled: true
+    metadata:
+      dependsOn: []
+  {{- end }}
+
+  # Cloud Monitoring alert policy for function failures
+  {{- if .enable_monitoring }}
+  - name: function-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Asset Documentation Function Failures"
+      documentation:
+        content: "Alert when the asset documentation function fails to execute successfully"
+        mimeType: "text/markdown"
+      
+      # Alert conditions
+      conditions:
+        - displayName: "Function execution failures"
+          conditionThreshold:
+            filter: |
+              resource.type="cloud_function"
+              resource.label.function_name="{{ .function_name }}"
+              metric.type="cloudfunctions.googleapis.com/function/execution_count"
+              metric.label.status!="ok"
+            comparison: "COMPARISON_GT"
+            thresholdValue: 0
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "300s"
+                perSeriesAligner: "ALIGN_RATE"
+                crossSeriesReducer: "REDUCE_SUM"
+                groupByFields:
+                  - "resource.label.function_name"
+      
+      # Notification channels
+      {{- if .notification_email }}
+      notificationChannels:
+        - $(ref.email-notification-channel.name)
+      {{- end }}
+      
+      # Alert policy configuration
+      enabled: true
+      alertStrategy:
+        autoClose: "86400s"  # Auto-close after 24 hours
+    
+    metadata:
+      dependsOn:
+        - asset-documentation-function
+        {{- if .notification_email }}
+        - email-notification-channel
+        {{- end }}
+  {{- end }}
+
+# Output values for verification and integration
+outputs:
+  # Storage outputs
+  - name: documentation_bucket_name
+    description: "Name of the Cloud Storage bucket for documentation artifacts"
+    value: $(ref.documentation-bucket.name)
+  
+  - name: documentation_bucket_url
+    description: "Cloud Console URL for the documentation bucket"
+    value: |
+      https://console.cloud.google.com/storage/browser/{{ .bucket_name }}
+  
+  # Function outputs
+  - name: function_name
+    description: "Name of the Cloud Function for documentation generation"
+    value: $(ref.asset-documentation-function.name)
+  
+  - name: function_url
+    description: "Cloud Console URL for the function"
+    value: |
+      https://console.cloud.google.com/functions/details/{{ .region }}/{{ .function_name }}
+  
+  # Pub/Sub outputs
+  - name: pubsub_topic_name
+    description: "Name of the Pub/Sub topic for function triggers"
+    value: $(ref.asset-inventory-topic.name)
+  
+  # Scheduler outputs
+  - name: scheduler_job_name
+    description: "Name of the Cloud Scheduler job"
+    value: $(ref.documentation-scheduler.name)
+  
+  - name: next_execution_time
+    description: "Next scheduled execution time"
+    value: $(ref.documentation-scheduler.scheduleTime)
+  
+  # Service account outputs
+  - name: service_account_email
+    description: "Service account email for the documentation function"
+    value: |
+      {{ .service_account_name }}@{{ .project_id }}.iam.gserviceaccount.com
+  
+  # Manual trigger command
+  - name: manual_trigger_command
+    description: "gcloud command to manually trigger documentation generation"
+    value: |
+      gcloud pubsub topics publish {{ .topic_name }} --message='{"trigger": "manual"}' --project={{ .project_id }}
+  
+  # Verification commands
+  - name: verification_commands
+    description: "Commands to verify the deployment"
+    value: |
+      # Check function logs:
+      gcloud functions logs read {{ .function_name }} --region={{ .region }} --limit=10
+      
+      # List generated documentation:
+      gsutil ls -la gs://{{ .bucket_name }}/reports/
+      
+      # Check scheduler status:
+      gcloud scheduler jobs describe {{ .scheduler_name }} --location={{ .region }}
+      
+      # Manual test trigger:
+      gcloud pubsub topics publish {{ .topic_name }} --message='{"trigger": "test"}'
+
+# Metadata for deployment tracking
+metadata:
+  description: "Automated Infrastructure Documentation System using Cloud Asset Inventory and Cloud Functions"
+  version: "1.0"
+  author: "Infrastructure Manager Template"
+  created: "2025-07-12"
+  
+  # Resource tags applied to all resources
+  labels:
+    environment: "production"
+    purpose: "infrastructure-documentation"
+    managed-by: "infrastructure-manager"
+    cost-center: "devops"
+    
+  # Deployment annotations
+  annotations:
+    deployment.cloud.google.com/recipe: "automated-infrastructure-documentation-asset-inventory-functions"
+    deployment.cloud.google.com/version: "1.1"
+    deployment.cloud.google.com/generator: "infrastructure-manager"

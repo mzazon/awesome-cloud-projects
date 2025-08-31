@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Chaos Studio, Application Insights, Azure Monitor, Azure Virtual Machines
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: chaos-engineering, resilience-testing, monitoring, devops, fault-injection
 recipe-generator-version: 1.3
@@ -136,7 +136,7 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
 
 2. **Deploy Target Virtual Machine for Testing**:
 
-   Creating a target virtual machine provides a controlled environment for chaos experiments. This VM represents a typical application server that might experience failures in production. By using Ubuntu 20.04 LTS with a Standard_B2s size, we balance cost-effectiveness with sufficient resources to demonstrate meaningful chaos scenarios.
+   Creating a target virtual machine provides a controlled environment for chaos experiments. This VM represents a typical application server that might experience failures in production. By using Ubuntu 22.04 LTS with a Standard_B2s size, we balance cost-effectiveness with sufficient resources to demonstrate meaningful chaos scenarios while ensuring compatibility with the Chaos Agent.
 
    ```bash
    # Create virtual machine as chaos target
@@ -172,12 +172,18 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
        --resource-group ${RESOURCE_GROUP} \
        --query id --output tsv)
    
-   IDENTITY_PRINCIPAL_ID=$(az identity show \
+   IDENTITY_CLIENT_ID=$(az identity show \
        --name ${IDENTITY_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query principalId --output tsv)
+       --query clientId --output tsv)
    
-   echo "✅ Managed identity created: ${IDENTITY_NAME}"
+   # Assign managed identity to VM for agent authentication
+   az vm identity assign \
+       --resource-group ${RESOURCE_GROUP} \
+       --name ${VM_NAME} \
+       --identities ${IDENTITY_ID}
+   
+   echo "✅ Managed identity created and assigned: ${IDENTITY_NAME}"
    ```
 
 4. **Enable Chaos Studio on Target Resources**:
@@ -188,16 +194,20 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
    # Register Chaos Studio resource provider
    az provider register --namespace Microsoft.Chaos
    
-   # Wait for registration to complete
-   az provider show --namespace Microsoft.Chaos \
-       --query registrationState --output tsv
+   # Wait for registration to complete (may take several minutes)
+   while [[ $(az provider show --namespace Microsoft.Chaos \
+       --query registrationState --output tsv) != "Registered" ]]; do
+       echo "Waiting for Microsoft.Chaos provider registration..."
+       sleep 30
+   done
    
-   # Enable VM as chaos target (service-direct)
+   # Get VM resource ID for target configuration
    VM_RESOURCE_ID=$(az vm show \
        --name ${VM_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query id --output tsv)
    
+   # Enable VM as chaos target (service-direct)
    az rest --method put \
        --url "https://management.azure.com${VM_RESOURCE_ID}/providers/Microsoft.Chaos/targets/Microsoft-VirtualMachine?api-version=2024-01-01" \
        --body '{"properties":{}}'
@@ -205,12 +215,62 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
    echo "✅ Chaos Studio enabled on virtual machine"
    ```
 
-5. **Install and Configure Chaos Agent with Application Insights**:
+5. **Configure Agent-Based Target for In-Guest Faults**:
 
-   The Chaos Agent enables in-guest fault injection capabilities such as CPU stress, memory pressure, and process killing. By configuring the agent with Application Insights integration, all fault events are automatically logged with detailed telemetry, providing visibility into how your application responds to various failure scenarios.
+   Agent-based targets enable advanced fault injection capabilities within the virtual machine's operating system. By creating a Microsoft-Agent target with proper managed identity configuration, we establish the foundation for testing scenarios like CPU stress, memory pressure, and process disruption.
 
    ```bash
-   # Install Chaos Agent on VM with Application Insights configuration
+   # Get tenant ID for identity configuration
+   TENANT_ID=$(az account show --query tenantId --output tsv)
+   
+   # Create target configuration JSON
+   cat > agent-target.json << EOF
+   {
+       "properties": {
+           "identities": [
+               {
+                   "clientId": "${IDENTITY_CLIENT_ID}",
+                   "tenantId": "${TENANT_ID}",
+                   "type": "AzureManagedIdentity"
+               }
+           ]
+       }
+   }
+   EOF
+   
+   # Create Microsoft-Agent target
+   AGENT_PROFILE_ID=$(az rest --method put \
+       --url "https://management.azure.com${VM_RESOURCE_ID}/providers/Microsoft.Chaos/targets/Microsoft-Agent?api-version=2024-01-01" \
+       --body @agent-target.json \
+       --query properties.agentProfileId --output tsv)
+   
+   echo "✅ Agent target created with profile ID: ${AGENT_PROFILE_ID}"
+   ```
+
+6. **Enable Chaos Capabilities for Agent-Based Faults**:
+
+   Capabilities define the specific types of faults that can be executed against a target resource. By enabling CPU pressure capabilities, we prepare the VM to handle stress testing scenarios that simulate resource exhaustion conditions common in production environments.
+
+   ```bash
+   # Enable CPU Pressure capability for agent-based testing
+   az rest --method put \
+       --url "https://management.azure.com${VM_RESOURCE_ID}/providers/Microsoft.Chaos/targets/Microsoft-Agent/capabilities/CPUPressure-1.0?api-version=2024-01-01" \
+       --body '{"properties":{}}'
+   
+   # Enable VM Shutdown capability for service-direct testing
+   az rest --method put \
+       --url "https://management.azure.com${VM_RESOURCE_ID}/providers/Microsoft.Chaos/targets/Microsoft-VirtualMachine/capabilities/Shutdown-1.0?api-version=2024-01-01" \
+       --body '{"properties":{}}'
+   
+   echo "✅ Chaos capabilities enabled (CPU Pressure and VM Shutdown)"
+   ```
+
+7. **Install and Configure Chaos Agent**:
+
+   The Chaos Agent is a VM extension that enables in-guest fault injection capabilities. By configuring the agent with Application Insights integration and proper authentication, all fault events are automatically logged with detailed telemetry, providing comprehensive visibility into system behavior during chaos experiments.
+
+   ```bash
+   # Install Chaos Agent VM extension with Application Insights
    az vm extension set \
        --resource-group ${RESOURCE_GROUP} \
        --vm-name ${VM_NAME} \
@@ -218,38 +278,30 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
        --publisher Microsoft.Azure.Chaos \
        --version 1.0 \
        --settings "{
-           'profile': 'Node',
-           'auth': {
-               'msi': {
-                   'clientId': '${IDENTITY_PRINCIPAL_ID}'
-               }
-           },
-           'appInsightsSettings': {
-               'isEnabled': true,
-               'instrumentationKey': '${INSTRUMENTATION_KEY}',
-               'logLevel': 'Information'
-           }
+           \"agentProfileId\": \"${AGENT_PROFILE_ID}\",
+           \"clientId\": \"${IDENTITY_CLIENT_ID}\",
+           \"appInsightsKey\": \"${INSTRUMENTATION_KEY}\"
        }"
    
-   # Verify agent installation
-   az vm extension show \
+   # Verify agent installation status
+   AGENT_STATUS=$(az vm extension show \
        --resource-group ${RESOURCE_GROUP} \
        --vm-name ${VM_NAME} \
        --name ChaosAgent \
-       --query provisioningState --output tsv
+       --query provisioningState --output tsv)
    
-   echo "✅ Chaos Agent installed with Application Insights integration"
+   echo "✅ Chaos Agent installed with status: ${AGENT_STATUS}"
    ```
 
    The Chaos Agent is now running on the VM and configured to send all fault injection events to Application Insights, enabling real-time monitoring of chaos experiments.
 
-6. **Create Basic Chaos Experiment**:
+8. **Create CPU Pressure Chaos Experiment**:
 
-   Creating a chaos experiment defines the controlled failure scenarios you want to test. This experiment uses a VM shutdown fault to simulate sudden infrastructure failures, helping validate whether your application can handle unexpected VM terminations and recover gracefully through mechanisms like auto-scaling or failover.
+   Creating a chaos experiment defines the controlled failure scenarios you want to test. This experiment uses CPU pressure to simulate resource exhaustion scenarios, helping validate whether your application can handle high CPU utilization and maintain acceptable performance under stress conditions.
 
    ```bash
    # Create chaos experiment definition
-   EXPERIMENT_NAME="exp-vm-shutdown-$(openssl rand -hex 3)"
+   EXPERIMENT_NAME="exp-cpu-pressure-$(openssl rand -hex 3)"
    
    cat > experiment.json << EOF
    {
@@ -263,20 +315,20 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
        "properties": {
            "steps": [
                {
-                   "name": "Step 1",
+                   "name": "CPU Stress Test",
                    "branches": [
                        {
-                           "name": "Branch 1",
+                           "name": "CPU Pressure Branch",
                            "actions": [
                                {
                                    "type": "continuous",
-                                   "name": "VM Shutdown",
-                                   "selectorId": "Selector1",
+                                   "name": "High CPU Load",
+                                   "selectorId": "CPUSelector",
                                    "duration": "PT5M",
                                    "parameters": [
                                        {
-                                           "key": "abruptShutdown",
-                                           "value": "true"
+                                           "key": "pressureLevel",
+                                           "value": "95"
                                        }
                                    ]
                                }
@@ -287,12 +339,12 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
            ],
            "selectors": [
                {
-                   "id": "Selector1",
+                   "id": "CPUSelector",
                    "type": "List",
                    "targets": [
                        {
                            "type": "ChaosTarget",
-                           "id": "${VM_RESOURCE_ID}/providers/Microsoft.Chaos/targets/Microsoft-VirtualMachine"
+                           "id": "${VM_RESOURCE_ID}/providers/Microsoft.Chaos/targets/Microsoft-Agent"
                        }
                    ]
                }
@@ -309,9 +361,9 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
    echo "✅ Chaos experiment ${EXPERIMENT_NAME} created"
    ```
 
-7. **Grant Permissions for Experiment Execution**:
+9. **Grant Permissions for Experiment Execution**:
 
-   Chaos experiments require specific Azure RBAC permissions to execute faults against target resources. By assigning the Virtual Machine Contributor role to the experiment's managed identity, you enable it to perform VM-level operations like shutdown and restart while maintaining security boundaries.
+   Chaos experiments require specific Azure RBAC permissions to execute faults against target resources. By assigning the Virtual Machine Contributor role to the experiment's managed identity, you enable it to perform the necessary operations while maintaining security boundaries through least-privilege access control.
 
    ```bash
    # Get experiment principal ID
@@ -319,7 +371,7 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
        --url "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Chaos/experiments/${EXPERIMENT_NAME}?api-version=2024-01-01" \
        --query identity.principalId --output tsv)
    
-   # Assign Virtual Machine Contributor role
+   # Assign Virtual Machine Contributor role for agent-based faults
    az role assignment create \
        --assignee ${EXPERIMENT_PRINCIPAL_ID} \
        --role "Virtual Machine Contributor" \
@@ -328,59 +380,75 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
    echo "✅ Permissions granted to chaos experiment"
    ```
 
-8. **Configure Application Insights Alerts**:
+10. **Configure Application Insights Alerts**:
 
-   Setting up alerts ensures you're immediately notified when chaos experiments impact your application. These alerts can trigger automated responses, notify on-call teams, or integrate with incident management systems, creating a comprehensive monitoring strategy for resilience testing.
+    Setting up alerts ensures you're immediately notified when chaos experiments impact your application. These alerts can trigger automated responses, notify on-call teams, or integrate with incident management systems, creating a comprehensive monitoring strategy for resilience testing.
 
-   ```bash
-   # Create action group for notifications
-   ACTION_GROUP_NAME="ag-chaos-alerts"
-   
-   az monitor action-group create \
-       --name ${ACTION_GROUP_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --short-name ChaosAlert \
-       --email-receiver admin-email \
-           admin@example.com
-   
-   # Create alert rule for chaos events
-   az monitor metrics alert create \
-       --name "Chaos Experiment Active" \
-       --resource-group ${RESOURCE_GROUP} \
-       --scopes ${VM_RESOURCE_ID} \
-       --condition "avg Percentage CPU > 80" \
-       --window-size 5m \
-       --evaluation-frequency 1m \
-       --action ${ACTION_GROUP_NAME} \
-       --description "Alert when chaos experiment affects VM performance"
-   
-   echo "✅ Application Insights alerts configured"
-   ```
+    ```bash
+    # Create action group for notifications
+    ACTION_GROUP_NAME="ag-chaos-alerts-$(openssl rand -hex 3)"
+    
+    az monitor action-group create \
+        --name ${ACTION_GROUP_NAME} \
+        --resource-group ${RESOURCE_GROUP} \
+        --short-name ChaosAlert
+    
+    # Create alert rule for high CPU usage during chaos experiments
+    az monitor metrics alert create \
+        --name "Chaos CPU Stress Alert" \
+        --resource-group ${RESOURCE_GROUP} \
+        --scopes ${VM_RESOURCE_ID} \
+        --condition "avg Percentage CPU > 90" \
+        --window-size 5m \
+        --evaluation-frequency 1m \
+        --action ${ACTION_GROUP_NAME} \
+        --description "Alert when chaos experiment causes high CPU usage"
+    
+    echo "✅ Application Insights alerts configured"
+    ```
 
 ## Validation & Testing
 
 1. Verify Chaos Studio configuration:
 
    ```bash
-   # Check target enablement status
+   # Check service-direct target enablement
    az rest --method get \
        --url "https://management.azure.com${VM_RESOURCE_ID}/providers/Microsoft.Chaos/targets/Microsoft-VirtualMachine?api-version=2024-01-01" \
-       --query properties.enabled
+       --query properties
+   
+   # Check agent-based target enablement
+   az rest --method get \
+       --url "https://management.azure.com${VM_RESOURCE_ID}/providers/Microsoft.Chaos/targets/Microsoft-Agent?api-version=2024-01-01" \
+       --query properties
    ```
 
-   Expected output: `true`
+   Expected output: Properties object showing enabled targets
 
-2. Run the chaos experiment:
+2. Verify Chaos Agent installation:
+
+   ```bash
+   # Check agent extension status
+   az vm extension show \
+       --resource-group ${RESOURCE_GROUP} \
+       --vm-name ${VM_NAME} \
+       --name ChaosAgent \
+       --query "{Status: provisioningState, HandlerStatus: instanceView.statuses[0].message}"
+   ```
+
+   Expected output: Status should be "Succeeded" and HandlerStatus should show "Ready"
+
+3. Run the chaos experiment:
 
    ```bash
    # Start chaos experiment
    az rest --method post \
        --url "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Chaos/experiments/${EXPERIMENT_NAME}/start?api-version=2024-01-01"
    
-   echo "✅ Chaos experiment started"
+   echo "✅ Chaos experiment started - monitoring CPU pressure for 5 minutes"
    ```
 
-3. Monitor experiment in Application Insights:
+4. Monitor experiment in Application Insights:
 
    ```bash
    # Query Application Insights for chaos events
@@ -388,12 +456,24 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
        --app ${APP_INSIGHTS_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --analytics-query "customEvents | where name contains 'Chaos' | project timestamp, name, customDimensions | order by timestamp desc | take 10"
+   
+   # Monitor VM CPU metrics during experiment
+   az monitor metrics list \
+       --resource ${VM_RESOURCE_ID} \
+       --metric "Percentage CPU" \
+       --interval PT1M \
+       --output table
    ```
 
-4. Verify VM recovery after experiment:
+5. Verify experiment completion and VM recovery:
 
    ```bash
-   # Check VM status after experiment
+   # Check experiment status
+   az rest --method get \
+       --url "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Chaos/experiments/${EXPERIMENT_NAME}/statuses?api-version=2024-01-01" \
+       --query "value[0].status"
+   
+   # Verify VM is running normally after experiment
    az vm get-instance-view \
        --name ${VM_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -401,14 +481,14 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
        --output tsv
    ```
 
-   Expected output: `VM running`
+   Expected output: "VM running" after experiment completes
 
 ## Cleanup
 
 1. Stop any running experiments:
 
    ```bash
-   # List and stop active experiments
+   # Stop active experiments
    az rest --method post \
        --url "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Chaos/experiments/${EXPERIMENT_NAME}/stop?api-version=2024-01-01"
    
@@ -438,29 +518,34 @@ echo "✅ Preparation complete with resource group: ${RESOURCE_GROUP}"
    echo "Note: Deletion may take several minutes to complete"
    
    # Clean up local files
-   rm -f experiment.json
+   rm -f experiment.json agent-target.json
    ```
 
 ## Discussion
 
-Azure Chaos Studio implements chaos engineering principles by providing a managed platform for controlled failure injection, enabling organizations to proactively discover and fix resilience gaps before they impact production systems. The integration with Application Insights creates a comprehensive observability solution that captures detailed telemetry during experiments, helping teams understand exactly how their applications respond to various failure scenarios. This approach aligns with the [Azure Well-Architected Framework's reliability pillar](https://docs.microsoft.com/en-us/azure/architecture/framework/resiliency/overview), which emphasizes the importance of testing failure scenarios.
+Azure Chaos Studio implements chaos engineering principles by providing a managed platform for controlled failure injection, enabling organizations to proactively discover and fix resilience gaps before they impact production systems. The integration with Application Insights creates a comprehensive observability solution that captures detailed telemetry during experiments, helping teams understand exactly how their applications respond to various failure scenarios. This approach aligns with the [Azure Well-Architected Framework's reliability pillar](https://docs.microsoft.com/en-us/azure/architecture/framework/resiliency/overview), which emphasizes the importance of testing failure scenarios to build resilient applications.
 
-The combination of service-direct and agent-based faults provides flexibility in testing different failure modes. Service-direct faults operate at the Azure control plane level, simulating infrastructure-level failures like VM shutdowns or network disruptions. Agent-based faults run inside the target resources, enabling more granular testing such as CPU stress, memory pressure, or process termination. This dual approach ensures comprehensive coverage of potential failure scenarios as outlined in the [Chaos Studio documentation](https://docs.microsoft.com/en-us/azure/chaos-studio/chaos-studio-overview).
+The combination of service-direct and agent-based faults provides flexibility in testing different failure modes. Service-direct faults operate at the Azure control plane level, simulating infrastructure-level failures like VM shutdowns or network disruptions. Agent-based faults run inside the target resources, enabling more granular testing such as CPU stress, memory pressure, or process termination. This dual approach ensures comprehensive coverage of potential failure scenarios as outlined in the [Chaos Studio documentation](https://docs.microsoft.com/en-us/azure/chaos-studio/chaos-studio-overview). The Chaos Agent requires specific operating system compatibility and network access to function properly, as detailed in the [agent compatibility guide](https://docs.microsoft.com/en-us/azure/chaos-studio/chaos-agent-os-support).
 
-From a cost optimization perspective, Chaos Studio follows a pay-per-use model where you're only charged for the duration of active experiments. Combined with Application Insights' sampling capabilities, teams can run comprehensive resilience testing programs without significant monitoring overhead. The [Application Insights best practices guide](https://docs.microsoft.com/en-us/azure/azure-monitor/app/best-practices) provides detailed guidance on optimizing data ingestion costs while maintaining visibility.
+From a cost optimization perspective, Chaos Studio follows a pay-per-use model where you're only charged for the duration of active experiments. Combined with Application Insights' sampling capabilities, teams can run comprehensive resilience testing programs without significant monitoring overhead. The [Application Insights best practices guide](https://docs.microsoft.com/en-us/azure/azure-monitor/app/best-practices) provides detailed guidance on optimizing data ingestion costs while maintaining visibility. Security is maintained through Azure RBAC and managed identities, ensuring that chaos experiments can only execute authorized actions against designated target resources.
 
-> **Tip**: Schedule chaos experiments during off-peak hours initially, then gradually increase testing frequency and complexity as your team gains confidence. Consider integrating experiments into your CI/CD pipeline for continuous resilience validation as recommended in [Microsoft's chaos engineering guidance](https://docs.microsoft.com/en-us/azure/well-architected/reliability/testing-strategy).
+> **Tip**: Schedule chaos experiments during off-peak hours initially, then gradually increase testing frequency and complexity as your team gains confidence. Consider integrating experiments into your CI/CD pipeline for continuous resilience validation as recommended in [Microsoft's chaos engineering guidance](https://docs.microsoft.com/en-us/azure/well-architected/reliability/testing-strategy). Monitor the [Chaos Agent status](https://docs.microsoft.com/en-us/azure/chaos-studio/chaos-agent-verify-status) regularly to ensure proper connectivity and functionality.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. Create multi-step chaos experiments that combine different fault types (CPU stress + network latency) to simulate complex failure scenarios
-2. Implement automated recovery mechanisms using Azure Monitor alerts to trigger Azure Functions that remediate specific failure conditions
-3. Build a chaos experiment library with templates for common scenarios like region failures, dependency outages, and resource exhaustion
-4. Integrate chaos experiments into your CI/CD pipeline using Azure DevOps or GitHub Actions to validate resilience with every deployment
-5. Create custom KQL queries in Application Insights to measure mean time to recovery (MTTR) and track resilience improvements over time
+1. Create multi-step chaos experiments that combine different fault types (CPU stress + memory pressure + network latency) to simulate complex real-world failure scenarios
+2. Implement automated recovery mechanisms using Azure Monitor alerts to trigger Azure Functions that automatically remediate specific failure conditions detected during experiments
+3. Build a comprehensive chaos experiment library with reusable templates for common scenarios like region failures, dependency outages, and cascading resource exhaustion patterns
+4. Integrate chaos experiments into your CI/CD pipeline using Azure DevOps or GitHub Actions to validate application resilience with every deployment and infrastructure change
+5. Create custom KQL queries in Application Insights to measure mean time to recovery (MTTR), system steady-state deviation, and track resilience improvements over time using chaos engineering metrics
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

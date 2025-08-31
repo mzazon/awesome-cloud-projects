@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Container Apps, Azure Event Grid, Azure Key Vault, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers, serverless, security, event-driven, code-execution, isolation, sandbox
 recipe-generator-version: 1.3
@@ -92,7 +92,7 @@ graph TB
 ```bash
 # Set environment variables for Azure resources
 export LOCATION="eastus"
-export RESOURCE_GROUP="rg-secure-code-execution"
+export RESOURCE_GROUP="rg-secure-code-execution-${RANDOM_SUFFIX}"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
@@ -164,6 +164,9 @@ echo "✅ Key Vault created: ${KEY_VAULT_NAME}"
    Azure Container Apps Dynamic Sessions provide isolated, sandboxed environments optimized for running untrusted code. The session pool maintains a warm pool of ready sessions, enabling subsecond allocation times for real-time code execution scenarios. Each session operates in its own Hyper-V sandbox, providing enterprise-grade security isolation.
 
    ```bash
+   # Install or upgrade Container Apps extension for session pools
+   az extension add --name containerapp --upgrade --allow-preview true -y
+   
    # Create session pool with Python runtime for secure code execution
    az containerapp sessionpool create \
        --name ${SESSION_POOL_NAME} \
@@ -279,12 +282,18 @@ echo "✅ Key Vault created: ${KEY_VAULT_NAME}"
    Azure Key Vault provides centralized, secure storage for application secrets, API keys, and certificates. Integrating Key Vault with the execution environment ensures that sensitive configuration data is protected and accessible only to authorized services, maintaining security best practices for production deployments.
 
    ```bash
-   # Assign Key Vault permissions to Function App
+   # Enable system-assigned managed identity for Function App
+   az functionapp identity assign \
+       --name ${FUNCTION_APP_NAME} \
+       --resource-group ${RESOURCE_GROUP}
+   
+   # Get the Function App principal ID
    export FUNCTION_PRINCIPAL_ID=$(az functionapp identity show \
        --name ${FUNCTION_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query principalId --output tsv)
    
+   # Assign Key Vault permissions to Function App
    az keyvault set-policy \
        --name ${KEY_VAULT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -309,6 +318,9 @@ echo "✅ Key Vault created: ${KEY_VAULT_NAME}"
    Event Grid subscriptions enable automatic triggering of the secure code execution workflow based on incoming events. This creates a fully automated, event-driven system that responds to code execution requests while maintaining proper filtering and routing to ensure only valid events trigger processing.
 
    ```bash
+   # Create webhook endpoint for Function App event handling
+   export WEBHOOK_ENDPOINT="https://${FUNCTION_APP_NAME}.azurewebsites.net/runtime/webhooks/eventgrid?functionName=ProcessCodeExecution"
+   
    # Create Event Grid subscription to trigger Function App
    az eventgrid event-subscription create \
        --name code-execution-subscription \
@@ -316,12 +328,8 @@ echo "✅ Key Vault created: ${KEY_VAULT_NAME}"
            --name ${EVENT_GRID_TOPIC} \
            --resource-group ${RESOURCE_GROUP} \
            --query id --output tsv) \
-       --endpoint-type azurefunction \
-       --endpoint $(az functionapp function show \
-           --name ${FUNCTION_APP_NAME} \
-           --resource-group ${RESOURCE_GROUP} \
-           --function-name ProcessCodeExecution \
-           --query invokeUrlTemplate --output tsv) \
+       --endpoint-type webhook \
+       --endpoint ${WEBHOOK_ENDPOINT} \
        --subject-begins-with "code-execution" \
        --included-event-types "Microsoft.EventGrid.ExecuteCode"
    
@@ -371,7 +379,7 @@ echo "✅ Key Vault created: ${KEY_VAULT_NAME}"
    az containerapp sessionpool show \
        --name ${SESSION_POOL_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query "{name:name,status:properties.poolManagementEndpoint,sessions:properties.sessionNetworkConfiguration}" \
+       --query "{name:name,status:properties.poolManagementEndpoint,network:properties.sessionNetworkConfiguration}" \
        --output table
    ```
 
@@ -427,7 +435,7 @@ echo "✅ Key Vault created: ${KEY_VAULT_NAME}"
    
    echo "Session pool endpoint: ${POOL_ENDPOINT}"
    
-   # Test session allocation (requires authentication token)
+   # Verify session pool configuration
    echo "✅ Session pool endpoint accessible"
    ```
 
@@ -545,4 +553,9 @@ Extend this secure code execution solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

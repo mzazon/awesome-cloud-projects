@@ -4,12 +4,12 @@ id: f7a9c8d2
 category: analytics
 difficulty: 200
 subject: aws
-services: Kinesis Data Firehose, EventBridge Pipes, Lambda, S3
+services: Kinesis Data Streams, EventBridge Pipes, Lambda, DynamoDB
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: streaming, real-time, data-enrichment, serverless, analytics
 recipe-generator-version: 1.3
@@ -342,7 +342,7 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
        }'
    
    # Wait for role propagation
-   sleep 10
+   sleep 15
    
    echo "✅ EventBridge Pipes IAM role created"
    ```
@@ -443,7 +443,7 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    aws pipes create-pipe \
        --name ${PIPE_NAME} \
        --role-arn ${PIPES_ROLE_ARN} \
-       --source arn:aws:pipes::${AWS_REGION}:source/aws.kinesis-stream \
+       --source ${STREAM_ARN} \
        --source-parameters '{
            "KinesisStreamParameters": {
                "StartingPosition": "LATEST",
@@ -452,16 +452,9 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
            }
        }' \
        --enrichment ${LAMBDA_ARN} \
-       --target arn:aws:pipes::${AWS_REGION}:target/aws.kinesis-firehose \
-       --target-parameters '{
-           "KinesisStreamParameters": {
-               "PartitionKey": "$.productId"
-           }
-       }' \
+       --target ${FIREHOSE_ARN} \
+       --desired-state RUNNING \
        --region ${AWS_REGION}
-   
-   # Note: The exact API might vary. Using generic approach
-   # In practice, you might need to use CloudFormation or SDK
    
    echo "✅ EventBridge Pipe created for enrichment pipeline"
    ```
@@ -550,10 +543,19 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
 3. Verify EventBridge Pipes status:
 
    ```bash
-   # Check pipe status (using CloudFormation or Console)
-   # Note: Direct CLI command might not be available
-   echo "Check EventBridge Pipes console for pipeline status"
+   # Check pipe status and configuration
+   aws pipes describe-pipe --name ${PIPE_NAME}
+   
+   # Verify pipe is in RUNNING state
+   PIPE_STATE=$(aws pipes describe-pipe \
+       --name ${PIPE_NAME} \
+       --query 'CurrentState' \
+       --output text)
+   
+   echo "Pipe current state: ${PIPE_STATE}"
    ```
+
+   Expected output: CurrentState should be "RUNNING" and the pipe should show proper source, enrichment, and target configurations.
 
 4. Monitor Kinesis Data Stream metrics:
 
@@ -574,9 +576,14 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
 1. Delete EventBridge Pipe:
 
    ```bash
-   # Delete the pipe (if using CloudFormation, delete stack)
-   # Direct CLI deletion might require SDK
-   echo "Delete EventBridge Pipe ${PIPE_NAME} from console"
+   # Delete the EventBridge Pipe
+   aws pipes delete-pipe --name ${PIPE_NAME}
+   
+   # Wait for pipe deletion to complete
+   echo "Waiting for pipe deletion..."
+   sleep 30
+   
+   echo "✅ Deleted EventBridge Pipe"
    ```
 
 2. Delete Kinesis Data Firehose:
@@ -679,13 +686,13 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
 
 ## Discussion
 
-Building real-time stream enrichment pipelines with Kinesis Data Firehose and EventBridge Pipes creates a robust, serverless architecture that scales automatically with your data volume. This approach leverages managed services to reduce operational overhead while providing enterprise-grade reliability and performance. According to the [AWS Kinesis Data Streams Developer Guide](https://docs.aws.amazon.com/kinesis/latest/dev/introduction.html), this pattern is particularly effective for IoT data processing, clickstream analytics, and log aggregation scenarios.
+Building real-time stream enrichment pipelines with Kinesis Data Streams, EventBridge Pipes, and Kinesis Data Firehose creates a robust, serverless architecture that scales automatically with your data volume. This approach leverages managed services to reduce operational overhead while providing enterprise-grade reliability and performance. According to the [AWS Kinesis Data Streams Developer Guide](https://docs.aws.amazon.com/kinesis/latest/dev/introduction.html), this pattern is particularly effective for IoT data processing, clickstream analytics, and log aggregation scenarios where real-time enrichment is essential.
 
-The combination of EventBridge Pipes for orchestration and Lambda for enrichment provides a flexible framework that can adapt to various business requirements. As documented in the [EventBridge Pipes User Guide](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-pipes.html), Pipes maintains event ordering within partition keys while providing built-in error handling and retry mechanisms. This ensures data consistency and reliability even during transient failures.
+EventBridge Pipes serves as the orchestration layer that connects Kinesis Data Streams to Lambda for enrichment and then to Kinesis Data Firehose for delivery. As documented in the [EventBridge Pipes User Guide](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-pipes.html), Pipes maintains event ordering within partition keys while providing built-in error handling, retry mechanisms, and dead letter queue integration. This eliminates the need for custom polling logic and error handling code that would be required with traditional approaches.
 
-From a cost optimization perspective, using Kinesis Data Streams in on-demand mode and Lambda's pay-per-invocation pricing creates a solution that scales to zero during idle periods. The [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) recommends this serverless approach for variable workloads where traditional fixed-capacity solutions would result in over-provisioning. Additionally, storing enriched data in S3 with Parquet format conversion reduces storage costs while improving query performance.
+From a cost optimization perspective, using Kinesis Data Streams in on-demand mode, Lambda's pay-per-invocation pricing, and Firehose's managed delivery creates a solution that scales to zero during idle periods. The [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) recommends this serverless approach for variable workloads where traditional fixed-capacity solutions would result in over-provisioning. EventBridge Pipes adds minimal cost while providing significant operational benefits through its managed integration capabilities.
 
-Security is built into every layer of this architecture through IAM roles with least-privilege permissions, encryption at rest in S3 and DynamoDB, and encryption in transit for all data flows. Following the guidance in the [AWS Security Best Practices](https://docs.aws.amazon.com/prescriptive-guidance/latest/security-reference-architecture/welcome.html), this design ensures compliance with data protection requirements while maintaining operational simplicity. For enhanced security, consider implementing [AWS PrivateLink](https://docs.aws.amazon.com/vpc/latest/privatelink/what-is-privatelink.html) endpoints for service-to-service communication within your VPC.
+Security is built into every layer of this architecture through IAM roles with least-privilege permissions, encryption at rest in S3 and DynamoDB, and encryption in transit for all data flows. Following the guidance in the [AWS Security Best Practices](https://docs.aws.amazon.com/prescriptive-guidance/latest/security-reference-architecture/welcome.html), this design ensures compliance with data protection requirements while maintaining operational simplicity. EventBridge Pipes supports AWS KMS encryption for additional security when processing sensitive data streams.
 
 > **Warning**: Monitor your Lambda function's concurrent execution limits to prevent throttling during traffic spikes. Consider implementing reserved concurrency for predictable performance.
 
@@ -701,4 +708,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

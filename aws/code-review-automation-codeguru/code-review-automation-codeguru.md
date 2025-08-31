@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: CodeGuru, CodeCommit, IAM
 estimated-time: 90 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: codeguru, code-review, automation, static-analysis, profiling
 recipe-generator-version: 1.3
 ---
 
 # Code Review Automation with CodeGuru
-
 
 ## Problem
 
@@ -316,13 +315,13 @@ echo "✅ IAM role created successfully"
    # Create profiler group
    aws codeguru-profiler create-profiling-group \
        --profiling-group-name ${PROFILER_GROUP_NAME} \
-       --compute-platform Default \
-       --agent-permissions '{
-           "actionGroupPermissions": [
-               "agentPermissions:CreateProfilingGroup",
-               "agentPermissions:DescribeProfilingGroup"
-           ]
-       }'
+       --compute-platform Default
+   
+   # Configure agent permissions for the profiling group
+   aws codeguru-profiler put-permission \
+       --action-group agentPermissions \
+       --profiling-group-name ${PROFILER_GROUP_NAME} \
+       --principals "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME}"
    
    echo "✅ Profiler group created: ${PROFILER_GROUP_NAME}"
    ```
@@ -914,32 +913,39 @@ echo "✅ IAM role created successfully"
 
 ## Discussion
 
-Amazon CodeGuru represents a significant advancement in automated code quality assurance, leveraging machine learning models trained on millions of lines of code from Amazon's internal repositories and open-source projects. The service addresses the fundamental challenge of scaling code review processes while maintaining consistent quality standards across development teams.
+Amazon CodeGuru represents a significant advancement in automated code quality assurance, leveraging machine learning models trained on millions of lines of code from Amazon's internal repositories and open-source projects. The service addresses the fundamental challenge of scaling code review processes while maintaining consistent quality standards across development teams. CodeGuru's AI-powered analysis provides context-aware recommendations that go beyond traditional static analysis tools by understanding code patterns, security implications, and performance characteristics.
 
-CodeGuru Reviewer's static analysis capabilities extend beyond traditional linting tools by providing context-aware recommendations that consider code patterns, security vulnerabilities, and performance implications. The service's integration with pull request workflows enables proactive quality gates that prevent problematic code from reaching production environments. The ML-powered detector library continuously evolves, incorporating new patterns and improving accuracy based on user feedback.
+CodeGuru Reviewer's static analysis capabilities extend beyond traditional linting tools by providing context-aware recommendations that consider code patterns, security vulnerabilities, and performance implications. The service's integration with pull request workflows enables proactive quality gates that prevent problematic code from reaching production environments. The ML-powered detector library continuously evolves, incorporating new patterns and improving accuracy based on user feedback through the recommendation feedback system.
 
-CodeGuru Profiler complements static analysis by providing runtime insights into application performance characteristics. By collecting detailed profiling data from production environments, it identifies actual performance bottlenecks and provides cost-optimization recommendations. The service's ability to visualize CPU utilization patterns, memory allocation, and method-level performance metrics enables data-driven optimization decisions.
+CodeGuru Profiler complements static analysis by providing runtime insights into application performance characteristics. By collecting detailed profiling data from production environments, it identifies actual performance bottlenecks and provides cost-optimization recommendations. The service's ability to visualize CPU utilization patterns, memory allocation, and method-level performance metrics enables data-driven optimization decisions that static analysis alone cannot provide.
 
-The integration between CodeGuru services and existing development workflows creates a comprehensive code quality ecosystem. By combining static analysis with runtime profiling, teams can establish evidence-based quality standards that balance development velocity with code maintainability. The automated feedback loop ensures that identified issues are tracked and addressed systematically, reducing technical debt accumulation over time.
+The integration between CodeGuru services and existing development workflows creates a comprehensive code quality ecosystem that follows AWS Well-Architected Framework principles. By combining static analysis with runtime profiling, teams can establish evidence-based quality standards that balance development velocity with code maintainability. The automated feedback loop ensures that identified issues are tracked and addressed systematically, reducing technical debt accumulation over time while maintaining security and performance standards.
 
-> **Warning**: AWS CodeCommit is no longer available to new customers as of July 2024. For new implementations, consider using GitHub, GitLab, or Bitbucket with CodeGuru Reviewer's [repository association capabilities](https://docs.aws.amazon.com/codeguru/latest/reviewer-ug/working-with-repositories.html). Existing CodeCommit users can continue using the service normally.
+> **Warning**: AWS CodeCommit is no longer available to new customers as of July 2024. For new implementations, consider using GitHub, GitLab, or Bitbucket with CodeGuru Reviewer's [repository association capabilities](https://docs.aws.amazon.com/codeguru/latest/reviewer-ug/working-with-repositories.html). Existing CodeCommit users can continue using the service normally. See the [AWS migration guide](https://aws.amazon.com/blogs/devops/how-to-migrate-your-aws-codecommit-repository-to-another-git-provider/) for transitioning to alternative Git providers.
 
-> **Tip**: Use CodeGuru's recommendation feedback feature to train the ML models for your specific codebase patterns and reduce false positives over time. Learn more about [how CodeGuru Reviewer works](https://docs.aws.amazon.com/codeguru/latest/reviewer-ug/how-codeguru-reviewer-works.html) and the feedback mechanism for improving recommendations.
+> **Tip**: Use CodeGuru's recommendation feedback feature to train the ML models for your specific codebase patterns and reduce false positives over time. Learn more about [how CodeGuru Reviewer works](https://docs.aws.amazon.com/codeguru/latest/reviewer-ug/how-codeguru-reviewer-works.html) and the feedback mechanism for improving recommendations. Regular feedback helps the service adapt to your team's coding standards and reduces notification fatigue.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Repository Management**: Create a centralized dashboard that aggregates CodeGuru recommendations across multiple repositories, implementing priority-based issue tracking and automated assignment to development teams.
+1. **Multi-Repository Management**: Create a centralized dashboard that aggregates CodeGuru recommendations across multiple repositories, implementing priority-based issue tracking and automated assignment to development teams using AWS Lambda and DynamoDB for scalable management.
 
-2. **Custom Detector Development**: Develop organization-specific detectors using CodeGuru's custom detector framework to identify anti-patterns unique to your codebase and coding standards.
+2. **Custom Detector Development**: Develop organization-specific detectors using CodeGuru's custom detector framework to identify anti-patterns unique to your codebase and coding standards, integrating with your existing code review workflows and quality gates.
 
-3. **Performance Regression Detection**: Implement automated performance regression testing by comparing CodeGuru Profiler data across application releases, creating alerts for performance degradation.
+3. **Performance Regression Detection**: Implement automated performance regression testing by comparing CodeGuru Profiler data across application releases, creating CloudWatch alarms and SNS notifications for performance degradation patterns that exceed defined thresholds.
 
-4. **Integration with JIRA/ServiceNow**: Build automated ticket creation workflows that generate tracking issues for high-severity CodeGuru recommendations, including remediation guidance and ownership assignment.
+4. **Integration with JIRA/ServiceNow**: Build automated ticket creation workflows that generate tracking issues for high-severity CodeGuru recommendations, including remediation guidance, ownership assignment, and progress tracking using AWS API Gateway and Lambda functions.
 
-5. **Cost Optimization Analytics**: Develop a comprehensive cost analysis system that correlates CodeGuru recommendations with actual infrastructure costs, quantifying the ROI of code quality improvements.
+5. **Cost Optimization Analytics**: Develop a comprehensive cost analysis system that correlates CodeGuru recommendations with actual infrastructure costs using AWS Cost Explorer APIs, quantifying the ROI of code quality improvements and enabling data-driven optimization decisions.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

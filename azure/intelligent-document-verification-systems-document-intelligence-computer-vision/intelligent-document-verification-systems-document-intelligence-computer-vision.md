@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Document Intelligence, Azure Computer Vision, Azure Logic Apps, Azure Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: document-processing, ocr, ai, verification, fraud-detection, compliance
 recipe-generator-version: 1.3
@@ -200,7 +200,7 @@ echo "✅ Storage containers created for document processing"
        --storage-account ${STORAGE_ACCOUNT} \
        --consumption-plan-location ${LOCATION} \
        --runtime python \
-       --runtime-version 3.11 \
+       --runtime-version 3.12 \
        --functions-version 4 \
        --disable-app-insights false
    
@@ -279,7 +279,7 @@ echo "✅ Storage containers created for document processing"
              "type": "Http",
              "inputs": {
                "method": "POST",
-               "uri": "'${DOC_INTELLIGENCE_ENDPOINT}'/formrecognizer/documentModels/prebuilt-idDocument:analyze?api-version=2023-10-31-preview",
+               "uri": "'${DOC_INTELLIGENCE_ENDPOINT}'/formrecognizer/documentModels/prebuilt-idDocument:analyze?api-version=2024-11-30",
                "headers": {
                  "Ocp-Apim-Subscription-Key": "'${DOC_INTELLIGENCE_KEY}'"
                }
@@ -289,7 +289,7 @@ echo "✅ Storage containers created for document processing"
              "type": "Http",
              "inputs": {
                "method": "POST",
-               "uri": "'${VISION_ENDPOINT}'/computervision/imageanalysis:analyze?api-version=2023-10-01",
+               "uri": "'${VISION_ENDPOINT}'/computervision/imageanalysis:analyze?api-version=2024-02-01",
                "headers": {
                  "Ocp-Apim-Subscription-Key": "'${VISION_KEY}'"
                }
@@ -350,8 +350,8 @@ EOF
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
 azure-functions
-azure-ai-formrecognizer
-azure-cognitiveservices-vision-computervision
+azure-ai-documentintelligence
+azure-ai-vision-imageanalysis
 azure-storage-blob
 azure-cosmos
 requests
@@ -385,11 +385,9 @@ import azure.functions as func
 import json
 import logging
 import os
-from azure.ai.formrecognizer import DocumentAnalysisClient
-from azure.cognitiveservices.vision.computervision import ComputerVisionClient
-from azure.cognitiveservices.vision.computervision.models import OperationStatusCodes
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.vision.imageanalysis import ImageAnalysisClient
 from azure.core.credentials import AzureKeyCredential
-from msrest.authentication import CognitiveServicesCredentials
 from azure.cosmos import CosmosClient
 from datetime import datetime
 import uuid
@@ -408,14 +406,14 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             )
         
         # Initialize clients
-        doc_intel_client = DocumentAnalysisClient(
+        doc_intel_client = DocumentIntelligenceClient(
             endpoint=os.environ["DOCUMENT_INTELLIGENCE_ENDPOINT"],
             credential=AzureKeyCredential(os.environ["DOCUMENT_INTELLIGENCE_KEY"])
         )
         
-        vision_client = ComputerVisionClient(
+        vision_client = ImageAnalysisClient(
             endpoint=os.environ["COMPUTER_VISION_ENDPOINT"],
-            credentials=CognitiveServicesCredentials(os.environ["COMPUTER_VISION_KEY"])
+            credential=AzureKeyCredential(os.environ["COMPUTER_VISION_KEY"])
         )
         
         cosmos_client = CosmosClient.from_connection_string(
@@ -423,14 +421,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
         
         # Document Intelligence analysis
-        doc_intel_result = doc_intel_client.begin_analyze_document_from_url(
-            "prebuilt-idDocument", document_url
+        doc_intel_result = doc_intel_client.begin_analyze_document(
+            "prebuilt-idDocument", 
+            analyze_request={"urlSource": document_url}
         ).result()
         
         # Computer Vision analysis
-        vision_result = vision_client.analyze_image(
-            url=document_url,
-            visual_features=["Categories", "Description", "Color", "Tags", "Objects"]
+        vision_result = vision_client.analyze_from_url(
+            image_url=document_url,
+            visual_features=["Tags", "Objects", "Caption", "Read"],
+            smart_crops_aspect_ratios=[0.9, 1.33]
         )
         
         # Process results
@@ -443,8 +443,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 "confidence": calculate_confidence(doc_intel_result)
             },
             "computer_vision": {
-                "description": vision_result.description.captions[0].text if vision_result.description.captions else "",
-                "tags": [tag.name for tag in vision_result.tags],
+                "caption": vision_result.caption.text if vision_result.caption else "",
+                "tags": [tag.name for tag in vision_result.tags.list],
                 "quality_score": assess_image_quality(vision_result)
             },
             "verification_status": determine_verification_status(doc_intel_result, vision_result),
@@ -496,12 +496,14 @@ def assess_image_quality(vision_result):
     """Assess image quality based on Computer Vision analysis"""
     quality_score = 0.5  # Default
     
-    # Check for blur, noise, or other quality indicators
-    if vision_result.color:
-        quality_score += 0.2 if vision_result.color.is_bw_img else 0.1
+    # Check caption confidence
+    if vision_result.caption and vision_result.caption.confidence:
+        quality_score += min(vision_result.caption.confidence, 0.3)
     
-    if vision_result.description and vision_result.description.captions:
-        quality_score += min(vision_result.description.captions[0].confidence, 0.3)
+    # Check tag confidence
+    if vision_result.tags and vision_result.tags.list:
+        avg_tag_confidence = sum(tag.confidence for tag in vision_result.tags.list[:5]) / min(5, len(vision_result.tags.list))
+        quality_score += min(avg_tag_confidence, 0.2)
     
     return min(quality_score, 1.0)
 
@@ -534,14 +536,11 @@ def detect_fraud_indicators(doc_intel_result, vision_result):
     return indicators
 EOF
    
-   # Deploy function
-   cd /tmp/docverify-function
-   func azure functionapp publish ${FUNCTION_APP_NAME} --python
-   
-   echo "✅ Document verification function deployed successfully"
+   # Deploy function (requires Azure Functions Core Tools)
+   echo "✅ Function code prepared. Deploy with: func azure functionapp publish ${FUNCTION_APP_NAME}"
    ```
 
-   The Azure Function is now deployed with comprehensive document verification logic. This serverless function coordinates AI services, applies business rules, and maintains audit trails for compliance requirements.
+   The Azure Function is now prepared with comprehensive document verification logic. This serverless function coordinates AI services, applies business rules, and maintains audit trails for compliance requirements.
 
 7. **Configure API Management for Security**:
 
@@ -704,13 +703,13 @@ EOF
 
 ## Discussion
 
-Azure Document Intelligence and Computer Vision form a powerful combination for automated document verification systems that can significantly reduce manual processing time while improving accuracy and security. This architecture leverages Azure's AI capabilities to extract structured data from identity documents and validate their authenticity through advanced image analysis. The serverless design ensures cost-effective scaling while maintaining enterprise-grade security and compliance standards. For comprehensive guidance on AI-powered document processing, see the [Azure Document Intelligence documentation](https://docs.microsoft.com/en-us/azure/applied-ai-services/form-recognizer/) and [Computer Vision best practices](https://docs.microsoft.com/en-us/azure/cognitive-services/computer-vision/overview).
+Azure Document Intelligence and Computer Vision form a powerful combination for automated document verification systems that can significantly reduce manual processing time while improving accuracy and security. This architecture leverages Azure's AI capabilities to extract structured data from identity documents and validate their authenticity through advanced image analysis. The serverless design ensures cost-effective scaling while maintaining enterprise-grade security and compliance standards following the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles. For comprehensive guidance on AI-powered document processing, see the [Azure Document Intelligence documentation](https://learn.microsoft.com/en-us/azure/ai-services/document-intelligence/) and [Computer Vision best practices](https://learn.microsoft.com/en-us/azure/ai-services/computer-vision/overview).
 
-The integration of Logic Apps provides visual workflow orchestration that enables business users to modify verification rules without coding, while Azure Functions handles complex business logic and custom validation requirements. This hybrid approach follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of reliability, security, and operational excellence. The solution's modular design allows for easy extension to support additional document types, verification rules, and integration with existing systems.
+The integration of Logic Apps provides visual workflow orchestration that enables business users to modify verification rules without coding, while Azure Functions handles complex business logic and custom validation requirements. This hybrid approach supports various Azure security features including Azure AD integration, Azure Key Vault for secrets management, and comprehensive audit logging through Azure Monitor. The solution's modular design allows for easy extension to support additional document types, verification rules, and integration with existing enterprise systems.
 
-From a compliance perspective, this architecture supports various regulatory requirements including GDPR, HIPAA, and financial services regulations through built-in encryption, audit trails, and data residency controls. Azure Cosmos DB provides global distribution capabilities while maintaining consistency and compliance with data protection regulations. The comprehensive logging and monitoring capabilities enable organizations to maintain detailed audit trails for regulatory reporting and fraud investigation. For detailed compliance information, review the [Azure compliance documentation](https://docs.microsoft.com/en-us/azure/compliance/).
+From a compliance perspective, this architecture supports various regulatory requirements including GDPR, HIPAA, and financial services regulations through built-in encryption, audit trails, and data residency controls. Azure Cosmos DB provides global distribution capabilities while maintaining consistency and compliance with data protection regulations. The comprehensive logging and monitoring capabilities enable organizations to maintain detailed audit trails for regulatory reporting and fraud investigation. For detailed compliance information, review the [Azure compliance documentation](https://learn.microsoft.com/en-us/azure/compliance/) and [Azure security documentation](https://learn.microsoft.com/en-us/azure/security/).
 
-> **Tip**: Use Azure Monitor and Application Insights to track document processing metrics, identify bottlenecks, and optimize performance. The [monitoring documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/overview) provides comprehensive guidance on setting up alerts and dashboards for production workloads.
+> **Tip**: Use Azure Monitor and Application Insights to track document processing metrics, identify bottlenecks, and optimize performance. The [monitoring documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/overview) provides comprehensive guidance on setting up alerts and dashboards for production workloads.
 
 ## Challenge
 
@@ -728,4 +727,9 @@ Extend this document verification system with these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

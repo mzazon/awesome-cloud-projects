@@ -1,0 +1,558 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for AI Code Assistant Setup with Amazon Q Developer.
+  This template creates the necessary IAM resources and configurations to support
+  Amazon Q Developer integration for development teams in an enterprise environment.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Amazon Q Developer Configuration"
+        Parameters:
+          - OrganizationName
+          - DeveloperTeamName
+          - Environment
+      - Label:
+          default: "IAM Identity Center Configuration"
+        Parameters:
+          - IdentityCenterInstanceArn
+          - CreateIdentityCenterResources
+      - Label:
+          default: "Security and Access Control"
+        Parameters:
+          - AllowedRegions
+          - EnableCloudTrailLogging
+          - LogRetentionInDays
+    ParameterLabels:
+      OrganizationName:
+        default: "Organization Name"
+      DeveloperTeamName:
+        default: "Developer Team Name"
+      Environment:
+        default: "Environment"
+      IdentityCenterInstanceArn:
+        default: "IAM Identity Center Instance ARN"
+      CreateIdentityCenterResources:
+        default: "Create Identity Center Resources"
+      AllowedRegions:
+        default: "Allowed AWS Regions"
+      EnableCloudTrailLogging:
+        default: "Enable CloudTrail Logging"
+      LogRetentionInDays:
+        default: "Log Retention Period (Days)"
+
+Parameters:
+  OrganizationName:
+    Type: String
+    Description: >
+      Name of your organization (used for resource naming and tagging).
+      This helps identify resources across your AWS environment.
+    Default: "MyOrganization"
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: >
+      Must begin with a letter and contain only alphanumeric characters and hyphens.
+
+  DeveloperTeamName:
+    Type: String
+    Description: >
+      Name of the developer team using Amazon Q Developer.
+      Used for resource organization and access control.
+    Default: "DevTeam"
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: >
+      Must begin with a letter and contain only alphanumeric characters and hyphens.
+
+  Environment:
+    Type: String
+    Description: >
+      Environment designation for this deployment (development, staging, production).
+      This affects security policies and resource configurations.
+    Default: "development"
+    AllowedValues:
+      - "development"
+      - "staging"
+      - "production"
+    ConstraintDescription: Must be one of development, staging, or production.
+
+  IdentityCenterInstanceArn:
+    Type: String
+    Description: >
+      ARN of your IAM Identity Center instance (required for Amazon Q Developer Pro).
+      Leave empty if using AWS Builder ID or if Identity Center is not configured.
+      Format: arn:aws:sso:::instance/ssoins-instanceid
+    Default: ""
+    AllowedPattern: ^(arn:aws:sso::.*:instance/ssoins-.*|)$
+    ConstraintDescription: >
+      Must be a valid IAM Identity Center instance ARN or empty string.
+
+  CreateIdentityCenterResources:
+    Type: String
+    Description: >
+      Whether to create IAM Identity Center permission sets and assignments.
+      Set to 'Yes' only if you have an active Identity Center instance and want Pro features.
+    Default: "No"
+    AllowedValues:
+      - "Yes"
+      - "No"
+    ConstraintDescription: Must be Yes or No.
+
+  AllowedRegions:
+    Type: CommaDelimitedList
+    Description: >
+      List of AWS regions where Amazon Q Developer can be used.
+      Restricts usage to specific regions for compliance and cost control.
+    Default: "us-east-1,us-west-2,eu-west-1"
+
+  EnableCloudTrailLogging:
+    Type: String
+    Description: >
+      Enable CloudTrail logging for Amazon Q Developer API calls.
+      Recommended for production environments to track usage and compliance.
+    Default: "Yes"
+    AllowedValues:
+      - "Yes"
+      - "No"
+    ConstraintDescription: Must be Yes or No.
+
+  LogRetentionInDays:
+    Type: Number
+    Description: >
+      Number of days to retain CloudWatch logs for Amazon Q Developer activities.
+      Longer retention periods may increase costs but improve auditability.
+    Default: 30
+    MinValue: 1
+    MaxValue: 3653
+    ConstraintDescription: Must be between 1 and 3653 days.
+
+Conditions:
+  CreateIdentityCenter: !Equals [!Ref CreateIdentityCenterResources, "Yes"]
+  HasIdentityCenterArn: !Not [!Equals [!Ref IdentityCenterInstanceArn, ""]]
+  EnableLogging: !Equals [!Ref EnableCloudTrailLogging, "Yes"]
+  IsProduction: !Equals [!Ref Environment, "production"]
+
+Resources:
+  # IAM Role for Amazon Q Developer Service
+  AmazonQDeveloperServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${OrganizationName}-${DeveloperTeamName}-AmazonQ-ServiceRole-${Environment}"
+      Description: >
+        Service role for Amazon Q Developer to access AWS services on behalf of developers.
+        This role enables Q to provide AWS-specific code suggestions and documentation.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - q.amazonaws.com
+                - codewhisperer.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonQDeveloperServicePolicy
+      Tags:
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Team
+          Value: !Ref DeveloperTeamName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Amazon Q Developer Service Access"
+
+  # IAM Policy for Developer Access to Amazon Q
+  AmazonQDeveloperAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${OrganizationName}-${DeveloperTeamName}-AmazonQ-DeveloperAccess-${Environment}"
+      Description: >
+        Policy granting developers access to Amazon Q Developer features including
+        code suggestions, chat interface, and security scanning capabilities.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Core Amazon Q Developer permissions
+          - Sid: AmazonQDeveloperAccess
+            Effect: Allow
+            Action:
+              - codewhisperer:GenerateRecommendations
+              - codewhisperer:GetRecommendations
+              - codewhisperer:StartCodeAnalysis
+              - codewhisperer:GetCodeAnalysis
+              - codewhisperer:ListCodeAnalysisFindings
+              - q:GetUsage
+              - q:GetConfiguration
+              - q:StartConversation
+              - q:SendMessage
+              - q:GetConversation
+              - q:ListConversations
+              - q:PassRequest
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AllowedRegions
+          
+          # Identity Center integration (if applicable)
+          - Sid: IdentityCenterAccess
+            Effect: Allow
+            Action:
+              - sso:DescribeInstance
+              - sso:DescribePermissionSet
+              - sso:ListPermissionSets
+              - identitystore:DescribeUser
+              - identitystore:DescribeGroup
+            Resource: '*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'true'
+          
+          # CloudFormation and infrastructure read access for AWS guidance
+          - Sid: AWSServiceDocumentationAccess
+            Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackResources
+              - cloudformation:GetTemplate
+              - ec2:DescribeInstances
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeVpcs
+              - lambda:ListFunctions
+              - lambda:GetFunction
+              - s3:ListAllMyBuckets
+              - s3:GetBucketLocation
+              - iam:ListRoles
+              - iam:ListPolicies
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AllowedRegions
+
+  # IAM Role for Developers using Amazon Q
+  AmazonQDeveloperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${OrganizationName}-${DeveloperTeamName}-AmazonQ-DeveloperRole-${Environment}"
+      Description: >
+        Role for developers to assume when using Amazon Q Developer.
+        Provides necessary permissions while maintaining security boundaries.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              Bool:
+                'aws:MultiFactorAuthPresent': !If [IsProduction, 'true', 'false']
+              StringEquals:
+                'sts:ExternalId': !Sub "${OrganizationName}-${DeveloperTeamName}"
+      ManagedPolicyArns:
+        - !Ref AmazonQDeveloperAccessPolicy
+      MaxSessionDuration: 14400  # 4 hours
+      Tags:
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Team
+          Value: !Ref DeveloperTeamName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Developer Access to Amazon Q"
+
+  # CloudWatch Log Group for Amazon Q Developer activities
+  AmazonQLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub "/aws/amazonq/${OrganizationName}/${DeveloperTeamName}/${Environment}"
+      RetentionInDays: !Ref LogRetentionInDays
+      Tags:
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Team
+          Value: !Ref DeveloperTeamName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Amazon Q Developer Logging"
+
+  # CloudTrail for Amazon Q API call logging
+  AmazonQCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: EnableLogging
+    Properties:
+      TrailName: !Sub "${OrganizationName}-${DeveloperTeamName}-AmazonQ-CloudTrail-${Environment}"
+      S3BucketName: !Ref CloudTrailLogsBucket
+      S3KeyPrefix: "amazon-q-developer-logs/"
+      CloudWatchLogsLogGroupArn: !Sub "${AmazonQLogGroup}:*"
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+      IsMultiRegionTrail: false
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: "AWS::CodeWhisperer::*"
+              Values: ["*"]
+            - Type: "AWS::Q::*"
+              Values: ["*"]
+      Tags:
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Team
+          Value: !Ref DeveloperTeamName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Amazon Q Developer API Logging"
+
+  # S3 Bucket for CloudTrail logs
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableLogging
+    Properties:
+      BucketName: !Sub "${OrganizationName}-${DeveloperTeamName}-amazonq-logs-${Environment}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionInDays
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref AmazonQLogGroup
+      Tags:
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Team
+          Value: !Ref DeveloperTeamName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Amazon Q Developer CloudTrail Storage"
+
+  # S3 Bucket Policy for CloudTrail
+  CloudTrailLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnableLogging
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogsBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${OrganizationName}-${DeveloperTeamName}-AmazonQ-CloudTrail-${Environment}"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailLogsBucket.Arn}/amazon-q-developer-logs/*"
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'AWS:SourceArn': !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${OrganizationName}-${DeveloperTeamName}-AmazonQ-CloudTrail-${Environment}"
+
+  # IAM Role for CloudTrail to write to CloudWatch Logs
+  CloudTrailLogsRole:
+    Type: AWS::IAM::Role
+    Condition: EnableLogging
+    Properties:
+      RoleName: !Sub "${OrganizationName}-${DeveloperTeamName}-CloudTrail-LogsRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${AmazonQLogGroup}:*"
+
+  # IAM Identity Center Permission Set (if enabled)
+  AmazonQPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Condition: CreateIdentityCenter
+    Properties:
+      InstanceArn: !Ref IdentityCenterInstanceArn
+      Name: !Sub "${OrganizationName}-${DeveloperTeamName}-AmazonQ-PermissionSet"
+      Description: >
+        Permission set for Amazon Q Developer Pro access through IAM Identity Center.
+        Provides developers with necessary permissions for AI-powered coding assistance.
+      SessionDuration: "PT4H"  # 4 hours
+      ManagedPolicies:
+        - !Ref AmazonQDeveloperAccessPolicy
+      Tags:
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Team
+          Value: !Ref DeveloperTeamName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Amazon Q Developer Identity Center Access"
+
+  # CloudWatch Dashboard for Amazon Q Developer monitoring
+  AmazonQDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableLogging
+    Properties:
+      DashboardName: !Sub "${OrganizationName}-${DeveloperTeamName}-AmazonQ-Dashboard-${Environment}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "log",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${AmazonQLogGroup}'\n| fields @timestamp, sourceIPAddress, userIdentity.type, eventName, errorMessage\n| filter eventName like /CodeWhisperer\\|Q/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Amazon Q Developer API Calls",
+                "view": "table"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${AmazonQLogGroup}'\n| fields @timestamp, eventName\n| filter eventName like /CodeWhisperer\\|Q/\n| stats count() by eventName\n| sort count desc",
+                "region": "${AWS::Region}",
+                "title": "API Call Distribution",
+                "view": "pie"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${AmazonQLogGroup}'\n| fields @timestamp, eventName\n| filter eventName like /CodeWhisperer\\|Q/\n| stats count() by bin(5m)",
+                "region": "${AWS::Region}",
+                "title": "API Calls Over Time",
+                "view": "line"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ServiceRoleArn:
+    Description: >
+      ARN of the Amazon Q Developer service role.
+      Use this role for service-to-service authentication.
+    Value: !GetAtt AmazonQDeveloperServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceRoleArn"
+
+  DeveloperRoleArn:
+    Description: >
+      ARN of the developer role for Amazon Q access.
+      Developers can assume this role to use Amazon Q Developer features.
+    Value: !GetAtt AmazonQDeveloperRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DeveloperRoleArn"
+
+  DeveloperAccessPolicyArn:
+    Description: >
+      ARN of the managed policy granting Amazon Q Developer access.
+      Attach this policy to users or roles requiring Amazon Q access.
+    Value: !Ref AmazonQDeveloperAccessPolicy
+    Export:
+      Name: !Sub "${AWS::StackName}-DeveloperAccessPolicyArn"
+
+  CloudTrailLogsBucket:
+    Description: >
+      S3 bucket name where Amazon Q Developer CloudTrail logs are stored.
+      Use for audit and compliance review of Amazon Q usage.
+    Value: !If [EnableLogging, !Ref CloudTrailLogsBucket, "Not created - logging disabled"]
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailLogsBucket"
+
+  CloudWatchLogGroup:
+    Description: >
+      CloudWatch log group for Amazon Q Developer activities.
+      Monitor this log group for usage patterns and troubleshooting.
+    Value: !If [EnableLogging, !Ref AmazonQLogGroup, "Not created - logging disabled"]
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudWatchLogGroup"
+
+  PermissionSetArn:
+    Description: >
+      ARN of the IAM Identity Center permission set for Amazon Q Developer Pro.
+      Use this for enterprise user access management.
+    Value: !If [CreateIdentityCenter, !GetAtt AmazonQPermissionSet.PermissionSetArn, "Not created - Identity Center disabled"]
+    Export:
+      Name: !Sub "${AWS::StackName}-PermissionSetArn"
+
+  DashboardURL:
+    Description: >
+      URL to the CloudWatch dashboard for monitoring Amazon Q Developer usage.
+      Access this dashboard to view usage analytics and API call patterns.
+    Value: !If 
+      - EnableLogging
+      - !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${OrganizationName}-${DeveloperTeamName}-AmazonQ-Dashboard-${Environment}"
+      - "Not created - logging disabled"
+    Export:
+      Name: !Sub "${AWS::StackName}-DashboardURL"
+
+  DeploymentInstructions:
+    Description: >
+      Quick reference for completing Amazon Q Developer setup after CloudFormation deployment.
+    Value: !Sub |
+      1. Install Amazon Q Developer VS Code extension: code --install-extension AmazonWebServices.amazon-q-vscode
+      2. For AWS Builder ID: Use personal account authentication in VS Code
+      3. For IAM Identity Center: Configure users/groups with permission set ${AmazonQPermissionSet}
+      4. Monitor usage via CloudWatch dashboard: ${AmazonQDashboard}
+      5. Review API calls in CloudTrail logs: ${CloudTrailLogsBucket}

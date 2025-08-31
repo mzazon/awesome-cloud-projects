@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Data Loss Prevention, BigQuery, Cloud Storage, Cloud Functions
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-privacy, gdpr, compliance, automation, security, sensitive-data-protection
 recipe-generator-version: 1.3
@@ -87,7 +87,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for the project
+# Set environment variables for GCP resources
 export PROJECT_ID="privacy-compliance-$(date +%s)"
 export REGION="us-central1"
 export ZONE="us-central1-a"
@@ -110,6 +110,7 @@ gcloud services enable storage.googleapis.com
 gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable monitoring.googleapis.com
+gcloud services enable pubsub.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled for data privacy compliance"
@@ -253,18 +254,20 @@ echo "✅ APIs enabled for data privacy compliance"
    EOF
    
    # Create the DLP inspection template
-   curl -X POST \
+   TEMPLATE_RESPONSE=$(curl -X POST \
        -H "Authorization: Bearer $(gcloud auth print-access-token)" \
        -H "Content-Type: application/json" \
        -d @dlp_template.json \
-       "https://dlp.googleapis.com/v2/projects/${PROJECT_ID}/inspectTemplates"
+       "https://dlp.googleapis.com/v2/projects/${PROJECT_ID}/inspectTemplates")
    
    # Store template name for later use
-   export TEMPLATE_NAME="projects/${PROJECT_ID}/inspectTemplates/privacy-compliance-scanner"
+   export TEMPLATE_NAME=$(echo $TEMPLATE_RESPONSE | \
+       python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('name', ''))")
    
    rm dlp_template.json
    
    echo "✅ DLP inspection template created for privacy compliance"
+   echo "Template name: ${TEMPLATE_NAME}"
    ```
 
    The DLP inspection template is now configured to detect multiple categories of personal data with appropriate sensitivity thresholds. This template follows privacy regulation best practices by casting a wide net for potential PII while providing configurable confidence levels to balance detection accuracy with operational efficiency.
@@ -279,23 +282,25 @@ echo "✅ APIs enabled for data privacy compliance"
    
    # Create requirements.txt for Python dependencies
    cat > requirements.txt << EOF
-   google-cloud-dlp==3.12.0
-   google-cloud-bigquery==3.11.4
-   google-cloud-storage==2.10.0
-   google-cloud-logging==3.8.0
+   google-cloud-dlp==3.22.0
+   google-cloud-bigquery==3.25.0
+   google-cloud-storage==2.17.0
+   google-cloud-logging==3.11.0
+   functions-framework==3.8.0
    EOF
    
    # Create main function code
    cat > main.py << 'EOF'
    import json
    import os
+   import base64
    from datetime import datetime
    from google.cloud import dlp_v2
    from google.cloud import bigquery
    from google.cloud import storage
    from google.cloud import logging as cloud_logging
    
-   def process_dlp_results(event, context):
+   def process_dlp_results(cloud_event):
        """Process DLP scan results and perform automated remediation."""
        
        # Initialize clients
@@ -306,12 +311,16 @@ echo "✅ APIs enabled for data privacy compliance"
        logger = logging_client.logger("dlp-remediation")
        
        try:
-           # Parse the message from Pub/Sub
-           message_data = json.loads(event['data'].decode('utf-8'))
+           # Parse the Pub/Sub message
+           if 'data' in cloud_event:
+               message_data = json.loads(base64.b64decode(cloud_event['data']).decode('utf-8'))
+           else:
+               logger.error("No data in cloud event")
+               return {'status': 'error', 'message': 'No data in cloud event'}
            
            # Extract scan results
            scan_results = message_data.get('findings', [])
-           file_path = message_data.get('file_path', '')
+           file_path = message_data.get('resource', {}).get('name', '')
            
            # Process each finding
            for finding in scan_results:
@@ -322,7 +331,7 @@ echo "✅ APIs enabled for data privacy compliance"
                # Insert results into BigQuery
                table_id = f"{os.environ['PROJECT_ID']}.privacy_compliance.dlp_scan_results"
                rows_to_insert = [{
-                   'scan_id': context.eventId,
+                   'scan_id': cloud_event.get('id', ''),
                    'file_path': file_path,
                    'scan_timestamp': datetime.utcnow().isoformat(),
                    'info_type': info_type,
@@ -338,22 +347,23 @@ echo "✅ APIs enabled for data privacy compliance"
                if errors:
                    logger.error(f"BigQuery insert errors: {errors}")
                
-               # Implement remediation logic
-               if likelihood in ['LIKELY', 'VERY_LIKELY']:
-                   # High-confidence PII detected - implement quarantine
-                   bucket_name = file_path.split('/')[2]  # Extract bucket from gs:// path
-                   blob_name = '/'.join(file_path.split('/')[3:])  # Extract object path
-                   
-                   bucket = storage_client.bucket(bucket_name)
-                   blob = bucket.blob(blob_name)
-                   
-                   # Add metadata tag for compliance tracking
-                   blob.metadata = blob.metadata or {}
-                   blob.metadata['compliance_status'] = 'HIGH_RISK_PII_DETECTED'
-                   blob.metadata['scan_timestamp'] = datetime.utcnow().isoformat()
-                   blob.patch()
-                   
-                   logger.warning(f"High-risk PII detected in {file_path}: {info_type}")
+               # Implement remediation logic for high-confidence findings
+               if likelihood in ['LIKELY', 'VERY_LIKELY'] and file_path.startswith('gs://'):
+                   # Extract bucket and object path from gs:// URL
+                   path_parts = file_path.replace('gs://', '').split('/', 1)
+                   if len(path_parts) == 2:
+                       bucket_name, blob_name = path_parts
+                       
+                       bucket = storage_client.bucket(bucket_name)
+                       blob = bucket.blob(blob_name)
+                       
+                       # Add metadata tag for compliance tracking
+                       blob.metadata = blob.metadata or {}
+                       blob.metadata['compliance_status'] = 'HIGH_RISK_PII_DETECTED'
+                       blob.metadata['scan_timestamp'] = datetime.utcnow().isoformat()
+                       blob.patch()
+                       
+                       logger.warning(f"High-risk PII detected in {file_path}: {info_type}")
            
            return {'status': 'success', 'processed_findings': len(scan_results)}
            
@@ -362,14 +372,16 @@ echo "✅ APIs enabled for data privacy compliance"
            return {'status': 'error', 'message': str(e)}
    EOF
    
-   # Deploy the Cloud Function
+   # Deploy the Cloud Function with updated runtime
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --gen2 \
+       --runtime python312 \
        --trigger-topic dlp-notifications \
        --entry-point process_dlp_results \
-       --memory 256MB \
-       --timeout 60s \
-       --set-env-vars PROJECT_ID=${PROJECT_ID}
+       --memory 512Mi \
+       --timeout 120s \
+       --set-env-vars PROJECT_ID=${PROJECT_ID} \
+       --region ${REGION}
    
    cd ..
    
@@ -383,6 +395,9 @@ echo "✅ APIs enabled for data privacy compliance"
    DLP jobs provide systematic scanning of Cloud Storage data to identify privacy-sensitive information across your entire data lake. This configuration establishes recurring scans that automatically process new files and generate findings that feed into the compliance monitoring and remediation pipeline, ensuring continuous privacy protection as data volumes grow.
 
    ```bash
+   # Create Pub/Sub topic for DLP notifications first
+   gcloud pubsub topics create dlp-notifications --quiet || true
+   
    # Create DLP job configuration for Cloud Storage scanning
    cat > dlp_job.json << EOF
    {
@@ -423,9 +438,6 @@ echo "✅ APIs enabled for data privacy compliance"
    }
    EOF
    
-   # Create Pub/Sub topic for DLP notifications (if not exists)
-   gcloud pubsub topics create dlp-notifications --quiet || true
-   
    # Create the DLP scan job
    JOB_RESPONSE=$(curl -X POST \
        -H "Authorization: Bearer $(gcloud auth print-access-token)" \
@@ -433,8 +445,9 @@ echo "✅ APIs enabled for data privacy compliance"
        -d @dlp_job.json \
        "https://dlp.googleapis.com/v2/projects/${PROJECT_ID}/dlpJobs")
    
-   # Extract job name from response
-   export DLP_JOB_NAME=$(echo $JOB_RESPONSE | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+   # Extract job name from response with better parsing
+   export DLP_JOB_NAME=$(echo $JOB_RESPONSE | \
+       python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('name', ''))")
    
    rm dlp_job.json
    
@@ -452,24 +465,35 @@ echo "✅ APIs enabled for data privacy compliance"
    # Check DLP job status
    echo "Monitoring DLP job progress..."
    
-   # Function to check job status
+   # Function to check job status with improved error handling
    check_job_status() {
+       if [ -z "${DLP_JOB_NAME}" ]; then
+           echo "DLP job name not available"
+           return 1
+       fi
+       
        curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" \
            "https://dlp.googleapis.com/v2/${DLP_JOB_NAME}" | \
            python3 -c "
    import sys, json
-   data = json.load(sys.stdin)
-   print(f\"Job State: {data.get('state', 'UNKNOWN')}\")
-   print(f\"Create Time: {data.get('createTime', 'N/A')}\")
-   if 'inspectDetails' in data:
-       details = data['inspectDetails']
-       print(f\"Processed Bytes: {details.get('result', {}).get('processedBytes', 0)}\")
-       print(f\"Total Estimated Bytes: {details.get('result', {}).get('totalEstimatedBytes', 0)}\")
+   try:
+       data = json.load(sys.stdin)
+       print(f\"Job State: {data.get('state', 'UNKNOWN')}\")
+       print(f\"Create Time: {data.get('createTime', 'N/A')}\")
+       if 'inspectDetails' in data:
+           details = data['inspectDetails']
+           result = details.get('result', {})
+           print(f\"Processed Bytes: {result.get('processedBytes', 0)}\")
+           print(f\"Total Estimated Bytes: {result.get('totalEstimatedBytes', 0)}\")
+   except json.JSONDecodeError:
+       print('Error parsing job status response')
+   except Exception as e:
+       print(f'Error checking job status: {e}')
    "
    }
    
-   # Monitor job until completion
-   for i in {1..10}; do
+   # Monitor job until completion with timeout
+   for i in {1..20}; do
        echo "Check #${i}:"
        check_job_status
        echo "---"
@@ -522,6 +546,7 @@ echo "✅ APIs enabled for data privacy compliance"
    ```bash
    # Check Cloud Function logs
    gcloud functions logs read ${FUNCTION_NAME} \
+       --region ${REGION} \
        --limit 50 \
        --format "table(timestamp,severity,textPayload)"
    
@@ -567,7 +592,7 @@ echo "✅ APIs enabled for data privacy compliance"
 
    ```bash
    # Delete BigQuery dataset and all tables
-   bq rm -r -f ${DATASET_NAME}
+   bq rm -r -f ${PROJECT_ID}:${DATASET_NAME}
    
    echo "✅ BigQuery dataset deleted"
    ```
@@ -636,4 +661,9 @@ Extend this privacy compliance solution by implementing these advanced capabilit
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

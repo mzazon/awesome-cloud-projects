@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Playwright Testing, Application Insights, Azure Key Vault
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: browser-testing, e2e-testing, monitoring, devops, automation
 recipe-generator-version: 1.3
@@ -87,20 +87,19 @@ graph TB
 
 ```bash
 # Set environment variables for the recipe
-export RESOURCE_GROUP="rg-playwright-testing"
+export RESOURCE_GROUP="rg-playwright-testing-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
-export KEYVAULT_NAME="kv-playwright-$(openssl rand -hex 3)"
-export AI_NAME="ai-playwright-testing"
-export WORKSPACE_NAME="playwright-workspace-$(openssl rand -hex 3)"
+export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
+export KEYVAULT_NAME="kv-playwright-${RANDOM_SUFFIX}"
+export AI_NAME="ai-playwright-testing-${RANDOM_SUFFIX}"
+export WORKSPACE_NAME="playwright-workspace-${RANDOM_SUFFIX}"
 
 # Login to Azure (skip if using Cloud Shell)
 az login
 
-# Set subscription if needed
-SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 echo "Using subscription: ${SUBSCRIPTION_ID}"
 
 # Create resource group
@@ -166,6 +165,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ Key Vault created: ${KEYVAULT_NAME}"
    ```
 
+   The Key Vault is now configured with RBAC authorization, providing secure, role-based access to secrets. This approach follows Azure security best practices and enables fine-grained control over who can access test credentials.
+
 3. **Store Test Credentials in Key Vault**:
 
    Storing test credentials in Key Vault ensures secure management of sensitive data across all testing environments. This approach supports credential rotation without code changes and provides audit logging for compliance. The secrets can include application URLs, test user credentials, API keys, and environment-specific configuration values.
@@ -197,6 +198,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ Test credentials stored securely in Key Vault"
    ```
 
+   All sensitive configuration data is now centrally managed and secured through Azure's identity and access management system.
+
 4. **Create Playwright Testing Workspace**:
 
    The Playwright Testing workspace provides cloud infrastructure for running browser tests at scale. This managed service eliminates the need to maintain test infrastructure and provides automatic scaling based on test volume. The workspace supports parallel execution across multiple browsers and operating systems, significantly reducing test execution time.
@@ -219,11 +222,14 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    read -p "Press Enter after creating the workspace..."
    
    # Prompt for service endpoint
-   read -p "Enter the Playwright Testing service endpoint URL: " PLAYWRIGHT_SERVICE_URL
+   read -p "Enter the Playwright Testing service endpoint URL: " \
+       PLAYWRIGHT_SERVICE_URL
    export PLAYWRIGHT_SERVICE_URL
    
    echo "✅ Playwright Testing workspace configured"
    ```
+
+   The workspace is now ready to execute tests in the cloud. The service endpoint URL will be used to connect your local test runner to Azure's managed browser infrastructure.
 
 5. **Initialize Playwright Test Project**:
 
@@ -245,8 +251,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    
    # Create playwright.config.ts for Azure integration
    cat > playwright.config.ts << 'EOF'
-   import { defineConfig } from '@playwright/test';
-   import { PlaywrightServiceConfig } from '@azure/microsoft-playwright-testing';
+   import { defineConfig, devices } from '@playwright/test';
    
    export default defineConfig({
      testDir: './tests',
@@ -261,9 +266,18 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
      },
      
      projects: [
-       { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
-       { name: 'firefox', use: { ...devices['Desktop Firefox'] } },
-       { name: 'webkit', use: { ...devices['Desktop Safari'] } },
+       { 
+         name: 'chromium', 
+         use: { ...devices['Desktop Chrome'] } 
+       },
+       { 
+         name: 'firefox', 
+         use: { ...devices['Desktop Firefox'] } 
+       },
+       { 
+         name: 'webkit', 
+         use: { ...devices['Desktop Safari'] } 
+       },
      ],
      
      reporter: [
@@ -276,11 +290,16 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ Playwright project initialized with Azure integration"
    ```
 
+   The project configuration is optimized for cloud execution with multiple browser support and comprehensive reporting capabilities.
+
 6. **Configure Application Insights Integration**:
 
    Integrating Application Insights with Playwright tests enables comprehensive monitoring of test execution metrics and custom events. This configuration captures test duration, success rates, and custom properties that help identify patterns in test failures. The telemetry data flows directly to Azure Monitor, enabling advanced analytics and alerting on test health.
 
    ```bash
+   # Create test helper directory
+   mkdir -p tests/helpers
+   
    # Create test helper for Application Insights
    cat > tests/helpers/telemetry.ts << 'EOF'
    import { TelemetryClient } from 'applicationinsights';
@@ -337,14 +356,13 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ Application Insights integration configured"
    ```
 
+   The telemetry helper class provides structured logging of test events and metrics, enabling comprehensive analysis of test performance trends.
+
 7. **Create Sample E2E Test with Monitoring**:
 
    This sample test demonstrates how to integrate Azure services into your Playwright tests. The test retrieves credentials from Key Vault, executes browser automation, and sends telemetry to Application Insights. This pattern ensures secure credential handling while providing comprehensive monitoring of test execution across all browsers.
 
    ```bash
-   # Create test directory
-   mkdir -p tests
-   
    # Create sample E2E test
    cat > tests/sample.spec.ts << 'EOF'
    import { test, expect } from '@playwright/test';
@@ -413,6 +431,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ Sample E2E test created with Azure integration"
    ```
 
+   The test demonstrates secure credential retrieval and comprehensive telemetry collection for monitoring test execution patterns.
+
 8. **Configure Test Execution Environment**:
 
    Proper environment configuration ensures seamless integration between Playwright tests and Azure services. Setting up authentication and service endpoints enables the test framework to connect to cloud browsers and report results. This configuration supports both local development and CI/CD pipeline execution with appropriate security contexts.
@@ -442,17 +462,23 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    
    # Create package.json test scripts
    npm pkg set scripts.test="playwright test"
-   npm pkg set scripts.test:azure="source ./setup-test-env.sh && playwright test --config=playwright.service.config.ts"
+   npm pkg set scripts.test:azure="source ./setup-test-env.sh && \
+       playwright test --config=playwright.service.config.ts"
    npm pkg set scripts.test:local="playwright test --config=playwright.config.ts"
    
    echo "✅ Test execution environment configured"
    ```
+
+   The environment setup script provides consistent configuration across different execution contexts, supporting both local development and cloud execution.
 
 9. **Set Up Application Insights Dashboard**:
 
    Creating custom dashboards in Application Insights provides real-time visibility into test execution metrics. These dashboards help identify trends in test performance, failure rates, and browser-specific issues. The visualization capabilities enable teams to quickly spot regressions and make data-driven decisions about test stability and application quality.
 
    ```bash
+   # Create queries directory
+   mkdir -p queries
+   
    # Create custom metrics query for test analysis
    cat > queries/test-analytics.kql << 'EOF'
    // Test execution summary
@@ -460,8 +486,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    | where name == "TestCompleted"
    | summarize 
        TotalTests = count(),
-       PassedTests = countif(tostring(customDimensions.passed) == "True"),
-       FailedTests = countif(tostring(customDimensions.passed) == "False"),
+       PassedTests = countif(tostring(customDimensions.passed) == "true"),
+       FailedTests = countif(tostring(customDimensions.passed) == "false"),
        AvgDuration = avg(todouble(customMeasurements.duration))
      by Browser = tostring(customDimensions.browser)
    | extend PassRate = round(100.0 * PassedTests / TotalTests, 2)
@@ -475,21 +501,27 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    | render timechart
    EOF
    
-   # Create alert rule for high failure rate
-   az monitor metrics alert create \
+   # Create basic alert rule for monitoring test health
+   az monitor scheduled-query create \
        --name "High Test Failure Rate" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes $(az monitor app-insights component show \
            --app ${AI_NAME} \
            --resource-group ${RESOURCE_GROUP} \
            --query id --output tsv) \
-       --condition "customMetrics/TestFailureRate > 20" \
+       --condition "count 'Heartbeat' > 0" \
+       --condition-query "customEvents | where name == 'TestCompleted' \
+           and tostring(customDimensions.passed) == 'false' \
+           | summarize FailureCount = count() by bin(TimeGenerated, 5m) \
+           | where FailureCount > 5" \
        --window-size 5m \
-       --evaluation-frequency 1m \
-       --description "Alert when test failure rate exceeds 20%"
+       --evaluation-frequency 5m \
+       --description "Alert when test failure count exceeds 5 in 5 minutes"
    
-   echo "✅ Application Insights dashboard and alerts configured"
+   echo "✅ Application Insights analytics and monitoring configured"
    ```
+
+   The KQL queries provide comprehensive analysis of test execution patterns, while the alert rule ensures immediate notification of test health issues.
 
 ## Validation & Testing
 
@@ -588,4 +620,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

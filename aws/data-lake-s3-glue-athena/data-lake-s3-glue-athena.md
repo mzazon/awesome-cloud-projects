@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: S3, Glue, Athena, IAM
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: analytics, data-lake, s3, glue, athena, etl, serverless
 recipe-generator-version: 1.3
@@ -130,7 +130,7 @@ echo "Athena Results: ${ATHENA_RESULTS_BUCKET}"
 
 1. **Create S3 buckets for data lake storage**:
 
-   Data lake storage follows a zone-based architecture where raw data lands in the raw zone, gets processed and moved to the processed zone, and eventually archived for long-term retention. This separation enables better data governance and lifecycle management.
+   Amazon S3 provides the foundation for your data lake with 99.999999999% (11 9's) durability and multiple storage classes for cost optimization. The zone-based architecture separates raw data from processed data, enabling better governance, security, and lifecycle management while maintaining data lineage and audit capabilities.
 
    ```bash
    # Create main data lake bucket with versioning
@@ -141,8 +141,34 @@ echo "Athena Results: ${ATHENA_RESULTS_BUCKET}"
        --bucket ${DATA_LAKE_BUCKET} \
        --versioning-configuration Status=Enabled
    
+   # Enable server-side encryption
+   aws s3api put-bucket-encryption \
+       --bucket ${DATA_LAKE_BUCKET} \
+       --server-side-encryption-configuration '{
+           "Rules": [
+               {
+                   "ApplyServerSideEncryptionByDefault": {
+                       "SSEAlgorithm": "AES256"
+                   }
+               }
+           ]
+       }'
+   
    # Create Athena query results bucket
    aws s3 mb s3://${ATHENA_RESULTS_BUCKET} --region ${AWS_REGION}
+   
+   # Enable encryption for Athena results bucket
+   aws s3api put-bucket-encryption \
+       --bucket ${ATHENA_RESULTS_BUCKET} \
+       --server-side-encryption-configuration '{
+           "Rules": [
+               {
+                   "ApplyServerSideEncryptionByDefault": {
+                       "SSEAlgorithm": "AES256"
+                   }
+               }
+           ]
+       }'
    
    # Create folder structure for data lake zones
    aws s3api put-object \
@@ -185,7 +211,7 @@ echo "Athena Results: ${ATHENA_RESULTS_BUCKET}"
                        "StorageClass": "GLACIER"
                    },
                    {
-                       "Days":365,
+                       "Days": 365,
                        "StorageClass": "DEEP_ARCHIVE"
                    }
                ]
@@ -303,13 +329,13 @@ echo "Athena Results: ${ATHENA_RESULTS_BUCKET}"
    order_id,customer_id,product_name,category,quantity,price,order_date,region
    1001,C001,Laptop,Electronics,1,999.99,2024-01-15,North
    1002,C002,Coffee Maker,Appliances,2,79.99,2024-01-15,South
- 1003,C003,Book Set,Books,3,45.50,2024-01-16,East
+   1003,C003,Book Set,Books,3,45.50,2024-01-16,East
    1004,C001,Wireless Mouse,Electronics,1,29.99,2024-01-16,North
    1005,C004,Desk Chair,Furniture,1,199.99,2024-01-17,West
    1006,C005,Smartphone,Electronics,1,699.99,2024-01-17,South
    1007,C002,Blender,Appliances,1,89.99,2024-01-18,South
    1008,C006,Novel,Books,5,12.99,2024-01-18,East
- 1009,C003,Monitor,Electronics,2,299.99,2024-01-19,East
+   1009,C003,Monitor,Electronics,2,299.99,2024-01-19,East
    1010,C007,Coffee Table,Furniture,1,149.99,2024-01-19,West
    EOF
    
@@ -377,7 +403,10 @@ echo "Athena Results: ${ATHENA_RESULTS_BUCKET}"
    
    echo "✅ Created and started Glue crawlers"
    echo "Waiting for crawlers to complete..."
-   sleep 60
+   
+   # Wait for crawlers to complete
+   aws glue wait crawler-ready --name "sales-data-crawler-${RANDOM_SUFFIX}"
+   aws glue wait crawler-ready --name "web-logs-crawler-${RANDOM_SUFFIX}"
    
    # Check crawler status
    aws glue get-crawler --name "sales-data-crawler-${RANDOM_SUFFIX}" \
@@ -660,13 +689,13 @@ echo "Athena Results: ${ATHENA_RESULTS_BUCKET}"
 
 ## Discussion
 
-Building a data lake architecture with S3, Glue, and Athena provides organizations with a cost-effective, scalable solution for modern analytics workloads. This serverless approach eliminates the need for infrastructure management while providing enterprise-grade capabilities for data storage, cataloging, transformation, and analysis.
+Building a data lake architecture with S3, Glue, and Athena provides organizations with a cost-effective, scalable solution for modern analytics workloads. This serverless approach eliminates the need for infrastructure management while providing enterprise-grade capabilities for data storage, cataloging, transformation, and analysis, following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
-The key advantages include automatic schema discovery through Glue crawlers, which reduces manual effort in maintaining data catalogs, and the pay-per-query model of Athena, which makes analytics cost-effective for varying workloads. The solution supports multiple data formats and enables self-service analytics for business users through familiar SQL interfaces.
+The key advantages include automatic schema discovery through Glue crawlers, which reduces manual effort in maintaining data catalogs, and the pay-per-query model of Athena, which makes analytics cost-effective for varying workloads. The solution supports multiple data formats and enables self-service analytics for business users through familiar SQL interfaces. AWS Glue's serverless ETL capabilities provide automatic scaling and cost optimization without requiring cluster management.
 
-Cost optimization strategies such as data partitioning, compression, and intelligent storage tiering can significantly reduce both storage and query costs. Partitioning by commonly filtered columns like date or region can improve query performance by orders of magnitude while reducing the amount of data scanned. Using columnar formats like Parquet further enhances compression and query performance.
+Cost optimization strategies such as data partitioning, compression, and intelligent storage tiering can significantly reduce both storage and query costs by up to 90%. Partitioning by commonly filtered columns like date or region can improve query performance by orders of magnitude while reducing the amount of data scanned. Using columnar formats like Parquet further enhances compression ratios and query performance, as documented in [Athena performance best practices](https://docs.aws.amazon.com/athena/latest/ug/performance-tuning-data-optimization-techniques.html).
 
-The architecture scales automatically with data growth and query demand, making it suitable for everything from small departmental analytics to enterprise-wide data platforms. Integration with AWS Lake Formation can add fine-grained access controls and data governance capabilities for regulated industries.
+The architecture scales automatically with data growth and query demand, making it suitable for everything from small departmental analytics to enterprise-wide data platforms. Integration with [AWS Lake Formation](https://docs.aws.amazon.com/lake-formation/latest/dg/what-is-lake-formation.html) can add fine-grained access controls and data governance capabilities for regulated industries, while [AWS Glue DataBrew](https://docs.aws.amazon.com/databrew/latest/dg/what-is.html) provides visual data preparation for business analysts.
 
 > **Tip**: Always use partitioning for large datasets and consider converting data to Parquet format in your ETL processes to minimize Athena query costs and improve performance. See [Athena partitioning best practices](https://docs.aws.amazon.com/athena/latest/ug/partitions.html) and [Glue Data Catalog best practices](https://docs.aws.amazon.com/glue/latest/dg/best-practice-catalog.html) for optimization strategies.
 
@@ -682,4 +711,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

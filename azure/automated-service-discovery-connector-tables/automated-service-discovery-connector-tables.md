@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Service Connector, Azure Tables, Azure Functions, Azure App Service
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: service-discovery, microservices, azure-service-connector, azure-tables, service-registry, health-monitoring
 recipe-generator-version: 1.3
@@ -390,7 +390,8 @@ export STORAGE_CONNECTION_STRING=$(az storage account show-connection-string \
        --target-resource-group ${RESOURCE_GROUP} \
        --account ${STORAGE_ACCOUNT} \
        --connection "StorageConnection" \
-       --client-type nodejs
+       --client-type nodejs \
+       --secret
    
    # Connect Web App to Storage Tables
    az webapp connection create storage-table \
@@ -399,7 +400,8 @@ export STORAGE_CONNECTION_STRING=$(az storage account show-connection-string \
        --target-resource-group ${RESOURCE_GROUP} \
        --account ${STORAGE_ACCOUNT} \
        --connection "ServiceRegistryConnection" \
-       --client-type nodejs
+       --client-type nodejs \
+       --secret
    
    # Connect Web App to SQL Database
    az webapp connection create sql \
@@ -409,7 +411,8 @@ export STORAGE_CONNECTION_STRING=$(az storage account show-connection-string \
        --server ${SQL_SERVER} \
        --database ${SQL_DATABASE} \
        --connection "DatabaseConnection" \
-       --client-type nodejs
+       --client-type nodejs \
+       --secret
    
    # Connect Web App to Redis Cache
    az webapp connection create redis \
@@ -418,7 +421,8 @@ export STORAGE_CONNECTION_STRING=$(az storage account show-connection-string \
        --target-resource-group ${RESOURCE_GROUP} \
        --server ${REDIS_CACHE} \
        --connection "CacheConnection" \
-       --client-type nodejs
+       --client-type nodejs \
+       --secret
    
    echo "✅ Service Connector connections configured"
    ```
@@ -824,4 +828,9 @@ Extend this dynamic service discovery solution by implementing these enhancement
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

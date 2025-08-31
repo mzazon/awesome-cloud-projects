@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Tasks, Cloud Storage, Cloud Run, Cloud Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: async-processing, file-processing, task-queues, serverless, workflow-orchestration
 recipe-generator-version: 1.3
@@ -273,10 +273,10 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-Flask==2.3.3
-google-cloud-storage==2.10.0
-google-cloud-tasks==2.14.0
-gunicorn==21.2.0
+Flask==3.1.0
+google-cloud-storage==2.18.0
+google-cloud-tasks==2.16.4
+gunicorn==23.0.0
 EOF
    
    # Create Dockerfile
@@ -425,10 +425,10 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-Flask==2.3.3
-google-cloud-storage==2.10.0
-Pillow==10.0.0
-gunicorn==21.2.0
+Flask==3.1.0
+google-cloud-storage==2.18.0
+Pillow==11.0.0
+gunicorn==23.0.0
 EOF
    
    # Create Dockerfile
@@ -774,4 +774,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: amazon comprehend, aws lambda, amazon s3, amazon eventbridge
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-24
 passed-qa: null
 tags: machine-learning, nlp, comprehend, serverless, analytics, ai
 recipe-generator-version: 1.3
@@ -91,7 +91,7 @@ graph TB
 5. Sample text data for testing (customer reviews, support tickets, etc.)
 6. Estimated cost: $20-50 for running all examples with moderate data volumes
 
-> **Note**: Amazon Comprehend pricing is based on the amount of text processed and job complexity. Custom models incur additional training costs.
+> **Note**: Amazon Comprehend pricing is based on the amount of text processed and job complexity. Custom models incur additional training costs. See the [Amazon Comprehend pricing page](https://aws.amazon.com/comprehend/pricing/) for detailed information.
 
 ## Preparation
 
@@ -149,7 +149,7 @@ echo "✅ Created buckets and uploaded sample files"
 
 1. **Create IAM Service Role for Comprehend**:
 
-   Amazon Comprehend requires a service role to access your S3 buckets and process text files. This IAM role establishes the security boundary and permissions needed for batch processing jobs to read input data and write results. Understanding IAM roles is crucial for AWS security - they provide temporary, rotatable credentials that follow the principle of least privilege.
+   Amazon Comprehend requires a service role to access your S3 buckets and process text files. This IAM role establishes the security boundary and permissions needed for batch processing jobs to read input data and write results. Understanding IAM roles is crucial for AWS security - they provide temporary, rotatable credentials that follow the principle of least privilege as outlined in the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
    ```bash
    # Create trust policy for Comprehend service
@@ -187,11 +187,11 @@ echo "✅ Created buckets and uploaded sample files"
    echo "✅ Created IAM role: ${COMPREHEND_ROLE_ARN}"
    ```
 
-   The service role is now configured with the necessary permissions to read from S3 input buckets and write results to output buckets. This foundational security setup enables all subsequent batch processing operations while maintaining proper access controls.
+   The service role is now configured with the necessary permissions to read from S3 input buckets and write results to output buckets. This foundational security setup enables all subsequent batch processing operations while maintaining proper access controls following AWS security best practices.
 
 2. **Perform Real-time Sentiment Analysis**:
 
-   Sentiment analysis is the foundation of customer feedback understanding, providing immediate insights into customer emotions and satisfaction levels. Amazon Comprehend's real-time sentiment detection can process individual texts in milliseconds, making it perfect for chatbots, social media monitoring, and customer service applications. The service returns both a sentiment label (POSITIVE, NEGATIVE, NEUTRAL, MIXED) and confidence scores for each sentiment.
+   Sentiment analysis is the foundation of customer feedback understanding, providing immediate insights into customer emotions and satisfaction levels. Amazon Comprehend's real-time sentiment detection can process individual texts in milliseconds, making it perfect for chatbots, social media monitoring, and customer service applications. The service returns both a sentiment label (POSITIVE, NEGATIVE, NEUTRAL, MIXED) and confidence scores for each sentiment, enabling precise filtering and quality control.
 
    ```bash
    # Analyze sentiment of individual text samples
@@ -211,11 +211,11 @@ echo "✅ Created buckets and uploaded sample files"
    echo "✅ Completed real-time sentiment analysis"
    ```
 
-   The sentiment analysis results show both the overall sentiment classification and detailed confidence scores. This dual approach allows you to filter results based on confidence thresholds, ensuring high-quality sentiment detection for business-critical applications.
+   The sentiment analysis results show both the overall sentiment classification and detailed confidence scores. This dual approach allows you to filter results based on confidence thresholds, ensuring high-quality sentiment detection for business-critical applications where accuracy is paramount.
 
 3. **Extract Named Entities from Text**:
 
-   Named Entity Recognition (NER) automatically identifies and classifies key information in text such as people, organizations, locations, dates, and commercial items. This capability is essential for data mining, compliance monitoring, and automated information extraction from documents. Amazon Comprehend's pre-trained models can detect multiple entity types including PERSON, ORGANIZATION, LOCATION, DATE, QUANTITY, and COMMERCIAL_ITEM.
+   Named Entity Recognition (NER) automatically identifies and classifies key information in text such as people, organizations, locations, dates, and commercial items. This capability is essential for data mining, compliance monitoring, and automated information extraction from documents. Amazon Comprehend's pre-trained models can detect multiple entity types including PERSON, ORGANIZATION, LOCATION, DATE, QUANTITY, and COMMERCIAL_ITEM with high accuracy across various text formats.
 
    ```bash
    # Detect entities in customer support text
@@ -235,13 +235,13 @@ echo "✅ Created buckets and uploaded sample files"
    echo "✅ Completed entity extraction"
    ```
 
-   The entity extraction results provide structured data from unstructured text, enabling automated processing workflows. Each detected entity includes confidence scores, allowing you to implement quality thresholds and validation logic in your applications.
+   The entity extraction results provide structured data from unstructured text, enabling automated processing workflows. Each detected entity includes confidence scores, allowing you to implement quality thresholds and validation logic in your applications for production deployments.
 
 4. **Perform Key Phrase Extraction**:
 
-   Key phrase extraction identifies the most important words and phrases in your text, enabling content summarization and topic identification. This capability is valuable for creating automatic tags, extracting key concepts from documents, and building content recommendation systems. The confidence scores help you filter results to focus on the most relevant phrases for your use case.
+   Key phrase extraction identifies the most important words and phrases in your text, enabling content summarization and topic identification. This capability is valuable for creating automatic tags, extracting key concepts from documents, and building content recommendation systems. The confidence scores help you filter results to focus on the most relevant phrases for your specific use case and business requirements.
 
-> **Warning**: Amazon Comprehend has a 5,000 UTF-8 character limit per real-time request. For longer documents, use batch processing or split text into smaller chunks.
+   > **Warning**: Amazon Comprehend has a 5,000 UTF-8 character limit per real-time request. For longer documents, use batch processing or split text into smaller chunks as described in the [Amazon Comprehend Developer Guide](https://docs.aws.amazon.com/comprehend/latest/dg/guidelines-and-limits.html).
 
    ```bash
    # Extract key phrases from customer feedback
@@ -261,11 +261,11 @@ echo "✅ Created buckets and uploaded sample files"
    echo "✅ Completed key phrase extraction"
    ```
 
-   The extracted key phrases provide a structured summary of the most important concepts in your text. These results can be used for automatic tagging, content categorization, and building search indices for document discovery systems.
+   The extracted key phrases provide a structured summary of the most important concepts in your text. These results can be used for automatic tagging, content categorization, and building search indices for document discovery systems that enhance user experience and content findability.
 
 5. **Start Batch Sentiment Analysis Job**:
 
-   Batch processing is essential for analyzing large volumes of text data that exceed real-time processing limits. Amazon Comprehend's batch jobs can process thousands of documents simultaneously, making it cost-effective for analyzing customer reviews, social media posts, or historical documents. The asynchronous nature allows your applications to continue operating while analysis runs in the background.
+   Batch processing is essential for analyzing large volumes of text data that exceed real-time processing limits. Amazon Comprehend's batch jobs can process thousands of documents simultaneously, making it cost-effective for analyzing customer reviews, social media posts, or historical documents. The asynchronous nature allows your applications to continue operating while analysis runs in the background, maximizing system efficiency.
 
    ```bash
    # Start asynchronous sentiment analysis job
@@ -289,11 +289,11 @@ echo "✅ Created buckets and uploaded sample files"
    echo "✅ Started batch sentiment analysis job"
    ```
 
-   The batch job is now processing all documents in your S3 input bucket. Results will be written to the output bucket as JSON files containing sentiment classifications and confidence scores for each document, enabling downstream analytics and reporting.
+   The batch job is now processing all documents in your S3 input bucket. Results will be written to the output bucket as JSON files containing sentiment classifications and confidence scores for each document, enabling downstream analytics and reporting systems to consume the processed insights.
 
 6. **Start Batch Entity Detection Job**:
 
-   Batch entity detection processes large volumes of documents to extract structured information at scale. This asynchronous approach is cost-effective for analyzing document archives, processing daily content feeds, or extracting entities from historical data. The batch processing can handle thousands of documents simultaneously, providing consistent entity extraction across your entire dataset.
+   Batch entity detection processes large volumes of documents to extract structured information at scale. This asynchronous approach is cost-effective for analyzing document archives, processing daily content feeds, or extracting entities from historical data. The batch processing can handle thousands of documents simultaneously, providing consistent entity extraction across your entire dataset with enterprise-grade reliability.
 
    ```bash
    # Start asynchronous entity detection job
@@ -316,13 +316,13 @@ echo "✅ Created buckets and uploaded sample files"
    echo "✅ Started batch entity detection job"
    ```
 
-   The batch entity detection job is now processing all documents in your S3 bucket. Results will include detected entities with confidence scores and location information, enabling automated data extraction and structured analysis of your document collection.
+   The batch entity detection job is now processing all documents in your S3 bucket. Results will include detected entities with confidence scores and location information, enabling automated data extraction and structured analysis of your document collection for business intelligence and compliance applications.
 
 7. **Create Custom Entity Recognition Model**:
 
-   Custom entity recognition enables you to train models that detect domain-specific entities like product names, internal codes, or specialized terminology. This powerful capability extends Comprehend's pre-trained models to recognize business-specific information, enabling automated data extraction from industry-specific documents. Training requires well-formatted data but provides highly accurate results for your unique use cases.
+   Custom entity recognition enables you to train models that detect domain-specific entities like product names, internal codes, or specialized terminology. This powerful capability extends Comprehend's pre-trained models to recognize business-specific information, enabling automated data extraction from industry-specific documents. Training requires well-formatted data but provides highly accurate results for your unique use cases and business requirements.
 
-> **Note**: Custom entity recognizer training typically takes 30-60 minutes and requires a minimum of 250 annotations per entity type. See the [Amazon Comprehend Developer Guide](https://docs.aws.amazon.com/comprehend/latest/dg/custom-entity-recognition.html) for detailed training requirements.
+   > **Note**: Custom entity recognizer training typically takes 30-60 minutes and requires a minimum of 250 annotations per entity type. Training costs are separate from inference costs. See the [Amazon Comprehend Developer Guide](https://docs.aws.amazon.com/comprehend/latest/dg/custom-entity-recognition.html) for detailed training requirements and best practices.
 
    ```bash
    # Create training data for custom entity recognition
@@ -348,11 +348,11 @@ echo "✅ Created buckets and uploaded sample files"
    echo "✅ Started custom entity recognizer training (this may take 30-60 minutes)"
    ```
 
-   The custom entity recognizer is now training on your domain-specific data. Once trained, it will provide highly accurate detection of your custom entity types, enabling automated processing of business-specific information from documents and text data.
+   The custom entity recognizer is now training on your domain-specific data. Once trained, it will provide highly accurate detection of your custom entity types, enabling automated processing of business-specific information from documents and text data with precision tailored to your organization's needs.
 
 8. **Start Topic Modeling Job**:
 
-   Topic modeling automatically discovers abstract topics within a collection of documents using unsupervised machine learning. This capability is essential for content organization, trend analysis, and understanding large document collections without manual review. Amazon Comprehend's topic modeling can identify themes across thousands of documents, making it valuable for analyzing customer feedback, research papers, or news articles.
+   Topic modeling automatically discovers abstract topics within a collection of documents using unsupervised machine learning. This capability is essential for content organization, trend analysis, and understanding large document collections without manual review. Amazon Comprehend's topic modeling can identify themes across thousands of documents, making it valuable for analyzing customer feedback, research papers, or news articles to uncover hidden patterns and insights.
 
    ```bash
    # Create additional sample documents for topic modeling
@@ -386,11 +386,11 @@ echo "✅ Created buckets and uploaded sample files"
    echo "✅ Started topic modeling analysis"
    ```
 
-   The topic modeling job will analyze document patterns and identify common themes across your text collection. Results include topic keywords and document-to-topic associations, enabling automated content categorization and trend identification.
+   The topic modeling job will analyze document patterns and identify common themes across your text collection. Results include topic keywords and document-to-topic associations, enabling automated content categorization and trend identification for strategic business insights.
 
 9. **Create Lambda Function for Real-time Processing**:
 
-   AWS Lambda enables serverless, event-driven text processing that scales automatically based on demand. This approach eliminates server management while providing sub-second response times for real-time sentiment analysis, entity extraction, and key phrase detection. The Lambda function integrates multiple Comprehend APIs to provide comprehensive text analysis in a single invocation, perfect for chatbots, customer feedback systems, and content moderation.
+   AWS Lambda enables serverless, event-driven text processing that scales automatically based on demand. This approach eliminates server management while providing sub-second response times for real-time sentiment analysis, entity extraction, and key phrase detection. The Lambda function integrates multiple Comprehend APIs to provide comprehensive text analysis in a single invocation, perfect for chatbots, customer feedback systems, and content moderation applications.
 
    ```bash
    # Create Lambda execution role
@@ -502,7 +502,7 @@ echo "✅ Created buckets and uploaded sample files"
    # Create Lambda function
    LAMBDA_ARN=$(aws lambda create-function \
        --function-name "comprehend-processor-${RANDOM_SUFFIX}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE}" \
        --handler comprehend-processor.lambda_handler \
        --zip-file fileb://comprehend-processor.zip \
@@ -512,11 +512,11 @@ echo "✅ Created buckets and uploaded sample files"
    echo "✅ Created real-time processing Lambda function"
    ```
 
-   The Lambda function is now deployed and ready to process text through multiple Comprehend APIs simultaneously. This serverless architecture provides cost-effective scaling and can handle varying workloads from occasional requests to high-volume processing bursts.
+   The Lambda function is now deployed and ready to process text through multiple Comprehend APIs simultaneously. This serverless architecture provides cost-effective scaling and can handle varying workloads from occasional requests to high-volume processing bursts, with automatic scaling based on demand.
 
 10. **Test Real-time Lambda Processing**:
 
-    Testing your Lambda function validates the integration between multiple Comprehend APIs and ensures the serverless architecture performs as expected. This validation step confirms that sentiment analysis, entity detection, and key phrase extraction work together seamlessly, providing comprehensive text analysis in a single function call.
+    Testing your Lambda function validates the integration between multiple Comprehend APIs and ensures the serverless architecture performs as expected. This validation step confirms that sentiment analysis, entity detection, and key phrase extraction work together seamlessly, providing comprehensive text analysis in a single function call with consistent performance.
 
     ```bash
     # Test the Lambda function with sample text
@@ -542,11 +542,11 @@ echo "✅ Created buckets and uploaded sample files"
     echo "✅ Tested real-time Lambda processing"
     ```
 
-    The Lambda function successfully processed both positive and negative sentiment examples, demonstrating the comprehensive NLP capabilities available through the serverless architecture. This validates the integration and performance of your real-time text analysis pipeline.
+    The Lambda function successfully processed both positive and negative sentiment examples, demonstrating the comprehensive NLP capabilities available through the serverless architecture. This validates the integration and performance of your real-time text analysis pipeline for production deployment.
 
 11. **Create EventBridge Rule for Automated Processing**:
 
-    Amazon EventBridge provides event-driven automation that triggers text processing whenever new documents are uploaded to S3. This serverless orchestration pattern eliminates the need for scheduled jobs or manual processing, ensuring immediate analysis of incoming text data. EventBridge rules use pattern matching to filter events, enabling sophisticated routing logic for different document types or sources.
+    Amazon EventBridge provides event-driven automation that triggers text processing whenever new documents are uploaded to S3. This serverless orchestration pattern eliminates the need for scheduled jobs or manual processing, ensuring immediate analysis of incoming text data. EventBridge rules use pattern matching to filter events, enabling sophisticated routing logic for different document types or sources with fine-grained control.
 
     ```bash
     # Create EventBridge rule for S3 events
@@ -578,11 +578,11 @@ echo "✅ Created buckets and uploaded sample files"
     echo "✅ Created EventBridge automation rule"
     ```
 
-    The EventBridge rule is now monitoring S3 for new file uploads and will automatically trigger Lambda processing. This creates a fully automated text analysis pipeline that scales with your data volume and provides immediate insights from uploaded documents.
+    The EventBridge rule is now monitoring S3 for new file uploads and will automatically trigger Lambda processing. This creates a fully automated text analysis pipeline that scales with your data volume and provides immediate insights from uploaded documents without manual intervention.
 
 12. **Monitor and Check Job Status**:
 
-    Monitoring Comprehend jobs is essential for understanding processing progress and identifying potential issues. Amazon Comprehend provides detailed job status information including progress indicators, error messages, and completion times. This monitoring capability enables you to track large-scale processing operations and plan downstream activities based on job completion.
+    Monitoring Comprehend jobs is essential for understanding processing progress and identifying potential issues. Amazon Comprehend provides detailed job status information including progress indicators, error messages, and completion times. This monitoring capability enables you to track large-scale processing operations and plan downstream activities based on job completion, ensuring reliable pipeline operations.
 
     ```bash
     # Check sentiment analysis job status
@@ -615,7 +615,7 @@ echo "✅ Created buckets and uploaded sample files"
     echo "✅ Monitored job status"
     ```
 
-    Job monitoring provides visibility into your NLP processing pipeline, enabling proactive management of batch operations and timely access to results. This operational insight is crucial for production deployments where reliable processing timelines are essential for business operations.
+    Job monitoring provides visibility into your NLP processing pipeline, enabling proactive management of batch operations and timely access to results. This operational insight is crucial for production deployments where reliable processing timelines are essential for business operations and SLA compliance.
 
 ## Validation & Testing
 
@@ -784,30 +784,37 @@ echo "✅ Created buckets and uploaded sample files"
 
 ## Discussion
 
-Amazon Comprehend provides a powerful, managed natural language processing service that eliminates the complexity of building and maintaining ML models for text analysis. The service offers both real-time and batch processing capabilities, making it suitable for various use cases from interactive applications to large-scale document processing. The pre-trained models deliver high accuracy across multiple languages and domains, while custom models allow organizations to train domain-specific classifiers and entity recognizers.
+Amazon Comprehend provides a powerful, managed natural language processing service that eliminates the complexity of building and maintaining ML models for text analysis. The service offers both real-time and batch processing capabilities, making it suitable for various use cases from interactive applications to large-scale document processing. The pre-trained models deliver high accuracy across multiple languages and domains, while custom models allow organizations to train domain-specific classifiers and entity recognizers tailored to their unique business requirements.
 
-The architecture demonstrated in this recipe showcases key patterns for NLP solutions: real-time processing for immediate insights, batch processing for large datasets, and event-driven automation for scalable processing pipelines. The combination of Lambda functions for real-time processing and EventBridge for orchestration creates a responsive system that can handle varying workloads while maintaining cost efficiency through serverless scaling.
+The architecture demonstrated in this recipe showcases key patterns for NLP solutions: real-time processing for immediate insights, batch processing for large datasets, and event-driven automation for scalable processing pipelines. The combination of Lambda functions for real-time processing and EventBridge for orchestration creates a responsive system that can handle varying workloads while maintaining cost efficiency through serverless scaling. This approach follows the AWS Well-Architected Framework principles of operational excellence and cost optimization.
 
-Custom entity recognition and document classification features enable organizations to extract business-specific insights from their text data. Training custom models requires careful preparation of training data, but the AutoML capabilities significantly reduce the machine learning expertise needed. The service's integration with other AWS services like S3, Lambda, and EventBridge enables sophisticated data processing workflows that can be tailored to specific business requirements.
+Custom entity recognition and document classification features enable organizations to extract business-specific insights from their text data. Training custom models requires careful preparation of training data, but the AutoML capabilities significantly reduce the machine learning expertise needed. The service's integration with other AWS services like S3, Lambda, and EventBridge enables sophisticated data processing workflows that can be tailored to specific business requirements and compliance standards.
 
-Performance considerations include understanding the service limits for real-time processing (maximum 5,000 UTF-8 characters per request) and batch processing quotas. For high-volume applications, consider implementing request batching and result caching strategies. The service provides detailed metrics through CloudWatch, enabling monitoring and optimization of both cost and performance.
+Performance considerations include understanding the service limits for real-time processing (maximum 5,000 UTF-8 characters per request) and batch processing quotas as outlined in the [Amazon Comprehend guidelines and quotas documentation](https://docs.aws.amazon.com/comprehend/latest/dg/guidelines-and-limits.html). For high-volume applications, consider implementing request batching and result caching strategies. The service provides detailed metrics through CloudWatch, enabling monitoring and optimization of both cost and performance parameters for production deployments.
 
-> **Tip**: Use Amazon Comprehend Medical for healthcare-specific entity extraction and PHI detection when processing medical texts and documents.
+> **Tip**: Use Amazon Comprehend Medical for healthcare-specific entity extraction and PHI detection when processing medical texts and documents. This specialized service provides HIPAA-eligible functionality for healthcare applications.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Build a Custom Classification Model**: Create a document classifier to automatically categorize customer support tickets into departments (billing, technical, product, etc.) using your own training data and evaluate model performance metrics.
+1. **Build a Custom Classification Model**: Create a document classifier to automatically categorize customer support tickets into departments (billing, technical, product, etc.) using your own training data and evaluate model performance metrics against a validation dataset.
 
-2. **Implement Multi-language Support**: Modify the Lambda function to detect the dominant language first, then process text in the detected language, handling multiple languages simultaneously in the same dataset.
+2. **Implement Multi-language Support**: Modify the Lambda function to detect the dominant language first using Comprehend's language detection API, then process text in the detected language, handling multiple languages simultaneously in the same dataset with appropriate routing logic.
 
-3. **Create Real-time Sentiment Dashboard**: Build a real-time dashboard using Amazon QuickSight that displays sentiment trends, entity frequency, and key phrase analytics with automatic refresh capabilities.
+3. **Create Real-time Sentiment Dashboard**: Build a real-time dashboard using Amazon QuickSight that displays sentiment trends, entity frequency, and key phrase analytics with automatic refresh capabilities and interactive filtering options.
 
-4. **Add PII Detection and Redaction**: Integrate Amazon Comprehend's PII detection capabilities to automatically identify and redact sensitive information like credit card numbers, SSNs, and email addresses from processed text.
+4. **Add PII Detection and Redaction**: Integrate Amazon Comprehend's PII detection capabilities to automatically identify and redact sensitive information like credit card numbers, SSNs, and email addresses from processed text before storing results.
 
-5. **Implement Advanced Topic Modeling**: Create a more sophisticated topic modeling solution that tracks topic evolution over time, identifies trending topics, and provides topic-based document recommendation systems.
+5. **Implement Advanced Topic Modeling**: Create a more sophisticated topic modeling solution that tracks topic evolution over time, identifies trending topics, and provides topic-based document recommendation systems with similarity scoring and content clustering.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

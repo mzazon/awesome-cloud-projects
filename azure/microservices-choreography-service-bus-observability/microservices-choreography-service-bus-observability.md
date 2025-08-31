@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Service Bus, Azure Monitor, Azure Functions, Azure Container Apps
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: microservices, event-driven, choreography, service-bus, observability, distributed-tracing
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Enterprise applications often struggle with tightly coupled microservices that r
 
 ## Solution
 
-This recipe implements the choreography pattern using Azure Service Bus Premium for high-performance message processing and Azure Monitor Workbooks for comprehensive distributed tracing. The solution enables loosely coupled microservices to coordinate complex business workflows through event-driven communication, where each service responds to events and publishes new events without central coordination. Azure Container Apps and Azure Functions provide the serverless compute foundation, while Azure Monitor Workbooks deliver real-time visibility into distributed transaction flows and performance metrics.
+This recipe implements the choreography pattern using Azure Service Bus Premium for high-performance message processing and Azure Monitor Application Insights for comprehensive distributed tracing. The solution enables loosely coupled microservices to coordinate complex business workflows through event-driven communication, where each service responds to events and publishes new events without central coordination. Azure Container Apps and Azure Functions provide the serverless compute foundation, while Azure Monitor Application Insights delivers real-time visibility into distributed transaction flows and performance metrics.
 
 ## Architecture Diagram
 
@@ -421,6 +421,9 @@ export WORKSPACE_ID=$(az monitor log-analytics workspace show \
    # Create directory for workbook template
    mkdir -p workbook-templates
    
+   # Generate unique workbook ID
+   export WORKBOOK_ID=$(uuidgen)
+   
    # Create workbook template JSON
    cat > workbook-templates/choreography-workbook.json << 'EOF'
    {
@@ -468,9 +471,9 @@ export WORKSPACE_ID=$(az monitor log-analytics workspace show \
    EOF
    
    # Create the workbook
-   az monitor workbook create \
+   az monitor app-insights workbook create \
        --resource-group ${RESOURCE_GROUP} \
-       --name "Microservices Choreography Dashboard" \
+       --name ${WORKBOOK_ID} \
        --display-name "Microservices Choreography Dashboard" \
        --source-id ${WORKSPACE_ID} \
        --category "microservices" \
@@ -548,12 +551,12 @@ export WORKSPACE_ID=$(az monitor log-analytics workspace show \
        --query "[].{Name:name,Status:properties.runningStatus}" \
        --output table
    
-   # Test Order Service endpoint
-   curl -X GET "https://${ORDER_SERVICE_URL}/api/health" \
+   # Test Order Service endpoint (basic connectivity test)
+   curl -X GET "https://${ORDER_SERVICE_URL}" \
        -H "accept: application/json"
    ```
 
-   Expected output: Both container apps should show "Running" status and the Order Service should respond with a health check response.
+   Expected output: Both container apps should show "Running" status and the Order Service should respond with a basic response from the hello world container.
 
 3. **Verify Function Apps Configuration**:
 
@@ -590,10 +593,10 @@ export WORKSPACE_ID=$(az monitor log-analytics workspace show \
    # Check Application Insights for telemetry data
    sleep 30
    echo "Navigate to Application Insights to view distributed traces"
-   echo "URL: https://portal.azure.com/#@/resource${APPINSIGHTS_CONNECTION}/overview"
+   echo "URL: https://portal.azure.com/#resource${WORKSPACE_ID}/overview"
    ```
 
-   Expected result: Test message should trigger the choreography workflow with telemetry data appearing in Application Insights showing distributed transaction correlation.
+   Expected result: Test message should be successfully sent to the Service Bus topic. You can verify this by checking the Service Bus namespace metrics in the Azure portal.
 
 ## Cleanup
 
@@ -678,7 +681,7 @@ The choreography pattern implemented in this recipe represents a fundamental shi
 
 Azure Service Bus Premium provides the high-performance, reliable messaging infrastructure essential for enterprise choreography implementations. With dedicated messaging units, predictable performance, and advanced features like message sessions and large message support, the Premium tier ensures that complex business workflows can execute reliably under variable loads. The [Service Bus Premium messaging documentation](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-premium-messaging) details the technical advantages and capacity planning considerations for production deployments.
 
-The observability solution built with Azure Monitor Workbooks and Application Insights addresses one of the key challenges in distributed systems: understanding transaction flows across multiple services. Distributed tracing capabilities automatically correlate events across service boundaries, enabling operators to visualize end-to-end transaction flows and identify performance bottlenecks. For comprehensive observability strategies, refer to the [Azure Monitor best practices documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/best-practices) and the [Application Insights distributed tracing guide](https://learn.microsoft.com/en-us/azure/azure-monitor/app/distributed-trace-data).
+The observability solution built with Azure Monitor Application Insights addresses one of the key challenges in distributed systems: understanding transaction flows across multiple services. Distributed tracing capabilities automatically correlate events across service boundaries, enabling operators to visualize end-to-end transaction flows and identify performance bottlenecks. For comprehensive observability strategies, refer to the [Azure Monitor best practices documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/best-practices) and the [Application Insights distributed tracing guide](https://learn.microsoft.com/en-us/azure/azure-monitor/app/distributed-trace-data).
 
 From a cost optimization perspective, the combination of Container Apps and Azure Functions provides excellent scalability characteristics with pay-per-use pricing models. Container Apps automatically scale based on demand while providing consistent hosting for stateful services, while Azure Functions offer true serverless execution for event-driven workloads. The [Azure Well-Architected Framework cost optimization principles](https://learn.microsoft.com/en-us/azure/architecture/framework/cost/) provide detailed guidance on optimizing costs in distributed architectures.
 
@@ -700,4 +703,9 @@ Extend this choreography implementation by adding these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

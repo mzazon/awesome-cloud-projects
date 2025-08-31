@@ -6,16 +6,16 @@ difficulty: 200
 subject: aws
 services: Route 53 Resolver, CloudWatch, Lambda, SNS
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: dns-security, monitoring, automation, threat-detection, firewall
 recipe-generator-version: 1.3
 ---
 
-# Automated DNS Security Monitoring
+# Automated DNS Security Monitoring with Route 53 Resolver and CloudWatch
 
 ## Problem
 
@@ -52,17 +52,29 @@ graph TB
         EMAIL[Email Alerts]
     end
     
-    EC2 --> VPC
-    VPC --> DNSFW
-    DNSFW --> RULES
-    RULES --> DOMAINS
-    DNSFW --> CW
-    DNSFW --> LOGS
-    CW --> ALARMS
-    ALARMS --> LAMBDA
-    ALARMS --> SNS
-    LAMBDA --> SNS
-    SNS --> EMAIL
+    EC2-->1
+    VPC-->2
+    DNSFW-->3
+    RULES-->4
+    DOMAINS-->5
+    DNSFW-->6
+    DNSFW-->7
+    CW-->8
+    ALARMS-->9
+    ALARMS-->10
+    LAMBDA-->11
+    SNS-->12
+    
+    VPC-.->1
+    DNSFW-.->2
+    RULES-.->3
+    DOMAINS-.->4
+    CW-.->5
+    LOGS-.->6
+    ALARMS-.->7
+    LAMBDA-.->8
+    SNS-.->9
+    EMAIL-.->10
     
     style DNSFW fill:#FF9900
     style CW fill:#3F8624
@@ -213,7 +225,7 @@ echo "✅ Preparation complete - VPC: ${VPC_ID}, SNS Topic: ${SNS_TOPIC_ARN}"
 
    ```bash
    # Create query log configuration for DNS monitoring
-   aws route53resolver put-resolver-query-log-config \
+   aws route53resolver create-resolver-query-log-config \
        --name "dns-security-logs-${RANDOM_SUFFIX}" \
        --destination-arn "arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:${LOG_GROUP_NAME}"
    
@@ -320,10 +332,10 @@ EOF
    # Package Lambda function
    zip dns-security-function.zip dns-security-function.py
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    aws lambda create-function \
        --function-name dns-security-response-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/dns-security-lambda-role-${RANDOM_SUFFIX} \
        --handler dns-security-function.lambda_handler \
        --zip-file fileb://dns-security-function.zip \
@@ -337,18 +349,18 @@ EOF
    echo "✅ Lambda function created: ${LAMBDA_FUNCTION_ARN}"
    ```
 
-   The Lambda function is now deployed and ready to process DNS security alerts. This serverless approach ensures immediate response to threats while maintaining cost efficiency through pay-per-execution pricing and automatic scaling based on alert volume.
+   The Lambda function is now deployed with the latest Python 3.12 runtime and ready to process DNS security alerts. This serverless approach ensures immediate response to threats while maintaining cost efficiency through pay-per-execution pricing and automatic scaling based on alert volume.
 
 7. **Configure CloudWatch Alarms for DNS Threat Detection**:
 
    CloudWatch alarms monitor DNS Firewall metrics to detect suspicious activity patterns such as high block rates, unusual query volumes, or potential DGA traffic. These alarms provide early warning capabilities for security incidents and trigger automated response workflows through SNS and Lambda integration.
 
    ```bash
-   # Create alarm for blocked DNS queries (potential attacks)
+   # Create alarm for blocked DNS queries using correct metric name
    aws cloudwatch put-metric-alarm \
        --alarm-name "DNS-High-Block-Rate-${RANDOM_SUFFIX}" \
        --alarm-description "High rate of blocked DNS queries detected" \
-       --metric-name "QueryCount" \
+       --metric-name "FirewallRuleGroupQueryVolume" \
        --namespace "AWS/Route53Resolver" \
        --statistic "Sum" \
        --period 300 \
@@ -358,11 +370,11 @@ EOF
        --alarm-actions ${SNS_TOPIC_ARN} \
        --dimensions Name=FirewallRuleGroupId,Value=${RULE_GROUP_ID}
    
-   # Create alarm for unusual query volume patterns
+   # Create alarm for unusual query volume patterns using VPC metric
    aws cloudwatch put-metric-alarm \
        --alarm-name "DNS-Unusual-Volume-${RANDOM_SUFFIX}" \
        --alarm-description "Unusual DNS query volume detected" \
-       --metric-name "QueryCount" \
+       --metric-name "VpcFirewallQueryVolume" \
        --namespace "AWS/Route53Resolver" \
        --statistic "Sum" \
        --period 900 \
@@ -375,7 +387,7 @@ EOF
    echo "✅ CloudWatch alarms configured for DNS threat detection"
    ```
 
-   The alarms are now monitoring DNS activity for security threats with configurable thresholds. These metrics provide real-time visibility into potential attacks while minimizing false positives through statistical analysis and multiple evaluation periods.
+   The alarms are now monitoring DNS activity using the correct CloudWatch metrics for Route 53 Resolver DNS Firewall. These metrics provide real-time visibility into potential attacks while minimizing false positives through statistical analysis and multiple evaluation periods.
 
 8. **Set Up SNS Email Notifications for Security Alerts**:
 
@@ -433,10 +445,10 @@ EOF
    # This should be blocked and return NXDOMAIN
    dig malware.example
    
-   # Verify blocking in CloudWatch metrics
+   # Verify blocking in CloudWatch metrics using correct metric
    aws cloudwatch get-metric-statistics \
        --namespace "AWS/Route53Resolver" \
-       --metric-name "QueryCount" \
+       --metric-name "FirewallRuleGroupQueryVolume" \
        --start-time $(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S) \
        --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
        --period 300 \
@@ -602,4 +614,11 @@ Extend this DNS security monitoring solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

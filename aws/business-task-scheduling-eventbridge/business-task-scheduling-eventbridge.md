@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: EventBridge Scheduler, Lambda, SNS, S3
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: automation, scheduling, serverless, business-workflows, event-driven, notifications
 recipe-generator-version: 1.3
@@ -366,14 +366,14 @@ echo "✅ Environment configured for business automation setup"
    # Create deployment package
    zip -r business-task-processor.zip business_task_processor.py
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    LAMBDA_ROLE_ARN=$(aws iam get-role \
        --role-name ${LAMBDA_ROLE_NAME} \
        --query 'Role.Arn' --output text)
    
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler business_task_processor.lambda_handler \
        --zip-file fileb://business-task-processor.zip \
@@ -384,7 +384,7 @@ echo "✅ Environment configured for business automation setup"
    echo "✅ Lambda function created: ${LAMBDA_FUNCTION_NAME}"
    ```
 
-   The Lambda function is now deployed and ready to process business tasks. It includes comprehensive error handling, logging, and notification capabilities to ensure reliable execution of automated workflows.
+   The Lambda function is now deployed using Python 3.12 runtime and ready to process business tasks. It includes comprehensive error handling, logging, and notification capabilities to ensure reliable execution of automated workflows.
 
 6. **Create IAM Role for EventBridge Scheduler**:
 
@@ -707,4 +707,11 @@ Extend this automation system by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,22 +1,21 @@
 ---
-title: Streaming Data Enrichment with Kinesis
+title: Streaming Data Enrichment with Kinesis and Lambda
 id: 14c05722
-category: compute
+category: analytics
 difficulty: 300
 subject: aws
-services: lambda,kinesis
+services: kinesis, lambda, dynamodb, s3
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: lambda,kinesis
+tags: kinesis, lambda, dynamodb, s3, streaming, data-enrichment
 recipe-generator-version: 1.3
 ---
 
-# Streaming Data Enrichment with Kinesis
-
+# Streaming Data Enrichment with Kinesis and Lambda
 
 ## Problem
 
@@ -24,7 +23,7 @@ E-commerce companies need to process millions of clickstream events in real-time
 
 ## Solution
 
-This solution implements a streaming data enrichment pipeline using Amazon Kinesis Data Streams as the ingestion layer and AWS Lambda functions for real-time data transformation and enrichment. The architecture processes events as they arrive, enriches them with contextual data from external sources, and outputs enriched events for downstream analytics and decision-making systems.
+This solution implements a streaming data enrichment pipeline using Amazon Kinesis Data Streams as the ingestion layer and AWS Lambda functions for real-time data transformation and enrichment. The architecture processes events as they arrive, enriches them with contextual data from DynamoDB lookup tables, and outputs enriched events to S3 for downstream analytics and decision-making systems.
 
 ## Architecture Diagram
 
@@ -67,7 +66,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with permissions for Kinesis, Lambda, DynamoDB, S3, and CloudWatch
+1. AWS account with permissions for Kinesis, Lambda, DynamoDB, S3, IAM, and CloudWatch
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of streaming data processing concepts
 4. Familiarity with Python programming for Lambda functions
@@ -128,8 +127,6 @@ echo "Role Name: ${ROLE_NAME}"
    ```
 
    The table is now ready to serve as our enrichment data source. Using PAY_PER_REQUEST billing mode ensures cost-effective operation during development and testing phases, automatically scaling with demand without requiring capacity planning. This foundation enables our Lambda function to perform fast lookups during stream processing.
-
-   > **Note**: Learn more about DynamoDB's core concepts and capabilities in the [DynamoDB Developer Guide](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.CoreComponents.html).
 
 2. **Populate lookup table with sample data**:
 
@@ -218,8 +215,6 @@ echo "Role Name: ${ROLE_NAME}"
 
    The IAM role is now established with basic Lambda execution permissions, including CloudWatch Logs access for monitoring and debugging. This security foundation uses temporary, rotatable credentials rather than permanent access keys, reducing security risks while enabling comprehensive logging and monitoring capabilities.
 
-   > **Note**: Learn more about Lambda execution roles and security best practices in the [Lambda Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/lambda-intro-execution-role.html).
-
 5. **Create custom policy for Lambda permissions**:
 
    Fine-grained IAM policies implement the principle of least privilege by granting only the specific permissions required for the Lambda function to perform its data enrichment tasks. This custom policy enables the function to read from Kinesis streams, perform lookups in DynamoDB, and write enriched data to S3 while preventing access to other AWS resources or operations that aren't needed for the workflow.
@@ -240,16 +235,15 @@ echo "Role Name: ${ROLE_NAME}"
                    "kinesis:ListShards",
                    "kinesis:SubscribeToShard"
                ],
-               "Resource": "*"
+               "Resource": "arn:aws:kinesis:${AWS_REGION}:${AWS_ACCOUNT_ID}:stream/${STREAM_NAME}"
            },
            {
                "Effect": "Allow",
                "Action": [
                    "dynamodb:GetItem",
-                   "dynamodb:Query",
-                   "dynamodb:Scan"
+                   "dynamodb:Query"
                ],
-               "Resource": "*"
+               "Resource": "arn:aws:dynamodb:${AWS_REGION}:${AWS_ACCOUNT_ID}:table/${TABLE_NAME}"
            },
            {
                "Effect": "Allow",
@@ -288,6 +282,7 @@ echo "Role Name: ${ROLE_NAME}"
    import boto3
    import base64
    import datetime
+   import os
    from decimal import Decimal
    
    dynamodb = boto3.resource('dynamodb')
@@ -320,6 +315,7 @@ echo "Role Name: ${ROLE_NAME}"
                    else:
                        data['user_name'] = 'Unknown'
                        data['user_segment'] = 'Unknown'
+                       data['user_location'] = 'Unknown'
                except Exception as e:
                    print(f"Error enriching user data: {e}")
                    data['enrichment_error'] = str(e)
@@ -345,8 +341,6 @@ echo "Role Name: ${ROLE_NAME}"
                raise
        
        return f"Successfully processed {len(event['Records'])} records"
-   
-   import os
    EOF
    
    # Create deployment package
@@ -355,7 +349,7 @@ echo "Role Name: ${ROLE_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${ROLE_NAME} \
        --handler enrichment_function.lambda_handler \
        --zip-file fileb://enrichment_function.zip \
@@ -367,8 +361,6 @@ echo "Role Name: ${ROLE_NAME}"
    ```
 
    The Lambda function is now deployed and ready to process streaming data. The function includes error handling for enrichment failures, time-based partitioning for S3 storage, and comprehensive logging for monitoring. This serverless architecture automatically scales with stream volume while maintaining cost efficiency by only charging for actual processing time.
-
-   > **Note**: Learn more about Lambda fundamentals and best practices in the [Lambda Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html).
 
 7. **Create Kinesis Data Stream**:
 
@@ -393,8 +385,6 @@ echo "Role Name: ${ROLE_NAME}"
    ```
 
    The Kinesis stream is now active and ready to receive data from multiple sources. Each shard can handle up to 1,000 records per second or 1 MB per second of incoming data, with the 2-shard configuration providing 2,000 records/second capacity. This scalable ingestion layer enables real-time processing while maintaining data ordering within each shard.
-
-   > **Note**: Learn more about Kinesis Data Streams concepts and scaling in the [Kinesis Developer Guide](https://docs.aws.amazon.com/streams/latest/dev/introduction.html).
 
 8. **Create event source mapping to connect Kinesis to Lambda**:
 
@@ -527,8 +517,10 @@ echo "Role Name: ${ROLE_NAME}"
    aws s3 ls s3://${BUCKET_NAME}/enriched-data/ --recursive
    
    # Download and examine an enriched data file
-   LATEST_FILE=$(aws s3 ls s3://${BUCKET_NAME}/enriched-data/ --recursive | tail -1 | awk '{print $4}')
-   aws s3 cp s3://${BUCKET_NAME}/${LATEST_FILE} /tmp/enriched_sample.json
+   LATEST_FILE=$(aws s3 ls s3://${BUCKET_NAME}/enriched-data/ \
+       --recursive | tail -1 | awk '{print $4}')
+   aws s3 cp s3://${BUCKET_NAME}/${LATEST_FILE} \
+       /tmp/enriched_sample.json
    cat /tmp/enriched_sample.json
    ```
 
@@ -665,26 +657,33 @@ echo "Role Name: ${ROLE_NAME}"
 
 ## Discussion
 
-This streaming data enrichment solution demonstrates how to build a scalable, real-time data processing pipeline using AWS managed services. The architecture leverages Amazon Kinesis Data Streams for high-throughput data ingestion and AWS Lambda for serverless data processing, ensuring automatic scaling based on demand without infrastructure management overhead.
+This streaming data enrichment solution demonstrates how to build a scalable, real-time data processing pipeline using AWS managed services following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html). The architecture leverages Amazon Kinesis Data Streams for high-throughput data ingestion and AWS Lambda for serverless data processing, ensuring automatic scaling based on demand without infrastructure management overhead.
 
 The solution addresses several key architectural considerations. First, it implements proper error handling and monitoring through CloudWatch alarms and detailed logging, enabling quick identification and resolution of processing issues. Second, it uses DynamoDB for fast lookup operations, ensuring sub-millisecond response times for data enrichment queries. Third, it stores enriched data in S3 with time-based partitioning, optimizing for both storage costs and query performance.
 
-The batch processing configuration (batch size of 10 records, maximum batching window of 5 seconds) balances between processing latency and cost efficiency. This configuration can be adjusted based on specific requirements - higher batch sizes reduce Lambda invocations but increase processing latency, while lower batch sizes provide near real-time processing at higher costs.
+The batch processing configuration (batch size of 10 records, maximum batching window of 5 seconds) balances between processing latency and cost efficiency. This configuration can be adjusted based on specific requirements - higher batch sizes reduce Lambda invocations but increase processing latency, while lower batch sizes provide near real-time processing at higher costs. The IAM policies implement the principle of least privilege, restricting access to only the resources needed for the specific workflow.
 
-From a business perspective, this solution enables companies to make real-time decisions based on enriched data, such as personalized recommendations, fraud detection, or dynamic pricing. The enriched data can feed into downstream systems like Amazon Redshift for analytics, Amazon OpenSearch for search functionality, or ML pipelines for predictive modeling.
+From a business perspective, this solution enables companies to make real-time decisions based on enriched data, such as personalized recommendations, fraud detection, or dynamic pricing. The enriched data can feed into downstream systems like Amazon Redshift for analytics, Amazon OpenSearch for search functionality, or ML pipelines for predictive modeling. Learn more about streaming data architectures in the [Kinesis Developer Guide](https://docs.aws.amazon.com/streams/latest/dev/introduction.html) and Lambda best practices in the [Lambda Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html).
 
-> **Tip**: Monitor the IteratorAge metric in CloudWatch to ensure your Lambda function is keeping up with the stream. High iterator age indicates processing lag and may require scaling adjustments.
+> **Tip**: Monitor the IteratorAge metric in CloudWatch to ensure your Lambda function is keeping up with the stream. High iterator age indicates processing lag and may require scaling adjustments or batch size optimization.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Add data validation and schema evolution** - Implement JSON schema validation in the Lambda function and handle schema changes gracefully
-2. **Implement dead letter queue handling** - Add SQS dead letter queues for failed processing records and implement retry logic
-3. **Add multiple enrichment sources** - Extend the solution to enrich data from multiple sources like external APIs, additional DynamoDB tables, or cached data
-4. **Implement data lineage tracking** - Add metadata tracking to trace data transformations and maintain audit trails
-5. **Scale with Kinesis Data Firehose** - Replace the S3 storage logic with Kinesis Data Firehose for better throughput and built-in format conversion
+1. **Add data validation and schema evolution** - Implement JSON schema validation in the Lambda function and handle schema changes gracefully using AWS Glue Schema Registry
+2. **Implement dead letter queue handling** - Add SQS dead letter queues for failed processing records and implement retry logic with exponential backoff
+3. **Add multiple enrichment sources** - Extend the solution to enrich data from multiple sources like external APIs, additional DynamoDB tables, or cached data from ElastiCache
+4. **Implement data lineage tracking** - Add metadata tracking to trace data transformations and maintain audit trails using AWS Lake Formation or custom solutions
+5. **Scale with Kinesis Data Firehose** - Replace the S3 storage logic with Kinesis Data Firehose for better throughput and built-in format conversion to Parquet
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

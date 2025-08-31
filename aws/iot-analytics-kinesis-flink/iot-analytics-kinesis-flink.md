@@ -4,12 +4,12 @@ id: 99aef8e0
 category: analytics
 difficulty: 300
 subject: aws
-services: kinesis, flink, lambda, s3
+services: kinesis, kinesisanalyticsv2, lambda, s3
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot,real-time-analytics,kinesis,flink,lambda,streaming-data
 recipe-generator-version: 1.3
@@ -117,6 +117,11 @@ export SNS_TOPIC_NAME="${PROJECT_NAME}-alerts"
 # Create S3 bucket for data storage
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
 
+aws s3api put-bucket-encryption \
+    --bucket ${S3_BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
 # Create folder structure in S3
 aws s3api put-object \
     --bucket ${S3_BUCKET_NAME} \
@@ -133,7 +138,7 @@ aws s3api put-object \
     --key analytics-results/ \
     --content-length 0
 
-echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
+echo "✅ S3 bucket created with encryption: ${S3_BUCKET_NAME}"
 ```
 
 ## Steps
@@ -146,8 +151,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    # Create Kinesis Data Stream with appropriate shard count
    aws kinesis create-stream \
        --stream-name ${KINESIS_STREAM_NAME} \
-       --shard-count 2 \
-       --stream-mode-details StreamMode=PROVISIONED
+       --shard-count 2
    
    # Wait for stream to become active
    aws kinesis wait stream-exists \
@@ -163,7 +167,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    echo "Stream ARN: ${STREAM_ARN}"
    ```
 
-   The stream is now active and ready to receive IoT data from thousands of sensors. With 2 shards, this configuration can handle up to 2,000 records per second or 2 MB/sec of incoming data, providing sufficient capacity for moderate IoT deployments while allowing for future scaling.
+   The stream is now active and ready to receive IoT data from thousands of sensors. With 2 shards, this configuration can handle up to 2,000 records per second or 2 MB/sec of incoming data, providing sufficient capacity for moderate IoT deployments while allowing for future scaling through shard splitting or using on-demand mode.
 
 2. **Create SNS Topic for Alerting**:
 
@@ -269,7 +273,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    echo "✅ Lambda IAM role created: ${LAMBDA_ROLE_ARN}"
    ```
 
-   The IAM role is now configured with precise permissions for the Lambda function's operation. This security foundation ensures the function can access required AWS services while maintaining strong security boundaries and audit trails for compliance requirements.
+   The IAM role is now configured with precise permissions for the Lambda function's operation. This security foundation ensures the function can access required AWS services while maintaining strong security boundaries and audit trails for compliance requirements, following the AWS Well-Architected Framework's security pillar.
 
 4. **Create Lambda Function for IoT Data Processing**:
 
@@ -362,7 +366,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.11 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler iot-processor.lambda_handler \
        --zip-file fileb://iot-processor.zip \
@@ -373,9 +377,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    echo "✅ Lambda function created: ${LAMBDA_FUNCTION_NAME}"
    ```
 
-   The Lambda function is now deployed and ready to process IoT data streams. The function includes built-in anomaly detection logic, S3 archival capabilities, and SNS alerting, providing a complete event-driven processing solution that responds instantly to incoming sensor data.
-
-> **Warning**: Ensure proper IAM permissions are configured before proceeding to avoid access denied errors during function execution.
+   The Lambda function is now deployed and ready to process IoT data streams. The function includes built-in anomaly detection logic, S3 archival capabilities, and SNS alerting, providing a complete event-driven processing solution that responds instantly to incoming sensor data while following serverless best practices.
 
 5. **Create Kinesis to Lambda Event Source Mapping**:
 
@@ -393,7 +395,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    echo "✅ Event source mapping created between Kinesis and Lambda"
    ```
 
-   The event source mapping is now active and monitoring the Kinesis stream for new data. Lambda functions will be automatically invoked with batches of up to 10 records, processing IoT data in near real-time while optimizing for cost through intelligent batching.
+   The event source mapping is now active and monitoring the Kinesis stream for new data. Lambda functions will be automatically invoked with batches of up to 10 records, processing IoT data in near real-time while optimizing for cost through intelligent batching and dead letter queue support for error handling.
 
 6. **Create IAM Role for Managed Service for Apache Flink**:
 
@@ -471,7 +473,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    echo "✅ Flink IAM role created: ${FLINK_ROLE_ARN}"
    ```
 
-   The Flink IAM role is now configured with appropriate permissions for stream processing operations. This enables the Flink application to read streaming data, perform complex analytics, and write results while maintaining secure access controls and comprehensive audit trails.
+   The Flink IAM role is now configured with appropriate permissions for stream processing operations. This enables the Flink application to read streaming data, perform complex analytics, and write results while maintaining secure access controls and comprehensive audit trails through CloudTrail.
 
 7. **Create Flink Application for Stream Analytics**:
 
@@ -481,7 +483,6 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    # Create Flink application code
    cat > /tmp/flink-app.py << 'EOF'
    from pyflink.table import EnvironmentSettings, TableEnvironment
-   from pyflink.table.descriptors import Schema, Kafka, Json
    import os
    
    def create_iot_analytics_job():
@@ -501,8 +502,8 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
            WATERMARK FOR timestamp AS timestamp - INTERVAL '5' SECOND
        ) WITH (
            'connector' = 'kinesis',
-           'stream' = '{os.environ['KINESIS_STREAM_NAME']}',
-           'aws.region' = '{os.environ['AWS_REGION']}',
+           'stream' = '{os.environ.get('KINESIS_STREAM_NAME', 'default-stream')}',
+           'aws.region' = '{os.environ.get('AWS_REGION', 'us-east-1')}',
            'format' = 'json'
        )
        """
@@ -520,7 +521,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
            window_end TIMESTAMP(3)
        ) WITH (
            'connector' = 's3',
-           'path' = 's3://{os.environ['S3_BUCKET_NAME']}/analytics-results/',
+           'path' = 's3://{os.environ.get('S3_BUCKET_NAME', 'default-bucket')}/analytics-results/',
            'format' = 'json'
        )
        """
@@ -566,7 +567,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    # Create Flink application
    aws kinesisanalyticsv2 create-application \
        --application-name ${FLINK_APP_NAME} \
-       --runtime-environment FLINK-1_18 \
+       --runtime-environment FLINK-1_20 \
        --service-execution-role ${FLINK_ROLE_ARN} \
        --application-configuration '{
            "ApplicationCodeConfiguration": {
@@ -593,7 +594,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    echo "✅ Flink application created: ${FLINK_APP_NAME}"
    ```
 
-   The Flink application is now deployed and configured for stream processing. The application performs 5-minute windowed aggregations on IoT sensor data, computing average, maximum, and minimum values grouped by device, sensor type, and location. This provides continuous analytics that update in real-time as new data arrives.
+   The Flink application is now deployed and configured for stream processing. The application performs 5-minute windowed aggregations on IoT sensor data, computing average, maximum, and minimum values grouped by device, sensor type, and location. This provides continuous analytics that update in real-time as new data arrives, with exactly-once processing guarantees.
 
 > **Tip**: Monitor Flink application metrics through CloudWatch to optimize performance and identify potential bottlenecks in your stream processing pipeline. See [Amazon Managed Service for Apache Flink Monitoring](https://docs.aws.amazon.com/managed-flink/latest/java/monitoring-overview.html) for detailed guidance.
 
@@ -645,12 +646,13 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        sensor_types = ['temperature', 'pressure', 'vibration', 'flow']
        locations = ['factory-floor-1', 'factory-floor-2', 'warehouse-a', 'warehouse-b']
        
+       sensor_type = random.choice(sensor_types)
        return {
            'device_id': f"sensor-{random.randint(1000, 9999)}",
            'timestamp': datetime.now().isoformat(),
-           'sensor_type': random.choice(sensor_types),
+           'sensor_type': sensor_type,
            'value': round(random.uniform(10, 100), 2),
-           'unit': get_unit_for_sensor(random.choice(sensor_types)),
+           'unit': get_unit_for_sensor(sensor_type),
            'location': random.choice(locations)
        }
    
@@ -760,7 +762,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
     echo "✅ CloudWatch alarms configured"
     ```
 
-    CloudWatch monitoring is now active for the IoT analytics pipeline. The alarms will trigger notifications when data volume exceeds normal patterns or when processing errors occur, enabling proactive management and quick resolution of operational issues.
+    CloudWatch monitoring is now active for the IoT analytics pipeline. The alarms will trigger notifications when data volume exceeds normal patterns or when processing errors occur, enabling proactive management and quick resolution of operational issues following AWS operational excellence principles.
 
 12. **Create Analytics Dashboard**:
 
@@ -817,7 +819,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
     echo "✅ CloudWatch dashboard created: ${PROJECT_NAME}-analytics"
     ```
 
-    The analytics dashboard is now available in CloudWatch, providing visual monitoring of Kinesis stream metrics and Lambda function performance. This operational visibility enables continuous monitoring of pipeline health and performance optimization based on actual usage patterns.
+    The analytics dashboard is now available in CloudWatch, providing visual monitoring of Kinesis stream metrics and Lambda function performance. This operational visibility enables continuous monitoring of pipeline health and performance optimization based on actual usage patterns and Key Performance Indicators (KPIs).
 
 ## Validation & Testing
 
@@ -931,8 +933,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    
    # Delete the Flink application
    aws kinesisanalyticsv2 delete-application \
-       --application-name ${FLINK_APP_NAME} \
-       --create-timestamp $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+       --application-name ${FLINK_APP_NAME}
    
    echo "✅ Flink application stopped and deleted"
    ```
@@ -1060,34 +1061,41 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
 
 ## Discussion
 
-This real-time IoT analytics architecture demonstrates how to build a comprehensive streaming data processing pipeline using modern AWS services. The solution addresses the critical need for immediate insights from IoT sensor data while maintaining scalability and cost efficiency.
+This real-time IoT analytics architecture demonstrates how to build a comprehensive streaming data processing pipeline using modern AWS services. The solution addresses the critical need for immediate insights from IoT sensor data while maintaining scalability and cost efficiency, following the AWS Well-Architected Framework principles.
 
-The architecture leverages Amazon Kinesis Data Streams as the primary data ingestion service, providing the ability to handle thousands of concurrent IoT devices sending telemetry data. Kinesis Data Streams offers low-latency data ingestion with built-in fault tolerance and automatic scaling capabilities. The provisioned mode with multiple shards ensures consistent performance for high-throughput scenarios.
+The architecture leverages Amazon Kinesis Data Streams as the primary data ingestion service, providing the ability to handle thousands of concurrent IoT devices sending telemetry data. Kinesis Data Streams offers low-latency data ingestion with built-in fault tolerance and automatic scaling capabilities. The service provides 99.999999999% (11 9's) durability and can scale to handle millions of records per second, making it ideal for IoT workloads of any size.
 
-Amazon Managed Service for Apache Flink serves as the core stream processing engine, enabling complex event processing, windowed aggregations, and real-time analytics. Flink's SQL-based approach makes it accessible to data analysts while providing enterprise-grade features like exactly-once processing semantics and state management. The 5-minute tumbling windows provide a balance between real-time responsiveness and computational efficiency.
+Amazon Managed Service for Apache Flink serves as the core stream processing engine, enabling complex event processing, windowed aggregations, and real-time analytics. Flink's SQL-based approach makes it accessible to data analysts while providing enterprise-grade features like exactly-once processing semantics and state management. The 5-minute tumbling windows provide a balance between real-time responsiveness and computational efficiency. Flink automatically handles checkpointing and recovery, ensuring no data loss during failures.
 
-The dual-processing approach using both Flink and Lambda provides flexibility and resilience. Lambda functions handle simple event-driven processing, anomaly detection, and data archival, while Flink performs complex stream analytics and aggregations. This pattern allows for different processing paradigms within the same pipeline, optimizing for both simplicity and sophisticated analytics requirements.
+The dual-processing approach using both Flink and Lambda provides flexibility and resilience. Lambda functions handle simple event-driven processing, anomaly detection, and data archival, while Flink performs complex stream analytics and aggregations. This pattern allows for different processing paradigms within the same pipeline, optimizing for both simplicity and sophisticated analytics requirements while following serverless best practices.
 
-> **Tip**: Consider implementing data partitioning strategies based on device location or sensor type to optimize parallel processing and reduce cross-partition queries in your analytics workloads.
+> **Tip**: Consider implementing data partitioning strategies based on device location or sensor type to optimize parallel processing and reduce cross-partition queries in your analytics workloads. Use [AWS X-Ray](https://docs.aws.amazon.com/xray/latest/devguide/) for distributed tracing to monitor performance across services.
 
-The integration with Amazon S3 for data storage follows a multi-tiered approach, separating raw data, processed data, and analytics results. This design supports both real-time processing and batch analytics, enabling machine learning model training and historical analysis. The time-based partitioning scheme in S3 optimizes for query performance and cost management through lifecycle policies.
+The integration with Amazon S3 for data storage follows a multi-tiered approach, separating raw data, processed data, and analytics results. This design supports both real-time processing and batch analytics, enabling machine learning model training and historical analysis. The time-based partitioning scheme in S3 optimizes for query performance and cost management through lifecycle policies. S3's 99.999999999% durability ensures long-term data preservation for compliance and analytics needs.
 
-Real-time alerting through Amazon SNS enables immediate response to critical events, such as equipment failures or safety threshold violations. The threshold-based anomaly detection can be enhanced with machine learning models for more sophisticated pattern recognition and predictive maintenance capabilities.
+Real-time alerting through Amazon SNS enables immediate response to critical events, such as equipment failures or safety threshold violations. The threshold-based anomaly detection can be enhanced with machine learning models using Amazon SageMaker for more sophisticated pattern recognition and predictive maintenance capabilities. This architecture supports the operational excellence pillar by providing comprehensive monitoring and alerting capabilities.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Implement Machine Learning-based Anomaly Detection**: Replace the simple threshold-based anomaly detection with Amazon SageMaker models that can learn normal patterns and detect subtle anomalies in sensor data.
+1. **Implement Machine Learning-based Anomaly Detection**: Replace the simple threshold-based anomaly detection with Amazon SageMaker models that can learn normal patterns and detect subtle anomalies in sensor data using algorithms like Isolation Forest or autoencoders.
 
-2. **Add Real-time Visualization Dashboard**: Create a real-time dashboard using Amazon QuickSight or a custom web application that displays live sensor readings, analytics results, and alerts with auto-refreshing capabilities.
+2. **Add Real-time Visualization Dashboard**: Create a real-time dashboard using Amazon QuickSight or a custom web application with WebSocket connections that displays live sensor readings, analytics results, and alerts with auto-refreshing capabilities.
 
-3. **Implement Multi-Region Deployment**: Extend the architecture to support multiple regions for global IoT deployments, including cross-region replication and disaster recovery mechanisms.
+3. **Implement Multi-Region Deployment**: Extend the architecture to support multiple regions for global IoT deployments, including cross-region replication using S3 Cross-Region Replication and disaster recovery mechanisms with Route 53 health checks.
 
-4. **Add Predictive Maintenance Capabilities**: Integrate historical data analysis with real-time streams to predict equipment failures and optimize maintenance schedules using Amazon Forecast or custom machine learning models.
+4. **Add Predictive Maintenance Capabilities**: Integrate historical data analysis with real-time streams to predict equipment failures and optimize maintenance schedules using Amazon Forecast or custom machine learning models deployed on SageMaker endpoints.
 
-5. **Implement Data Quality Monitoring**: Add data quality checks and monitoring using AWS Glue DataBrew to automatically detect and handle data quality issues in the IoT data streams.
+5. **Implement Data Quality Monitoring**: Add data quality checks and monitoring using AWS Glue DataBrew to automatically detect and handle data quality issues in the IoT data streams, including schema validation and data profiling.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

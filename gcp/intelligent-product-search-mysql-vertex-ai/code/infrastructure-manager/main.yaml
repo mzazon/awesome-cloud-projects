@@ -1,0 +1,494 @@
+# Infrastructure Manager Configuration for Intelligent Product Search
+# This deploys a complete semantic search system using Cloud SQL MySQL and Vertex AI
+# Resources: Cloud SQL, Cloud Functions, Cloud Storage, Vertex AI API
+
+metadata:
+  name: intelligent-product-search
+  description: "Semantic product search using Cloud SQL MySQL with Vertex AI embeddings"
+  labels:
+    environment: "development"
+    application: "product-search"
+    managed-by: "infrastructure-manager"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Google Cloud zone for resources"
+    default: "us-central1-a"
+  
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+  
+  db_tier:
+    type: string
+    description: "Cloud SQL machine type"
+    default: "db-n1-standard-2"
+    validation:
+      pattern: "^db-(n1|f1|g1)-(micro|small|standard|highmem|highcpu)-[0-9]+$"
+  
+  db_storage_size:
+    type: integer
+    description: "Cloud SQL storage size in GB"
+    default: 20
+    validation:
+      minimum: 10
+      maximum: 1000
+
+# Required APIs that need to be enabled
+providers:
+  google:
+    project: ${variables.project_id}
+    region: ${variables.region}
+
+# Resources section - defines all infrastructure components
+resources:
+  # Enable required Google Cloud APIs
+  enable_apis:
+    type: google_project_service
+    properties:
+      project: ${variables.project_id}
+      services:
+        - sqladmin.googleapis.com
+        - aiplatform.googleapis.com
+        - cloudfunctions.googleapis.com
+        - storage.googleapis.com
+        - cloudbuild.googleapis.com
+      disable_dependent_services: false
+      disable_on_destroy: false
+
+  # Random suffix for unique resource naming
+  random_suffix:
+    type: random_id
+    properties:
+      byte_length: 3
+
+  # Cloud Storage bucket for product data and function source
+  product_storage_bucket:
+    type: google_storage_bucket
+    properties:
+      name: "${variables.project_id}-products-${random_suffix.hex}"
+      location: ${variables.region}
+      project: ${variables.project_id}
+      storage_class: "STANDARD"
+      
+      # Enable versioning for data protection
+      versioning:
+        enabled: true
+      
+      # Lifecycle management to control costs
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "SetStorageClass"
+            storage_class: "NEARLINE"
+        - condition:
+            age: 90
+          action:
+            type: "SetStorageClass"
+            storage_class: "COLDLINE"
+      
+      # Security configurations
+      uniform_bucket_level_access: true
+      
+      labels:
+        environment: ${variables.environment}
+        component: "storage"
+        purpose: "product-data"
+    
+    depends_on:
+      - enable_apis
+
+  # Generate secure random password for Cloud SQL
+  db_password:
+    type: random_password
+    properties:
+      length: 16
+      special: true
+      override_special: "!#$%&*()-_=+[]{}<>:?"
+
+  # Cloud SQL MySQL instance for product catalog with vector embeddings
+  product_database:
+    type: google_sql_database_instance
+    properties:
+      name: "product-db-${random_suffix.hex}"
+      project: ${variables.project_id}
+      region: ${variables.region}
+      database_version: "MYSQL_8_0"
+      deletion_protection: false
+      
+      # Instance configuration optimized for vector operations
+      settings:
+        tier: ${variables.db_tier}
+        disk_size: ${variables.db_storage_size}
+        disk_type: "PD_SSD"
+        disk_autoresize: true
+        disk_autoresize_limit: 100
+        
+        # Backup configuration for data protection
+        backup_configuration:
+          enabled: true
+          start_time: "03:00"
+          binary_log_enabled: true
+          transaction_log_retention_days: 7
+          backup_retention_settings:
+            retained_backups: 7
+            retention_unit: "COUNT"
+        
+        # Maintenance window configuration
+        maintenance_window:
+          day: 7  # Sunday
+          hour: 4
+          update_track: "stable"
+        
+        # IP configuration for secure access
+        ip_configuration:
+          authorized_networks: []
+          ipv4_enabled: true
+          require_ssl: false
+          
+        # Database flags for optimal performance
+        database_flags:
+          - name: "slow_query_log"
+            value: "on"
+          - name: "long_query_time"
+            value: "2"
+          - name: "max_connections"
+            value: "300"
+          - name: "innodb_buffer_pool_size"
+            value: "75%"
+      
+      labels:
+        environment: ${variables.environment}
+        component: "database"
+        purpose: "product-catalog"
+    
+    depends_on:
+      - enable_apis
+
+  # Set root password for Cloud SQL instance
+  db_user_root:
+    type: google_sql_user
+    properties:
+      name: "root"
+      instance: ${product_database.name}
+      project: ${variables.project_id}
+      host: "%"
+      password: ${db_password.result}
+    
+    depends_on:
+      - product_database
+
+  # Create products database
+  products_database:
+    type: google_sql_database
+    properties:
+      name: "products"
+      instance: ${product_database.name}
+      project: ${variables.project_id}
+      charset: "utf8mb4"
+      collation: "utf8mb4_unicode_ci"
+    
+    depends_on:
+      - product_database
+
+  # Service account for Cloud Functions
+  function_service_account:
+    type: google_service_account
+    properties:
+      account_id: "product-search-sa-${random_suffix.hex}"
+      project: ${variables.project_id}
+      display_name: "Product Search Function Service Account"
+      description: "Service account for Cloud Functions accessing Cloud SQL and Vertex AI"
+    
+    depends_on:
+      - enable_apis
+
+  # IAM binding for Cloud SQL client access
+  function_sql_client_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${variables.project_id}
+      role: "roles/cloudsql.client"
+      member: "serviceAccount:${function_service_account.email}"
+    
+    depends_on:
+      - function_service_account
+
+  # IAM binding for Vertex AI user access
+  function_ai_user_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${variables.project_id}
+      role: "roles/aiplatform.user"
+      member: "serviceAccount:${function_service_account.email}"
+    
+    depends_on:
+      - function_service_account
+
+  # IAM binding for Storage object access
+  function_storage_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${variables.project_id}
+      role: "roles/storage.objectViewer"
+      member: "serviceAccount:${function_service_account.email}"
+    
+    depends_on:
+      - function_service_account
+
+  # Cloud Storage bucket for Cloud Function source code
+  function_source_bucket:
+    type: google_storage_bucket
+    properties:
+      name: "${variables.project_id}-function-source-${random_suffix.hex}"
+      location: ${variables.region}
+      project: ${variables.project_id}
+      storage_class: "STANDARD"
+      uniform_bucket_level_access: true
+      
+      labels:
+        environment: ${variables.environment}
+        component: "storage"
+        purpose: "function-source"
+    
+    depends_on:
+      - enable_apis
+
+  # Cloud Storage object for function source code (placeholder)
+  function_source_archive:
+    type: google_storage_bucket_object
+    properties:
+      name: "function-source.zip"
+      bucket: ${function_source_bucket.name}
+      content: "UEsDBAoAAAAAAKZTsVQAAAAAAAAAAAAAAAAJABwAZnVuY3Rpb24vVVQJAAOi3pZhot6WYXWeCwEDU9QBBJPVAQRQSwMECgAAAAAAdFOxVAAAAAAAAAAAAAAAAA8AHABmdW5jdGlvbi9tYWluLnB5VVQJAAOo3pZhqN6WYXV4CwABU9QBBJPVAQRQSwECHgMKAAAAAAA="  # Empty zip placeholder
+      content_encoding: "base64"
+    
+    depends_on:
+      - function_source_bucket
+
+  # Cloud Function for product search API
+  product_search_function:
+    type: google_cloudfunctions2_function
+    properties:
+      name: "product-search-${random_suffix.hex}"
+      project: ${variables.project_id}
+      location: ${variables.region}
+      description: "Semantic product search using Vertex AI embeddings"
+      
+      build_config:
+        runtime: "python311"
+        entry_point: "search_products"
+        source:
+          storage_source:
+            bucket: ${function_source_bucket.name}
+            object: ${function_source_archive.name}
+      
+      service_config:
+        max_instance_count: 10
+        min_instance_count: 0
+        available_memory: "512Mi"
+        timeout_seconds: 60
+        max_instance_request_concurrency: 1
+        available_cpu: "1"
+        
+        # Environment variables for function configuration
+        environment_variables:
+          PROJECT_ID: ${variables.project_id}
+          REGION: ${variables.region}
+          INSTANCE_NAME: ${product_database.name}
+          DB_PASSWORD: ${db_password.result}
+          
+        # Use custom service account
+        service_account_email: ${function_service_account.email}
+        
+        # VPC connector configuration (if needed)
+        ingress_settings: "ALLOW_ALL"
+        
+        # Security settings
+        all_traffic_on_latest_revision: true
+      
+      labels:
+        environment: ${variables.environment}
+        component: "compute"
+        purpose: "search-api"
+    
+    depends_on:
+      - function_service_account
+      - function_source_archive
+      - products_database
+      - function_sql_client_binding
+      - function_ai_user_binding
+
+  # Cloud Function for adding products API
+  product_add_function:
+    type: google_cloudfunctions2_function
+    properties:
+      name: "product-add-${random_suffix.hex}"
+      project: ${variables.project_id}
+      location: ${variables.region}
+      description: "Add products with automatic embedding generation"
+      
+      build_config:
+        runtime: "python311"
+        entry_point: "add_product"
+        source:
+          storage_source:
+            bucket: ${function_source_bucket.name}
+            object: ${function_source_archive.name}
+      
+      service_config:
+        max_instance_count: 5
+        min_instance_count: 0
+        available_memory: "512Mi"
+        timeout_seconds: 60
+        max_instance_request_concurrency: 1
+        available_cpu: "1"
+        
+        # Environment variables for function configuration
+        environment_variables:
+          PROJECT_ID: ${variables.project_id}
+          REGION: ${variables.region}
+          INSTANCE_NAME: ${product_database.name}
+          DB_PASSWORD: ${db_password.result}
+          
+        # Use custom service account
+        service_account_email: ${function_service_account.email}
+        
+        # Security settings
+        ingress_settings: "ALLOW_ALL"
+        all_traffic_on_latest_revision: true
+      
+      labels:
+        environment: ${variables.environment}
+        component: "compute"
+        purpose: "product-api"
+    
+    depends_on:
+      - function_service_account
+      - function_source_archive
+      - products_database
+      - function_sql_client_binding
+      - function_ai_user_binding
+
+  # IAM policy to allow unauthenticated access to search function
+  search_function_invoker:
+    type: google_cloudfunctions2_function_iam_member
+    properties:
+      project: ${variables.project_id}
+      location: ${variables.region}
+      cloud_function: ${product_search_function.name}
+      role: "roles/cloudfunctions.invoker"
+      member: "allUsers"
+    
+    depends_on:
+      - product_search_function
+
+  # IAM policy to allow unauthenticated access to add function
+  add_function_invoker:
+    type: google_cloudfunctions2_function_iam_member
+    properties:
+      project: ${variables.project_id}
+      location: ${variables.region}
+      cloud_function: ${product_add_function.name}
+      role: "roles/cloudfunctions.invoker"
+      member: "allUsers"
+    
+    depends_on:
+      - product_add_function
+
+# Outputs section - provides important information after deployment
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${variables.project_id}
+  
+  region:
+    description: "Deployment region"
+    value: ${variables.region}
+  
+  database_instance_name:
+    description: "Cloud SQL instance name"
+    value: ${product_database.name}
+  
+  database_connection_name:
+    description: "Cloud SQL connection string"
+    value: "${variables.project_id}:${variables.region}:${product_database.name}"
+  
+  database_ip_address:
+    description: "Cloud SQL instance IP address"
+    value: ${product_database.ip_address.0.ip_address}
+  
+  storage_bucket_name:
+    description: "Cloud Storage bucket for product data"
+    value: ${product_storage_bucket.name}
+  
+  storage_bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: ${product_storage_bucket.url}
+  
+  search_function_name:
+    description: "Product search Cloud Function name"
+    value: ${product_search_function.name}
+  
+  search_function_url:
+    description: "Product search API endpoint URL"
+    value: ${product_search_function.service_config.0.uri}
+  
+  add_function_name:
+    description: "Product addition Cloud Function name"
+    value: ${product_add_function.name}
+  
+  add_function_url:
+    description: "Product addition API endpoint URL"
+    value: ${product_add_function.service_config.0.uri}
+  
+  service_account_email:
+    description: "Service account email for functions"
+    value: ${function_service_account.email}
+  
+  db_password:
+    description: "Database root password (sensitive)"
+    value: ${db_password.result}
+    sensitive: true
+
+# Deployment notes and instructions
+deployment_notes: |
+  This Infrastructure Manager configuration deploys a complete intelligent product search system using:
+  
+  1. Cloud SQL MySQL instance with optimized configuration for vector storage
+  2. Cloud Functions for search and product addition APIs with Vertex AI integration
+  3. Cloud Storage buckets for data storage and function source code
+  4. Proper IAM roles and service accounts for security
+  5. Required API enablement for all services
+  
+  After deployment:
+  1. Upload your Cloud Function source code to the function source bucket
+  2. Redeploy functions with actual source code
+  3. Initialize database schema using the provided SQL scripts
+  4. Load sample product data to test semantic search capabilities
+  
+  Security considerations:
+  - Functions allow unauthenticated access for demo purposes
+  - In production, implement proper authentication and authorization
+  - Consider VPC connectivity for enhanced security
+  - Enable Cloud SQL SSL for encrypted connections
+  
+  Cost optimization:
+  - Adjust Cloud SQL tier based on expected load
+  - Configure appropriate storage lifecycle policies
+  - Monitor Cloud Functions concurrency and memory usage
+  - Consider using Cloud SQL Proxy for connection pooling

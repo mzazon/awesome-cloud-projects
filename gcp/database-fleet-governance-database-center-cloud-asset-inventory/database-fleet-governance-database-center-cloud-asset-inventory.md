@@ -1,21 +1,21 @@
 ---
-title: Architecting Centralized Database Fleet Governance with Database Center and Cloud Asset Inventory
+title: Centralized Database Fleet Governance with Database Center and Cloud Asset Inventory
 id: db7f3a9c
 category: management
 difficulty: 200
 subject: gcp
 services: Database Center, Cloud Asset Inventory, Cloud Workflows, Cloud Monitoring
 estimated-time: 75 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database governance, fleet management, compliance, ai-powered insights, automation
 recipe-generator-version: 1.3
 ---
 
-# Architecting Centralized Database Fleet Governance with Database Center and Cloud Asset Inventory
+# Centralized Database Fleet Governance with Database Center and Cloud Asset Inventory
 
 ## Problem
 
@@ -92,7 +92,7 @@ graph TB
 5. Multiple Google Cloud projects with database resources (or ability to create test resources)
 6. Estimated cost: $50-100 for testing resources over 75 minutes
 
-> **Note**: Database Center is now generally available and provides AI-powered insights across all Google Cloud database services including Cloud SQL, AlloyDB, Spanner, Bigtable, Memorystore, and Firestore.
+> **Note**: Database Center is generally available and provides AI-powered insights across all Google Cloud database services including Cloud SQL, AlloyDB, Spanner, Bigtable, Memorystore, and Firestore.
 
 ## Preparation
 
@@ -202,7 +202,7 @@ echo "✅ Project configured for database governance: ${PROJECT_ID}"
    # Export current asset snapshot to BigQuery
    gcloud asset export \
        --project=${PROJECT_ID} \
-       --bigquery-table=//bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/database_governance/tables/asset_inventory \
+       --bigquery-table=${PROJECT_ID}:database_governance.asset_inventory \
        --content-type=resource \
        --asset-types="sqladmin.googleapis.com/Instance,spanner.googleapis.com/Instance,bigtableadmin.googleapis.com/Instance"
    
@@ -698,4 +698,9 @@ Extend this database governance solution by implementing these advanced capabili
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: Transfer Family, S3, IAM Identity Center, Access Grants
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: file-sharing, self-service, web-portal, secure-access, identity-management
 recipe-generator-version: 1.3
@@ -76,7 +76,7 @@ graph TB
 2. AWS CLI v2 installed and configured with appropriate credentials
 3. Basic understanding of identity management concepts (SAML, OIDC)
 4. An existing IAM Identity Center instance (account or organization level)
-5. Estimated cost: $10-25 per month for resources created (varies by usage)
+5. Estimated cost: $360-400 per month for resources created (primarily web app units at $0.50/hour)
 
 > **Note**: This recipe assumes you have an IAM Identity Center instance configured. If not, the web app creation process can help you set one up.
 
@@ -320,14 +320,15 @@ echo "✅ AWS environment configured with unique identifiers"
    ```bash
    # Create Transfer Family web app with IAM Identity Center
    aws transfer create-web-app \
-       --identity-provider-type IDENTITY_CENTER \
        --identity-provider-details '{
            "IdentityCenterConfig": {
-               "InstanceArn": "'${IDC_INSTANCE_ARN}'"
+               "InstanceArn": "'${IDC_INSTANCE_ARN}'",
+               "Role": "'${WEBAPP_ROLE_ARN}'"
            }
        }' \
-       --access-role ${WEBAPP_ROLE_ARN} \
-       --web-app-units 1 \
+       --web-app-units '{
+           "Provisioned": 1
+       }' \
        --tags '[{
            "Key": "Name",
            "Value": "'${WEBAPP_NAME}'"
@@ -374,27 +375,10 @@ echo "✅ AWS environment configured with unique identifiers"
        }'
    
    echo "✅ CORS configuration applied to S3 bucket for web app access"
+   echo "Access URL: https://${ACCESS_ENDPOINT}"
    ```
 
-   The CORS configuration now allows the web app to perform secure file operations while maintaining proper browser security policies. This enables seamless file uploads and downloads through the web interface.
-
-10. **Configure Web App Identity Center Integration**:
-
-    The final step configures the web app to properly integrate with IAM Identity Center, enabling users to authenticate and access files through the portal.
-
-    ```bash
-    # Configure Identity Center integration for the web app
-    aws transfer put-web-app-identity-center-config \
-        --web-app-id ${WEBAPP_ID} \
-        --identity-center-config '{
-            "Role": "'${WEBAPP_ROLE_ARN}'"
-        }'
-    
-    echo "✅ Web app configured with Identity Center integration"
-    echo "Access URL: https://${ACCESS_ENDPOINT}"
-    ```
-
-    The user is now fully configured to access the web portal with secure authentication and appropriate file permissions. The access URL provides direct browser access to the self-service file portal.
+   The CORS configuration now allows the web app to perform secure file operations while maintaining proper browser security policies. This enables seamless file uploads and downloads through the web interface, and users can now access the portal at the provided URL.
 
 ## Validation & Testing
 
@@ -532,15 +516,15 @@ echo "✅ AWS environment configured with unique identifiers"
 
 ## Discussion
 
-AWS Transfer Family Web Apps represents a significant advancement in cloud-based file sharing, providing enterprise-grade security with consumer-grade usability. The service eliminates the complexity traditionally associated with secure file sharing by offering a fully managed solution that integrates seamlessly with existing identity management systems. Unlike traditional file sharing solutions that require client software or expose security vulnerabilities, Transfer Family Web Apps provides browser-based access with enterprise security controls.
+AWS Transfer Family Web Apps represents a significant advancement in cloud-based file sharing, providing enterprise-grade security with consumer-grade usability. The service eliminates the complexity traditionally associated with secure file sharing by offering a fully managed solution that integrates seamlessly with existing identity management systems. Unlike traditional file sharing solutions that require client software or expose security vulnerabilities, Transfer Family Web Apps provides browser-based access with enterprise security controls, following AWS Well-Architected Framework principles for security and operational excellence.
 
 The integration with IAM Identity Center is particularly powerful, as it enables organizations to leverage existing identity providers (SAML, OIDC) while maintaining centralized user management. This approach reduces IT overhead by eliminating the need to manage separate user databases while providing features like multi-factor authentication and single sign-on. The service automatically handles session management, token refresh, and secure credential vending, ensuring that users have seamless access without compromising security.
 
 S3 Access Grants provides the fine-grained access control layer that makes this solution enterprise-ready. Rather than managing complex IAM policies, administrators can create intuitive grants that map corporate identities directly to S3 resources. This approach provides temporary credentials with automatic expiration, detailed audit trails, and the ability to grant access at the bucket, prefix, or even object level. The integration with IAM Identity Center ensures that access grants automatically respect organizational hierarchies and group memberships.
 
-The architectural pattern demonstrated here follows AWS Well-Architected Framework principles, particularly in the areas of security and operational excellence. By leveraging managed services like Transfer Family Web Apps, organizations can achieve enterprise-grade file sharing capabilities without the operational overhead of managing custom applications, web servers, or complex authentication systems. This approach also provides built-in scalability, as the service automatically handles load balancing, availability, and performance optimization.
+The cost structure of Transfer Family Web Apps is straightforward with pay-as-you-go pricing at $0.50 per hour per web app unit, allowing 250 concurrent sessions per unit. This pricing model enables organizations to scale capacity based on actual usage patterns while maintaining predictable costs. The service also provides built-in scalability, automatically handling load balancing, availability, and performance optimization without operational overhead.
 
-> **Tip**: Enable AWS CloudTrail logging to monitor all file operations and access patterns. This provides comprehensive audit trails for compliance requirements and helps identify potential security issues or usage patterns that may require attention.
+> **Warning**: Monitor web app usage patterns and adjust capacity accordingly. Each web app unit supports 250 concurrent sessions, and costs approximately $360 per month at continuous operation. Consider implementing usage monitoring and automated scaling policies to optimize costs.
 
 For comprehensive guidance on this solution, refer to the official AWS documentation: [Transfer Family Web Apps User Guide](https://docs.aws.amazon.com/transfer/latest/userguide/web-app.html), [IAM Identity Center User Guide](https://docs.aws.amazon.com/singlesignon/latest/userguide/what-is.html), [S3 Access Grants User Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-grants.html), [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html), and [S3 Security Best Practices](https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html).
 
@@ -548,16 +532,23 @@ For comprehensive guidance on this solution, refer to the official AWS documenta
 
 Extend this solution by implementing these enhancements:
 
-1. **Custom Branding Integration**: Customize the web app with corporate logos, colors, and themes to match organizational branding standards while implementing custom domain names with SSL certificates.
+1. **Custom Branding Integration**: Customize the web app with corporate logos, colors, and themes to match organizational branding standards while implementing custom domain names with SSL certificates for a seamless user experience.
 
-2. **Advanced Access Controls**: Implement time-based access grants with automatic expiration, IP address restrictions, and device-based access controls using IAM Identity Center conditional access policies.
+2. **Advanced Access Controls**: Implement time-based access grants with automatic expiration, IP address restrictions, and device-based access controls using IAM Identity Center conditional access policies for enhanced security.
 
-3. **Automated Workflow Integration**: Connect file uploads to AWS Step Functions workflows for automated processing, virus scanning, and document classification using services like Amazon Textract and Comprehend.
+3. **Automated Workflow Integration**: Connect file uploads to AWS Step Functions workflows for automated processing, virus scanning with Amazon Inspector, and document classification using services like Amazon Textract and Comprehend.
 
-4. **Multi-Region Deployment**: Configure cross-region replication for disaster recovery, implement global load balancing for improved performance, and ensure compliance with data residency requirements.
+4. **Multi-Region Deployment**: Configure cross-region replication for disaster recovery, implement global load balancing for improved performance, and ensure compliance with data residency requirements using AWS regions.
 
-5. **Advanced Monitoring and Analytics**: Implement comprehensive logging with CloudWatch dashboards, set up automated alerts for security events, and create usage analytics reports using Amazon QuickSight for business intelligence.
+5. **Advanced Monitoring and Analytics**: Implement comprehensive logging with CloudWatch dashboards, set up automated alerts for security events using EventBridge, and create usage analytics reports using Amazon QuickSight for business intelligence insights.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

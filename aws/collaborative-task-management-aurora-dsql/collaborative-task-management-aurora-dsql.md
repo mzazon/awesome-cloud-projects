@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: Aurora DSQL, EventBridge, Lambda, CloudWatch
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: aurora-dsql, eventbridge, lambda, cloudwatch, serverless, real-time, collaborative, task-management, multi-region, distributed-database
 recipe-generator-version: 1.3
@@ -37,7 +37,7 @@ graph TB
             CW1[CloudWatch Logs]
         end
         
-        subgraph "Secondary Region (us-west-2)"
+        subgraph "Secondary Region (us-east-2)"
             USER2[Team Members]
             EB2[EventBridge Bus]
             LAMBDA2[Task Processor Lambda]
@@ -46,6 +46,10 @@ graph TB
         
         subgraph "Aurora DSQL Multi-Region Cluster"
             DSQL[(Aurora DSQL Database)]
+        end
+        
+        subgraph "Witness Region (us-west-2)"
+            WITNESS[Transaction Logs]
         end
     end
     
@@ -61,14 +65,14 @@ graph TB
     LAMBDA1 --> CW1
     LAMBDA2 --> CW2
     
-    DSQL --> LAMBDA1
-    DSQL --> LAMBDA2
+    DSQL --> WITNESS
     
     style DSQL fill:#FF9900
     style EB1 fill:#FF4B4B
     style EB2 fill:#FF4B4B
     style LAMBDA1 fill:#FF9900
     style LAMBDA2 fill:#FF9900
+    style WITNESS fill:#32CD32
 ```
 
 ## Prerequisites
@@ -77,21 +81,21 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of serverless architecture and event-driven patterns
 4. Familiarity with SQL and distributed database concepts
-5. Two AWS regions enabled for multi-region deployment (us-east-1 and us-west-2)
-6. Estimated cost: $20-50/month for development workloads (scales with usage)
+5. Three AWS regions enabled: us-east-1, us-east-2 (for clusters), us-west-2 (witness)
+6. PostgreSQL client (psql) installed for database operations
+7. Estimated cost: $30-80/month for development workloads (scales with usage)
 
 > **Note**: Aurora DSQL is currently available in limited regions. Verify region availability before starting this recipe.
 
 ## Preparation
 
 ```bash
-# Set environment variables for primary region
+# Set environment variables for regions
 export AWS_REGION=us-east-1
+export SECONDARY_REGION=us-east-2
+export WITNESS_REGION=us-west-2
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
     --query Account --output text)
-
-# Set secondary region for multi-region setup
-export SECONDARY_REGION=us-west-2
 
 # Generate unique identifiers for resources
 RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
@@ -100,7 +104,8 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --output text --query RandomPassword)
 
 # Set resource names
-export DSQL_CLUSTER_NAME="task-mgmt-cluster-${RANDOM_SUFFIX}"
+export CLUSTER_NAME_PRIMARY="task-cluster-primary-${RANDOM_SUFFIX}"
+export CLUSTER_NAME_SECONDARY="task-cluster-secondary-${RANDOM_SUFFIX}"
 export EVENT_BUS_NAME="task-events-${RANDOM_SUFFIX}"
 export LAMBDA_FUNCTION_NAME="task-processor-${RANDOM_SUFFIX}"
 export LOG_GROUP_NAME="/aws/lambda/${LAMBDA_FUNCTION_NAME}"
@@ -108,46 +113,101 @@ export LOG_GROUP_NAME="/aws/lambda/${LAMBDA_FUNCTION_NAME}"
 echo "✅ Environment variables configured"
 echo "Primary Region: ${AWS_REGION}"
 echo "Secondary Region: ${SECONDARY_REGION}"
-echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
+echo "Witness Region: ${WITNESS_REGION}"
+echo "Primary Cluster: ${CLUSTER_NAME_PRIMARY}"
+echo "Secondary Cluster: ${CLUSTER_NAME_SECONDARY}"
 ```
 
 ## Steps
 
-1. **Create Aurora DSQL Multi-Region Cluster**:
+1. **Create Aurora DSQL Multi-Region Clusters**:
 
    Aurora DSQL provides a serverless, distributed relational database with active-active multi-region capabilities. Unlike traditional databases that require complex failover mechanisms, Aurora DSQL automatically manages replication, scaling, and failure recovery across regions while maintaining strong consistency and ACID transactions.
 
    ```bash
-   # Create multi-region Aurora DSQL cluster
-   aws dsql create-multi-region-clusters \
+   # Create primary cluster in us-east-1 with witness region
+   aws dsql create-cluster \
        --region ${AWS_REGION} \
-       --cluster-properties \
-       "clusterArn=arn:aws:dsql:${AWS_REGION}:${AWS_ACCOUNT_ID}:cluster/${DSQL_CLUSTER_NAME}-primary" \
-       --linked-cluster-properties \
-       "clusterArn=arn:aws:dsql:${SECONDARY_REGION}:${AWS_ACCOUNT_ID}:cluster/${DSQL_CLUSTER_NAME}-secondary"
+       --multi-region-properties "{\"witnessRegion\":\"${WITNESS_REGION}\"}"
    
-   # Wait for cluster to be active
+   # Store cluster identifier from response
+   PRIMARY_CLUSTER_ID=$(aws dsql list-clusters \
+       --region ${AWS_REGION} \
+       --query 'clusters[0].identifier' --output text)
+   
+   # Create secondary cluster in us-east-2 with same witness region
+   aws dsql create-cluster \
+       --region ${SECONDARY_REGION} \
+       --multi-region-properties "{\"witnessRegion\":\"${WITNESS_REGION}\"}"
+   
+   # Store secondary cluster identifier
+   SECONDARY_CLUSTER_ID=$(aws dsql list-clusters \
+       --region ${SECONDARY_REGION} \
+       --query 'clusters[0].identifier' --output text)
+   
+   # Get cluster ARNs for peering
+   PRIMARY_CLUSTER_ARN="arn:aws:dsql:${AWS_REGION}:${AWS_ACCOUNT_ID}:cluster/${PRIMARY_CLUSTER_ID}"
+   SECONDARY_CLUSTER_ARN="arn:aws:dsql:${SECONDARY_REGION}:${AWS_ACCOUNT_ID}:cluster/${SECONDARY_CLUSTER_ID}"
+   
+   echo "✅ Aurora DSQL clusters created"
+   echo "Primary Cluster ID: ${PRIMARY_CLUSTER_ID}"
+   echo "Secondary Cluster ID: ${SECONDARY_CLUSTER_ID}"
+   ```
+
+   The multi-region clusters are now created in pending setup state, ready for peering configuration to establish active-active capabilities.
+
+2. **Configure Multi-Region Cluster Peering**:
+
+   Aurora DSQL requires explicit peering configuration to establish active-active multi-region capabilities. This process creates bidirectional synchronization between regions with the witness region maintaining transaction consistency.
+
+   ```bash
+   # Peer primary cluster with secondary cluster
+   aws dsql update-cluster \
+       --region ${AWS_REGION} \
+       --identifier ${PRIMARY_CLUSTER_ID} \
+       --multi-region-properties "{
+           \"witnessRegion\": \"${WITNESS_REGION}\",
+           \"clusters\": [\"${SECONDARY_CLUSTER_ARN}\"]
+       }"
+   
+   # Peer secondary cluster with primary cluster
+   aws dsql update-cluster \
+       --region ${SECONDARY_REGION} \
+       --identifier ${SECONDARY_CLUSTER_ID} \
+       --multi-region-properties "{
+           \"witnessRegion\": \"${WITNESS_REGION}\",
+           \"clusters\": [\"${PRIMARY_CLUSTER_ARN}\"]
+       }"
+   
+   # Wait for clusters to become active
+   echo "Waiting for clusters to become active..."
    aws dsql wait cluster-active \
-       --cluster-identifier ${DSQL_CLUSTER_NAME}-primary
+       --region ${AWS_REGION} \
+       --identifier ${PRIMARY_CLUSTER_ID}
+   
+   aws dsql wait cluster-active \
+       --region ${SECONDARY_REGION} \
+       --identifier ${SECONDARY_CLUSTER_ID}
    
    # Get cluster endpoints
-   PRIMARY_ENDPOINT=$(aws dsql describe-cluster \
-       --cluster-identifier ${DSQL_CLUSTER_NAME}-primary \
-       --query 'Cluster.ClusterEndpoint' --output text)
+   PRIMARY_ENDPOINT=$(aws dsql get-cluster \
+       --region ${AWS_REGION} \
+       --identifier ${PRIMARY_CLUSTER_ID} \
+       --query 'endpoint' --output text)
    
-   SECONDARY_ENDPOINT=$(aws dsql describe-cluster \
+   SECONDARY_ENDPOINT=$(aws dsql get-cluster \
        --region ${SECONDARY_REGION} \
-       --cluster-identifier ${DSQL_CLUSTER_NAME}-secondary \
-       --query 'Cluster.ClusterEndpoint' --output text)
+       --identifier ${SECONDARY_CLUSTER_ID} \
+       --query 'endpoint' --output text)
    
-   echo "✅ Aurora DSQL multi-region cluster created"
+   echo "✅ Multi-region cluster peering established"
    echo "Primary Endpoint: ${PRIMARY_ENDPOINT}"
    echo "Secondary Endpoint: ${SECONDARY_ENDPOINT}"
    ```
 
-   The multi-region cluster is now established with automatic synchronous replication between regions, providing both regional endpoints for concurrent read/write operations with strong consistency guarantees.
+   The clusters are now peered with automatic synchronous replication between regions, providing both regional endpoints for concurrent read/write operations with strong consistency guarantees.
 
-2. **Create Task Management Database Schema**:
+3. **Create Task Management Database Schema**:
 
    Aurora DSQL supports PostgreSQL-compatible SQL, enabling familiar database operations while leveraging distributed architecture benefits. The schema design optimizes for concurrent task operations and real-time collaboration scenarios.
 
@@ -202,20 +262,21 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
        EXECUTE FUNCTION update_timestamp();
    EOF
    
-   # Apply schema to primary region
-   psql -h ${PRIMARY_ENDPOINT} -d postgres -f task_schema.sql
+   # Apply schema to primary region endpoint
+   PGPASSWORD=placeholder psql -h ${PRIMARY_ENDPOINT} \
+       -U postgres -d postgres -f task_schema.sql
    
    echo "✅ Database schema created and applied"
    ```
 
-   The schema includes optimized tables for task management with proper indexing and triggers for automatic timestamp updates, supporting high-concurrency collaborative scenarios.
+   The schema includes optimized tables for task management with proper indexing and triggers for automatic timestamp updates, supporting high-concurrency collaborative scenarios across both regions.
 
-3. **Create EventBridge Custom Event Bus**:
+4. **Create EventBridge Custom Event Bus**:
 
    EventBridge provides serverless event routing that enables decoupled, event-driven architecture. A custom event bus isolates task management events from other application events while providing flexible routing and filtering capabilities.
 
    ```bash
-   # Create custom event bus for task events
+   # Create custom event bus for task events in primary region
    aws events create-event-bus \
        --name ${EVENT_BUS_NAME} \
        --region ${AWS_REGION}
@@ -228,6 +289,7 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    # Get event bus ARNs
    EVENT_BUS_ARN=$(aws events describe-event-bus \
        --name ${EVENT_BUS_NAME} \
+       --region ${AWS_REGION} \
        --query 'Arn' --output text)
    
    SECONDARY_EVENT_BUS_ARN=$(aws events describe-event-bus \
@@ -242,7 +304,7 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
 
    The custom event buses are now available in both regions, enabling event-driven communication between task management components with built-in filtering and routing capabilities.
 
-4. **Create IAM Role for Lambda Functions**:
+5. **Create IAM Role for Lambda Functions**:
 
    Lambda functions require proper IAM permissions to interact with Aurora DSQL, EventBridge, and CloudWatch. This role follows the principle of least privilege while enabling necessary service integrations.
 
@@ -276,9 +338,8 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
            {
                "Effect": "Allow",
                "Action": [
-                   "dsql:DescribeCluster",
-                   "dsql:Execute",
-                   "dsql:BatchExecute"
+                   "dsql:GetCluster",
+                   "dsql:Connect"
                ],
                "Resource": "*"
            },
@@ -323,7 +384,7 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
 
    The IAM role is configured with precise permissions for Aurora DSQL operations, EventBridge event publishing, and CloudWatch logging, following AWS security best practices.
 
-5. **Create Task Processor Lambda Function**:
+6. **Create Task Processor Lambda Function**:
 
    The Lambda function handles task operations and event processing with Aurora DSQL integration. This serverless approach provides automatic scaling, cost efficiency, and event-driven processing capabilities.
 
@@ -332,9 +393,12 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    cat > task_processor.py << 'EOF'
    import json
    import boto3
-   import psycopg2
    import os
    from datetime import datetime
+   import logging
+   
+   logger = logging.getLogger()
+   logger.setLevel(logging.INFO)
    
    # Initialize AWS clients
    events_client = boto3.client('events')
@@ -342,6 +406,8 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    
    def lambda_handler(event, context):
        try:
+           logger.info(f"Processing event: {json.dumps(event)}")
+           
            # Process EventBridge event
            if 'source' in event and event['source'] == 'task.management':
                return process_task_event(event)
@@ -350,7 +416,7 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
            return process_direct_request(event)
            
        except Exception as e:
-           print(f"Error processing event: {str(e)}")
+           logger.error(f"Error processing event: {str(e)}")
            return {
                'statusCode': 500,
                'body': json.dumps({'error': str(e)})
@@ -374,35 +440,36 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
        """Handle task creation events"""
        task_data = detail['taskData']
        
-       # Insert task into database
-       conn = get_db_connection()
-       cursor = conn.cursor()
-       
-       cursor.execute("""
-           INSERT INTO tasks (title, description, status, priority, assigned_to, created_by, project_id, due_date)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-           RETURNING id
-       """, (
-           task_data['title'],
-           task_data.get('description', ''),
-           task_data.get('status', 'pending'),
-           task_data.get('priority', 'medium'),
-           task_data.get('assigned_to', ''),
-           task_data['created_by'],
-           task_data.get('project_id'),
-           task_data.get('due_date')
-       ))
-       
-       task_id = cursor.fetchone()[0]
-       conn.commit()
-       conn.close()
+       # Execute SQL using DSQL client
+       response = dsql_client.batch_execute_statement(
+           clusterIdentifier=os.environ['CLUSTER_ID'],
+           database='postgres',
+           sqls=[
+               {
+                   'statement': '''
+                       INSERT INTO tasks (title, description, status, priority, assigned_to, created_by, project_id, due_date)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ''',
+                   'parameters': [
+                       task_data['title'],
+                       task_data.get('description', ''),
+                       task_data.get('status', 'pending'),
+                       task_data.get('priority', 'medium'),
+                       task_data.get('assigned_to', ''),
+                       task_data['created_by'],
+                       task_data.get('project_id'),
+                       task_data.get('due_date')
+                   ]
+               }
+           ]
+       )
        
        # Publish notification event
-       publish_task_notification('task.created', task_id, task_data)
+       publish_task_notification('task.created', 1, task_data)
        
        return {
            'statusCode': 200,
-           'body': json.dumps({'task_id': task_id, 'message': 'Task created successfully'})
+           'body': json.dumps({'message': 'Task created successfully'})
        }
    
    def handle_task_updated(detail):
@@ -411,26 +478,25 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
        updates = detail['updates']
        updated_by = detail['updatedBy']
        
-       conn = get_db_connection()
-       cursor = conn.cursor()
-       
-       # Update task and log changes
+       # Update task using DSQL client
        for field, new_value in updates.items():
-           # Get current value
-           cursor.execute(f"SELECT {field} FROM tasks WHERE id = %s", (task_id,))
-           old_value = cursor.fetchone()[0]
-           
-           # Update task
-           cursor.execute(f"UPDATE tasks SET {field} = %s WHERE id = %s", (new_value, task_id))
+           dsql_client.execute_statement(
+               clusterIdentifier=os.environ['CLUSTER_ID'],
+               database='postgres',
+               sql=f'UPDATE tasks SET {field} = ? WHERE id = ?',
+               parameters=[new_value, task_id]
+           )
            
            # Log change
-           cursor.execute("""
-               INSERT INTO task_updates (task_id, field_name, old_value, new_value, updated_by)
-               VALUES (%s, %s, %s, %s, %s)
-           """, (task_id, field, str(old_value), str(new_value), updated_by))
-       
-       conn.commit()
-       conn.close()
+           dsql_client.execute_statement(
+               clusterIdentifier=os.environ['CLUSTER_ID'],
+               database='postgres',
+               sql='''
+                   INSERT INTO task_updates (task_id, field_name, old_value, new_value, updated_by)
+                   VALUES (?, ?, ?, ?, ?)
+               ''',
+               parameters=[task_id, field, '', str(new_value), updated_by]
+           )
        
        # Publish notification event
        publish_task_notification('task.updated', task_id, updates)
@@ -445,23 +511,16 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
        task_id = detail['taskId']
        completed_by = detail['completedBy']
        
-       conn = get_db_connection()
-       cursor = conn.cursor()
-       
        # Update task status and completion timestamp
-       cursor.execute("""
-           UPDATE tasks SET status = 'completed', completed_at = CURRENT_TIMESTAMP
-           WHERE id = %s
-       """, (task_id,))
-       
-       # Log completion
-       cursor.execute("""
-           INSERT INTO task_updates (task_id, field_name, old_value, new_value, updated_by)
-           VALUES (%s, %s, %s, %s, %s)
-       """, (task_id, 'status', 'in-progress', 'completed', completed_by))
-       
-       conn.commit()
-       conn.close()
+       dsql_client.execute_statement(
+           clusterIdentifier=os.environ['CLUSTER_ID'],
+           database='postgres',
+           sql='''
+               UPDATE tasks SET status = ?, completed_at = CURRENT_TIMESTAMP
+               WHERE id = ?
+           ''',
+           parameters=['completed', task_id]
+       )
        
        # Publish notification event
        publish_task_notification('task.completed', task_id, {'completed_by': completed_by})
@@ -470,16 +529,6 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
            'statusCode': 200,
            'body': json.dumps({'message': 'Task completed successfully'})
        }
-   
-   def get_db_connection():
-       """Get database connection to Aurora DSQL"""
-       return psycopg2.connect(
-           host=os.environ['DSQL_ENDPOINT'],
-           database='postgres',
-           user=os.environ['DB_USER'],
-           password=os.environ['DB_PASSWORD'],
-           port=5432
-       )
    
    def publish_task_notification(event_type, task_id, data):
        """Publish task notification to EventBridge"""
@@ -500,7 +549,7 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
                ]
            )
        except Exception as e:
-           print(f"Failed to publish notification: {str(e)}")
+           logger.error(f"Failed to publish notification: {str(e)}")
    
    def process_direct_request(event):
        """Process direct API requests"""
@@ -529,34 +578,33 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    
    def get_all_tasks():
        """Get all tasks from database"""
-       conn = get_db_connection()
-       cursor = conn.cursor()
-       
-       cursor.execute("""
-           SELECT id, title, description, status, priority, assigned_to, created_by, 
-                  created_at, updated_at, project_id, due_date, completed_at
-           FROM tasks 
-           ORDER BY created_at DESC
-       """)
+       response = dsql_client.execute_statement(
+           clusterIdentifier=os.environ['CLUSTER_ID'],
+           database='postgres',
+           sql='''
+               SELECT id, title, description, status, priority, assigned_to, created_by, 
+                      created_at, updated_at, project_id, due_date, completed_at
+               FROM tasks 
+               ORDER BY created_at DESC
+           '''
+       )
        
        tasks = []
-       for row in cursor.fetchall():
+       for record in response.get('records', []):
            tasks.append({
-               'id': row[0],
-               'title': row[1],
-               'description': row[2],
-               'status': row[3],
-               'priority': row[4],
-               'assigned_to': row[5],
-               'created_by': row[6],
-               'created_at': row[7].isoformat() if row[7] else None,
-               'updated_at': row[8].isoformat() if row[8] else None,
-               'project_id': row[9],
-               'due_date': row[10].isoformat() if row[10] else None,
-               'completed_at': row[11].isoformat() if row[11] else None
+               'id': record[0]['longValue'] if record[0] else None,
+               'title': record[1]['stringValue'] if record[1] else None,
+               'description': record[2]['stringValue'] if record[2] else None,
+               'status': record[3]['stringValue'] if record[3] else None,
+               'priority': record[4]['stringValue'] if record[4] else None,
+               'assigned_to': record[5]['stringValue'] if record[5] else None,
+               'created_by': record[6]['stringValue'] if record[6] else None,
+               'created_at': record[7]['stringValue'] if record[7] else None,
+               'updated_at': record[8]['stringValue'] if record[8] else None,
+               'project_id': record[9]['longValue'] if record[9] else None,
+               'due_date': record[10]['stringValue'] if record[10] else None,
+               'completed_at': record[11]['stringValue'] if record[11] else None
            })
-       
-       conn.close()
        
        return {
            'statusCode': 200,
@@ -565,49 +613,43 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    
    def create_task(task_data):
        """Create new task"""
-       conn = get_db_connection()
-       cursor = conn.cursor()
-       
-       cursor.execute("""
-           INSERT INTO tasks (title, description, status, priority, assigned_to, created_by, project_id, due_date)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-           RETURNING id
-       """, (
-           task_data['title'],
-           task_data.get('description', ''),
-           task_data.get('status', 'pending'),
-           task_data.get('priority', 'medium'),
-           task_data.get('assigned_to', ''),
-           task_data['created_by'],
-           task_data.get('project_id'),
-           task_data.get('due_date')
-       ))
-       
-       task_id = cursor.fetchone()[0]
-       conn.commit()
-       conn.close()
+       response = dsql_client.execute_statement(
+           clusterIdentifier=os.environ['CLUSTER_ID'],
+           database='postgres',
+           sql='''
+               INSERT INTO tasks (title, description, status, priority, assigned_to, created_by, project_id, due_date)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ''',
+           parameters=[
+               task_data['title'],
+               task_data.get('description', ''),
+               task_data.get('status', 'pending'),
+               task_data.get('priority', 'medium'),
+               task_data.get('assigned_to', ''),
+               task_data['created_by'],
+               task_data.get('project_id'),
+               task_data.get('due_date')
+           ]
+       )
        
        # Publish creation event
-       publish_task_notification('task.created', task_id, task_data)
+       publish_task_notification('task.created', 1, task_data)
        
        return {
            'statusCode': 201,
-           'body': json.dumps({'task_id': task_id, 'message': 'Task created successfully'})
+           'body': json.dumps({'message': 'Task created successfully'})
        }
    
    def update_task(task_id, updates):
        """Update existing task"""
-       conn = get_db_connection()
-       cursor = conn.cursor()
-       
        # Build dynamic update query
        update_fields = []
-       values = []
+       parameters = []
        
        for field, value in updates.items():
            if field in ['title', 'description', 'status', 'priority', 'assigned_to', 'due_date']:
-               update_fields.append(f"{field} = %s")
-               values.append(value)
+               update_fields.append(f"{field} = ?")
+               parameters.append(value)
        
        if not update_fields:
            return {
@@ -615,15 +657,18 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
                'body': json.dumps({'error': 'No valid fields to update'})
            }
        
-       values.append(task_id)
-       query = f"UPDATE tasks SET {', '.join(update_fields)} WHERE id = %s"
+       parameters.append(int(task_id))
+       sql = f"UPDATE tasks SET {', '.join(update_fields)} WHERE id = ?"
        
-       cursor.execute(query, values)
-       conn.commit()
-       conn.close()
+       dsql_client.execute_statement(
+           clusterIdentifier=os.environ['CLUSTER_ID'],
+           database='postgres',
+           sql=sql,
+           parameters=parameters
+       )
        
        # Publish update event
-       publish_task_notification('task.updated', task_id, updates)
+       publish_task_notification('task.updated', int(task_id), updates)
        
        return {
            'statusCode': 200,
@@ -631,56 +676,50 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
        }
    EOF
    
-   # Install dependencies
-   pip install psycopg2-binary -t .
-   
    # Create deployment package
-   zip -r task_processor.zip task_processor.py psycopg2*
+   zip -r task_processor.zip task_processor.py
    
-   # Create Lambda function
+   # Create Lambda function in primary region
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler task_processor.lambda_handler \
        --zip-file fileb://task_processor.zip \
        --timeout 60 \
        --memory-size 512 \
        --environment Variables="{
-           \"DSQL_ENDPOINT\":\"${PRIMARY_ENDPOINT}\",
-           \"EVENT_BUS_NAME\":\"${EVENT_BUS_NAME}\",
-           \"DB_USER\":\"postgres\",
-           \"DB_PASSWORD\":\"temporary_password\"
-       }"
+           \"CLUSTER_ID\":\"${PRIMARY_CLUSTER_ID}\",
+           \"EVENT_BUS_NAME\":\"${EVENT_BUS_NAME}\"
+       }" \
+       --region ${AWS_REGION}
    
    # Create function in secondary region
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler task_processor.lambda_handler \
        --zip-file fileb://task_processor.zip \
        --timeout 60 \
        --memory-size 512 \
-       --region ${SECONDARY_REGION} \
        --environment Variables="{
-           \"DSQL_ENDPOINT\":\"${SECONDARY_ENDPOINT}\",
-           \"EVENT_BUS_NAME\":\"${EVENT_BUS_NAME}\",
-           \"DB_USER\":\"postgres\",
-           \"DB_PASSWORD\":\"temporary_password\"
-       }"
+           \"CLUSTER_ID\":\"${SECONDARY_CLUSTER_ID}\",
+           \"EVENT_BUS_NAME\":\"${EVENT_BUS_NAME}\"
+       }" \
+       --region ${SECONDARY_REGION}
    
    echo "✅ Lambda functions created in both regions"
    ```
 
-   The Lambda function now handles task operations with automatic scaling, event-driven processing, and database integration. The code includes proper error handling, change tracking, and support for both EventBridge events and direct API requests.
+   The Lambda function now handles task operations with automatic scaling, event-driven processing, and database integration using the AWS DSQL client. The code includes proper error handling, logging, and support for both EventBridge events and direct API requests.
 
-6. **Create EventBridge Rules for Task Processing**:
+7. **Create EventBridge Rules for Task Processing**:
 
    EventBridge rules enable automatic routing of task events to appropriate Lambda functions. This creates a decoupled architecture where task operations trigger downstream processing and notifications.
 
    ```bash
-   # Create EventBridge rule for task events
+   # Create EventBridge rule for task events in primary region
    aws events put-rule \
        --name task-processing-rule \
        --event-pattern '{
@@ -688,13 +727,15 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
            "detail-type": ["Task Created", "Task Updated", "Task Completed"]
        }' \
        --state ENABLED \
-       --event-bus-name ${EVENT_BUS_NAME}
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${AWS_REGION}
    
    # Add Lambda target to the rule
    aws events put-targets \
        --rule task-processing-rule \
        --event-bus-name ${EVENT_BUS_NAME} \
-       --targets "Id"="1","Arn"="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}"
+       --targets "Id"="1","Arn"="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}" \
+       --region ${AWS_REGION}
    
    # Grant EventBridge permission to invoke Lambda
    aws lambda add-permission \
@@ -702,7 +743,8 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
        --statement-id eventbridge-invoke \
        --action lambda:InvokeFunction \
        --principal events.amazonaws.com \
-       --source-arn "arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:rule/${EVENT_BUS_NAME}/task-processing-rule"
+       --source-arn "arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:rule/${EVENT_BUS_NAME}/task-processing-rule" \
+       --region ${AWS_REGION}
    
    # Create similar setup in secondary region
    aws events put-rule \
@@ -734,7 +776,7 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
 
    The EventBridge rules now automatically route task events to Lambda functions in both regions, enabling event-driven task processing with automatic scaling and fault tolerance.
 
-7. **Create CloudWatch Log Groups and Monitoring**:
+8. **Create CloudWatch Log Groups and Monitoring**:
 
    CloudWatch provides comprehensive monitoring and logging for the serverless task management system. Centralized logging enables troubleshooting, performance monitoring, and audit trails for collaborative task operations.
 
@@ -742,7 +784,8 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    # Create log groups for Lambda functions
    aws logs create-log-group \
        --log-group-name ${LOG_GROUP_NAME} \
-       --retention-in-days 7
+       --retention-in-days 7 \
+       --region ${AWS_REGION}
    
    aws logs create-log-group \
        --log-group-name ${LOG_GROUP_NAME} \
@@ -760,36 +803,38 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
        --threshold 5 \
        --comparison-operator GreaterThanThreshold \
        --evaluation-periods 2 \
-       --dimensions Name=FunctionName,Value=${LAMBDA_FUNCTION_NAME}
+       --dimensions Name=FunctionName,Value=${LAMBDA_FUNCTION_NAME} \
+       --region ${AWS_REGION}
    
    # Create dashboard for monitoring
    aws cloudwatch put-dashboard \
        --dashboard-name "TaskManagementDashboard" \
-       --dashboard-body '{
-           "widgets": [
+       --dashboard-body "{
+           \"widgets\": [
                {
-                   "type": "metric",
-                   "properties": {
-                       "metrics": [
-                           ["AWS/Lambda", "Invocations", "FunctionName", "'${LAMBDA_FUNCTION_NAME}'"],
-                           [".", "Errors", ".", "."],
-                           [".", "Duration", ".", "."]
+                   \"type\": \"metric\",
+                   \"properties\": {
+                       \"metrics\": [
+                           [\"AWS/Lambda\", \"Invocations\", \"FunctionName\", \"${LAMBDA_FUNCTION_NAME}\"],
+                           [\".\", \"Errors\", \".\", \".\"],
+                           [\".\", \"Duration\", \".\", \".\"]
                        ],
-                       "period": 300,
-                       "stat": "Sum",
-                       "region": "'${AWS_REGION}'",
-                       "title": "Lambda Function Metrics"
+                       \"period\": 300,
+                       \"stat\": \"Sum\",
+                       \"region\": \"${AWS_REGION}\",
+                       \"title\": \"Lambda Function Metrics\"
                    }
                }
            ]
-       }'
+       }" \
+       --region ${AWS_REGION}
    
    echo "✅ CloudWatch monitoring configured"
    ```
 
    CloudWatch monitoring is now active with log groups, alarms, and dashboards providing comprehensive visibility into the task management system performance and health.
 
-8. **Create Sample Task Data and Test Integration**:
+9. **Create Sample Task Data and Test Integration**:
 
    Testing the complete system validates the event-driven architecture, database operations, and multi-region synchronization. Sample data demonstrates real-world collaborative task management scenarios.
 
@@ -808,7 +853,7 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
                "assigned_to": "developer@company.com",
                "created_by": "manager@company.com",
                "project_id": 1,
-               "due_date": "2025-07-20T17:00:00Z"
+               "due_date": "2025-07-30T17:00:00Z"
            }
        }
    }
@@ -821,18 +866,20 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
            \"DetailType\": \"Task Created\",
            \"Detail\": \"$(cat sample_task_event.json | jq -r '.detail | tostring')\",
            \"EventBusName\": \"${EVENT_BUS_NAME}\"
-       }]"
+       }]" \
+       --region ${AWS_REGION}
    
    # Test Lambda function directly
    aws lambda invoke \
        --function-name ${LAMBDA_FUNCTION_NAME} \
        --payload file://sample_task_event.json \
-       response.json
+       response.json \
+       --region ${AWS_REGION}
    
    # Display response
    cat response.json
    
-   # Test task creation via direct API call
+   # Test direct API call for task creation
    cat > direct_task_request.json << 'EOF'
    {
        "httpMethod": "POST",
@@ -844,7 +891,8 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    aws lambda invoke \
        --function-name ${LAMBDA_FUNCTION_NAME} \
        --payload file://direct_task_request.json \
-       direct_response.json
+       direct_response.json \
+       --region ${AWS_REGION}
    
    cat direct_response.json
    
@@ -859,14 +907,15 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
 
    ```bash
    # Check cluster status in both regions
-   aws dsql describe-cluster \
-       --cluster-identifier ${DSQL_CLUSTER_NAME}-primary \
-       --query 'Cluster.Status'
+   aws dsql get-cluster \
+       --identifier ${PRIMARY_CLUSTER_ID} \
+       --region ${AWS_REGION} \
+       --query 'status'
    
-   aws dsql describe-cluster \
-       --cluster-identifier ${DSQL_CLUSTER_NAME}-secondary \
+   aws dsql get-cluster \
+       --identifier ${SECONDARY_CLUSTER_ID} \
        --region ${SECONDARY_REGION} \
-       --query 'Cluster.Status'
+       --query 'status'
    ```
 
    Expected output: `"ACTIVE"` for both clusters
@@ -875,10 +924,12 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
 
    ```bash
    # Test database connection and schema
-   psql -h ${PRIMARY_ENDPOINT} -d postgres -c \
+   PGPASSWORD=placeholder psql -h ${PRIMARY_ENDPOINT} \
+       -U postgres -d postgres -c \
        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';"
    
-   psql -h ${SECONDARY_ENDPOINT} -d postgres -c \
+   PGPASSWORD=placeholder psql -h ${SECONDARY_ENDPOINT} \
+       -U postgres -d postgres -c \
        "SELECT COUNT(*) FROM tasks;"
    ```
 
@@ -890,6 +941,7 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    # Check EventBridge rules
    aws events list-rules \
        --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${AWS_REGION} \
        --query 'Rules[].Name'
    
    # Test event publishing
@@ -899,7 +951,8 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
            \"DetailType\": \"Task Updated\",
            \"Detail\": \"{\\\"eventType\\\":\\\"task.updated\\\",\\\"taskId\\\":1,\\\"updates\\\":{\\\"status\\\":\\\"in-progress\\\"},\\\"updatedBy\\\":\\\"test@example.com\\\"}\",
            \"EventBusName\": \"${EVENT_BUS_NAME}\"
-       }]"
+       }]" \
+       --region ${AWS_REGION}
    ```
 
    Expected output: Shows configured rules and successful event publishing
@@ -909,7 +962,8 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    ```bash
    # Check Lambda function metrics
    aws logs describe-log-groups \
-       --log-group-name-prefix ${LOG_GROUP_NAME}
+       --log-group-name-prefix ${LOG_GROUP_NAME} \
+       --region ${AWS_REGION}
    
    # View recent log events
    LOG_STREAM=$(aws logs describe-log-streams \
@@ -918,12 +972,14 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
        --descending \
        --max-items 1 \
        --query 'logStreams[0].logStreamName' \
-       --output text)
+       --output text \
+       --region ${AWS_REGION})
    
    aws logs get-log-events \
        --log-group-name ${LOG_GROUP_NAME} \
        --log-stream-name ${LOG_STREAM} \
-       --limit 10
+       --limit 10 \
+       --region ${AWS_REGION}
    ```
 
    Expected output: Shows log groups and recent execution logs
@@ -942,7 +998,8 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    aws lambda invoke \
        --function-name ${LAMBDA_FUNCTION_NAME} \
        --payload file://get_tasks_request.json \
-       get_tasks_response.json
+       get_tasks_response.json \
+       --region ${AWS_REGION}
    
    cat get_tasks_response.json
    ```
@@ -956,10 +1013,11 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    ```bash
    # Delete multi-region clusters
    aws dsql delete-cluster \
-       --cluster-identifier ${DSQL_CLUSTER_NAME}-primary
+       --identifier ${PRIMARY_CLUSTER_ID} \
+       --region ${AWS_REGION}
    
    aws dsql delete-cluster \
-       --cluster-identifier ${DSQL_CLUSTER_NAME}-secondary \
+       --identifier ${SECONDARY_CLUSTER_ID} \
        --region ${SECONDARY_REGION}
    
    echo "✅ Aurora DSQL clusters deleted"
@@ -970,7 +1028,8 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    ```bash
    # Delete Lambda functions
    aws lambda delete-function \
-       --function-name ${LAMBDA_FUNCTION_NAME}
+       --function-name ${LAMBDA_FUNCTION_NAME} \
+       --region ${AWS_REGION}
    
    aws lambda delete-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
@@ -982,18 +1041,21 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
 3. **Delete EventBridge Resources**:
 
    ```bash
-   # Remove EventBridge rules and targets
+   # Remove EventBridge rules and targets in primary region
    aws events remove-targets \
        --rule task-processing-rule \
        --event-bus-name ${EVENT_BUS_NAME} \
-       --ids "1"
+       --ids "1" \
+       --region ${AWS_REGION}
    
    aws events delete-rule \
        --name task-processing-rule \
-       --event-bus-name ${EVENT_BUS_NAME}
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${AWS_REGION}
    
    aws events delete-event-bus \
-       --name ${EVENT_BUS_NAME}
+       --name ${EVENT_BUS_NAME} \
+       --region ${AWS_REGION}
    
    # Clean up secondary region
    aws events remove-targets \
@@ -1036,7 +1098,8 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    ```bash
    # Delete log groups
    aws logs delete-log-group \
-       --log-group-name ${LOG_GROUP_NAME}
+       --log-group-name ${LOG_GROUP_NAME} \
+       --region ${AWS_REGION}
    
    aws logs delete-log-group \
        --log-group-name ${LOG_GROUP_NAME} \
@@ -1044,10 +1107,12 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
    
    # Delete CloudWatch alarms and dashboard
    aws cloudwatch delete-alarms \
-       --alarm-names "${LAMBDA_FUNCTION_NAME}-errors"
+       --alarm-names "${LAMBDA_FUNCTION_NAME}-errors" \
+       --region ${AWS_REGION}
    
    aws cloudwatch delete-dashboards \
-       --dashboard-names "TaskManagementDashboard"
+       --dashboard-names "TaskManagementDashboard" \
+       --region ${AWS_REGION}
    
    # Clean up local files
    rm -f task_schema.sql lambda_trust_policy.json \
@@ -1064,13 +1129,13 @@ echo "Cluster Name: ${DSQL_CLUSTER_NAME}"
 
 This recipe demonstrates building a highly available, real-time collaborative task management system using Aurora DSQL's active-active multi-region architecture combined with EventBridge for event-driven processing. The solution addresses common challenges in collaborative systems including data consistency, regional availability, and real-time synchronization.
 
-Aurora DSQL provides several key advantages for collaborative applications. Its distributed architecture eliminates traditional database bottlenecks by providing active-active capabilities across multiple regions with strong consistency guarantees. Unlike conventional databases that require complex failover mechanisms, Aurora DSQL automatically handles failure recovery and load distribution. The serverless nature eliminates infrastructure management while providing automatic scaling based on workload demands. The PostgreSQL compatibility ensures familiar development patterns while gaining distributed database benefits.
+Aurora DSQL provides several key advantages for collaborative applications. Its distributed architecture eliminates traditional database bottlenecks by providing active-active capabilities across multiple regions with strong consistency guarantees. Unlike conventional databases that require complex failover mechanisms, Aurora DSQL automatically handles failure recovery and load distribution through its witness region architecture. The serverless nature eliminates infrastructure management while providing automatic scaling based on workload demands. The PostgreSQL compatibility ensures familiar development patterns while gaining distributed database benefits.
 
 EventBridge serves as the event routing backbone, enabling loose coupling between system components. The custom event bus isolates task management events while providing flexible routing and filtering capabilities. Event-driven architecture allows the system to handle high concurrency scenarios gracefully, with automatic scaling and fault tolerance. The integration with Lambda functions provides serverless event processing that scales from zero to thousands of concurrent executions based on demand.
 
-The multi-region deployment pattern ensures high availability and disaster recovery capabilities. Both regions maintain active endpoints that can handle read and write operations simultaneously, providing users with consistent performance regardless of their location. The synchronous replication ensures data consistency across regions without the complexity of eventual consistency models typically associated with distributed systems.
+The multi-region deployment pattern with witness region ensures high availability and disaster recovery capabilities. Both regions maintain active endpoints that can handle read and write operations simultaneously, providing users with consistent performance regardless of their location. The witness region stores encrypted transaction logs to improve multi-region durability and availability, ensuring data consistency across regions without the complexity of eventual consistency models typically associated with distributed systems.
 
-> **Tip**: Monitor EventBridge event patterns and Lambda function performance using CloudWatch metrics to optimize system performance and identify bottlenecks during high-concurrency scenarios.
+> **Tip**: Monitor EventBridge event patterns and Lambda function performance using CloudWatch metrics to optimize system performance and identify bottlenecks during high-concurrency scenarios. Use the DSQL client's built-in connection pooling and retry mechanisms for optimal database performance.
 
 This architecture follows AWS Well-Architected Framework principles across all pillars. The operational excellence pillar is addressed through automated monitoring, logging, and event-driven operations. Security is implemented through IAM roles with least privilege access, encrypted data transmission, and audit trails. Reliability is achieved through multi-region deployment, automatic failover, and distributed architecture. Performance efficiency is optimized through serverless components and automatic scaling. Cost optimization is realized through pay-per-use pricing models and efficient resource utilization.
 
@@ -1092,4 +1157,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Security Command Center, Cloud Key Management Service, Cloud Asset Inventory, Cloud Monitoring
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: quantum-safe, post-quantum-cryptography, security-posture, compliance, threat-detection
 recipe-generator-version: 1.3
@@ -129,6 +129,9 @@ gcloud services enable cloudasset.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable cloudresourcemanager.googleapis.com
+gcloud services enable pubsub.googleapis.com
+gcloud services enable cloudfunctions.googleapis.com
+gcloud services enable cloudscheduler.googleapis.com
 
 echo "✅ Project and APIs configured: ${PROJECT_ID}"
 echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
@@ -141,10 +144,6 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
    Security Command Center Enterprise provides the foundational platform for quantum-safe security posture management, offering advanced threat detection, compliance monitoring, and security posture assessment capabilities. Enabling this service at the organization level ensures comprehensive visibility across all projects and resources while establishing the governance framework necessary for quantum threat mitigation.
 
    ```bash
-   # Enable Security Command Center at organization level
-   gcloud scc organizations set-iam-policy ${ORGANIZATION_ID##*/} \
-       policy.json --quiet || echo "Organization policy already set"
-   
    # Create organization policy for quantum-safe requirements
    cat > quantum-security-policy.yaml << 'EOF'
    name: organizations/ORGANIZATION_ID/policies/compute.requireOsLogin
@@ -159,7 +158,8 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
    EOF
    
    # Replace placeholder with actual organization ID
-   sed -i "s/ORGANIZATION_ID/${ORGANIZATION_ID##*/}/g" quantum-security-policy.yaml
+   sed -i "s/ORGANIZATION_ID/${ORGANIZATION_ID##*/}/g" \
+       quantum-security-policy.yaml
    
    # Apply quantum security policies
    gcloud org-policies set-policy quantum-security-policy.yaml
@@ -185,7 +185,7 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
        --location=${REGION} \
        --keyring=${KMS_KEYRING_NAME} \
        --purpose=asymmetric-signing \
-       --algorithm=PQ_SIGN_ML_DSA_65 \
+       --algorithm=pq-sign-ml-dsa-65 \
        --project=${PROJECT_ID}
    
    # Create post-quantum cryptography key for SLH-DSA (hash-based)
@@ -193,27 +193,29 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
        --location=${REGION} \
        --keyring=${KMS_KEYRING_NAME} \
        --purpose=asymmetric-signing \
-       --algorithm=PQ_SIGN_SLH_DSA_SHA2_128S \
+       --algorithm=pq-sign-slh-dsa-sha2-128s \
        --project=${PROJECT_ID}
    
-   # Set up automatic key rotation for quantum agility
-   gcloud kms keys update "${KMS_KEY_NAME}-ml-dsa" \
-       --location=${REGION} \
-       --keyring=${KMS_KEYRING_NAME} \
-       --rotation-period=30d \
-       --next-rotation-time=$(date -d "+30 days" +%Y-%m-%dT%H:%M:%SZ)
-   
+   # Note: PQC key rotation must be managed manually
    echo "✅ Post-quantum cryptography keys created with ML-DSA-65 and SLH-DSA algorithms"
-   echo "✅ Automatic key rotation configured for cryptographic agility"
+   echo "✅ Manual key rotation schedule recommended for cryptographic agility"
    ```
 
-   The post-quantum keys provide quantum-resistant digital signatures using NIST-approved algorithms, ensuring that digital signatures created today will remain secure against future quantum computers. Automatic rotation enhances cryptographic agility, allowing rapid response to emerging quantum threats or algorithm updates.
+   The post-quantum keys provide quantum-resistant digital signatures using NIST-approved algorithms, ensuring that digital signatures created today will remain secure against future quantum computers. Manual rotation planning enhances cryptographic agility, allowing rapid response to emerging quantum threats or algorithm updates.
 
 3. **Configure Cloud Asset Inventory for Cryptographic Asset Discovery**:
 
    Cloud Asset Inventory provides comprehensive discovery and tracking of cryptographic assets across the Google Cloud environment. This enables security teams to identify quantum-vulnerable encryption implementations, track cryptographic key usage, and maintain an accurate inventory of assets requiring quantum-safe migration, supporting risk assessment and remediation planning.
 
    ```bash
+   # Create Pub/Sub topic for asset change notifications first
+   gcloud pubsub topics create crypto-asset-changes \
+       --project=${PROJECT_ID}
+   
+   # Create storage bucket for inventory exports
+   gsutil mb -p ${PROJECT_ID} -c STANDARD -l ${REGION} \
+       gs://${PROJECT_ID}-crypto-inventory
+   
    # Create asset inventory feed for cryptographic resources
    gcloud asset feeds create quantum-crypto-assets \
        --organization=${ORGANIZATION_ID##*/} \
@@ -221,20 +223,12 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
        --content-type=RESOURCE \
        --pubsub-topic=projects/${PROJECT_ID}/topics/crypto-asset-changes
    
-   # Create Pub/Sub topic for asset change notifications
-   gcloud pubsub topics create crypto-asset-changes \
-       --project=${PROJECT_ID}
-   
    # Export current cryptographic asset inventory
    gcloud asset export \
        --organization=${ORGANIZATION_ID##*/} \
        --content-type=RESOURCE \
        --asset-types="cloudkms.googleapis.com/CryptoKey,cloudkms.googleapis.com/KeyRing,compute.googleapis.com/Disk" \
        --output-path=gs://${PROJECT_ID}-crypto-inventory/initial-inventory.json
-   
-   # Create storage bucket for inventory exports
-   gsutil mb -p ${PROJECT_ID} -c STANDARD -l ${REGION} \
-       gs://${PROJECT_ID}-crypto-inventory
    
    echo "✅ Asset inventory feed configured for cryptographic resources"
    echo "✅ Continuous monitoring enabled for encryption key changes"
@@ -247,49 +241,8 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
    Security posture assessment establishes continuous monitoring for quantum vulnerabilities and cryptographic compliance. This creates automated detection of weak encryption algorithms, outdated cryptographic implementations, and non-quantum-safe configurations, enabling proactive identification and remediation of quantum security risks before they can be exploited.
 
    ```bash
-   # Create custom security posture for quantum readiness
-   cat > quantum-security-posture.yaml << 'EOF'
-   displayName: "Quantum-Safe Security Posture"
-   description: "Assess readiness for post-quantum cryptography threats"
-   policySets:
-   - policySet: "organizations/ORGANIZATION_ID/policySets/quantum-crypto-standards"
-     policies:
-     - policy: "Require post-quantum cryptography for new deployments"
-       constraint: "cloudkms.restrictCryptoKeyAlgorithms"
-       parameters:
-         allowedAlgorithms: ["PQ_SIGN_ML_DSA_65", "PQ_SIGN_SLH_DSA_SHA2_128S"]
-     - policy: "Detect weak encryption algorithms"
-       constraint: "compute.restrictSharedVpcSubnetworks"
-   EOF
-   
-   # Replace organization ID placeholder
-   sed -i "s/ORGANIZATION_ID/${ORGANIZATION_ID##*/}/g" quantum-security-posture.yaml
-   
-   # Apply security posture configuration
-   gcloud scc postures create quantum-safe-posture \
-       --organization=${ORGANIZATION_ID##*/} \
-       --location=global \
-       --from-file=quantum-security-posture.yaml
-   
-   # Create notification channel for quantum security alerts
-   gcloud alpha monitoring channels create \
-       --display-name="Quantum Security Alerts" \
-       --type=email \
-       --channel-labels=email_address=security-team@company.com \
-       --project=${PROJECT_ID}
-   
-   echo "✅ Quantum-safe security posture implemented"
-   echo "✅ Automated threat detection configured for cryptographic vulnerabilities"
-   ```
-
-   The security posture framework continuously evaluates the organization's quantum readiness, automatically detecting configurations that may be vulnerable to quantum attacks. This proactive approach ensures early identification of security gaps and supports systematic remediation efforts across the enterprise.
-
-5. **Deploy Cloud Monitoring for Quantum Security Metrics**:
-
-   Cloud Monitoring provides real-time visibility into quantum security metrics, tracking encryption algorithm usage, key rotation compliance, and post-quantum cryptography adoption rates. This observability platform enables security teams to measure quantum readiness progress, identify non-compliant resources, and demonstrate regulatory compliance for post-quantum security requirements.
-
-   ```bash
-   # Create custom metrics for quantum security monitoring
+   # Note: Security Command Center postures are managed through console
+   # Create monitoring dashboard for quantum security tracking
    cat > quantum-metrics-dashboard.json << 'EOF'
    {
      "displayName": "Quantum Security Posture Dashboard",
@@ -317,11 +270,11 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
            "width": 6,
            "height": 4,
            "widget": {
-             "title": "Quantum Vulnerability Alerts",
+             "title": "Cryptographic Asset Inventory",
              "scorecard": {
                "timeSeriesQuery": {
                  "timeSeriesFilter": {
-                   "filter": "resource.type=\"gce_instance\" AND log_name=\"quantum_vulnerability_scan\"",
+                   "filter": "resource.type=\"cloudkms_keyring\"",
                    "aggregation": {
                      "alignmentPeriod": "3600s",
                      "perSeriesAligner": "ALIGN_COUNT"
@@ -341,13 +294,31 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
        --config-from-file=quantum-metrics-dashboard.json \
        --project=${PROJECT_ID}
    
+   # Create notification channel for quantum security alerts
+   gcloud alpha monitoring channels create \
+       --display-name="Quantum Security Alerts" \
+       --type=email \
+       --channel-labels=email_address=admin@example.com \
+       --project=${PROJECT_ID}
+   
+   echo "✅ Quantum security monitoring dashboard implemented"
+   echo "✅ Manual posture configuration via Security Command Center console required"
+   ```
+
+   The monitoring framework provides visibility into quantum security resources, automatically tracking cryptographic asset usage. Security Command Center postures require console configuration for organization-level quantum readiness assessment and compliance monitoring.
+
+5. **Deploy Cloud Monitoring for Quantum Security Metrics**:
+
+   Cloud Monitoring provides real-time visibility into quantum security metrics, tracking encryption algorithm usage, key rotation compliance, and post-quantum cryptography adoption rates. This observability platform enables security teams to measure quantum readiness progress, identify non-compliant resources, and demonstrate regulatory compliance for post-quantum security requirements.
+
+   ```bash
    # Create alerting policy for quantum vulnerabilities
    cat > quantum-alert-policy.yaml << 'EOF'
    displayName: "Quantum Vulnerability Detection"
    conditions:
    - displayName: "Weak encryption detected"
      conditionThreshold:
-       filter: 'resource.type="gce_instance" AND log_name="quantum_vulnerability_scan"'
+       filter: 'resource.type="cloudkms_cryptokey" AND log_name="quantum_vulnerability_scan"'
        comparison: COMPARISON_GT
        thresholdValue: 0
        duration: 300s
@@ -361,6 +332,13 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
        --policy-from-file=quantum-alert-policy.yaml \
        --project=${PROJECT_ID}
    
+   # Create custom metrics for quantum readiness tracking
+   cat > requirements.txt << 'EOF'
+   google-cloud-asset==3.19.0
+   google-cloud-securitycenter==1.23.0
+   functions-framework==3.4.0
+   EOF
+   
    echo "✅ Quantum security monitoring dashboard deployed"
    echo "✅ Automated alerting configured for quantum vulnerabilities"
    ```
@@ -373,66 +351,79 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
 
    ```bash
    # Create compliance reporting function for quantum readiness
-   cat > compliance-report-function.py << 'EOF'
+   cat > main.py << 'EOF'
    import json
    from google.cloud import asset_v1
    from google.cloud import securitycenter
-   from datetime import datetime, timedelta
-   
+   from datetime import datetime
+   import functions_framework
+
+   @functions_framework.http
    def generate_quantum_compliance_report(request):
        """Generate quarterly quantum readiness compliance report"""
        
        # Initialize clients
        asset_client = asset_v1.AssetServiceClient()
-       scc_client = securitycenter.SecurityCenterClient()
        
        # Query cryptographic assets
-       parent = f"organizations/{request.args.get('org_id')}"
-       assets = asset_client.list_assets(
-           request={"parent": parent, 
-                   "filter": "assetType:cloudkms.googleapis.com/CryptoKey"}
-       )
+       org_id = request.args.get('org_id')
+       parent = f"organizations/{org_id}"
        
-       # Analyze quantum readiness
-       quantum_safe_keys = 0
-       vulnerable_keys = 0
-       
-       for asset in assets:
-           if "PQ_SIGN" in str(asset.asset.resource.data):
-               quantum_safe_keys += 1
-           else:
-               vulnerable_keys += 1
-       
-       # Generate compliance report
-       report = {
-           "report_date": datetime.now().isoformat(),
-           "organization_id": request.args.get('org_id'),
-           "quantum_readiness_score": (quantum_safe_keys / (quantum_safe_keys + vulnerable_keys)) * 100,
-           "quantum_safe_keys": quantum_safe_keys,
-           "vulnerable_keys": vulnerable_keys,
-           "recommendations": [
-               "Migrate remaining vulnerable keys to post-quantum algorithms",
-               "Implement automated key rotation for quantum agility",
-               "Conduct quantum threat assessment for critical applications"
-           ]
-       }
-       
-       return json.dumps(report, indent=2)
+       try:
+           assets = asset_client.list_assets(
+               request={"parent": parent, 
+                       "filter": "assetType:cloudkms.googleapis.com/CryptoKey"}
+           )
+           
+           # Analyze quantum readiness
+           quantum_safe_keys = 0
+           vulnerable_keys = 0
+           
+           for asset in assets:
+               if "PQ_SIGN" in str(asset.asset.resource.data):
+                   quantum_safe_keys += 1
+               else:
+                   vulnerable_keys += 1
+           
+           # Generate compliance report
+           total_keys = quantum_safe_keys + vulnerable_keys
+           readiness_score = (quantum_safe_keys / total_keys * 100) if total_keys > 0 else 0
+           
+           report = {
+               "report_date": datetime.now().isoformat(),
+               "organization_id": org_id,
+               "quantum_readiness_score": readiness_score,
+               "quantum_safe_keys": quantum_safe_keys,
+               "vulnerable_keys": vulnerable_keys,
+               "recommendations": [
+                   "Migrate remaining vulnerable keys to post-quantum algorithms",
+                   "Implement automated key rotation for quantum agility",
+                   "Conduct quantum threat assessment for critical applications"
+               ]
+           }
+           
+           return json.dumps(report, indent=2)
+           
+       except Exception as e:
+           return json.dumps({"error": str(e)}, indent=2), 500
    EOF
    
    # Deploy compliance reporting function
    gcloud functions deploy quantum-compliance-report \
-       --runtime=python39 \
+       --runtime=python311 \
        --trigger=http \
        --source=. \
        --entry-point=generate_quantum_compliance_report \
-       --project=${PROJECT_ID}
+       --allow-unauthenticated \
+       --project=${PROJECT_ID} \
+       --region=${REGION}
    
    # Create scheduled compliance report generation
    gcloud scheduler jobs create http quantum-compliance-scheduler \
        --schedule="0 9 1 */3 *" \
        --uri="https://${REGION}-${PROJECT_ID}.cloudfunctions.net/quantum-compliance-report?org_id=${ORGANIZATION_ID##*/}" \
        --http-method=GET \
+       --location=${REGION} \
        --project=${PROJECT_ID}
    
    echo "✅ Automated compliance reporting deployed"
@@ -490,13 +481,11 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
        --query="name:quantum-safe"
    ```
 
-4. Test security posture monitoring:
+4. Test compliance reporting function:
 
    ```bash
-   # Check security posture status
-   gcloud scc postures describe quantum-safe-posture \
-       --organization=${ORGANIZATION_ID##*/} \
-       --location=global
+   # Test compliance reporting function
+   curl "https://${REGION}-${PROJECT_ID}.cloudfunctions.net/quantum-compliance-report?org_id=${ORGANIZATION_ID##*/}"
    
    # Verify monitoring dashboard
    gcloud monitoring dashboards list \
@@ -552,15 +541,14 @@ echo "✅ Organization ID: ${ORGANIZATION_ID##*/}"
 3. Clean up Security Command Center configurations:
 
    ```bash
-   # Remove security posture
-   gcloud scc postures delete quantum-safe-posture \
-       --organization=${ORGANIZATION_ID##*/} \
-       --location=global \
-       --quiet
-   
    # Remove asset inventory feed
    gcloud asset feeds delete quantum-crypto-assets \
        --organization=${ORGANIZATION_ID##*/} \
+       --quiet
+   
+   # Remove Pub/Sub topic
+   gcloud pubsub topics delete crypto-asset-changes \
+       --project=${PROJECT_ID} \
        --quiet
    
    echo "✅ Security Command Center configurations removed"
@@ -587,11 +575,11 @@ The integration of Security Command Center Enterprise with post-quantum cryptogr
 
 Cloud Asset Inventory integration provides comprehensive tracking of cryptographic resources across the enterprise, supporting risk assessment and migration planning for post-quantum transitions. The automated compliance reporting framework generates executive-level visibility into quantum security posture, supporting regulatory compliance efforts and strategic planning initiatives. This systematic approach ensures that organizations can demonstrate measurable progress toward quantum-safe security while maintaining operational efficiency and cost-effectiveness.
 
-The monitoring and alerting capabilities enable proactive identification of quantum vulnerabilities before they can be exploited, supporting incident response and threat mitigation efforts. By establishing cryptographic agility through automated key rotation and algorithm updates, organizations can rapidly adapt to emerging quantum threats or evolving cryptographic standards without disrupting business operations.
+The monitoring and alerting capabilities enable proactive identification of quantum vulnerabilities before they can be exploited, supporting incident response and threat mitigation efforts. By establishing cryptographic agility through manual key rotation planning and algorithm updates, organizations can rapidly adapt to emerging quantum threats or evolving cryptographic standards without disrupting business operations.
 
 > **Warning**: Post-quantum cryptography features are currently in preview and may have regional availability limitations. Organizations should thoroughly test quantum-safe implementations in non-production environments before deploying to critical systems.
 
-This implementation follows Google Cloud's [security best practices](https://cloud.google.com/security/best-practices) and aligns with [NIST post-quantum cryptography standards](https://csrc.nist.gov/pqc-standardization) for maximum compatibility and future-proofing. The solution supports [Google Cloud's Well-Architected Framework](https://cloud.google.com/architecture/framework/security) principles for security, ensuring enterprise-grade protection while maintaining operational excellence. For detailed implementation guidance, refer to the [Cloud KMS post-quantum cryptography documentation](https://cloud.google.com/kms/docs/post-quantum-cryptography) and [Security Command Center best practices](https://cloud.google.com/security-command-center/docs/best-practices).
+This implementation follows Google Cloud's [security best practices](https://cloud.google.com/security/best-practices) and aligns with [NIST post-quantum cryptography standards](https://csrc.nist.gov/pqc-standardization) for maximum compatibility and future-proofing. The solution supports [Google Cloud's Well-Architected Framework](https://cloud.google.com/architecture/framework/security) principles for security, ensuring enterprise-grade protection while maintaining operational excellence. For detailed implementation guidance, refer to the [Cloud KMS algorithms documentation](https://cloud.google.com/kms/docs/algorithms) and [Security Command Center best practices](https://cloud.google.com/security-command-center/docs/best-practices).
 
 ## Challenge
 
@@ -609,4 +597,9 @@ Extend this quantum-safe security posture management solution by implementing th
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: Cost Optimization Hub, AWS Budgets, SNS, Lambda
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: cost-optimization, budgets, notifications, automation
 recipe-generator-version: 1.3
@@ -49,18 +49,18 @@ graph TB
     subgraph "Automation Layer"
         LAM[Lambda Functions]
         IAM[IAM Policies]
-        CAD[Cost Anomaly Detection]
+        CAM[Cost Anomaly Detection]
     end
     
     CMP-->COH
     BLS-->COH
     BLS-->BUD
-    BLS-->CAD
+    BLS-->CAM
     
     COH-->LAM
     BUD-->BAC
     BUD-->SNS
-    CAD-->SNS
+    CAM-->SNS
     BAC-->IAM
     
     SNS-->EMAIL
@@ -359,28 +359,31 @@ echo "✅ Environment configured with SNS topic: ${SNS_TOPIC_ARN}"
    AWS Cost Anomaly Detection uses machine learning algorithms to identify unusual spending patterns and integrates seamlessly with your notification system. This service complements traditional budgets by detecting cost anomalies that might not trigger budget thresholds but still represent significant deviations from normal spending patterns.
 
    ```bash
-   # Create cost anomaly detector
-   aws ce create-anomaly-detector \
-       --anomaly-detector '{
-         "DetectorName": "cost-anomaly-detector-'${RANDOM_SUFFIX}'",
+   # Create cost anomaly monitor for key services
+   aws ce create-anomaly-monitor \
+       --anomaly-monitor '{
+         "MonitorName": "cost-anomaly-monitor-'${RANDOM_SUFFIX}'",
          "MonitorType": "DIMENSIONAL",
-         "DimensionKey": "SERVICE",
-         "MatchOptions": ["EQUALS"],
-         "MonitorSpecification": "{\"DimensionKey\":\"SERVICE\",\"MatchOptions\":[\"EQUALS\"],\"Values\":[\"EC2-Instance\",\"RDS\",\"S3\"]}"
+         "MonitorSpecification": "{\"DimensionKey\":\"SERVICE\",\"Values\":[\"Amazon Elastic Compute Cloud - Compute\",\"Amazon Relational Database Service\",\"Amazon Simple Storage Service\"]}"
        }'
+   
+   # Store the monitor ARN
+   export ANOMALY_MONITOR_ARN=$(aws ce get-anomaly-monitors \
+       --query 'AnomalyMonitors[?MonitorName==`cost-anomaly-monitor-'${RANDOM_SUFFIX}'`].MonitorArn' \
+       --output text)
    
    # Create anomaly subscription
    aws ce create-anomaly-subscription \
        --anomaly-subscription '{
          "SubscriptionName": "cost-anomaly-subscription-'${RANDOM_SUFFIX}'",
-         "MonitorArnList": [],
+         "MonitorArnList": ["'${ANOMALY_MONITOR_ARN}'"],
          "Subscribers": [
            {
              "Address": "'${SNS_TOPIC_ARN}'",
              "Type": "SNS"
            }
          ],
-         "Threshold": 100,
+         "Threshold": 100.0,
          "Frequency": "DAILY"
        }'
    
@@ -415,10 +418,29 @@ echo "✅ Environment configured with SNS topic: ${SNS_TOPIC_ARN}"
        --role-name CostOptimizationLambdaRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
-   # Add Cost Optimization Hub permissions
+   # Create custom policy for Cost Optimization Hub access
+   aws iam create-policy \
+       --policy-name CostOptimizationHubPolicy-${RANDOM_SUFFIX} \
+       --policy-document '{
+         "Version": "2012-10-17",
+         "Statement": [
+           {
+             "Effect": "Allow",
+             "Action": [
+               "cost-optimization-hub:ListRecommendations",
+               "cost-optimization-hub:GetRecommendation",
+               "ce:GetAnomalies",
+               "ce:GetAnomalyMonitors"
+             ],
+             "Resource": "*"
+           }
+         ]
+       }'
+   
+   # Attach Cost Optimization Hub policy
    aws iam attach-role-policy \
        --role-name CostOptimizationLambdaRole-${RANDOM_SUFFIX} \
-       --policy-arn arn:aws:iam::aws:policy/CostOptimizationHubServiceRolePolicy
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/CostOptimizationHubPolicy-${RANDOM_SUFFIX}
    
    # Create Lambda function code
    cat > /tmp/cost_optimization_handler.py << 'EOF'
@@ -456,8 +478,8 @@ def lambda_handler(event, context):
                     for rec in recommendations.get('items', []):
                         logger.info(f"Recommendation: {rec['recommendationId']} - {rec['actionType']}")
                         
-                        # Example: Auto-stop idle instances
-                        if rec['actionType'] == 'StopDbInstances':
+                        # Example: Log potential savings
+                        if 'estimatedMonthlySavings' in rec:
                             logger.info(f"Potential savings: ${rec['estimatedMonthlySavings']}")
         
         return {
@@ -480,7 +502,7 @@ EOF
    # Create Lambda function
    aws lambda create-function \
        --function-name cost-optimization-handler-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/CostOptimizationLambdaRole-${RANDOM_SUFFIX} \
        --handler cost_optimization_handler.lambda_handler \
        --zip-file fileb://cost_optimization_function.zip \
@@ -525,16 +547,16 @@ EOF
 3. **Validate Cost Anomaly Detection**:
 
    ```bash
-   # Check anomaly detectors
-   aws ce get-anomaly-detectors \
-       --query 'AnomalyDetectors[?contains(DetectorName, `'${RANDOM_SUFFIX}'`)]'
+   # Check anomaly monitors
+   aws ce get-anomaly-monitors \
+       --query 'AnomalyMonitors[?contains(MonitorName, `'${RANDOM_SUFFIX}'`)]'
    
    # Verify anomaly subscriptions
    aws ce get-anomaly-subscriptions \
        --query 'AnomalySubscriptions[?contains(SubscriptionName, `'${RANDOM_SUFFIX}'`)]'
    ```
 
-   Expected output: Active anomaly detector and subscription configuration with proper SNS integration.
+   Expected output: Active anomaly monitor and subscription configuration with proper SNS integration.
 
 4. **Test Lambda Function Integration**:
 
@@ -568,7 +590,10 @@ EOF
    
    aws iam detach-role-policy \
        --role-name CostOptimizationLambdaRole-${RANDOM_SUFFIX} \
-       --policy-arn arn:aws:iam::aws:policy/CostOptimizationHubServiceRolePolicy
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/CostOptimizationHubPolicy-${RANDOM_SUFFIX}
+   
+   aws iam delete-policy \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/CostOptimizationHubPolicy-${RANDOM_SUFFIX}
    
    aws iam delete-role \
        --role-name CostOptimizationLambdaRole-${RANDOM_SUFFIX}
@@ -596,13 +621,18 @@ EOF
 3. **Delete Cost Anomaly Detection Resources**:
 
    ```bash
+   # Get subscription ARN
+   export SUBSCRIPTION_ARN=$(aws ce get-anomaly-subscriptions \
+       --query 'AnomalySubscriptions[?SubscriptionName==`cost-anomaly-subscription-'${RANDOM_SUFFIX}'`].SubscriptionArn' \
+       --output text)
+   
    # Delete anomaly subscription
    aws ce delete-anomaly-subscription \
-       --subscription-arn arn:aws:ce::${AWS_ACCOUNT_ID}:anomaly-subscription/cost-anomaly-subscription-${RANDOM_SUFFIX}
+       --subscription-arn ${SUBSCRIPTION_ARN}
    
-   # Delete anomaly detector
-   aws ce delete-anomaly-detector \
-       --detector-arn arn:aws:ce::${AWS_ACCOUNT_ID}:anomaly-detector/cost-anomaly-detector-${RANDOM_SUFFIX}
+   # Delete anomaly monitor
+   aws ce delete-anomaly-monitor \
+       --monitor-arn ${ANOMALY_MONITOR_ARN}
    
    echo "✅ Cost anomaly detection resources cleaned up"
    ```
@@ -669,4 +699,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

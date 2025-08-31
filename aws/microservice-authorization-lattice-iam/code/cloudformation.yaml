@@ -1,0 +1,778 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Microservice Authorization with VPC Lattice and IAM - Deploy a comprehensive 
+  zero-trust networking solution using VPC Lattice service mesh with fine-grained 
+  IAM-based authorization policies for secure microservice communication.
+
+# ============================================================================
+# METADATA SECTION
+# ============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - ResourceSuffix
+          - Environment
+      - Label:
+          default: "Microservice Configuration"
+        Parameters:
+          - ProductServiceName
+          - OrderServiceName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - ServiceNetworkName
+          - VPCLatticeServiceName
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableDetailedMonitoring
+          - AlarmNotificationEmail
+      - Label:
+          default: "Authorization Configuration"
+        Parameters:
+          - AllowedHTTPMethods
+          - AllowedRequestPaths
+    ParameterLabels:
+      ResourceSuffix:
+        default: "Resource Name Suffix"
+      Environment:
+        default: "Environment Tag"
+      ProductServiceName:
+        default: "Product Service Function Name"
+      OrderServiceName:
+        default: "Order Service Function Name"
+      ServiceNetworkName:
+        default: "VPC Lattice Service Network Name"
+      VPCLatticeServiceName:
+        default: "VPC Lattice Service Name"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed CloudWatch Monitoring"
+      AlarmNotificationEmail:
+        default: "Email for CloudWatch Alarm Notifications"
+      AllowedHTTPMethods:
+        default: "Allowed HTTP Methods for Authorization"
+      AllowedRequestPaths:
+        default: "Allowed Request Path Patterns"
+
+# ============================================================================
+# PARAMETERS SECTION
+# ============================================================================
+Parameters:
+  ResourceSuffix:
+    Type: String
+    Description: Unique suffix to append to resource names for identification
+    Default: demo
+    MinLength: 3
+    MaxLength: 10
+    AllowedPattern: ^[a-z0-9]+$
+    ConstraintDescription: Must contain only lowercase letters and numbers
+
+  Environment:
+    Type: String
+    Description: Environment tag for resource organization and cost allocation
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+    ConstraintDescription: Must be development, staging, or production
+
+  ProductServiceName:
+    Type: String
+    Description: Name for the product service Lambda function (client microservice)
+    Default: product-service
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: ^[a-z][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must start with a letter, contain only lowercase letters, numbers, and hyphens
+
+  OrderServiceName:
+    Type: String
+    Description: Name for the order service Lambda function (provider microservice)
+    Default: order-service
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: ^[a-z][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must start with a letter, contain only lowercase letters, numbers, and hyphens
+
+  ServiceNetworkName:
+    Type: String
+    Description: Name for the VPC Lattice service network
+    Default: microservices-network
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[a-z][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must start with a letter, contain only lowercase letters, numbers, and hyphens
+
+  VPCLatticeServiceName:
+    Type: String
+    Description: Name for the VPC Lattice service that exposes the order service
+    Default: order-service-lattice
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[a-z][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must start with a letter, contain only lowercase letters, numbers, and hyphens
+
+  EnableDetailedMonitoring:
+    Type: String
+    Description: Enable detailed CloudWatch monitoring with custom metrics and dashboards
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  AlarmNotificationEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm notifications (optional)
+    Default: ''
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+  AllowedHTTPMethods:
+    Type: CommaDelimitedList
+    Description: List of HTTP methods allowed in the authorization policy
+    Default: 'GET,POST'
+    ConstraintDescription: Comma-separated list of HTTP methods (e.g., GET,POST,PUT)
+
+  AllowedRequestPaths:
+    Type: String
+    Description: Request path pattern allowed in the authorization policy
+    Default: '/orders*'
+    MinLength: 1
+    MaxLength: 100
+    ConstraintDescription: Must be a valid path pattern
+
+# ============================================================================
+# CONDITIONS SECTION
+# ============================================================================
+Conditions:
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  CreateSNSTopic: !And
+    - !Condition EnableMonitoring
+    - !Not [!Equals [!Ref AlarmNotificationEmail, '']]
+  IsProductionEnvironment: !Equals [!Ref Environment, 'production']
+
+# ============================================================================
+# RESOURCES SECTION
+# ============================================================================
+Resources:
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+  
+  # Product Service IAM Role (Client Microservice)
+  ProductServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProductServiceName}-role-${ResourceSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VPCLatticeInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - vpc-lattice-svcs:Invoke
+                Resource: !Sub 'arn:aws:vpc-lattice:${AWS::Region}:${AWS::AccountId}:service/${VPCLatticeService}/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+        - Key: Service
+          Value: ProductService
+
+  # Order Service IAM Role (Provider Microservice)
+  OrderServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${OrderServiceName}-role-${ResourceSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+        - Key: Service
+          Value: OrderService
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS (MICROSERVICES)
+  # ============================================================================
+
+  # Product Service Lambda Function (Client)
+  ProductServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProductServiceName}-${ResourceSuffix}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ProductServiceRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrencyLimit: !If [IsProductionEnvironment, 100, 10]
+      Environment:
+        Variables:
+          SERVICE_NAME: !Sub '${ProductServiceName}'
+          ENVIRONMENT: !Ref Environment
+          ORDER_SERVICE_ENDPOINT: !GetAtt VPCLatticeService.DnsEntry.DomainName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+          import os
+          
+          def lambda_handler(event, context):
+              """
+              Product Service Lambda Handler - Simulates a client microservice
+              that needs to communicate with the order service through VPC Lattice
+              """
+              try:
+                  service_name = os.environ.get('SERVICE_NAME', 'product-service')
+                  environment = os.environ.get('ENVIRONMENT', 'development')
+                  order_endpoint = os.environ.get('ORDER_SERVICE_ENDPOINT', 'unknown')
+                  
+                  # Simulate product service logic
+                  response_data = {
+                      'statusCode': 200,
+                      'service': service_name,
+                      'environment': environment,
+                      'message': 'Product service authenticated and ready for VPC Lattice communication',
+                      'orderServiceEndpoint': order_endpoint,
+                      'timestamp': context.aws_request_id,
+                      'functionArn': context.invoked_function_arn,
+                      'capabilities': [
+                          'Product catalog management',
+                          'Inventory tracking',
+                          'Order service integration'
+                      ]
+                  }
+                  
+                  # Log successful execution
+                  print(f"Product service executed successfully: {json.dumps(response_data)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'X-Service': service_name,
+                          'X-Environment': environment
+                      },
+                      'body': json.dumps(response_data)
+                  }
+                  
+              except Exception as e:
+                  error_response = {
+                      'statusCode': 500,
+                      'error': f'Product service error: {str(e)}',
+                      'service': service_name,
+                      'requestId': context.aws_request_id
+                  }
+                  
+                  print(f"Product service error: {json.dumps(error_response)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps(error_response)
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+        - Key: Service
+          Value: ProductService
+
+  # Order Service Lambda Function (Provider)
+  OrderServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${OrderServiceName}-${ResourceSuffix}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt OrderServiceRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrencyLimit: !If [IsProductionEnvironment, 200, 20]
+      Environment:
+        Variables:
+          SERVICE_NAME: !Sub '${OrderServiceName}'
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              Order Service Lambda Handler - Simulates a provider microservice
+              that processes orders and responds to VPC Lattice requests
+              """
+              try:
+                  service_name = os.environ.get('SERVICE_NAME', 'order-service')
+                  environment = os.environ.get('ENVIRONMENT', 'development')
+                  
+                  # Simulate order processing logic
+                  current_time = datetime.utcnow().isoformat()
+                  
+                  # Mock order data
+                  orders = [
+                      {
+                          'orderId': 'ORD-001',
+                          'productId': 'WIDGET-A',
+                          'quantity': 5,
+                          'price': 29.99,
+                          'status': 'processing'
+                      },
+                      {
+                          'orderId': 'ORD-002',
+                          'productId': 'WIDGET-B',
+                          'quantity': 3,
+                          'price': 45.50,
+                          'status': 'confirmed'
+                      },
+                      {
+                          'orderId': 'ORD-003',
+                          'productId': 'WIDGET-C',
+                          'quantity': 2,
+                          'price': 15.75,
+                          'status': 'shipped'
+                      }
+                  ]
+                  
+                  response_data = {
+                      'service': service_name,
+                      'environment': environment,
+                      'message': 'Order service processing request via VPC Lattice',
+                      'timestamp': current_time,
+                      'requestId': context.aws_request_id,
+                      'orderSummary': {
+                          'totalOrders': len(orders),
+                          'totalValue': sum(order['price'] * order['quantity'] for order in orders)
+                      },
+                      'orders': orders,
+                      'serviceMetadata': {
+                          'functionArn': context.invoked_function_arn,
+                          'memoryLimit': context.memory_limit_in_mb,
+                          'remainingTime': context.get_remaining_time_in_millis()
+                      }
+                  }
+                  
+                  # Log successful processing
+                  print(f"Order service processed request: {json.dumps(response_data)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'X-Service': service_name,
+                          'X-Environment': environment,
+                          'X-Request-ID': context.aws_request_id
+                      },
+                      'body': json.dumps(response_data)
+                  }
+                  
+              except Exception as e:
+                  error_response = {
+                      'statusCode': 500,
+                      'error': f'Order service error: {str(e)}',
+                      'service': service_name,
+                      'requestId': context.aws_request_id,
+                      'timestamp': datetime.utcnow().isoformat()
+                  }
+                  
+                  print(f"Order service error: {json.dumps(error_response)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps(error_response)
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+        - Key: Service
+          Value: OrderService
+
+  # Lambda Permission for VPC Lattice to invoke Order Service
+  OrderServiceLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderServiceFunction
+      Action: lambda:InvokeFunction
+      Principal: vpc-lattice.amazonaws.com
+      StatementId: VPCLatticeInvokePermission
+
+  # ============================================================================
+  # VPC LATTICE SERVICE NETWORK
+  # ============================================================================
+
+  # VPC Lattice Service Network with IAM Authentication
+  VPCLatticeServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub '${ServiceNetworkName}-${ResourceSuffix}'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+        - Key: NetworkType
+          Value: ServiceMesh
+
+  # ============================================================================
+  # VPC LATTICE SERVICE AND TARGET GROUP
+  # ============================================================================
+
+  # VPC Lattice Service for Order Service
+  VPCLatticeService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub '${VPCLatticeServiceName}-${ResourceSuffix}'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+        - Key: ServiceType
+          Value: OrderService
+
+  # Target Group for Lambda Function
+  OrderServiceTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub 'order-targets-${ResourceSuffix}'
+      Type: LAMBDA
+      Targets:
+        - Id: !Ref OrderServiceFunction
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+        - Key: TargetType
+          Value: Lambda
+
+  # Service Listener
+  OrderServiceListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref VPCLatticeService
+      Name: order-listener
+      Protocol: HTTP
+      Port: 80
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref OrderServiceTargetGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+
+  # Service Network Service Association
+  ServiceNetworkServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref VPCLatticeServiceNetwork
+      ServiceIdentifier: !Ref VPCLatticeService
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+
+  # ============================================================================
+  # AUTHORIZATION POLICY
+  # ============================================================================
+
+  # Fine-Grained Authorization Policy for VPC Lattice Service
+  VPCLatticeAuthPolicy:
+    Type: AWS::VpcLattice::AuthPolicy
+    Properties:
+      ResourceIdentifier: !Ref VPCLatticeService
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowProductServiceAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ProductServiceRole.Arn
+            Action: vpc-lattice-svcs:Invoke
+            Resource: !Sub 'arn:aws:vpc-lattice:${AWS::Region}:${AWS::AccountId}:service/${VPCLatticeService}/*'
+            Condition:
+              StringEquals:
+                vpc-lattice-svcs:RequestMethod: !Ref AllowedHTTPMethods
+              StringLike:
+                vpc-lattice-svcs:RequestPath: !Ref AllowedRequestPaths
+          - Sid: DenyUnauthorizedAccess
+            Effect: Deny
+            Principal: '*'
+            Action: vpc-lattice-svcs:Invoke
+            Resource: !Sub 'arn:aws:vpc-lattice:${AWS::Region}:${AWS::AccountId}:service/${VPCLatticeService}/*'
+            Condition:
+              StringNotLike:
+                aws:PrincipalArn: !GetAtt ProductServiceRole.Arn
+
+  # ============================================================================
+  # CLOUDWATCH MONITORING AND LOGGING
+  # ============================================================================
+
+  # CloudWatch Log Group for VPC Lattice Access Logs
+  VPCLatticeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpclattice/${ServiceNetworkName}-${ResourceSuffix}'
+      RetentionInDays: !If [IsProductionEnvironment, 90, 14]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+
+  # Access Log Subscription for Service Network
+  VPCLatticeAccessLogSubscription:
+    Type: AWS::VpcLattice::AccessLogSubscription
+    Properties:
+      ResourceIdentifier: !Ref VPCLatticeServiceNetwork
+      DestinationArn: !GetAtt VPCLatticeLogGroup.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+
+  # SNS Topic for Alarm Notifications (Conditional)
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub 'vpc-lattice-auth-alarms-${ResourceSuffix}'
+      DisplayName: VPC Lattice Authorization Alarms
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+
+  # SNS Subscription for Email Notifications (Conditional)
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSTopic
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref AlarmNotificationEmail
+
+  # CloudWatch Alarm for Authorization Failures
+  AuthorizationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub 'VPC-Lattice-Auth-Failures-${ResourceSuffix}'
+      AlarmDescription: Monitor VPC Lattice authorization failures for security incidents
+      MetricName: 4XXError
+      Namespace: AWS/VpcLattice
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceNetwork
+          Value: !Ref VPCLatticeServiceNetwork
+      AlarmActions: !If
+        - CreateSNSTopic
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+
+  # CloudWatch Alarm for High Request Volume
+  HighRequestVolumeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub 'VPC-Lattice-High-Request-Volume-${ResourceSuffix}'
+      AlarmDescription: Monitor unusually high request volume which may indicate security issues
+      MetricName: RequestCount
+      Namespace: AWS/VpcLattice
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !If [IsProductionEnvironment, 1000, 100]
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceNetwork
+          Value: !Ref VPCLatticeServiceNetwork
+      AlarmActions: !If
+        - CreateSNSTopic
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MicroserviceAuthorization
+
+# ============================================================================
+# OUTPUTS SECTION
+# ============================================================================
+Outputs:
+  # Service Network Information
+  ServiceNetworkId:
+    Description: VPC Lattice Service Network ID for microservice communication
+    Value: !Ref VPCLatticeServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkId'
+
+  ServiceNetworkArn:
+    Description: VPC Lattice Service Network ARN for resource references
+    Value: !GetAtt VPCLatticeServiceNetwork.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkArn'
+
+  # VPC Lattice Service Information
+  VPCLatticeServiceId:
+    Description: VPC Lattice Service ID for the order service
+    Value: !Ref VPCLatticeService
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCLatticeServiceId'
+
+  VPCLatticeServiceArn:
+    Description: VPC Lattice Service ARN for authorization policies
+    Value: !GetAtt VPCLatticeService.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCLatticeServiceArn'
+
+  VPCLatticeServiceEndpoint:
+    Description: VPC Lattice Service DNS endpoint for client connections
+    Value: !GetAtt VPCLatticeService.DnsEntry.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCLatticeServiceEndpoint'
+
+  # Lambda Function Information
+  ProductServiceFunctionName:
+    Description: Product Service Lambda function name (client microservice)
+    Value: !Ref ProductServiceFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductServiceFunctionName'
+
+  ProductServiceFunctionArn:
+    Description: Product Service Lambda function ARN for cross-stack references
+    Value: !GetAtt ProductServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductServiceFunctionArn'
+
+  OrderServiceFunctionName:
+    Description: Order Service Lambda function name (provider microservice)
+    Value: !Ref OrderServiceFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderServiceFunctionName'
+
+  OrderServiceFunctionArn:
+    Description: Order Service Lambda function ARN for cross-stack references
+    Value: !GetAtt OrderServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderServiceFunctionArn'
+
+  # IAM Role Information
+  ProductServiceRoleArn:
+    Description: Product Service IAM Role ARN for authorization policies
+    Value: !GetAtt ProductServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductServiceRoleArn'
+
+  OrderServiceRoleArn:
+    Description: Order Service IAM Role ARN for authorization policies
+    Value: !GetAtt OrderServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderServiceRoleArn'
+
+  # Monitoring Information
+  VPCLatticeLogGroupName:
+    Description: CloudWatch Log Group name for VPC Lattice access logs
+    Value: !Ref VPCLatticeLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCLatticeLogGroupName'
+
+  VPCLatticeLogGroupArn:
+    Description: CloudWatch Log Group ARN for integration with other services
+    Value: !GetAtt VPCLatticeLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCLatticeLogGroupArn'
+
+  # Alarm Information (Conditional)
+  AuthorizationFailureAlarmArn:
+    Description: CloudWatch Alarm ARN for authorization failure monitoring
+    Value: !If [EnableMonitoring, !GetAtt AuthorizationFailureAlarm.Arn, 'Monitoring disabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-AuthorizationFailureAlarmArn'
+
+  HighRequestVolumeAlarmArn:
+    Description: CloudWatch Alarm ARN for high request volume monitoring
+    Value: !If [EnableMonitoring, !GetAtt HighRequestVolumeAlarm.Arn, 'Monitoring disabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-HighRequestVolumeAlarmArn'
+
+  # Stack Information
+  StackStatus:
+    Description: CloudFormation stack deployment status and configuration summary
+    Value: !Sub |
+      Stack Name: ${AWS::StackName}
+      Environment: ${Environment}
+      Resource Suffix: ${ResourceSuffix}
+      VPC Lattice Service Network: ${VPCLatticeServiceNetwork}
+      Order Service Endpoint: ${VPCLatticeService.DnsEntry.DomainName}
+      Monitoring Enabled: ${EnableDetailedMonitoring}
+      Deployed Region: ${AWS::Region}
+      Account ID: ${AWS::AccountId}
+
+  # Security Information
+  AuthorizationPolicyDetails:
+    Description: Authorization policy configuration details for security review
+    Value: !Sub |
+      Authorized Principal: ${ProductServiceRole.Arn}
+      Allowed HTTP Methods: ${AllowedHTTPMethods}
+      Allowed Request Paths: ${AllowedRequestPaths}
+      Service Resource: arn:aws:vpc-lattice:${AWS::Region}:${AWS::AccountId}:service/${VPCLatticeService}/*
+      Zero-Trust Architecture: Enabled
+      Fine-Grained Access Control: Active

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud SQL, Blockchain Node Engine, Cloud Functions, Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: blockchain, supply-chain, transparency, cloud-sql, node-engine
 recipe-generator-version: 1.3
@@ -110,7 +110,7 @@ gcloud config set compute/zone ${ZONE}
 
 # Enable required Google Cloud APIs
 gcloud services enable sqladmin.googleapis.com
-gcloud services enable blockchainnode.googleapis.com  
+gcloud services enable blockchainnodeengine.googleapis.com  
 gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable pubsub.googleapis.com
 gcloud services enable cloudkms.googleapis.com
@@ -152,7 +152,6 @@ echo "✅ APIs enabled for supply chain transparency system"
        --tier=db-custom-2-8192 \
        --region=${REGION} \
        --backup-start-time=03:00 \
-       --enable-bin-log \
        --maintenance-window-day=SUN \
        --maintenance-window-hour=04
    
@@ -238,7 +237,7 @@ echo "✅ APIs enabled for supply chain transparency system"
 
    ```bash
    # Create blockchain node for Ethereum mainnet
-   gcloud blockchain-node-engine nodes create ${BLOCKCHAIN_NODE_NAME} \
+   gcloud alpha blockchain-node-engine nodes create ${BLOCKCHAIN_NODE_NAME} \
        --location=${REGION} \
        --blockchain-type=ETHEREUM \
        --network=MAINNET \
@@ -248,7 +247,7 @@ echo "✅ APIs enabled for supply chain transparency system"
    
    # Wait for node deployment
    echo "Waiting for blockchain node deployment..."
-   gcloud blockchain-node-engine nodes describe ${BLOCKCHAIN_NODE_NAME} \
+   gcloud alpha blockchain-node-engine nodes describe ${BLOCKCHAIN_NODE_NAME} \
        --location=${REGION} \
        --format="value(state)"
    
@@ -518,12 +517,12 @@ echo "✅ APIs enabled for supply chain transparency system"
 
    ```bash
    # Check blockchain node status
-   gcloud blockchain-node-engine nodes describe ${BLOCKCHAIN_NODE_NAME} \
+   gcloud alpha blockchain-node-engine nodes describe ${BLOCKCHAIN_NODE_NAME} \
        --location=${REGION} \
-       --format="table(name,state,blockchain.network,blockchain.nodeType)"
+       --format="table(name,state,blockchainType,nodeType)"
    ```
 
-   Expected output: Node status showing RUNNING state with ETHEREUM MAINNET FULL configuration.
+   Expected output: Node status showing RUNNING state with ETHEREUM FULL configuration.
 
 3. **Validate Pub/Sub Topic Configuration**:
 
@@ -588,7 +587,7 @@ echo "✅ APIs enabled for supply chain transparency system"
 
    ```bash
    # Delete blockchain node
-   gcloud blockchain-node-engine nodes delete ${BLOCKCHAIN_NODE_NAME} \
+   gcloud alpha blockchain-node-engine nodes delete ${BLOCKCHAIN_NODE_NAME} \
        --location=${REGION} --quiet
    
    echo "✅ Blockchain Node Engine deleted"
@@ -648,4 +647,9 @@ Extend this supply chain transparency solution by implementing these enhancement
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

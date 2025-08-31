@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Immersive Reader, Azure Bot Framework, Azure Language Understanding, Azure App Service
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: accessibility, ai-services, chatbot, inclusive-design, customer-service, cognitive-services
 recipe-generator-version: 1.3
@@ -490,13 +490,13 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
 ## Discussion
 
-Azure Immersive Reader integrated with Bot Framework creates a powerful accessibility solution that addresses the diverse needs of users with varying reading abilities and language preferences. This combination leverages Microsoft's research in reading comprehension and cognitive accessibility to provide features like text-to-speech, visual focus tools, syllable breakdown, and real-time translation. The solution follows [Microsoft's Inclusive Design principles](https://docs.microsoft.com/en-us/azure/architecture/guide/design-principles/inclusive-design) to ensure that customer service interactions are accessible to users with dyslexia, visual processing difficulties, and language learning needs.
+Azure Immersive Reader integrated with Bot Framework creates a powerful accessibility solution that addresses the diverse needs of users with varying reading abilities and language preferences. This combination leverages Microsoft's research in reading comprehension and cognitive accessibility to provide features like text-to-speech, visual focus tools, syllable breakdown, and real-time translation. The solution follows [Microsoft's Inclusive Design principles](https://learn.microsoft.com/en-us/azure/architecture/guide/design-principles/inclusive-design) to ensure that customer service interactions are accessible to users with dyslexia, visual processing difficulties, and language learning needs.
 
-The architectural approach demonstrates the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and security through Key Vault integration, managed identity authentication, and comprehensive monitoring. By using Bot Framework's multi-channel capabilities, organizations can deploy the same accessible experience across web chat, Microsoft Teams, and other communication platforms while maintaining consistent accessibility features. The [Bot Framework documentation](https://docs.microsoft.com/en-us/azure/bot-service/) provides extensive guidance on conversation design patterns that complement accessibility features.
+The architectural approach demonstrates the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and security through Key Vault integration, managed identity authentication, and comprehensive monitoring. By using Bot Framework's multi-channel capabilities, organizations can deploy the same accessible experience across web chat, Microsoft Teams, and other communication platforms while maintaining consistent accessibility features. The [Bot Framework documentation](https://learn.microsoft.com/en-us/azure/bot-service/) provides extensive guidance on conversation design patterns that complement accessibility features.
 
-From a business perspective, this solution reduces support costs by enabling more users to successfully complete self-service tasks while improving customer satisfaction through inclusive design. The integration with [Azure Application Insights](https://docs.microsoft.com/en-us/azure/azure-monitor/app/app-insights-overview) provides telemetry on accessibility feature usage, helping organizations optimize their inclusive design approach based on real user behavior and needs.
+From a business perspective, this solution reduces support costs by enabling more users to successfully complete self-service tasks while improving customer satisfaction through inclusive design. The integration with [Azure Application Insights](https://learn.microsoft.com/en-us/azure/azure-monitor/app/app-insights-overview) provides telemetry on accessibility feature usage, helping organizations optimize their inclusive design approach based on real user behavior and needs.
 
-> **Tip**: Use the [Immersive Reader SDK](https://docs.microsoft.com/en-us/azure/cognitive-services/immersive-reader/overview) client library to customize reading preferences and implement user-specific accessibility settings that persist across bot conversations for a personalized experience.
+> **Tip**: Use the [Immersive Reader SDK](https://learn.microsoft.com/en-us/azure/cognitive-services/immersive-reader/overview) client library to customize reading preferences and implement user-specific accessibility settings that persist across bot conversations for a personalized experience.
 
 ## Challenge
 
@@ -514,4 +514,9 @@ Extend this accessible customer service bot solution by implementing these enhan
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

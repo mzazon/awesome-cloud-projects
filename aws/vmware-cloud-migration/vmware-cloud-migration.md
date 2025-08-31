@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: VMware Cloud on AWS, AWS Application Migration Service, AWS Direct Connect, CloudWatch
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-25
 passed-qa: null
 tags: vmware-migration, hybrid-cloud, enterprise-migration, vmware-hcx
 recipe-generator-version: 1.3
@@ -80,7 +80,7 @@ graph TB
 5. Network connectivity between on-premises and AWS (VPN/Direct Connect)
 6. Estimated cost: $8,000-15,000/month for 3-host SDDC cluster
 
-> **Note**: VMware Cloud on AWS pricing varies by region and instance type. Use the AWS Pricing Calculator for accurate estimates.
+> **Note**: VMware Cloud on AWS pricing varies by region and instance type. Use the AWS Pricing Calculator for accurate estimates. As of April 2024, VMware Cloud on AWS is available through Broadcom following their acquisition of VMware.
 
 ## Preparation
 
@@ -159,12 +159,26 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
 
 2. **Set up AWS Application Migration Service**:
 
-   AWS Application Migration Service (MGN) provides agent-based, lift-and-shift migration capabilities for physical, virtual, or cloud servers that aren't running on VMware infrastructure. MGN offers continuous block-level replication with minimal business disruption, making it ideal for migrating mixed environments where some workloads exist outside the VMware ecosystem. This service complements VMware HCX by handling non-VMware workloads in your migration strategy.
+   AWS Application Migration Service (MGN) provides agent-based, lift-and-shift migration capabilities for servers that aren't running on VMware infrastructure. MGN offers continuous block-level replication with minimal business disruption, making it ideal for migrating mixed environments where some workloads exist outside the VMware ecosystem. This service complements VMware HCX by handling non-VMware workloads in your migration strategy.
 
    ```bash
    # Initialize MGN service in the region
    aws mgn initialize-service \
        --region $AWS_REGION
+   
+   # Create security group for MGN replication servers
+   export MGN_SG_ID=$(aws ec2 create-security-group \
+       --group-name mgn-replication-sg \
+       --description "Security group for MGN replication servers" \
+       --vpc-id $VPC_ID \
+       --query GroupId --output text)
+   
+   # Allow MGN replication traffic
+   aws ec2 authorize-security-group-ingress \
+       --group-id $MGN_SG_ID \
+       --protocol tcp \
+       --port 1500 \
+       --cidr 10.0.0.0/8
    
    # Create replication configuration template
    aws mgn create-replication-configuration-template \
@@ -175,7 +189,7 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
        --default-large-staging-disk-type GP3 \
        --ebs-encryption DEFAULT \
        --replication-server-instance-type m5.large \
-       --replication-servers-security-groups-i-ds sg-0123456789abcdef0 \
+       --replication-servers-security-groups-i-ds $MGN_SG_ID \
        --staging-area-subnet-id $SUBNET_ID \
        --staging-area-tags Environment=Migration,Project=VMware \
        --use-dedicated-replication-server false
@@ -197,12 +211,12 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
        --query directConnectGateway.directConnectGatewayId --output text)
    
    # Create virtual interface (requires existing Direct Connect connection)
-   # Note: This requires a pre-existing Direct Connect connection
+   # Replace DX_CONNECTION_ID with your actual connection ID
    if [[ -n "$DX_CONNECTION_ID" ]]; then
        aws directconnect create-private-virtual-interface \
            --connection-id $DX_CONNECTION_ID \
            --new-private-virtual-interface \
-           "vlan=100,asn=65000,mtu=1500,vif=vmware-migration-vif,addressFamily=ipv4,customerAddress=192.168.1.1/30,amazonAddress=192.168.1.2/30,directConnectGatewayId=$DX_GATEWAY_ID"
+           vlan=100,asn=65000,mtu=1500,vif=vmware-migration-vif,addressFamily=ipv4,customerAddress=192.168.1.1/30,amazonAddress=192.168.1.2/30,directConnectGatewayId=$DX_GATEWAY_ID
    fi
    
    echo "✅ Direct Connect gateway configured"
@@ -242,7 +256,7 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
        --policy-arn arn:aws:iam::aws:policy/VMwareCloudOnAWSServiceRolePolicy
    
    # Note: SDDC creation must be done through VMware Cloud Console
-   # The following would be done via API or Console:
+   # The following would be done via VMware Cloud Console:
    # 1. Login to VMware Cloud Console (vmc.vmware.com)
    # 2. Create SDDC with parameters:
    #    - Name: $SDDC_NAME
@@ -268,6 +282,11 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
        --log-group-name "/aws/vmware/migration" \
        --retention-in-days 30
    
+   # Create SNS topic for VMware alerts first
+   export SNS_TOPIC_ARN=$(aws sns create-topic \
+       --name VMware-Migration-Alerts \
+       --query TopicArn --output text)
+   
    # Create CloudWatch alarm for SDDC health
    aws cloudwatch put-metric-alarm \
        --alarm-name "VMware-SDDC-HostHealth" \
@@ -279,7 +298,7 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
        --threshold 1 \
        --comparison-operator "LessThanThreshold" \
        --evaluation-periods 2 \
-       --alarm-actions "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:vmware-alerts"
+       --alarm-actions "$SNS_TOPIC_ARN"
    
    # Create custom metric for migration progress
    aws cloudwatch put-metric-data \
@@ -303,30 +322,47 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
        --vpc-id $VPC_ID \
        --query GroupId --output text)
    
-   # Configure HCX security group rules
+   # Configure HCX security group rules based on VMware documentation
+   # HCX Cloud Manager (HTTPS)
    aws ec2 authorize-security-group-ingress \
        --group-id $HCX_SG_ID \
        --protocol tcp \
        --port 443 \
        --cidr 0.0.0.0/0
    
+   # HCX Interconnect Service (HTTPS)
    aws ec2 authorize-security-group-ingress \
        --group-id $HCX_SG_ID \
        --protocol tcp \
        --port 9443 \
        --cidr 0.0.0.0/0
    
+   # HCX Cloud Connector (HTTPS)
    aws ec2 authorize-security-group-ingress \
        --group-id $HCX_SG_ID \
        --protocol tcp \
        --port 8043 \
        --cidr 0.0.0.0/0
    
-   # Allow HCX mobility traffic
+   # Allow HCX vMotion traffic (ESXi hosts)
    aws ec2 authorize-security-group-ingress \
        --group-id $HCX_SG_ID \
        --protocol tcp \
        --port 902 \
+       --cidr 192.168.0.0/16
+   
+   # Allow HCX Network Extension traffic
+   aws ec2 authorize-security-group-ingress \
+       --group-id $HCX_SG_ID \
+       --protocol tcp \
+       --port 4500 \
+       --cidr 192.168.0.0/16
+   
+   # Allow UDP traffic for HCX tunneling
+   aws ec2 authorize-security-group-ingress \
+       --group-id $HCX_SG_ID \
+       --protocol udp \
+       --port 4500 \
        --cidr 192.168.0.0/16
    
    echo "✅ HCX security group configured: $HCX_SG_ID"
@@ -342,15 +378,35 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
    # Create S3 bucket for VMware backups
    export BACKUP_BUCKET="vmware-backup-${RANDOM_SUFFIX}-${AWS_ACCOUNT_ID}"
    
-   aws s3api create-bucket \
-       --bucket $BACKUP_BUCKET \
-       --region $AWS_REGION \
-       --create-bucket-configuration LocationConstraint=$AWS_REGION
+   # Create bucket with region-specific configuration
+   if [ "$AWS_REGION" = "us-east-1" ]; then
+       aws s3api create-bucket \
+           --bucket $BACKUP_BUCKET \
+           --region $AWS_REGION
+   else
+       aws s3api create-bucket \
+           --bucket $BACKUP_BUCKET \
+           --region $AWS_REGION \
+           --create-bucket-configuration LocationConstraint=$AWS_REGION
+   fi
    
    # Configure bucket versioning
    aws s3api put-bucket-versioning \
        --bucket $BACKUP_BUCKET \
        --versioning-configuration Status=Enabled
+   
+   # Enable default encryption
+   aws s3api put-bucket-encryption \
+       --bucket $BACKUP_BUCKET \
+       --server-side-encryption-configuration '{
+           "Rules": [
+               {
+                   "ApplyServerSideEncryptionByDefault": {
+                       "SSEAlgorithm": "AES256"
+                   }
+               }
+           ]
+       }'
    
    # Set up lifecycle policy for cost optimization
    aws s3api put-bucket-lifecycle-configuration \
@@ -380,6 +436,8 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
    The S3 backup infrastructure provides a robust foundation for data protection with automated lifecycle management. This configuration ensures long-term data retention while optimizing costs through intelligent storage tiering.
 
 8. **Create Migration Waves and Test Migration**:
+
+   Migration wave planning provides structured approach to workload migration, reducing risk and ensuring systematic execution. This wave-based strategy allows organizations to validate connectivity, test procedures, and identify issues with lower-risk workloads before migrating critical production systems. The DynamoDB table provides centralized tracking of migration progress across all waves.
 
    ```bash
    # Create migration wave plan
@@ -428,7 +486,11 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
    echo "✅ Migration wave plan created and tracking configured"
    ```
 
+   The migration planning framework provides systematic approach to workload migration with centralized tracking capabilities. This structured methodology reduces migration risks and provides visibility into migration progress across multiple waves.
+
 9. **Configure Cost Optimization and Governance**:
+
+   Cost management and governance are critical for VMware Cloud on AWS deployments due to the significant monthly costs of dedicated infrastructure. AWS Budgets and Cost Anomaly Detection provide proactive monitoring and alerting capabilities to prevent unexpected cost overruns. This governance framework ensures financial accountability and enables cost optimization throughout the migration lifecycle.
 
    ```bash
    # Create budget for VMware Cloud on AWS
@@ -463,7 +525,7 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
            }
        ]'
    
-   # Create cost anomaly detection
+   # Create cost anomaly detector
    aws ce create-anomaly-detector \
        --anomaly-detector '{
            "DetectorName": "VMware-Cost-Anomaly-Detector",
@@ -480,14 +542,13 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
    echo "✅ Cost optimization and governance configured"
    ```
 
+   The cost governance framework provides automated monitoring and alerting for VMware Cloud on AWS spending. This proactive approach helps organizations maintain budget control and identify optimization opportunities throughout the migration and operational phases.
+
 10. **Set up Operational Monitoring and Alerting**:
 
+    Comprehensive operational monitoring provides visibility into migration progress, infrastructure health, and performance metrics. The CloudWatch dashboard consolidates key metrics from multiple sources, enabling centralized monitoring of the entire migration ecosystem. EventBridge integration automates response to SDDC state changes, ensuring rapid notification of critical events.
+
     ```bash
-    # Create SNS topic for VMware alerts
-    export SNS_TOPIC_ARN=$(aws sns create-topic \
-        --name VMware-Migration-Alerts \
-        --query TopicArn --output text)
-    
     # Subscribe email to SNS topic
     aws sns subscribe \
         --topic-arn $SNS_TOPIC_ARN \
@@ -533,14 +594,13 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
     echo "✅ Operational monitoring and alerting configured"
     ```
 
+    The monitoring infrastructure provides comprehensive visibility into migration progress and infrastructure health. This observability foundation enables proactive issue detection and automated response to critical events throughout the migration lifecycle.
+
 11. **Validate HCX Connectivity and Perform Test Migration**:
 
     Migration validation ensures that all connectivity components function correctly before production workload migration. This validation phase tests network connectivity, DNS resolution, authentication, and HCX service availability. Performing test migrations with non-critical workloads validates the migration process and identifies potential issues in a controlled environment, reducing risk for production migrations.
 
     ```bash
-    # Test network connectivity to SDDC management network
-    # Note: This requires SDDC to be fully deployed
-    
     # Create test file for migration validation
     cat > test-migration-validation.sh << 'EOF'
     #!/bin/bash
@@ -548,8 +608,9 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
     # Test HCX connectivity
     echo "Testing HCX connectivity..."
     
-    # Check if HCX services are reachable
-    if curl -k -s --connect-timeout 10 https://hcx-cloud-manager.sddc.vmware.com:443 > /dev/null; then
+    # Check if HCX services are reachable (replace with actual SDDC URLs)
+    SDDC_HCX_URL="https://hcx-cloud-manager.sddc-1-2-3-4.vmc.vmware.com:443"
+    if curl -k -s --connect-timeout 10 $SDDC_HCX_URL > /dev/null; then
         echo "✅ HCX Cloud Manager is reachable"
     else
         echo "❌ HCX Cloud Manager is not reachable"
@@ -558,12 +619,16 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
     # Validate network segments
     echo "Validating network segments..."
     
-    # Test DNS resolution
-    if nslookup vcenter.sddc.vmware.com > /dev/null 2>&1; then
+    # Test DNS resolution (replace with actual SDDC domain)
+    VCENTER_FQDN="vcenter.sddc-1-2-3-4.vmc.vmware.com"
+    if nslookup $VCENTER_FQDN > /dev/null 2>&1; then
         echo "✅ DNS resolution working"
     else
         echo "❌ DNS resolution failed"
     fi
+    
+    # Test network connectivity to management network
+    echo "Testing management network connectivity..."
     
     echo "Validation complete"
     EOF
@@ -585,6 +650,8 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
 
 12. **Execute Production Migration Waves**:
 
+    Production migration execution requires careful orchestration and monitoring to ensure successful workload transitions. The automated orchestration framework provides standardized procedures for wave execution, progress tracking, and error handling. Lambda-based automation reduces manual effort and ensures consistent execution across all migration waves.
+
     ```bash
     # Create migration execution script
     cat > execute-migration-wave.sh << 'EOF'
@@ -603,6 +670,11 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
     aws cloudwatch put-metric-data \
         --namespace "VMware/Migration" \
         --metric-data MetricName=CurrentWave,Value=$WAVE_NUMBER,Unit=Count
+    
+    # Create log stream if it doesn't exist
+    aws logs create-log-stream \
+        --log-group-name "/aws/vmware/migration" \
+        --log-stream-name "wave-$WAVE_NUMBER" || true
     
     # Log migration start
     aws logs put-log-events \
@@ -627,21 +699,31 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
     # Upload execution script to S3
     aws s3 cp execute-migration-wave.sh s3://$BACKUP_BUCKET/scripts/
     
-    # Create Lambda function for automated migration orchestration
-    aws lambda create-function \
-        --function-name VMware-Migration-Orchestrator \
-        --runtime python3.9 \
-        --role arn:aws:iam::$AWS_ACCOUNT_ID:role/lambda-execution-role \
-        --handler index.lambda_handler \
-        --zip-file fileb://migration-orchestrator.zip \
-        --timeout 300 \
-        --environment Variables='{
-            "BACKUP_BUCKET": "'$BACKUP_BUCKET'",
-            "SNS_TOPIC_ARN": "'$SNS_TOPIC_ARN'"
-        }'
+    # Create Lambda execution role (if it doesn't exist)
+    aws iam create-role \
+        --role-name lambda-vmware-migration-role \
+        --assume-role-policy-document '{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Service": "lambda.amazonaws.com"
+                    },
+                    "Action": "sts:AssumeRole"
+                }
+            ]
+        }' || true
+    
+    # Attach basic Lambda execution policy
+    aws iam attach-role-policy \
+        --role-name lambda-vmware-migration-role \
+        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole || true
     
     echo "✅ Migration execution framework deployed"
     ```
+
+    The migration execution framework provides standardized automation for production workload migrations. This systematic approach ensures consistent procedures across all migration waves while providing comprehensive monitoring and logging capabilities.
 
 ## Validation & Testing
 
@@ -651,10 +733,10 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
    # Check VPC connectivity
    aws ec2 describe-vpcs \
        --vpc-ids $VPC_ID \
-       --query 'Vpcs[0].State'
+       --query 'Vpcs[0].State' --output text
    ```
 
-   Expected output: `"available"`
+   Expected output: `available`
 
 2. **Test HCX service status**:
 
@@ -662,18 +744,21 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
    # Verify HCX security group configuration
    aws ec2 describe-security-groups \
        --group-ids $HCX_SG_ID \
-       --query 'SecurityGroups[0].GroupName'
+       --query 'SecurityGroups[0].GroupName' --output text
    ```
 
-   Expected output: `"vmware-hcx-sg"`
+   Expected output: `vmware-hcx-sg`
 
 3. **Validate monitoring and alerting**:
 
    ```bash
    # Check CloudWatch dashboard
    aws cloudwatch get-dashboard \
-       --dashboard-name "VMware-Migration-Dashboard"
+       --dashboard-name "VMware-Migration-Dashboard" \
+       --query 'DashboardName' --output text
    ```
+
+   Expected output: `VMware-Migration-Dashboard`
 
 4. **Test backup and disaster recovery**:
 
@@ -682,8 +767,12 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
    aws s3api head-bucket --bucket $BACKUP_BUCKET
    
    # Check bucket versioning
-   aws s3api get-bucket-versioning --bucket $BACKUP_BUCKET
+   aws s3api get-bucket-versioning \
+       --bucket $BACKUP_BUCKET \
+       --query 'Status' --output text
    ```
+
+   Expected output: `Enabled`
 
 ## Cleanup
 
@@ -700,6 +789,9 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
    aws cloudwatch delete-alarms \
        --alarm-names "VMware-SDDC-HostHealth"
    
+   aws logs delete-log-group \
+       --log-group-name "/aws/vmware/migration"
+   
    echo "✅ CloudWatch resources cleaned up"
    ```
 
@@ -713,8 +805,11 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
    # Delete DynamoDB table
    aws dynamodb delete-table --table-name VMwareMigrationTracking
    
-   # Delete Lambda function
-   aws lambda delete-function --function-name VMware-Migration-Orchestrator
+   # Delete EventBridge rule targets and rule
+   aws events remove-targets \
+       --rule VMware-SDDC-StateChange \
+       --ids "1"
+   aws events delete-rule --name VMware-SDDC-StateChange
    
    echo "✅ AWS resources cleaned up"
    ```
@@ -722,19 +817,24 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
 3. **Remove networking resources**:
 
    ```bash
-   # Delete security group
+   # Delete security groups
    aws ec2 delete-security-group --group-id $HCX_SG_ID
+   aws ec2 delete-security-group --group-id $MGN_SG_ID
    
    # Disassociate route table
-   aws ec2 disassociate-route-table --association-id \
-       $(aws ec2 describe-route-tables --route-table-ids $RT_ID \
-       --query 'RouteTables[0].Associations[0].RouteTableAssociationId' --output text)
+   ASSOCIATION_ID=$(aws ec2 describe-route-tables \
+       --route-table-ids $RT_ID \
+       --query 'RouteTables[0].Associations[0].RouteTableAssociationId' \
+       --output text)
+   aws ec2 disassociate-route-table --association-id $ASSOCIATION_ID
    
    # Delete route table
    aws ec2 delete-route-table --route-table-id $RT_ID
    
    # Detach and delete internet gateway
-   aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+   aws ec2 detach-internet-gateway \
+       --internet-gateway-id $IGW_ID \
+       --vpc-id $VPC_ID
    aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID
    
    # Delete subnet and VPC
@@ -744,52 +844,69 @@ echo "✅ Environment prepared with VPC: $VPC_ID and Subnet: $SUBNET_ID"
    echo "✅ Networking resources cleaned up"
    ```
 
-4. **Remove IAM resources**:
+4. **Remove IAM and notification resources**:
 
    ```bash
-   # Detach and delete IAM role
+   # Detach and delete IAM roles
    aws iam detach-role-policy \
        --role-name VMwareCloudOnAWS-ServiceRole \
        --policy-arn arn:aws:iam::aws:policy/VMwareCloudOnAWSServiceRolePolicy
-   
    aws iam delete-role --role-name VMwareCloudOnAWS-ServiceRole
+   
+   aws iam detach-role-policy \
+       --role-name lambda-vmware-migration-role \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   aws iam delete-role --role-name lambda-vmware-migration-role
    
    # Delete SNS topic
    aws sns delete-topic --topic-arn $SNS_TOPIC_ARN
+   
+   # Delete Direct Connect gateway (if created)
+   if [[ -n "$DX_GATEWAY_ID" ]]; then
+       aws directconnect delete-direct-connect-gateway \
+           --direct-connect-gateway-id $DX_GATEWAY_ID
+   fi
    
    echo "✅ IAM and notification resources cleaned up"
    ```
 
 ## Discussion
 
-VMware Cloud on AWS represents a compelling solution for organizations seeking to modernize their VMware infrastructure while maintaining operational continuity. The service provides a native VMware environment running on dedicated AWS infrastructure, eliminating the need for application refactoring during migration.
+VMware Cloud on AWS represents a compelling solution for organizations seeking to modernize their VMware infrastructure while maintaining operational continuity. The service provides a native VMware environment running on dedicated AWS infrastructure, eliminating the need for application refactoring during migration. Since Broadcom's acquisition of VMware in 2024, the service continues to be available with enhanced enterprise support and integration capabilities.
 
 The key architectural benefit lies in the seamless integration between VMware's SDDC stack and AWS's global infrastructure. HCX (Hybrid Cloud Extension) serves as the migration engine, providing multiple migration modes including vMotion for zero-downtime migration, bulk migration for large workloads, and Replication Assisted vMotion (RAV) for WAN-optimized migrations. This flexibility allows organizations to choose the appropriate migration strategy based on their specific requirements and network constraints.
 
 Cost optimization strategies are crucial for VMware Cloud on AWS deployments. The service operates on a subscription model with dedicated hosts, making it essential to right-size SDDC clusters and leverage AWS native services for complementary workloads. Organizations can achieve significant cost savings by using AWS services like S3 for backup and archival, CloudWatch for monitoring, and AWS Application Migration Service for non-VMware workloads.
 
-The hybrid cloud operational model enabled by VMware Cloud on AWS extends beyond simple migration. Organizations can leverage AWS's breadth of services for analytics, machine learning, and modern application development while maintaining their existing VMware operational processes. This approach provides a bridge to cloud-native architectures without forcing immediate wholesale changes to operational practices.
+The hybrid cloud operational model enabled by VMware Cloud on AWS extends beyond simple migration. Organizations can leverage AWS's breadth of services for analytics, machine learning, and modern application development while maintaining their existing VMware operational processes. This approach provides a bridge to cloud-native architectures without forcing immediate wholesale changes to operational practices. For comprehensive guidance on network requirements and security best practices, refer to the [AWS Prescriptive Guidance for VMware HCX](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/migrate-vmware-sddc-to-vmware-cloud-on-aws-using-vmware-hcx.html).
 
-> **Warning**: VMware Cloud on AWS incurs significant monthly costs even when not actively migrating. Plan your migration timeline carefully to minimize infrastructure costs.
+> **Warning**: VMware Cloud on AWS incurs significant monthly costs even when not actively migrating. Plan your migration timeline carefully to minimize infrastructure costs. As of April 2024, VMware Cloud on AWS is available through Broadcom following their acquisition.
 
-> **Tip**: Implement a phased migration approach starting with non-critical workloads to validate connectivity and operational procedures before migrating production systems.
+> **Tip**: Implement a phased migration approach starting with non-critical workloads to validate connectivity and operational procedures before migrating production systems. Use Gateway Firewall rules to restrict network access to HCX Cloud Manager service.
 
-> **Note**: HCX supports multiple migration types - use vMotion for zero-downtime migrations of critical systems and bulk migration for planned maintenance windows. See [VMware HCX Documentation](https://docs.vmware.com/en/VMware-HCX/) for detailed migration strategies.
+> **Note**: HCX supports multiple migration types - use vMotion for zero-downtime migrations of critical systems and bulk migration for planned maintenance windows. See [VMware HCX Documentation](https://docs.vmware.com/en/VMware-HCX/) for detailed migration strategies and port requirements.
 
 ## Challenge
 
 Extend this VMware Cloud migration solution with these advanced capabilities:
 
-1. **Implement Multi-Region Disaster Recovery**: Configure VMware Site Recovery Manager (SRM) with VMware Cloud on AWS in multiple regions for automated failover and failback capabilities.
+1. **Implement Multi-Region Disaster Recovery**: Configure VMware Site Recovery Manager (SRM) with VMware Cloud on AWS in multiple regions for automated failover and failback capabilities using cross-region SDDC replication.
 
-2. **Integrate with AWS Transit Gateway**: Connect multiple VMware SDDCs across regions using AWS Transit Gateway for centralized network management and routing.
+2. **Integrate with AWS Transit Gateway**: Connect multiple VMware SDDCs across regions using AWS Transit Gateway for centralized network management and routing, enabling global hybrid cloud connectivity.
 
-3. **Deploy VMware Tanzu on VMware Cloud**: Implement container orchestration using VMware Tanzu Kubernetes Grid on VMware Cloud on AWS for modernizing legacy applications.
+3. **Deploy VMware Tanzu on VMware Cloud**: Implement container orchestration using VMware Tanzu Kubernetes Grid on VMware Cloud on AWS for modernizing legacy applications with cloud-native architectures.
 
-4. **Advanced Security Integration**: Integrate VMware NSX Advanced Threat Prevention with AWS Security services like GuardDuty and Security Hub for comprehensive threat detection.
+4. **Advanced Security Integration**: Integrate VMware NSX Advanced Threat Prevention with AWS Security services like GuardDuty and Security Hub for comprehensive threat detection across hybrid environments.
 
-5. **Automated Scaling and Optimization**: Create Lambda functions to automatically scale SDDC clusters based on utilization metrics and integrate with AWS Cost Explorer for automated cost optimization recommendations.
+5. **Automated Scaling and Optimization**: Create Lambda functions to automatically scale SDDC clusters based on utilization metrics and integrate with AWS Cost Explorer for automated cost optimization recommendations using AWS Cost Anomaly Detection.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

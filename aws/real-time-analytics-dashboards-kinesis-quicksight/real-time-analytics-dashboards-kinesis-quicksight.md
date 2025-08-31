@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: Kinesis Data Streams, Managed Service for Apache Flink, QuickSight, S3
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: analytics, real-time, streaming, kinesis, flink, quicksight, dashboards
 recipe-generator-version: 1.3
@@ -80,9 +80,10 @@ graph TB
 
 1. AWS account with permissions for Kinesis, Managed Service for Apache Flink, S3, and QuickSight
 2. AWS CLI v2 installed and configured with appropriate credentials
-3. Basic understanding of streaming data concepts and SQL
-4. Sample streaming data source or ability to generate test data
-5. Estimated cost: $50-100/month for moderate data volumes (1GB/day processing)
+3. Java 11 and Maven 3.8+ installed for building the Flink application
+4. Basic understanding of streaming data concepts and SQL
+5. Sample streaming data source or ability to generate test data
+6. Estimated cost: $50-100/month for moderate data volumes (1GB/day processing)
 
 > **Note**: Amazon Managed Service for Apache Flink was previously known as Amazon Kinesis Data Analytics for Apache Flink and provides more advanced capabilities than the discontinued SQL-based service.
 
@@ -119,6 +120,8 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
 
 1. **Create Kinesis Data Stream for ingestion**:
 
+   Amazon Kinesis Data Streams provides managed infrastructure for real-time data ingestion with high throughput and low latency. Each shard can handle 1,000 records per second or 1 MB per second of data ingestion, enabling scalable data processing. Multiple shards provide parallel processing capabilities and higher throughput, making this ideal for high-volume streaming applications.
+
    ```bash
    # Create Kinesis Data Stream with multiple shards for scalability
    # Multiple shards enable parallel processing and higher throughput
@@ -143,9 +146,13 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    echo "Stream ARN: ${STREAM_ARN}"
    ```
 
+   The stream is now active and ready to receive data. This serverless approach eliminates infrastructure management while providing automatic scaling based on data volume. Kinesis Data Streams integrates seamlessly with Managed Service for Apache Flink, enabling real-time processing of streaming data with exactly-once delivery guarantees.
+
    > **Note**: The number of shards determines your stream's data throughput capacity. Each shard can ingest 1,000 records per second or 1 MB per second. Learn more about [Kinesis Data Streams capacity](https://docs.aws.amazon.com/kinesis/latest/dev/key-concepts.html#shard).
 
 2. **Create IAM role for Managed Service for Apache Flink**:
+
+   IAM roles enable secure access to AWS resources without embedding credentials in application code. The Managed Service for Apache Flink requires specific permissions to read from Kinesis streams, write to S3 buckets, and create CloudWatch logs. This role follows the principle of least privilege by granting only the minimum permissions necessary for the application to function correctly.
 
    ```bash
    # Create trust policy allowing Flink service to assume this role
@@ -233,7 +240,10 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
        --query 'Role.Arn' --output text)
    
    echo "✅ Created IAM role: ${IAM_ROLE_NAME}"
+   echo "Role ARN: ${ROLE_ARN}"
    ```
+
+   The IAM role configuration is complete with secure permissions for all required AWS services. This approach follows AWS security best practices by using role-based authentication instead of long-term access keys, providing better security and easier credential rotation.
 
 3. **Create sample Flink application for stream processing**:
 
@@ -260,8 +270,8 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
        <properties>
            <maven.compiler.source>11</maven.compiler.source>
            <maven.compiler.target>11</maven.compiler.target>
-           <flink.version>1.18.0</flink.version>
-           <kda.version>2.0</kda.version>
+           <flink.version>1.18.1</flink.version>
+           <kda.version>4.0.0</kda.version>
        </properties>
        
        <dependencies>
@@ -278,7 +288,7 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
            <dependency>
                <groupId>org.apache.flink</groupId>
                <artifactId>flink-connector-kinesis</artifactId>
-               <version>4.2.0-1.18</version>
+               <version>4.3.0-1.18</version>
            </dependency>
            <dependency>
                <groupId>org.apache.flink</groupId>
@@ -297,7 +307,7 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
                <plugin>
                    <groupId>org.apache.maven.plugins</groupId>
                    <artifactId>maven-shade-plugin</artifactId>
-                   <version>3.2.4</version>
+                   <version>3.4.1</version>
                    <executions>
                        <execution>
                            <phase>package</phase>
@@ -315,7 +325,7 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    echo "✅ Created Flink application structure"
    ```
 
-   The Maven project structure is now established with all necessary dependencies for Kinesis connectivity and S3 output. This configuration enables the Flink application to consume streaming data, perform windowing operations, and write results to durable storage for dashboard consumption.
+   The Maven project structure is now established with all necessary dependencies for Kinesis connectivity and S3 output. This configuration uses the latest compatible versions of Flink and AWS connectors, ensuring optimal performance and security. The shade plugin creates a fat JAR containing all dependencies required for deployment to Managed Service for Apache Flink.
 
 4. **Create the main Flink application class**:
 
@@ -332,9 +342,7 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    import org.apache.flink.api.common.typeinfo.Types;
    import org.apache.flink.api.java.tuple.Tuple2;
    import org.apache.flink.connector.file.sink.FileSink;
-   import org.apache.flink.connector.kinesis.sink.KinesisStreamsSink;
    import org.apache.flink.core.fs.Path;
-   import org.apache.flink.formats.json.JsonRowDataSerializationSchema;
    import org.apache.flink.streaming.api.datastream.DataStream;
    import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
    import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
@@ -348,11 +356,14 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    public class StreamingAnalyticsJob {
        
        public static void main(String[] args) throws Exception {
-           final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+           final StreamExecutionEnvironment env = 
+               StreamExecutionEnvironment.getExecutionEnvironment();
            
            // Get application properties from Kinesis Analytics runtime
-           Map<String, Properties> applicationProperties = KinesisAnalyticsRuntime.getApplicationProperties();
-           Properties inputProperties = applicationProperties.get("kinesis.analytics.flink.run.options");
+           Map<String, Properties> applicationProperties = 
+               KinesisAnalyticsRuntime.getApplicationProperties();
+           Properties inputProperties = 
+               applicationProperties.get("kinesis.analytics.flink.run.options");
            
            String inputStreamName = inputProperties.getProperty("input.stream.name");
            String region = inputProperties.getProperty("aws.region");
@@ -361,7 +372,8 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
            // Configure Kinesis consumer with appropriate settings
            Properties kinesisConsumerConfig = new Properties();
            kinesisConsumerConfig.setProperty(ConsumerConfigConstants.AWS_REGION, region);
-           kinesisConsumerConfig.setProperty(ConsumerConfigConstants.STREAM_INITIAL_POSITION, "LATEST");
+           kinesisConsumerConfig.setProperty(
+               ConsumerConfigConstants.STREAM_INITIAL_POSITION, "LATEST");
            
            // Create Kinesis source for reading streaming data
            FlinkKinesisConsumer<String> kinesisSource = new FlinkKinesisConsumer<>(
@@ -383,14 +395,10 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
            
            // Write aggregated results to S3 for QuickSight consumption
            analytics
-               .map(tuple -> String.format("{\"timestamp\":\"%d\",\"metric\":\"%s\",\"value\":%d}", 
+               .map(tuple -> String.format(
+                   "{\"timestamp\":\"%d\",\"metric\":\"%s\",\"value\":%d}", 
                    System.currentTimeMillis(), tuple.f0, tuple.f1))
                .sinkTo(FileSink.forRowFormat(new Path(s3Path), new SimpleStringSchema())
-                   .withRollingPolicy(
-                       org.apache.flink.connector.file.sink.compaction.FileCompactStrategy
-                           .Builder.newBuilder()
-                           .enableCompactionOnCheckpoint(5)
-                           .build())
                    .build());
            
            env.execute("Real-time Analytics Job");
@@ -401,9 +409,11 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    echo "✅ Created Flink application code"
    ```
 
-   The Flink application now contains the complete streaming analytics logic with tumbling windows for one-minute aggregations. This implementation ensures consistent, non-overlapping time periods for accurate metrics while providing exactly-once processing guarantees. The application is ready for compilation and deployment to process real-time data streams and generate dashboard-ready analytics.
+   The Flink application now contains the complete streaming analytics logic with tumbling windows for one-minute aggregations. This implementation ensures consistent, non-overlapping time periods for accurate metrics while providing exactly-once processing guarantees. The application processes streaming data, performs windowing operations, and writes results to S3 for QuickSight dashboard consumption.
 
 5. **Build and upload Flink application**:
+
+   Maven builds the Flink application into a deployable JAR file containing all necessary dependencies. The build process compiles Java source code, downloads required libraries, and packages everything into a single artifact. This approach ensures consistent deployment across different environments and simplifies dependency management for complex streaming applications.
 
    ```bash
    # Navigate to the application directory for building
@@ -433,9 +443,13 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    echo "✅ Built and uploaded Flink application"
    ```
 
+   The Flink application is now compiled and uploaded to S3, ready for deployment. The Maven build process created a fat JAR containing all dependencies, ensuring the application runs correctly in the managed Flink environment without missing libraries or version conflicts.
+
    > **Warning**: Ensure Maven is properly installed and configured with internet access to download dependencies. The build process may take several minutes for the first run due to dependency downloads.
 
 6. **Create Managed Service for Apache Flink application**:
+
+   The Managed Service for Apache Flink application configuration defines the runtime environment, code location, and operational parameters. This step creates the serverless Flink cluster that will execute the streaming analytics job. The configuration includes auto-scaling settings, monitoring levels, and checkpoint configuration for fault tolerance and exactly-once processing guarantees.
 
    ```bash
    # Create comprehensive application configuration for the Flink service
@@ -495,7 +509,11 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    echo "✅ Created Managed Service for Apache Flink application: ${FLINK_APP_NAME}"
    ```
 
+   The Managed Service for Apache Flink application is now created and configured with optimal settings for real-time analytics. The configuration enables auto-scaling, comprehensive monitoring, and default checkpoint settings for reliability and fault tolerance.
+
 7. **Start the Flink application**:
+
+   Starting the Flink application initiates the streaming analytics pipeline. The application begins consuming data from the Kinesis stream, processing it through windowing operations, and writing aggregated results to S3. The startup process includes checkpoint recovery if available and begins processing from the configured stream position.
 
    ```bash
    # Start the Flink application to begin processing streaming data
@@ -513,13 +531,15 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    sleep 30
    
    # Verify the application is running successfully
-   aws kinesisanalyticsv2 describe-application \
+   APP_STATUS=$(aws kinesisanalyticsv2 describe-application \
        --application-name ${FLINK_APP_NAME} \
        --query 'ApplicationDetail.ApplicationStatus' \
-       --output text
+       --output text)
    
-   echo "✅ Started Flink application"
+   echo "✅ Started Flink application with status: ${APP_STATUS}"
    ```
+
+   The Flink application is now running and processing streaming data in real-time. The application continuously consumes data from Kinesis, performs windowing aggregations, and writes processed results to S3 for dashboard consumption. Auto-scaling ensures the application adjusts resource allocation based on data volume.
 
 8. **Generate sample data for testing**:
 
@@ -533,6 +553,7 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    import time
    import random
    import boto3
+   import os
    from datetime import datetime
    
    def generate_sample_events():
@@ -555,13 +576,12 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
                PartitionKey=event['user_id']
            )
            
-           if i %10 == 0:
+           if i % 10 == 0:
                print(f"Sent {i+1} events")
            
            time.sleep(0.1)
    
    if __name__ == '__main__':
-       import os
        generate_sample_events()
    EOF
    
@@ -578,16 +598,6 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    Amazon QuickSight provides business intelligence capabilities with automatic refresh features for real-time dashboards. By connecting QuickSight to the S3 bucket containing processed analytics data, you create interactive visualizations that update as new data arrives. The manifest file tells QuickSight exactly where to find the processed data and how to interpret the JSON format, enabling automatic dataset updates and real-time dashboard refresh capabilities.
 
    ```bash
-   # Provide instructions for QuickSight setup
-   # QuickSight configuration requires manual steps in the AWS Console
-   
-   echo "Setting up QuickSight data source..."
-   echo "Please complete the following steps in the AWS Console:"
-   echo "1. Go to QuickSight console"
-   echo "2. Create a new data source pointing to S3 bucket: ${S3_BUCKET_NAME}"
-   echo "3. Create a dataset from the analytics-results/ folder"
-   echo "4. Create a dashboard with real-time refresh enabled"
-   
    # Create a manifest file for QuickSight S3 data source configuration
    # This file tells QuickSight where to find the processed analytics data
    cat > quicksight-manifest.json << EOF
@@ -609,11 +619,20 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    aws s3 cp quicksight-manifest.json \
        s3://${S3_BUCKET_NAME}/quicksight-manifest.json
    
+   echo "Setting up QuickSight data source..."
+   echo "Complete the following steps in the AWS Console:"
+   echo "1. Go to QuickSight console at https://quicksight.aws.amazon.com/"
+   echo "2. Create a new data source pointing to S3"
+   echo "3. Use manifest location: s3://${S3_BUCKET_NAME}/quicksight-manifest.json"
+   echo "4. Create a dataset from the processed JSON data"
+   echo "5. Create a dashboard with real-time refresh enabled"
+   echo "6. Configure auto-refresh intervals (1-5 minutes recommended)"
+   
    echo "✅ Created QuickSight manifest file"
    echo "Manifest location: s3://${S3_BUCKET_NAME}/quicksight-manifest.json"
    ```
 
-   The QuickSight manifest configuration is now ready to enable automatic dataset discovery and refresh. This file enables QuickSight to automatically detect new analytics data as it arrives from the Flink processing pipeline, ensuring dashboards stay current with real-time metrics and provide up-to-the-minute business insights.
+   The QuickSight manifest configuration enables automatic dataset discovery and refresh capabilities. This file allows QuickSight to automatically detect new analytics data as it arrives from the Flink processing pipeline, ensuring dashboards stay current with real-time metrics and provide up-to-the-minute business insights. The manual setup in QuickSight console creates the final visualization layer for the streaming analytics pipeline.
 
 ## Validation & Testing
 
@@ -660,7 +679,7 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    aws s3 ls s3://${S3_BUCKET_NAME}/analytics-results/ --recursive
    
    # Download and examine sample processed files
-   aws s3 cp s3://${S3_BUCKET_NAME}/analytics-results/ . --recursive
+   aws s3 sync s3://${S3_BUCKET_NAME}/analytics-results/ ./analytics-results/
    head -5 analytics-results/*
    ```
 
@@ -673,7 +692,8 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    echo "1. Open your QuickSight dashboard"
    echo "2. Click 'Refresh' to update with latest data"
    echo "3. Verify that metrics update with new streaming data"
-   echo "4. Set up auto-refresh for real-time updates"
+   echo "4. Set up auto-refresh for real-time updates (1-5 minute intervals)"
+   echo "5. Monitor dashboard performance and data freshness"
    ```
 
 ## Cleanup
@@ -737,30 +757,38 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
    rm -f flink-app-config.json quicksight-manifest.json
    rm -f generate_sample_data.py
    rm -rf flink-analytics-app/
+   rm -rf analytics-results/
    
    echo "✅ Cleaned up IAM resources and local files"
    ```
 
 ## Discussion
 
-This real-time analytics solution demonstrates the power of combining managed streaming services to create scalable, low-latency analytics pipelines. Amazon Managed Service for Apache Flink provides the computational engine for complex stream processing, while Kinesis Data Streams handles high-throughput data ingestion with automatic scaling. The architecture separates concerns effectively: Kinesis handles ingestion, Flink processes and aggregates data, S3 provides durable storage, and QuickSight delivers interactive visualization.
+This real-time analytics solution demonstrates the power of combining managed streaming services to create scalable, low-latency analytics pipelines. Amazon Managed Service for Apache Flink provides the computational engine for complex stream processing, while Kinesis Data Streams handles high-throughput data ingestion with automatic scaling. The architecture separates concerns effectively: Kinesis handles ingestion, Flink processes and aggregates data, S3 provides durable storage, and QuickSight delivers interactive visualization. This follows AWS Well-Architected Framework principles by implementing operational excellence through automated monitoring, security through IAM roles and encryption, reliability through managed services and checkpointing, and cost optimization through serverless scaling.
 
-The solution's strength lies in its serverless nature and automatic scaling capabilities. Flink applications can process millions of events per second while automatically adjusting parallelism based on load. The windowing functions enable time-based aggregations essential for real-time metrics, while checkpointing ensures exactly-once processing guarantees. S3 integration provides both a data lake for historical analysis and a reliable source for QuickSight dashboards.
+The solution's strength lies in its serverless nature and automatic scaling capabilities. Flink applications can process millions of events per second while automatically adjusting parallelism based on load. The windowing functions enable time-based aggregations essential for real-time metrics, while checkpointing ensures exactly-once processing guarantees. S3 integration provides both a data lake for historical analysis and a reliable source for QuickSight dashboards. The architecture supports complex event processing patterns and can be extended with machine learning models for advanced analytics use cases.
 
-Cost optimization comes through several mechanisms: Flink's auto-scaling reduces compute costs during low-traffic periods, S3's lifecycle policies can archive older data to cheaper storage classes, and QuickSight's SPICE engine caches frequently accessed data to reduce query costs. The pay-per-use model means you only pay for actual data processing and storage consumption.
+Cost optimization comes through several mechanisms: Flink's auto-scaling reduces compute costs during low-traffic periods, S3's lifecycle policies can archive older data to cheaper storage classes, and QuickSight's SPICE engine caches frequently accessed data to reduce query costs. The pay-per-use model means you only pay for actual data processing and storage consumption. For production workloads, consider implementing data partitioning strategies, custom metrics for monitoring application health, and alert thresholds for operational visibility. The [AWS Managed Service for Apache Flink Developer Guide](https://docs.aws.amazon.com/managed-flink/latest/java/what-is.html) provides comprehensive guidance for advanced configurations and best practices.
 
-> **Tip**: Use Flink's watermarks and event-time processing for handling late-arriving data in production scenarios, and implement custom metrics to monitor application performance and data quality.
+> **Tip**: Use Flink's watermarks and event-time processing for handling late-arriving data in production scenarios, and implement custom metrics to monitor application performance and data quality. Consider implementing [complex event processing patterns](https://docs.aws.amazon.com/managed-flink/latest/java/how-creating-apps.html) for advanced business logic.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Advanced Analytics**: Add machine learning models using Flink ML to detect anomalies in real-time streaming data and trigger automated alerts
-2. **Multi-Source Integration**: Integrate additional data sources like DynamoDB Streams, CloudWatch Logs, and third-party APIs using Flink's connector ecosystem
-3. **Complex Event Processing**: Implement pattern detection using Flink CEP to identify complex business events across multiple data streams
-4. **Real-time Personalization**: Build a recommendation engine that updates user profiles in real-time based on streaming behavior data
-5. **Advanced Visualization**: Create custom QuickSight visuals with embedded analytics and implement real-time alerting based on dashboard thresholds
+1. **Advanced Analytics**: Add machine learning models using Flink ML to detect anomalies in real-time streaming data and trigger automated alerts through Amazon SNS
+2. **Multi-Source Integration**: Integrate additional data sources like DynamoDB Streams, CloudWatch Logs, and third-party APIs using Flink's connector ecosystem and build a unified data processing pipeline
+3. **Complex Event Processing**: Implement pattern detection using Flink CEP to identify complex business events across multiple data streams, such as fraud detection or user behavior analysis
+4. **Real-time Personalization**: Build a recommendation engine that updates user profiles in real-time based on streaming behavior data, integrating with Amazon Personalize for ML-driven recommendations
+5. **Advanced Visualization**: Create custom QuickSight visuals with embedded analytics, implement real-time alerting based on dashboard thresholds, and integrate with Amazon CloudWatch for comprehensive monitoring
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

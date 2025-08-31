@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: CloudFront, S3, Route 53, CloudWatch
 estimated-time: 150 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cloudfront, s3, cdn, content-delivery, networking
 recipe-generator-version: 1.3
 ---
 
 # Content Delivery Networks with CloudFront S3
-
 
 ## Problem
 
@@ -143,7 +142,7 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
 
 1. **Create sample content for testing**:
 
-   Creating diverse content types helps demonstrate CloudFront's caching behavior for different file types. This includes static HTML, CSS, JavaScript, and images which have different optimal caching strategies.
+   Creating diverse content types helps demonstrate CloudFront's caching behavior for different file types. This includes static HTML, CSS, JavaScript, and images which have different optimal caching strategies based on their update frequency and importance for performance.
 
    ```bash
    # Create sample HTML file
@@ -201,11 +200,11 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
    echo "✅ Created and uploaded sample content to S3"
    ```
 
-   These sample files establish the foundation for testing different caching strategies and performance optimizations. The HTML file represents dynamic content that may change frequently, while the CSS file represents static assets that can be cached for extended periods, demonstrating how CloudFront optimizes delivery for different content types.
+   These sample files establish the foundation for testing different caching strategies and performance optimizations. The HTML file represents dynamic content that may change frequently, while the CSS file represents static assets that can be cached for extended periods, demonstrating how CloudFront optimizes delivery for different content types through intelligent cache behaviors.
 
 2. **Create CloudFront Origin Access Control (OAC)**:
 
-   Origin Access Control (OAC) is the modern security mechanism that replaces the legacy Origin Access Identity (OAI). OAC provides better security by using AWS SigV4 authentication and supports all S3 features including server-side encryption with KMS. This enhanced security model ensures that S3 bucket access is properly restricted to only authorized CloudFront distributions, following AWS security best practices.
+   Origin Access Control (OAC) is AWS's modern security mechanism that replaces the legacy Origin Access Identity (OAI). OAC provides enhanced security by using AWS SigV4 authentication and supports all S3 features including server-side encryption with KMS, dynamic requests (PUT/DELETE), and all AWS Regions. This enhanced security model ensures that S3 bucket access is properly restricted to only authorized CloudFront distributions, following AWS security best practices.
 
    ```bash
    # Create OAC configuration
@@ -227,11 +226,11 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
    echo "✅ Created Origin Access Control: ${OAC_ID}"
    ```
 
-   The OAC ensures that only CloudFront can access your S3 bucket content, preventing direct access to your origin and improving security posture.
+   The OAC ensures that only CloudFront can access your S3 bucket content using secure, signed requests. This prevents direct access to your origin and improves security posture while maintaining compatibility with all S3 features including KMS encryption and cross-region replication.
 
 3. **Create CloudFront distribution configuration**:
 
-   This step creates a comprehensive distribution configuration that defines how CloudFront handles requests, caching behaviors, and security settings. The configuration includes multiple cache behaviors for different content types, each optimized for their specific use case.
+   This step creates a comprehensive distribution configuration that defines how CloudFront handles requests, caching behaviors, and security settings. The configuration includes multiple cache behaviors for different content types, each optimized for their specific use case, along with security enhancements and performance optimizations.
 
    ```bash
    # Create distribution configuration
@@ -253,7 +252,12 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
                    "S3OriginConfig": {
                        "OriginAccessIdentity": ""
                    },
-                   "OriginAccessControlId": "${OAC_ID}"
+                   "OriginAccessControlId": "${OAC_ID}",
+                   "ConnectionAttempts": 3,
+                   "ConnectionTimeout": 10,
+                   "OriginShield": {
+                       "Enabled": false
+                   }
                }
            ]
        },
@@ -352,11 +356,11 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
    echo "✅ Created CloudFront distribution configuration"
    ```
 
-   The configuration includes different TTL settings for various content types: HTML pages have shorter TTLs for dynamic updates, while CSS files have longer TTLs for better performance. The price class setting limits edge locations to US and Europe for cost optimization.
+   The configuration includes different TTL settings for various content types: HTML pages have shorter TTLs (1 day) for dynamic updates, while CSS files have longer TTLs (30 days) for better performance. The price class setting limits edge locations to US and Europe for cost optimization, and HTTP/2 is enabled for improved performance.
 
 4. **Create CloudFront distribution**:
 
-   This step creates the actual CloudFront distribution using the configuration defined in the previous step. CloudFront will provision edge locations worldwide and begin accepting traffic once deployment completes.
+   This step creates the actual CloudFront distribution using the configuration defined in the previous step. CloudFront will provision edge locations worldwide and begin accepting traffic once deployment completes. The distribution receives a unique domain name that can be used immediately for content delivery.
 
    ```bash
    # Create the distribution
@@ -373,11 +377,11 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
    echo "✅ Distribution domain: ${DISTRIBUTION_DOMAIN}"
    ```
 
-   The distribution ID and domain name are essential for subsequent configuration steps and testing. CloudFront assigns a unique domain name that can be used immediately for content delivery.
+   The distribution ID and domain name are essential for subsequent configuration steps and testing. CloudFront assigns a unique domain name that provides immediate global access to your content through the edge location network.
 
 5. **Configure S3 bucket policy for OAC access**:
 
-   The S3 bucket policy grants CloudFront permission to access objects in the bucket using the Origin Access Control. This policy ensures that only the specific CloudFront distribution can access the bucket content, preventing unauthorized direct access.
+   The S3 bucket policy grants CloudFront permission to access objects in the bucket using the Origin Access Control. This policy ensures that only the specific CloudFront distribution can access the bucket content using AWS SigV4-signed requests, preventing unauthorized direct access while maintaining the highest security standards.
 
    ```bash
    # Create bucket policy for OAC
@@ -411,11 +415,11 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
    echo "✅ Applied S3 bucket policy for OAC access"
    ```
 
-   The bucket policy uses the distribution ARN as a condition, ensuring that only requests from this specific CloudFront distribution are allowed. This provides granular access control and prevents other CloudFront distributions from accessing your content.
+   The bucket policy uses the distribution ARN as a condition, ensuring that only requests from this specific CloudFront distribution are allowed. This provides granular access control and prevents other CloudFront distributions from accessing your content, adhering to the principle of least privilege.
 
 6. **Wait for distribution deployment**:
 
-   CloudFront distribution deployment typically takes 10-15 minutes as AWS provisions edge locations worldwide and propagates the configuration. This wait is essential before testing the distribution to ensure all edge locations are ready.
+   CloudFront distribution deployment typically takes 10-15 minutes as AWS provisions edge locations worldwide and propagates the configuration. This wait is essential before testing the distribution to ensure all edge locations are ready and can serve cached content with optimal performance.
 
    ```bash
    # Wait for distribution to be deployed
@@ -428,11 +432,11 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
    echo "✅ CloudFront distribution deployed successfully"
    ```
 
-   Once deployment completes, all global edge locations will have the distribution configuration and can begin serving cached content to users with optimal performance.
+   Once deployment completes, all global edge locations will have the distribution configuration and can begin serving cached content to users with optimal performance. The distribution status changes from "InProgress" to "Deployed" when ready.
 
 7. **Configure CloudWatch alarms for monitoring**:
 
-   CloudWatch alarms provide proactive monitoring for your CDN by alerting when performance degrades or errors increase. These alarms help detect issues before they significantly impact user experience. CloudWatch integration with CloudFront enables comprehensive monitoring of distribution performance, error rates, and cache efficiency across all edge locations.
+   CloudWatch alarms provide proactive monitoring for your CDN by alerting when performance degrades or errors increase. These alarms help detect issues before they significantly impact user experience. CloudWatch integration with CloudFront enables comprehensive monitoring of distribution performance, error rates, and cache efficiency across all edge locations worldwide.
 
    ```bash
    # Create CloudWatch alarm for high error rate
@@ -461,17 +465,16 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
        --evaluation-periods 2 \
        --dimensions Name=DistributionId,Value=${DISTRIBUTION_ID}
    
-   
    echo "✅ Created CloudWatch alarms for distribution monitoring"
    ```
 
-   The error rate alarm triggers when 4xx errors exceed 5% average over two 5-minute periods, while the latency alarm triggers when origin response time exceeds 1000ms. These thresholds balance early warning with false positive prevention.
+   The error rate alarm triggers when 4xx errors exceed 5% average over two 5-minute periods, while the latency alarm triggers when origin response time exceeds 1000ms. These thresholds balance early warning with false positive prevention, ensuring actionable alerts for performance degradation.
 
    > **Tip**: Configure CloudWatch alarms with appropriate thresholds to balance between early warning and false positive alerts. See [CloudFront monitoring with CloudWatch documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/monitoring-using-cloudwatch.html) for comprehensive monitoring strategies.
 
 8. **Test cache invalidation functionality**:
 
-   Cache invalidation forces CloudFront to fetch fresh content from the origin for specified paths. This demonstrates how to update cached content when changes are made to the origin, though it should be used sparingly due to cost implications.
+   Cache invalidation forces CloudFront to fetch fresh content from the origin for specified paths. This demonstrates how to update cached content when changes are made to the origin, though it should be used sparingly due to cost implications and potential performance impact on cache hit rates.
 
    ```bash
    # Update the HTML file with new content
@@ -525,7 +528,7 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
 
 9. **Configure custom caching behaviors for different content types**:
 
-   Different content types benefit from different caching strategies. API responses typically have shorter cache durations than static assets, while images and documents can be cached for extended periods to maximize performance.
+   Different content types benefit from different caching strategies based on their update frequency and performance requirements. API responses typically have shorter cache durations than static assets, while images and documents can be cached for extended periods to maximize performance and reduce origin load.
 
    ```bash
    # Create additional content types for testing
@@ -550,11 +553,11 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
    echo "✅ Uploaded additional content types for cache behavior testing"
    ```
 
-   This diverse content allows testing of different cache behaviors defined in the distribution configuration. The API path will demonstrate shorter cache durations while the images path shows longer caching behavior.
+   This diverse content allows testing of different cache behaviors defined in the distribution configuration. The API path will demonstrate shorter cache durations while the images path shows longer caching behavior, illustrating how CloudFront optimizes content delivery based on path patterns and content types.
 
 10. **Set up performance monitoring dashboard**:
 
-    A CloudWatch dashboard provides centralized visibility into CloudFront performance metrics, enabling quick identification of traffic patterns, performance issues, and optimization opportunities.
+    A CloudWatch dashboard provides centralized visibility into CloudFront performance metrics, enabling quick identification of traffic patterns, performance issues, and optimization opportunities. The dashboard consolidates key metrics for comprehensive CDN monitoring and performance analysis.
 
     ```bash
     # Create CloudWatch dashboard
@@ -601,7 +604,7 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
     echo "✅ Created CloudWatch dashboard for performance monitoring"
     ```
 
-    The dashboard includes key metrics like request counts, error rates, cache hit ratios, and origin latency. These metrics provide insights for optimizing cache policies and identifying performance bottlenecks.
+    The dashboard includes key metrics like request counts, error rates, cache hit ratios, and origin latency. These metrics provide insights for optimizing cache policies and identifying performance bottlenecks, enabling data-driven decisions for CDN optimization.
 
 ## Validation & Testing
 
@@ -622,7 +625,7 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
    fi
    ```
 
-   Expected output: HTTP/2 200 status with CloudFront headers
+   Expected output: HTTP/2 200 status with CloudFront headers including X-Cache and X-Amz-Cf-Id
 
 2. **Test cache behavior for different content types**:
 
@@ -792,30 +795,37 @@ echo "✅ Created S3 buckets: ${BUCKET_NAME} and ${LOGS_BUCKET_NAME}"
 
 ## Discussion
 
-Amazon CloudFront provides a powerful global content delivery network that significantly improves web application performance and reduces operational costs. This implementation demonstrates key CDN concepts including edge caching, origin security, and performance optimization. The Origin Access Control (OAC) feature represents AWS's recommended approach for securing S3 origins, replacing the older Origin Access Identity (OAI) with better security and broader feature support.
+Amazon CloudFront provides a powerful global content delivery network that significantly improves web application performance and reduces operational costs. This implementation demonstrates key CDN concepts including edge caching, origin security, and performance optimization. The Origin Access Control (OAC) feature represents AWS's recommended approach for securing S3 origins, replacing the older Origin Access Identity (OAI) with better security, broader feature support, and enhanced compatibility with modern S3 features.
 
-The cache behavior configuration is crucial for optimizing performance and costs. Different content types require different caching strategies - static assets like CSS and images benefit from longer cache durations, while dynamic content may need shorter TTLs or conditional caching. The price class setting allows cost optimization by limiting edge locations to specific regions based on your user base geography.
+The cache behavior configuration is crucial for optimizing performance and costs. Different content types require different caching strategies - static assets like CSS and images benefit from longer cache durations (30 days), while dynamic content may need shorter TTLs (1 day) or conditional caching. The price class setting allows cost optimization by limiting edge locations to specific regions based on your user base geography, balancing performance with cost considerations.
 
-CloudWatch integration provides essential monitoring capabilities for production deployments. Key metrics include cache hit rates, origin latency, error rates, and bandwidth usage. Setting up alarms for critical thresholds ensures proactive monitoring and quick response to performance issues. The dashboard provides a centralized view of CDN performance across all metrics.
+CloudWatch integration provides essential monitoring capabilities for production deployments. Key metrics include cache hit rates, origin latency, error rates, and bandwidth usage. Setting up alarms for critical thresholds ensures proactive monitoring and quick response to performance issues. The dashboard provides a centralized view of CDN performance across all metrics, enabling data-driven optimization decisions. According to AWS best practices documented in the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html), monitoring and observability are fundamental to maintaining high-performing applications.
 
-Security considerations extend beyond origin access control. CloudFront integrates with AWS WAF for application-layer protection, supports SSL/TLS termination, and provides geographic restrictions for content compliance. The HTTPS redirect policy ensures secure content delivery while maintaining performance through HTTP/2 support.
+Security considerations extend beyond origin access control. CloudFront integrates with AWS WAF for application-layer protection, supports SSL/TLS termination, and provides geographic restrictions for content compliance. The HTTPS redirect policy ensures secure content delivery while maintaining performance through HTTP/2 support and modern TLS protocols.
 
-> **Tip**: Monitor cache hit rates regularly. Low cache hit rates may indicate suboptimal cache behaviors or excessive cache invalidations, both of which increase costs and reduce performance.
+> **Tip**: Monitor cache hit rates regularly. Low cache hit rates may indicate suboptimal cache behaviors or excessive cache invalidations, both of which increase costs and reduce performance. Aim for cache hit rates above 85% for optimal cost and performance benefits.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Custom Domain with SSL Certificate**: Configure a custom domain name using Route 53 and AWS Certificate Manager for branded URLs and enhanced security.
+1. **Custom Domain with SSL Certificate**: Configure a custom domain name using Route 53 and AWS Certificate Manager for branded URLs and enhanced security with custom SSL certificates.
 
-2. **Lambda@Edge Functions**: Implement Lambda@Edge functions for dynamic content modification, A/B testing, or request/response manipulation at edge locations.
+2. **Lambda@Edge Functions**: Implement Lambda@Edge functions for dynamic content modification, A/B testing, request/response manipulation at edge locations, or user authentication.
 
-3. **Multi-Origin Configuration**: Set up multiple origins (S3, ALB, API Gateway) with different cache behaviors and failover configurations for a complete web application.
+3. **Multi-Origin Configuration**: Set up multiple origins (S3, ALB, API Gateway) with different cache behaviors and failover configurations for a complete web application architecture.
 
-4. **Advanced Security**: Integrate AWS WAF with custom rules, implement signed URLs for premium content, and configure geographic restrictions based on compliance requirements.
+4. **Advanced Security**: Integrate AWS WAF with custom rules, implement signed URLs for premium content, configure geographic restrictions based on compliance requirements, and add rate limiting.
 
-5. **Performance Optimization**: Implement HTTP/2 server push, configure compression settings, and set up real-time logs for detailed performance analysis and optimization.
+5. **Performance Optimization**: Implement HTTP/2 server push, configure compression settings, set up real-time logs for detailed performance analysis, and optimize cache policies based on access patterns.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

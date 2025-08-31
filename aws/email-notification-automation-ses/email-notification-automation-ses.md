@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: SES, Lambda, EventBridge, CloudWatch
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: serverless, event-driven, email-automation, notifications, ses, lambda, eventbridge
 recipe-generator-version: 1.3
@@ -229,7 +229,7 @@ echo "✅ AWS environment configured with project: ${PROJECT_NAME}"
    }
    EOF
    
-   # Create the template in SES (using v1 API)
+   # Create the template in SES
    aws ses create-template \
        --template file://email-template.json \
        --region ${AWS_REGION}
@@ -250,7 +250,7 @@ echo "✅ AWS environment configured with project: ${PROJECT_NAME}"
 
 4. **Create Lambda Function for Email Processing**:
 
-   AWS Lambda provides serverless compute that automatically scales based on incoming events from EventBridge. This function processes events, formats email content, and sends notifications through SES with comprehensive error handling and logging capabilities.
+   AWS Lambda provides serverless compute that automatically scales based on incoming events from EventBridge. This function processes events, formats email content, and sends notifications through SES with comprehensive error handling and logging capabilities. We're using Python 3.12 as the current recommended runtime version.
 
    ```bash
    # Create Lambda function code
@@ -326,10 +326,10 @@ echo "✅ AWS environment configured with project: ${PROJECT_NAME}"
    # Upload to S3
    aws s3 cp function.zip s3://lambda-deployment-${PROJECT_NAME}/
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-email-processor \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-lambda-role \
        --handler email_processor.lambda_handler \
        --code S3Bucket=lambda-deployment-${PROJECT_NAME},S3Key=function.zip \
@@ -459,6 +459,7 @@ echo "✅ AWS environment configured with project: ${PROJECT_NAME}"
        --period 300 \
        --threshold 1 \
        --comparison-operator GreaterThanOrEqualToThreshold \
+       --treat-missing-data notBreaching \
        --evaluation-periods 1 \
        --dimensions Name=FunctionName,Value=${PROJECT_NAME}-email-processor
    
@@ -472,6 +473,7 @@ echo "✅ AWS environment configured with project: ${PROJECT_NAME}"
        --period 300 \
        --threshold 5 \
        --comparison-operator GreaterThanOrEqualToThreshold \
+       --treat-missing-data notBreaching \
        --evaluation-periods 2
    
    # Wait for Lambda log group to be created
@@ -694,11 +696,11 @@ This event-driven email automation system demonstrates the power of serverless a
 
 The use of EventBridge as the central event router provides several key advantages. First, it decouples event producers from consumers, allowing multiple systems to publish events without knowing about downstream processors. Second, it enables flexible event filtering and routing based on content, source, or other attributes. Third, it provides built-in retry mechanisms and dead letter queue support for handling failures gracefully. This design pattern is particularly valuable for microservices architectures where different services need to communicate asynchronously.
 
-Amazon SES integration provides enterprise-grade email delivery capabilities with features like bounce and complaint handling, reputation management, and sending statistics. The template-based approach enables consistent branding and personalization while reducing payload sizes and improving performance. SES also provides built-in security features like DKIM signing and SPF validation, which are essential for maintaining email deliverability in production environments.
+Amazon SES integration provides enterprise-grade email delivery capabilities with features like bounce and complaint handling, reputation management, and sending statistics. The template-based approach enables consistent branding and personalization while reducing payload sizes and improving performance. SES also provides built-in security features like DKIM signing and SPF validation, which are essential for maintaining email deliverability in production environments. For new implementations, consider using the SES v2 API for enhanced features and better performance, though the v1 API used in this recipe remains fully supported.
 
-The serverless nature of this solution offers significant operational benefits. Lambda functions automatically scale based on demand, eliminating the need for capacity planning and server management. CloudWatch provides comprehensive monitoring and logging capabilities that enable proactive issue detection and performance optimization. The pay-per-use pricing model ensures cost efficiency, especially for workloads with unpredictable or variable traffic patterns.
+The serverless nature of this solution offers significant operational benefits. Lambda functions automatically scale based on demand, eliminating the need for capacity planning and server management. We're using Python 3.12 runtime, which provides the latest security updates and performance improvements while maintaining long-term support until 2028. CloudWatch provides comprehensive monitoring and logging capabilities that enable proactive issue detection and performance optimization. The pay-per-use pricing model ensures cost efficiency, especially for workloads with unpredictable or variable traffic patterns.
 
-> **Tip**: For production deployments, consider implementing additional features like email throttling, recipient list management, and advanced template personalization using SES configuration sets and custom tracking domains.
+> **Tip**: For production deployments, consider implementing additional features like email throttling, recipient list management, and advanced template personalization using SES configuration sets and custom tracking domains. Also consider upgrading to SES v2 API for enhanced features and better performance.
 
 For more information about implementing event-driven architectures with AWS services, see the [AWS Lambda Event-Driven Architecture Guide](https://docs.aws.amazon.com/lambda/latest/dg/concepts-event-driven-architectures.html), [Amazon EventBridge User Guide](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-what-is.html), [Amazon SES Developer Guide](https://docs.aws.amazon.com/ses/latest/dg/Welcome.html), [SES EventBridge Integration Documentation](https://docs.aws.amazon.com/ses/latest/dg/monitoring-eventbridge.html), and [AWS Well-Architected Serverless Applications Lens](https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/welcome.html).
 
@@ -706,7 +708,7 @@ For more information about implementing event-driven architectures with AWS serv
 
 Extend this solution by implementing these enhancements:
 
-1. **Advanced Template Management**: Create a template management system that supports A/B testing, version control, and dynamic template selection based on recipient preferences or event types.
+1. **Advanced Template Management**: Create a template management system that supports A/B testing, version control, and dynamic template selection based on recipient preferences or event types using SES v2 API capabilities.
 
 2. **Multi-Channel Notifications**: Extend the system to support SMS, push notifications, and Slack integrations alongside email, using Amazon SNS and additional Lambda functions with unified event routing.
 
@@ -718,4 +720,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

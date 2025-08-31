@@ -1,0 +1,546 @@
+# Infrastructure Manager Configuration for MongoDB to Firestore Migration
+# Recipe: MongoDB to Firestore Migration with API Compatibility
+# This configuration deploys all necessary GCP resources for migrating from MongoDB to Firestore
+# with API compatibility layers and automated migration pipelines
+
+metadata:
+  name: mongodb-firestore-migration
+  description: "Complete infrastructure for MongoDB to Firestore migration with compatibility layers"
+  labels:
+    recipe-id: "4f8e2a1c"
+    category: "database"
+    difficulty: "200"
+    provider: "gcp"
+
+# Input variables for customization
+variables:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    type: string
+    default: "mongodb-migration-demo"
+    
+  - name: region
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+    
+  - name: zone
+    description: "Google Cloud zone for compute resources"
+    type: string
+    default: "us-central1-a"
+    
+  - name: environment
+    description: "Environment tag for resources (dev, staging, prod)"
+    type: string
+    default: "dev"
+    
+  - name: mongodb_connection_string
+    description: "MongoDB connection string (will be stored in Secret Manager)"
+    type: string
+    sensitive: true
+    
+  - name: enable_apis
+    description: "Whether to enable required APIs (set to false if already enabled)"
+    type: boolean
+    default: true
+
+# Resource configurations
+resources:
+  # Enable required Google Cloud APIs
+  - name: firestore-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-config.projectId)/services/firestore.googleapis.com
+      parent: projects/$(ref.project-config.projectId)
+    metadata:
+      dependsOn:
+        - project-config
+    condition: $(ref.enable-apis-condition.result)
+
+  - name: functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-config.projectId)/services/cloudfunctions.googleapis.com
+      parent: projects/$(ref.project-config.projectId)
+    metadata:
+      dependsOn:
+        - project-config
+    condition: $(ref.enable-apis-condition.result)
+
+  - name: build-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-config.projectId)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project-config.projectId)
+    metadata:
+      dependsOn:
+        - project-config
+    condition: $(ref.enable-apis-condition.result)
+
+  - name: secretmanager-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-config.projectId)/services/secretmanager.googleapis.com
+      parent: projects/$(ref.project-config.projectId)
+    metadata:
+      dependsOn:
+        - project-config
+    condition: $(ref.enable-apis-condition.result)
+
+  - name: logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-config.projectId)/services/logging.googleapis.com
+      parent: projects/$(ref.project-config.projectId)
+    metadata:
+      dependsOn:
+        - project-config
+    condition: $(ref.enable-apis-condition.result)
+
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-config.projectId)/services/monitoring.googleapis.com
+      parent: projects/$(ref.project-config.projectId)
+    metadata:
+      dependsOn:
+        - project-config
+    condition: $(ref.enable-apis-condition.result)
+
+  # Project configuration reference
+  - name: project-config
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(var.project_id)
+    accessControl:
+      gcpIamPolicy:
+        bindings:
+          - role: roles/owner
+            members:
+              - serviceAccount:$(ref.default-compute-sa.email)
+
+  # Default Compute Engine service account for Cloud Functions
+  - name: default-compute-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      parent: projects/$(ref.project-config.projectId)
+      accountId: compute-engine-default
+      serviceAccount:
+        displayName: "Default Compute Engine Service Account"
+        description: "Default service account for Compute Engine and Cloud Functions"
+    metadata:
+      dependsOn:
+        - project-config
+
+  # Firestore Database in Native Mode
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/$(ref.project-config.projectId)
+      databaseId: "(default)"
+      database:
+        type: FIRESTORE_NATIVE
+        locationId: $(var.region)
+        concurrencyMode: OPTIMISTIC
+        appEngineIntegrationMode: DISABLED
+        pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+        deleteProtectionState: DELETE_PROTECTION_DISABLED
+    metadata:
+      dependsOn:
+        - firestore-api
+        - project-config
+
+  # Secret Manager Secret for MongoDB Connection String
+  - name: mongodb-connection-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/$(ref.project-config.projectId)
+      secretId: mongodb-connection-string
+      secret:
+        labels:
+          purpose: "mongodb-migration"
+          environment: $(var.environment)
+        replication:
+          automatic: {}
+    metadata:
+      dependsOn:
+        - secretmanager-api
+        - project-config
+
+  # MongoDB Connection String Secret Version
+  - name: mongodb-connection-secret-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: $(ref.mongodb-connection-secret.name)
+      secret_data: $(var.mongodb_connection_string)
+    metadata:
+      dependsOn:
+        - mongodb-connection-secret
+
+  # IAM binding for Cloud Functions to access secrets
+  - name: secret-accessor-binding
+    type: gcp-types/secretmanager-v1:projects.secrets.iam
+    properties:
+      resource: $(ref.mongodb-connection-secret.name)
+      policy:
+        bindings:
+          - role: roles/secretmanager.secretAccessor
+            members:
+              - serviceAccount:$(ref.project-config.projectId)@appspot.gserviceaccount.com
+              - serviceAccount:$(ref.default-compute-sa.email)
+    metadata:
+      dependsOn:
+        - mongodb-connection-secret
+        - default-compute-sa
+
+  # Cloud Storage bucket for Cloud Functions source code
+  - name: functions-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.project-config.projectId)-functions-source
+      project: $(ref.project-config.projectId)
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30  # Delete old versions after 30 days
+      labels:
+        purpose: "function-source-code"
+        environment: $(var.environment)
+    metadata:
+      dependsOn:
+        - project-config
+
+  # Cloud Storage bucket for migration logs and artifacts
+  - name: migration-artifacts-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.project-config.projectId)-migration-artifacts
+      project: $(ref.project-config.projectId)
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30  # Move to Nearline after 30 days
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90  # Move to Coldline after 90 days
+      labels:
+        purpose: "migration-artifacts"
+        environment: $(var.environment)
+    metadata:
+      dependsOn:
+        - project-config
+
+  # Migration Cloud Function (Generation 2)
+  - name: migration-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project-config.projectId)/locations/$(var.region)
+      functionId: migrate-mongodb-collection
+      function:
+        description: "Function to migrate MongoDB collections to Firestore"
+        environment: GEN_2
+        buildConfig:
+          runtime: python312
+          entryPoint: migrate_collection
+          source:
+            storageSource:
+              bucket: $(ref.functions-source-bucket.name)
+              object: migration-function-source.zip
+          environmentVariables:
+            GCP_PROJECT: $(ref.project-config.projectId)
+        serviceConfig:
+          maxInstanceCount: 10
+          minInstanceCount: 0
+          availableMemory: 512Mi
+          timeoutSeconds: 540
+          maxInstanceRequestConcurrency: 1
+          availableCpu: "1"
+          environmentVariables:
+            GCP_PROJECT: $(ref.project-config.projectId)
+            LOG_EXECUTION_ID: "true"
+          ingressSettings: ALLOW_ALL
+          serviceAccountEmail: $(ref.project-config.projectId)@appspot.gserviceaccount.com
+        labels:
+          purpose: "mongodb-migration"
+          environment: $(var.environment)
+    metadata:
+      dependsOn:
+        - functions-api
+        - firestore-database
+        - mongodb-connection-secret-version
+        - functions-source-bucket
+        - secret-accessor-binding
+
+  # Compatibility API Cloud Function (Generation 2)
+  - name: compatibility-api-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project-config.projectId)/locations/$(var.region)
+      functionId: mongo-compatibility-api
+      function:
+        description: "MongoDB-compatible API layer for Firestore"
+        environment: GEN_2
+        buildConfig:
+          runtime: python312
+          entryPoint: mongo_api_compatibility
+          source:
+            storageSource:
+              bucket: $(ref.functions-source-bucket.name)
+              object: compatibility-api-source.zip
+        serviceConfig:
+          maxInstanceCount: 100
+          minInstanceCount: 0
+          availableMemory: 256Mi
+          timeoutSeconds: 60
+          maxInstanceRequestConcurrency: 10
+          availableCpu: "0.5"
+          ingressSettings: ALLOW_ALL
+          serviceAccountEmail: $(ref.project-config.projectId)@appspot.gserviceaccount.com
+        labels:
+          purpose: "mongodb-compatibility"
+          environment: $(var.environment)
+    metadata:
+      dependsOn:
+        - functions-api
+        - firestore-database
+        - functions-source-bucket
+
+  # IAM policy to allow unauthenticated invocations of migration function
+  - name: migration-function-invoker
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions.iam
+    properties:
+      resource: $(ref.migration-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - migration-function
+
+  # IAM policy to allow unauthenticated invocations of compatibility API
+  - name: compatibility-api-invoker
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions.iam
+    properties:
+      resource: $(ref.compatibility-api-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - compatibility-api-function
+
+  # Cloud Build Trigger for automated migration pipeline
+  - name: migration-build-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      parent: projects/$(ref.project-config.projectId)
+      trigger:
+        name: mongodb-migration-pipeline
+        description: "Automated MongoDB to Firestore migration pipeline"
+        disabled: false
+        substitutions:
+          _REGION: $(var.region)
+          _PROJECT_ID: $(ref.project-config.projectId)
+        github:
+          owner: "your-github-username"  # Replace with actual GitHub username
+          name: "your-repo-name"         # Replace with actual repository name
+          push:
+            branch: "^main$"
+        filename: cloudbuild.yaml
+        includedFiles:
+          - "migration/**"
+        tags:
+          - "mongodb-migration"
+          - $(var.environment)
+    metadata:
+      dependsOn:
+        - build-api
+        - project-config
+
+  # Log sink for migration function logs
+  - name: migration-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/$(ref.project-config.projectId)
+      sinkId: migration-function-logs
+      sink:
+        name: migration-function-logs
+        description: "Log sink for MongoDB migration function"
+        destination: storage.googleapis.com/$(ref.migration-artifacts-bucket.name)/logs
+        filter: |
+          resource.type="cloud_function"
+          resource.labels.function_name="migrate-mongodb-collection"
+        includeChildren: true
+    metadata:
+      dependsOn:
+        - logging-api
+        - migration-artifacts-bucket
+        - migration-function
+
+  # Log sink for compatibility API logs
+  - name: compatibility-api-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/$(ref.project-config.projectId)
+      sinkId: compatibility-api-logs
+      sink:
+        name: compatibility-api-logs
+        description: "Log sink for MongoDB compatibility API"
+        destination: storage.googleapis.com/$(ref.migration-artifacts-bucket.name)/logs
+        filter: |
+          resource.type="cloud_function"
+          resource.labels.function_name="mongo-compatibility-api"
+        includeChildren: true
+    metadata:
+      dependsOn:
+        - logging-api
+        - migration-artifacts-bucket
+        - compatibility-api-function
+
+  # Cloud Monitoring Alert Policy for failed migrations
+  - name: migration-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project-config.projectId)
+      alertPolicy:
+        displayName: "MongoDB Migration Failure Alert"
+        documentation:
+          content: "Alert when MongoDB migration function encounters errors"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Migration function error rate"
+            conditionThreshold:
+              filter: |
+                resource.type="cloud_function"
+                resource.labels.function_name="migrate-mongodb-collection"
+                severity>=ERROR
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.1
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        enabled: true
+        combiner: OR
+        notificationChannels: []  # Add notification channels as needed
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - migration-function
+
+  # Cloud Monitoring Alert Policy for API performance
+  - name: api-performance-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project-config.projectId)
+      alertPolicy:
+        displayName: "Compatibility API Performance Alert"
+        documentation:
+          content: "Alert when compatibility API response time exceeds threshold"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "API response time"
+            conditionThreshold:
+              filter: |
+                resource.type="cloud_function"
+                resource.labels.function_name="mongo-compatibility-api"
+                metric.type="cloudfunctions.googleapis.com/function/execution_time"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5000  # 5 seconds
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_MEAN
+        enabled: true
+        combiner: OR
+        notificationChannels: []  # Add notification channels as needed
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - compatibility-api-function
+
+# Conditional logic
+conditions:
+  - name: enable-apis-condition
+    description: "Condition to enable APIs based on variable"
+    expression: $(var.enable_apis)
+
+# Outputs for verification and integration
+outputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    value: $(ref.project-config.projectId)
+
+  - name: firestore_database_name
+    description: "Firestore database resource name"
+    value: $(ref.firestore-database.name)
+
+  - name: migration_function_url
+    description: "URL of the migration Cloud Function"
+    value: $(ref.migration-function.serviceConfig.uri)
+
+  - name: compatibility_api_url
+    description: "URL of the compatibility API Cloud Function"
+    value: $(ref.compatibility-api-function.serviceConfig.uri)
+
+  - name: mongodb_secret_name
+    description: "Secret Manager secret name for MongoDB connection"
+    value: $(ref.mongodb-connection-secret.name)
+
+  - name: functions_source_bucket
+    description: "Cloud Storage bucket for function source code"
+    value: $(ref.functions-source-bucket.name)
+
+  - name: migration_artifacts_bucket
+    description: "Cloud Storage bucket for migration artifacts and logs"
+    value: $(ref.migration-artifacts-bucket.name)
+
+  - name: build_trigger_id
+    description: "Cloud Build trigger ID for migration pipeline"
+    value: $(ref.migration-build-trigger.triggerId)
+
+  - name: deployment_region
+    description: "Deployment region for resources"
+    value: $(var.region)
+
+  - name: deployment_zone
+    description: "Deployment zone for compute resources"
+    value: $(var.zone)
+
+  - name: environment_tag
+    description: "Environment tag applied to resources"
+    value: $(var.environment)
+
+# Resource labeling for cost tracking and management
+labels:
+  recipe-id: "4f8e2a1c"
+  category: "database"
+  provider: "gcp"
+  difficulty: "200"
+  purpose: "mongodb-migration"
+  managed-by: "infrastructure-manager"

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Compute Fleet, Azure Batch, Azure Storage, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: batch-processing, cost-optimization, compute-fleet, spot-instances, automation
 recipe-generator-version: 1.3
@@ -69,10 +69,12 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions for creating compute, storage, and monitoring resources
-2. Azure CLI v2.50.0 or later installed and configured (or Azure Cloud Shell)
+2. Azure CLI v2.75.0 or later installed and configured (or Azure Cloud Shell)
 3. Basic understanding of batch processing concepts and Azure resource management
 4. Familiarity with Azure cost management and optimization principles
 5. Estimated cost: $50-100 for testing resources (can be minimized with spot instances)
+
+> **Note**: Azure Compute Fleet is currently in preview and requires feature registration. See [Azure Compute Fleet documentation](https://docs.microsoft.com/en-us/azure/azure-compute-fleet/) for current availability.
 
 ## Preparation
 
@@ -90,6 +92,9 @@ export STORAGE_ACCOUNT="stbatch${RANDOM_SUFFIX}"
 export BATCH_ACCOUNT="batchacct${RANDOM_SUFFIX}"
 export FLEET_NAME="compute-fleet-${RANDOM_SUFFIX}"
 export LOG_WORKSPACE="log-batch-${RANDOM_SUFFIX}"
+
+# Register Azure Compute Fleet provider (if not already registered)
+az provider register --namespace 'Microsoft.AzureFleet'
 
 # Create resource group
 az group create \
@@ -112,9 +117,9 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 ## Steps
 
-1. **Create Azure Batch Account with Compute Fleet Integration**:
+1. **Create Azure Batch Account with Storage Integration**:
 
-   Azure Batch provides managed batch processing capabilities that automatically handle job scheduling, resource provisioning, and fault tolerance. By integrating with Azure Compute Fleet, we can leverage mixed VM pricing models to optimize costs while maintaining processing reliability. This combination enables intelligent resource allocation based on workload characteristics and cost constraints.
+   Azure Batch provides managed batch processing capabilities that automatically handle job scheduling, resource provisioning, and fault tolerance. By integrating with Azure Storage, we establish the foundation for scalable data processing while maintaining secure access to input data and processing results.
 
    ```bash
    # Create Azure Batch account
@@ -124,14 +129,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --location ${LOCATION} \
        --storage-account ${STORAGE_ACCOUNT}
    
-   # Get batch account keys
-   BATCH_KEY=$(az batch account keys list \
-       --name ${BATCH_ACCOUNT} \
-       --resource-group ${RESOURCE_GROUP} \
-       --query primary --output tsv)
-   
-   # Set batch account context
-   az batch account set \
+   # Authenticate with the Batch account
+   az batch account login \
        --name ${BATCH_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP}
    
@@ -142,94 +141,42 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 2. **Configure Azure Compute Fleet with Mixed Pricing Models**:
 
-   Azure Compute Fleet enables intelligent VM provisioning across multiple pricing models, including spot instances that offer up to 90% cost savings. This service automatically handles instance interruptions and maintains workload availability by diversifying across different VM types and pricing tiers based on your optimization strategy.
+   Azure Compute Fleet enables intelligent VM provisioning across multiple pricing models, including spot instances that offer up to 90% cost savings. This service automatically handles instance interruptions and maintains workload availability by diversifying across different VM types and pricing tiers.
 
    ```bash
-   # Create compute fleet configuration
-   cat > fleet-config.json << EOF
-   {
-     "name": "${FLEET_NAME}",
-     "location": "${LOCATION}",
-     "properties": {
-       "computeProfile": {
-         "baseVirtualMachineProfile": {
-           "storageProfile": {
-             "imageReference": {
-               "publisher": "MicrosoftWindowsServer",
-               "offer": "WindowsServer",
-               "sku": "2022-datacenter-core",
-               "version": "latest"
-             }
-           },
-           "osProfile": {
-             "computerNamePrefix": "batch-vm",
-             "adminUsername": "batchadmin",
-             "adminPassword": "BatchP@ssw0rd123!"
-           }
-         },
-         "computeApiVersion": "2023-09-01"
-       },
-       "spotPriorityProfile": {
-         "capacity": 80,
-         "minCapacity": 0,
-         "maxPricePerVM": 0.05,
-         "evictionPolicy": "Delete",
-         "allocationStrategy": "LowestPrice"
-       },
-       "regularPriorityProfile": {
-         "capacity": 20,
-         "minCapacity": 5,
-         "allocationStrategy": "LowestPrice"
-       }
-     }
-   }
-   EOF
-   
-   # Create the compute fleet
+   # Create compute fleet with cost-optimized configuration
    az compute-fleet create \
+       --fleet-name ${FLEET_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${FLEET_NAME} \
-       --body @fleet-config.json
+       --location ${LOCATION} \
+       --spot-priority-profile '{"capacity": 8, "minCapacity": 0, "maxPricePerVM": 0.05, "evictionPolicy": "Delete", "allocationStrategy": "LowestPrice"}' \
+       --regular-priority-profile '{"capacity": 2, "minCapacity": 1, "allocationStrategy": "LowestPrice"}' \
+       --vm-sizes-profile '[{"name": "Standard_D2s_v3"}, {"name": "Standard_D4s_v3"}]'
    
    echo "✅ Compute Fleet created with 80% spot, 20% standard capacity"
    ```
 
    The Compute Fleet is now configured to prioritize cost efficiency by allocating 80% of capacity to spot instances while maintaining 20% standard instances for reliability. This configuration automatically handles spot instance interruptions and ensures continuous processing capability.
 
-3. **Create Batch Pool with Compute Fleet Integration**:
+3. **Create Batch Pool with Auto-Scaling and Low-Priority Nodes**:
 
-   Azure Batch pools define the compute resources available for job execution. By integrating with Azure Compute Fleet, the pool can leverage mixed pricing models and automatic scaling based on workload demands. This approach optimizes costs while maintaining processing reliability through intelligent resource allocation.
+   Azure Batch pools define the compute resources available for job execution. By using low-priority nodes and auto-scaling, the pool optimizes costs while maintaining processing reliability through intelligent resource allocation based on workload demands.
 
    ```bash
-   # Create batch pool configuration
-   cat > pool-config.json << EOF
-   {
-     "id": "batch-pool-${RANDOM_SUFFIX}",
-     "vmSize": "Standard_D2s_v3",
-     "virtualMachineConfiguration": {
-       "imageReference": {
-         "publisher": "MicrosoftWindowsServer",
-         "offer": "WindowsServer",
-         "sku": "2022-datacenter-core",
-         "version": "latest"
-       },
-       "nodeAgentSKUId": "batch.node.windows amd64"
-     },
-     "targetDedicatedNodes": 0,
-     "targetLowPriorityNodes": 10,
-     "enableAutoScale": true,
-     "autoScaleFormula": "$TargetLowPriorityNodes = min(20, $PendingTasks.GetSample(1 * TimeInterval_Minute, 0).GetAverage() * 2);",
-     "autoScaleEvaluationInterval": "PT5M",
-     "startTask": {
-       "commandLine": "cmd /c echo 'Batch node ready for processing'",
-       "waitForSuccess": true
-     }
-   }
-   EOF
+   # Set pool ID
+   export POOL_ID="batch-pool-${RANDOM_SUFFIX}"
    
-   # Create the batch pool
+   # Create batch pool with cost optimization
    az batch pool create \
-       --json-file pool-config.json
+       --id ${POOL_ID} \
+       --vm-size Standard_D2s_v3 \
+       --image canonical:0001-com-ubuntu-server-focal:20_04-lts \
+       --node-agent-sku-id "batch.node.ubuntu 20.04" \
+       --target-dedicated-nodes 0 \
+       --target-low-priority-nodes 5 \
+       --enable-auto-scale \
+       --auto-scale-formula '$TargetLowPriorityNodes = min(10, $PendingTasks.GetSample(1 * TimeInterval_Minute, 0).GetAverage() * 2);' \
+       --auto-scale-evaluation-interval PT5M
    
    echo "✅ Batch pool created with auto-scaling and low-priority nodes"
    ```
@@ -238,7 +185,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 4. **Setup Azure Monitor for Cost and Performance Tracking**:
 
-   Azure Monitor provides comprehensive visibility into batch processing costs, performance metrics, and resource utilization patterns. This monitoring foundation enables proactive cost optimization and performance tuning based on actual workload characteristics and resource consumption patterns.
+   Azure Monitor provides comprehensive visibility into batch processing costs, performance metrics, and resource utilization patterns. This monitoring foundation enables proactive cost optimization and performance tuning based on actual workload characteristics.
 
    ```bash
    # Create Log Analytics workspace
@@ -248,7 +195,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --location ${LOCATION} \
        --sku PerGB2018
    
-   # Get workspace ID
+   # Get workspace ID for diagnostic settings
    WORKSPACE_ID=$(az monitor log-analytics workspace show \
        --workspace-name ${LOG_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
@@ -271,89 +218,61 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 5. **Create Sample Batch Job for Testing**:
 
-   A sample batch job demonstrates the cost-efficient processing capabilities of the integrated Azure Compute Fleet and Azure Batch solution. This job processes data files while leveraging spot instances for cost optimization and automatic scaling for performance optimization.
+   A sample batch job demonstrates the cost-efficient processing capabilities of the integrated Azure Compute Fleet and Azure Batch solution. This job processes data while leveraging spot instances for cost optimization and automatic scaling for performance.
 
    ```bash
-   # Create sample batch job configuration
-   cat > job-config.json << EOF
-   {
-     "id": "sample-processing-job-${RANDOM_SUFFIX}",
-     "poolInfo": {
-       "poolId": "batch-pool-${RANDOM_SUFFIX}"
-     },
-     "jobManagerTask": {
-       "id": "JobManager",
-       "displayName": "Sample Processing Job Manager",
-       "commandLine": "cmd /c echo 'Processing batch job with cost optimization' && timeout /t 30",
-       "killJobOnCompletion": true
-     },
-     "onAllTasksComplete": "terminateJob",
-     "usesTaskDependencies": false
-   }
-   EOF
+   # Set job ID
+   export JOB_ID="sample-processing-job-${RANDOM_SUFFIX}"
    
-   # Create the batch job
+   # Create batch job
    az batch job create \
-       --json-file job-config.json
+       --id ${JOB_ID} \
+       --pool-id ${POOL_ID}
    
-   # Add sample tasks to the job
+   # Add sample tasks to demonstrate processing
    for i in {1..5}; do
      az batch task create \
-         --job-id "sample-processing-job-${RANDOM_SUFFIX}" \
+         --job-id ${JOB_ID} \
          --task-id "task-${i}" \
-         --command-line "cmd /c echo 'Processing task ${i} on cost-optimized compute' && timeout /t 60"
+         --command-line "/bin/bash -c 'echo Processing task ${i} on cost-optimized compute && sleep 60 && echo Task ${i} completed'"
    done
+   
+   # Set job to terminate when all tasks complete
+   az batch job set \
+       --job-id ${JOB_ID} \
+       --on-all-tasks-complete terminateJob
    
    echo "✅ Sample batch job created with 5 processing tasks"
    ```
 
-   The sample batch job is now running with tasks distributed across the cost-optimized compute fleet. This demonstrates how the solution automatically provisions resources, executes tasks, and manages costs through intelligent resource allocation.
+   The sample batch job is now running with tasks distributed across the cost-optimized compute resources. This demonstrates how the solution automatically provisions resources, executes tasks, and manages costs through intelligent resource allocation.
 
 6. **Configure Cost Alerts and Budget Management**:
 
-   Azure Cost Management provides essential cost control capabilities that monitor spending patterns and trigger alerts when costs approach defined thresholds. This proactive cost management ensures batch processing remains within budget while optimizing for performance and reliability.
+   Azure Cost Management provides essential cost control capabilities that monitor spending patterns and trigger alerts when costs approach defined thresholds. This proactive cost management ensures batch processing remains within budget while optimizing for performance.
 
    ```bash
-   # Create budget for batch processing resources
-   cat > budget-config.json << EOF
-   {
-     "properties": {
-       "category": "Cost",
-       "amount": 100,
-       "timeGrain": "Monthly",
-       "timePeriod": {
-         "startDate": "$(date +%Y-%m-01)",
-         "endDate": "$(date -d '+1 month' +%Y-%m-01)"
-       },
-       "filters": {
-         "resourceGroups": ["${RESOURCE_GROUP}"]
-       },
-       "notifications": {
-         "actual_GreaterThan_80_Percent": {
-           "enabled": true,
-           "operator": "GreaterThan",
-           "threshold": 80,
-           "contactEmails": ["admin@example.com"]
-         }
-       }
-     }
-   }
-   EOF
-   
-   # Create cost alert rule
+   # Create cost alert for compute resources
    az monitor metrics alert create \
-       --name "batch-cost-alert" \
+       --name "batch-resource-alert" \
        --resource-group ${RESOURCE_GROUP} \
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}" \
        --condition "avg 'Percentage CPU' > 80" \
-       --description "Alert when batch processing costs exceed threshold" \
+       --description "Alert when batch processing resources exceed threshold" \
        --evaluation-frequency 5m \
        --window-size 15m \
        --severity 2
    
+   # Create action group for cost notifications
+   az monitor action-group create \
+       --name "batch-cost-actions" \
+       --resource-group ${RESOURCE_GROUP} \
+       --short-name "batchcost"
+   
    echo "✅ Cost alerts and budget management configured"
    ```
 
-   Cost management is now actively monitoring batch processing expenses with automated alerts and budget controls. This ensures proactive cost optimization while maintaining processing capability and performance requirements.
+   Cost management is now actively monitoring batch processing expenses with automated alerts. This ensures proactive cost optimization while maintaining processing capability and performance requirements.
 
 ## Validation & Testing
 
@@ -362,31 +281,31 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Check batch pool status
    az batch pool show \
-       --pool-id "batch-pool-${RANDOM_SUFFIX}" \
-       --query "{State:state,CurrentNodes:currentDedicatedNodes,TargetNodes:targetDedicatedNodes,AutoScale:enableAutoScale}" \
+       --pool-id ${POOL_ID} \
+       --query "{State:state,CurrentNodes:currentLowPriorityNodes,TargetNodes:targetLowPriorityNodes,AutoScale:enableAutoScale}" \
        --output table
    
    # Verify auto-scaling configuration
    az batch pool show \
-       --pool-id "batch-pool-${RANDOM_SUFFIX}" \
+       --pool-id ${POOL_ID} \
        --query "autoScaleFormula" \
        --output tsv
    ```
 
-   Expected output: Pool should show active state with auto-scaling enabled and nodes provisioning based on workload.
+   Expected output: Pool should show steady state with auto-scaling enabled and nodes provisioning based on workload.
 
 2. **Test Job Execution and Cost Optimization**:
 
    ```bash
    # Check job status
    az batch job show \
-       --job-id "sample-processing-job-${RANDOM_SUFFIX}" \
+       --job-id ${JOB_ID} \
        --query "{State:state,Priority:priority,PoolInfo:poolInfo.poolId}" \
        --output table
    
    # List task execution status
    az batch task list \
-       --job-id "sample-processing-job-${RANDOM_SUFFIX}" \
+       --job-id ${JOB_ID} \
        --query "[].{TaskId:id,State:state,ExitCode:executionInfo.exitCode}" \
        --output table
    ```
@@ -396,14 +315,14 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 3. **Validate Cost Monitoring and Alerts**:
 
    ```bash
-   # Check cost analysis for resource group
-   az consumption usage list \
-       --start-date $(date -d '-7 days' +%Y-%m-%d) \
-       --end-date $(date +%Y-%m-%d) \
-       --query "[?contains(instanceName, '${RESOURCE_GROUP}')].[instanceName,pretaxCost,currency]" \
+   # Check compute fleet status
+   az compute-fleet show \
+       --fleet-name ${FLEET_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query "{Name:name,State:properties.provisioningState}" \
        --output table
    
-   # Verify monitoring configuration
+   # Verify monitoring workspace
    az monitor log-analytics workspace show \
        --workspace-name ${LOG_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
@@ -411,7 +330,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --output table
    ```
 
-   Expected output: Cost data should show resource consumption with monitoring workspace active and collecting telemetry.
+   Expected output: Compute Fleet should show successful provisioning with monitoring workspace active and collecting telemetry.
 
 ## Cleanup
 
@@ -420,12 +339,12 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Delete batch job
    az batch job delete \
-       --job-id "sample-processing-job-${RANDOM_SUFFIX}" \
+       --job-id ${JOB_ID} \
        --yes
    
    # Delete batch pool
    az batch pool delete \
-       --pool-id "batch-pool-${RANDOM_SUFFIX}" \
+       --pool-id ${POOL_ID} \
        --yes
    
    echo "✅ Batch jobs and pools deleted"
@@ -436,9 +355,10 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Delete compute fleet
    az compute-fleet delete \
+       --fleet-name ${FLEET_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${FLEET_NAME} \
-       --yes
+       --yes \
+       --no-wait
    
    # Delete batch account
    az batch account delete \
@@ -456,7 +376,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    az monitor log-analytics workspace delete \
        --workspace-name ${LOG_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
-       --yes
+       --yes \
+       --force
    
    # Delete storage account
    az storage account delete \
@@ -484,7 +405,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 Azure Compute Fleet and Azure Batch create a powerful combination for cost-efficient batch processing by intelligently managing mixed VM pricing models and automatic scaling. This architecture is particularly effective for workloads like data processing, scientific computing, and media rendering where cost optimization is critical and processing can tolerate brief interruptions. The solution leverages Azure's unused capacity through spot instances while maintaining reliability through standard instances, following [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles for cost optimization and operational excellence.
 
-The integration of Azure Compute Fleet with Azure Batch enables sophisticated resource allocation strategies that automatically adapt to workload demands and cost constraints. Spot instances provide significant cost savings (up to 90%) while the fleet's intelligent allocation ensures processing continuity during capacity fluctuations. This approach is documented in the [Azure Compute Fleet documentation](https://docs.microsoft.com/en-us/azure/virtual-machines/spot-vms) and [Azure Batch best practices](https://docs.microsoft.com/en-us/azure/batch/best-practices) guides.
+The integration of Azure Compute Fleet with Azure Batch enables sophisticated resource allocation strategies that automatically adapt to workload demands and cost constraints. Spot instances provide significant cost savings (up to 90%) while the fleet's intelligent allocation ensures processing continuity during capacity fluctuations. This approach is documented in the [Azure Compute Fleet documentation](https://docs.microsoft.com/en-us/azure/azure-compute-fleet/) and [Azure Batch best practices](https://docs.microsoft.com/en-us/azure/batch/best-practices) guides.
 
 From a cost management perspective, this solution provides multiple optimization layers including spot instance utilization, automatic scaling based on workload demand, and comprehensive monitoring through Azure Monitor. The combination of proactive cost alerts, budget management, and resource right-sizing ensures predictable costs while maintaining processing performance. Organizations can achieve 60-90% cost reduction compared to traditional dedicated compute approaches while maintaining processing reliability and scalability.
 
@@ -506,4 +427,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

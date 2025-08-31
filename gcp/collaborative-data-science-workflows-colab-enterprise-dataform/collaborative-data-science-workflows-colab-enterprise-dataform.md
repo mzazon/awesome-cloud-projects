@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Colab Enterprise, Dataform, BigQuery, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-science, collaboration, machine-learning, data-transformation, analytics
 recipe-generator-version: 1.3
@@ -253,39 +253,15 @@ echo "✅ APIs enabled for data science workflow"
    # Create custom runtime template for data science workloads
    TEMPLATE_NAME="ds-runtime-template-${RANDOM_SUFFIX}"
    
-   cat > /tmp/runtime-template.json << EOF
-   {
-     "name": "projects/${PROJECT_ID}/locations/${REGION}/runtimeTemplates/${TEMPLATE_NAME}",
-     "displayName": "Data Science Runtime Template",
-     "description": "Optimized runtime for collaborative data science workflows",
-     "machineSpec": {
-       "machineType": "n1-standard-4"
-     },
-     "dataPersistentDiskSpec": {
-       "diskType": "pd-standard",
-       "diskSizeGb": "100"
-     },
-     "containerSpec": {
-       "imageUri": "gcr.io/deeplearning-platform-release/base-cpu",
-       "env": [
-         {
-           "name": "GOOGLE_CLOUD_PROJECT",
-           "value": "${PROJECT_ID}"
-         }
-       ]
-     },
-     "networkSpec": {
-       "enableIpForwarding": false
-     }
-   }
-   EOF
-   
-   # Create the runtime template using Vertex AI API
-   curl -X POST \
-     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-     -H "Content-Type: application/json" \
-     -d @/tmp/runtime-template.json \
-     "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/runtimeTemplates"
+   gcloud colab runtime-templates create \
+       --display-name="Data Science Runtime Template" \
+       --description="Optimized runtime for collaborative data science workflows" \
+       --region=${REGION} \
+       --runtime-template-id=${TEMPLATE_NAME} \
+       --machine-type=n1-standard-4 \
+       --disk-size-gb=100 \
+       --disk-type=PD_STANDARD \
+       --idle-shutdown-timeout=3h
    
    export TEMPLATE_NAME
    echo "✅ Runtime template created: ${TEMPLATE_NAME}"
@@ -431,7 +407,7 @@ echo "✅ APIs enabled for data science workflow"
 
    ```bash
    # List available runtime templates
-   gcloud ai platform runtime-templates list --region=${REGION}
+   gcloud colab runtime-templates list --region=${REGION}
    ```
 
    Expected output: Runtime template showing configured machine specifications and environment settings.
@@ -476,10 +452,10 @@ echo "✅ APIs enabled for data science workflow"
 4. **Clean Up Runtime Templates**:
 
    ```bash
-   # Delete runtime template (requires API call)
-   curl -X DELETE \
-       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-       "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/runtimeTemplates/${TEMPLATE_NAME}"
+   # Delete runtime template
+   gcloud colab runtime-templates delete ${TEMPLATE_NAME} \
+       --region=${REGION} \
+       --quiet
    
    echo "✅ Runtime template deleted"
    ```
@@ -489,7 +465,6 @@ echo "✅ APIs enabled for data science workflow"
    ```bash
    # Clean up temporary files
    rm -f /tmp/customer_data.csv /tmp/transaction_data.csv
-   rm -f /tmp/runtime-template.json
    rm -rf /tmp/dataform-config
    
    # Optionally delete the entire project if created specifically for this recipe
@@ -528,4 +503,9 @@ Extend this collaborative data science workflow by implementing these enhancemen
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

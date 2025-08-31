@@ -6,17 +6,16 @@ difficulty: 400
 subject: aws
 services: CloudFront, Lambda, S3, CloudWatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cloudfront, cache-invalidation, content-delivery, optimization
 recipe-generator-version: 1.3
 ---
 
-# CloudFront Cache Invalidation Strategies
-
+# CloudFront Cache Invalidation Strategies with Intelligent Automation
 
 ## Problem
 
@@ -176,7 +175,6 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
        --attributes '{
            "VisibilityTimeoutSeconds": "300",
            "MessageRetentionPeriod": "1209600",
-           "MaxReceiveCount": "3",
            "ReceiveMessageWaitTimeSeconds": "20"
        }'
    
@@ -274,31 +272,39 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    # Create Lambda function directory
    mkdir -p /tmp/lambda-invalidation
    
-   # Create package.json for dependencies
+   # Create package.json for dependencies (using AWS SDK v3)
    cat > /tmp/lambda-invalidation/package.json << 'EOF'
    {
        "name": "cloudfront-invalidation",
        "version": "1.0.0",
        "description": "Intelligent CloudFront cache invalidation",
+       "type": "module",
        "dependencies": {
-           "aws-sdk": "^2.1000.0"
+           "@aws-sdk/client-cloudfront": "^3.0.0",
+           "@aws-sdk/client-dynamodb": "^3.0.0",
+           "@aws-sdk/lib-dynamodb": "^3.0.0",
+           "@aws-sdk/client-sqs": "^3.0.0"
        }
    }
    EOF
    
-   # Create Lambda function code
-   cat > /tmp/lambda-invalidation/index.js << 'EOF'
-   const AWS = require('aws-sdk');
-   const cloudfront = new AWS.CloudFront();
-   const dynamodb = new AWS.DynamoDB.DocumentClient();
-   const sqs = new AWS.SQS();
+   # Create Lambda function code (updated for AWS SDK v3)
+   cat > /tmp/lambda-invalidation/index.mjs << 'EOF'
+   import { CloudFrontClient, CreateInvalidationCommand } from '@aws-sdk/client-cloudfront';
+   import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
+   import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+   import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+   
+   const cloudfrontClient = new CloudFrontClient({});
+   const dynamodbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+   const sqsClient = new SQSClient({});
    
    const TABLE_NAME = process.env.DDB_TABLE_NAME;
    const QUEUE_URL = process.env.QUEUE_URL;
    const DISTRIBUTION_ID = process.env.DISTRIBUTION_ID;
    const BATCH_SIZE = 10; // CloudFront allows max 15 paths per invalidation
    
-   exports.handler = async (event) => {
+   export const handler = async (event) => {
        console.log('Received event:', JSON.stringify(event, null, 2));
        
        try {
@@ -458,7 +464,7 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    }
    
    async function createInvalidation(paths) {
-       const params = {
+       const command = new CreateInvalidationCommand({
            DistributionId: DISTRIBUTION_ID,
            InvalidationBatch: {
                Paths: {
@@ -467,14 +473,14 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
                },
                CallerReference: `invalidation-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
            }
-       };
+       });
        
        console.log('Creating invalidation for paths:', paths);
-       return await cloudfront.createInvalidation(params).promise();
+       return await cloudfrontClient.send(command);
    }
    
    async function logInvalidation(invalidationId, paths, originalEvent) {
-       const params = {
+       const command = new PutCommand({
            TableName: TABLE_NAME,
            Item: {
                InvalidationId: invalidationId,
@@ -486,9 +492,9 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
                Status: 'InProgress',
                TTL: Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60) // 30 days
            }
-       };
+       });
        
-       await dynamodb.put(params).promise();
+       await dynamodbClient.send(command);
    }
    
    async function sendToDeadLetterQueue(paths, error) {
@@ -498,12 +504,14 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
            timestamp: new Date().toISOString()
        };
        
-       const params = {
-           QueueUrl: QUEUE_URL.replace(QUEUE_URL.split('/').pop(), QUEUE_URL.split('/').pop().replace('batch-queue', 'dlq')),
-           MessageBody: JSON.stringify(message)
-       };
+       const dlqUrl = QUEUE_URL.replace(QUEUE_URL.split('/').pop(), QUEUE_URL.split('/').pop().replace('batch-queue', 'dlq'));
        
-       await sqs.sendMessage(params).promise();
+       const command = new SendMessageCommand({
+           QueueUrl: dlqUrl,
+           MessageBody: JSON.stringify(message)
+       });
+       
+       await sqsClient.send(command);
    }
    EOF
    
@@ -805,10 +813,10 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    Lambda event source mappings create the integration points that trigger invalidation processing. EventBridge permissions enable the function to receive events from the custom event bus, while SQS event source mappings provide batch processing capabilities with configurable batch sizes and processing windows. These triggers ensure the Lambda function responds appropriately to content changes while maintaining optimal performance and cost efficiency through intelligent batching and processing patterns.
 
    ```bash
-   # Create Lambda function
+   # Create Lambda function (using latest Node.js runtime)
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime nodejs18.x \
+       --runtime nodejs20.x \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_FUNCTION_NAME}-role \
        --handler index.handler \
        --zip-file fileb:///tmp/lambda-invalidation/lambda-invalidation.zip \
@@ -853,8 +861,7 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
        --event-bus-name ${EVENTBRIDGE_BUS_NAME} \
        --targets "[{
            \"Id\": \"1\",
-           \"Arn\": \"${LAMBDA_ARN}\",
-           \"RoleArn\": \"arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_FUNCTION_NAME}-role\"
+           \"Arn\": \"${LAMBDA_ARN}\"
        }]"
    
    # Add Lambda target to deployment rule
@@ -863,8 +870,7 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
        --event-bus-name ${EVENTBRIDGE_BUS_NAME} \
        --targets "[{
            \"Id\": \"1\",
-           \"Arn\": \"${LAMBDA_ARN}\",
-           \"RoleArn\": \"arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_FUNCTION_NAME}-role\"
+           \"Arn\": \"${LAMBDA_ARN}\"
        }]"
    
    echo "✅ EventBridge targets configured"
@@ -1254,7 +1260,7 @@ The architecture leverages [EventBridge](https://docs.aws.amazon.com/eventbridge
 
 The monitoring and logging components provide comprehensive visibility into invalidation patterns, enabling data-driven optimization of cache policies and invalidation strategies. The [DynamoDB Streams](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.Lambda.html) integration tracks invalidation history, costs, and effectiveness, while CloudWatch dashboards provide real-time insights into cache hit rates and invalidation frequency. This visibility is crucial for optimizing the balance between content freshness and performance, as different content types require different invalidation strategies based on their update patterns and user access characteristics.
 
-The batch processing mechanism using SQS prevents overwhelming [CloudFront's invalidation API](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Invalidation_Requests.html) during high-frequency content updates, while the dead letter queue ensures reliable processing even during failures. This robust error handling is essential for production environments where failed invalidations could result in stale content being served to users. The solution also implements intelligent path grouping that recognizes when wildcard patterns can replace multiple specific paths, further optimizing costs and reducing API calls while maintaining invalidation effectiveness.
+The updated solution now uses the latest [AWS SDK for JavaScript v3](https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/welcome.html) with modular architecture and improved performance characteristics. The batch processing mechanism using SQS prevents overwhelming [CloudFront's invalidation API](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Invalidation_Requests.html) during high-frequency content updates, while the dead letter queue ensures reliable processing even during failures. This robust error handling is essential for production environments where failed invalidations could result in stale content being served to users.
 
 > **Tip**: Monitor invalidation costs closely using the DynamoDB logs and CloudWatch metrics to identify opportunities for further optimization, such as adjusting cache policies to reduce invalidation frequency for certain content types. Use [CloudFront cache behaviors](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/distribution-web-values-specify.html#DownloadDistValuesCacheBehavior) to fine-tune TTL settings based on content characteristics.
 
@@ -1274,4 +1280,11 @@ Extend this solution by implementing these advanced enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

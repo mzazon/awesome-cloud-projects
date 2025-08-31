@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Microsoft Sentinel, Azure Monitor Workbooks, Azure Logic Apps, Microsoft Defender XDR
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, incident-response, automation, siem, workbooks, unified-operations
 recipe-generator-version: 1.3
@@ -94,11 +94,11 @@ graph TB
 1. Azure subscription with Global Administrator or Security Administrator privileges
 2. Microsoft Sentinel workspace with data connectors configured
 3. Microsoft Defender XDR onboarded to the Azure AD tenant
-4. Azure CLI v2.37.0 or higher installed and configured
+4. Azure CLI v2.60.0 or higher installed and configured
 5. Security operations team knowledge of incident response procedures
 6. Estimated cost: $200-500 per month depending on data ingestion volume and automation frequency
 
-> **Note**: The unified security operations platform requires both Microsoft Sentinel and Defender XDR to be properly configured. Review the [Microsoft Sentinel documentation](https://docs.microsoft.com/en-us/azure/sentinel/) for comprehensive setup guidance.
+> **Note**: The unified security operations platform requires both Microsoft Sentinel and Defender XDR to be properly configured. Review the [Microsoft Sentinel documentation](https://learn.microsoft.com/en-us/azure/sentinel/) for comprehensive setup guidance.
 
 ## Preparation
 
@@ -171,7 +171,7 @@ echo "✅ Resource providers registered for security operations"
    # Configure Sentinel settings and enable UEBA
    az rest \
        --method PUT \
-       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/settings/Ueba?api-version=2021-10-01-preview" \
+       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/settings/Ueba?api-version=2025-06-01" \
        --body '{
          "kind": "Ueba",
          "properties": {
@@ -192,7 +192,7 @@ echo "✅ Resource providers registered for security operations"
    # Enable Azure AD connector for identity security
    az rest \
        --method PUT \
-       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/dataConnectors/azuread-${RANDOM_SUFFIX}?api-version=2021-10-01-preview" \
+       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/dataConnectors/azuread-${RANDOM_SUFFIX}?api-version=2025-06-01" \
        --body '{
          "kind": "AzureActiveDirectory",
          "properties": {
@@ -206,7 +206,7 @@ echo "✅ Resource providers registered for security operations"
    # Enable Azure Activity connector for resource monitoring
    az rest \
        --method PUT \
-       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/dataConnectors/azureactivity-${RANDOM_SUFFIX}?api-version=2021-10-01-preview" \
+       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/dataConnectors/azureactivity-${RANDOM_SUFFIX}?api-version=2025-06-01" \
        --body '{
          "kind": "AzureActivity",
          "properties": {
@@ -219,7 +219,7 @@ echo "✅ Resource providers registered for security operations"
    # Enable Security Events connector for Windows logs
    az rest \
        --method PUT \
-       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/dataConnectors/securityevents-${RANDOM_SUFFIX}?api-version=2021-10-01-preview" \
+       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/dataConnectors/securityevents-${RANDOM_SUFFIX}?api-version=2025-06-01" \
        --body '{
          "kind": "SecurityEvents",
          "properties": {
@@ -242,7 +242,7 @@ echo "✅ Resource providers registered for security operations"
    # Create rule for suspicious sign-in attempts
    az rest \
        --method PUT \
-       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/alertRules/suspicious-signin-${RANDOM_SUFFIX}?api-version=2021-10-01-preview" \
+       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/alertRules/suspicious-signin-${RANDOM_SUFFIX}?api-version=2025-06-01" \
        --body '{
          "kind": "Scheduled",
          "properties": {
@@ -267,7 +267,7 @@ echo "✅ Resource providers registered for security operations"
    # Create rule for privilege escalation detection
    az rest \
        --method PUT \
-       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/alertRules/privilege-escalation-${RANDOM_SUFFIX}?api-version=2021-10-01-preview" \
+       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/alertRules/privilege-escalation-${RANDOM_SUFFIX}?api-version=2025-06-01" \
        --body '{
          "kind": "Scheduled",
          "properties": {
@@ -302,7 +302,7 @@ echo "✅ Resource providers registered for security operations"
    # Enable Sentinel in Defender portal (unified operations)
    az rest \
        --method POST \
-       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/onboardingStates/default?api-version=2021-10-01-preview" \
+       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/onboardingStates/default?api-version=2025-06-01" \
        --body '{
          "properties": {
            "customerManagedKey": false
@@ -312,7 +312,7 @@ echo "✅ Resource providers registered for security operations"
    # Configure XDR data connector in Sentinel
    az rest \
        --method PUT \
-       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/dataConnectors/defender-xdr-${RANDOM_SUFFIX}?api-version=2021-10-01-preview" \
+       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/dataConnectors/defender-xdr-${RANDOM_SUFFIX}?api-version=2025-06-01" \
        --body '{
          "kind": "MicrosoftThreatIntelligence",
          "properties": {
@@ -485,7 +485,7 @@ echo "✅ Resource providers registered for security operations"
                  "type": "Http",
                  "inputs": {
                    "method": "POST",
-                   "uri": "https://management.azure.com'${WORKSPACE_ID}'/providers/Microsoft.SecurityInsights/incidents/@{body(\"Parse_incident_data\")?[\"incidentId\"]}/comments/@{guid()}?api-version=2021-10-01-preview",
+                   "uri": "https://management.azure.com'${WORKSPACE_ID}'/providers/Microsoft.SecurityInsights/incidents/@{body(\"Parse_incident_data\")?[\"incidentId\"]}/comments/@{guid()}?api-version=2025-06-01",
                    "headers": {
                      "Authorization": "Bearer @{variables(\"AuthToken\")}"
                    },
@@ -514,7 +514,7 @@ echo "✅ Resource providers registered for security operations"
    # Create security operations workbook
    az rest \
        --method PUT \
-       --uri "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks/security-ops-${RANDOM_SUFFIX}?api-version=2021-03-08" \
+       --uri "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks/security-ops-${RANDOM_SUFFIX}?api-version=2022-04-01" \
        --body '{
          "location": "'${LOCATION}'",
          "kind": "shared",
@@ -527,7 +527,7 @@ echo "✅ Resource providers registered for security operations"
    # Get workbook details for access
    WORKBOOK_ID=$(az rest \
        --method GET \
-       --uri "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks?api-version=2021-03-08" \
+       --uri "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks?api-version=2022-04-01" \
        --query "value[?contains(properties.displayName, 'Security Operations')].id" \
        --output tsv)
 
@@ -566,7 +566,7 @@ echo "✅ Resource providers registered for security operations"
    # Check if analytics rules are running
    az rest \
        --method GET \
-       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/alertRules?api-version=2021-10-01-preview" \
+       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/alertRules?api-version=2025-06-01" \
        --query "value[].{Name:properties.displayName, Enabled:properties.enabled, LastModified:properties.lastModifiedUtc}"
 
    # Query recent incidents
@@ -607,7 +607,7 @@ echo "✅ Resource providers registered for security operations"
    # Validate workbook deployment
    az rest \
        --method GET \
-       --uri "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks?api-version=2021-03-08" \
+       --uri "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks?api-version=2022-04-01" \
        --query "value[?contains(properties.displayName, 'Security Operations')].{Name:properties.displayName, Location:location, ResourceId:id}"
    ```
 
@@ -621,11 +621,11 @@ echo "✅ Resource providers registered for security operations"
    # Delete analytics rules
    az rest \
        --method DELETE \
-       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/alertRules/suspicious-signin-${RANDOM_SUFFIX}?api-version=2021-10-01-preview"
+       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/alertRules/suspicious-signin-${RANDOM_SUFFIX}?api-version=2025-06-01"
 
    az rest \
        --method DELETE \
-       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/alertRules/privilege-escalation-${RANDOM_SUFFIX}?api-version=2021-10-01-preview"
+       --uri "https://management.azure.com${WORKSPACE_ID}/providers/Microsoft.SecurityInsights/alertRules/privilege-escalation-${RANDOM_SUFFIX}?api-version=2025-06-01"
 
    echo "✅ Analytics rules deleted"
    ```
@@ -653,7 +653,7 @@ echo "✅ Resource providers registered for security operations"
    # Delete workbook
    az rest \
        --method DELETE \
-       --uri "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks/security-ops-${RANDOM_SUFFIX}?api-version=2021-03-08"
+       --uri "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks/security-ops-${RANDOM_SUFFIX}?api-version=2022-04-01"
 
    echo "✅ Security operations workbook deleted"
    ```
@@ -676,11 +676,11 @@ echo "✅ Resource providers registered for security operations"
 
 ## Discussion
 
-The unified security operations platform represents a significant advancement in security operations center (SOC) capabilities by bringing together best-of-breed SIEM and XDR technologies in a single, cohesive experience. Microsoft Sentinel's cloud-native SIEM capabilities provide comprehensive log collection, advanced analytics, and threat hunting features, while Defender XDR delivers endpoint detection, email security, and identity protection in one integrated platform. This combination enables security teams to achieve complete visibility across their digital estate while maintaining operational efficiency through unified workflows and shared context across security tools, as detailed in the [Microsoft Unified Security Operations documentation](https://docs.microsoft.com/en-us/security/operations/siem-xdr-overview).
+The unified security operations platform represents a significant advancement in security operations center (SOC) capabilities by bringing together best-of-breed SIEM and XDR technologies in a single, cohesive experience. Microsoft Sentinel's cloud-native SIEM capabilities provide comprehensive log collection, advanced analytics, and threat hunting features, while Defender XDR delivers endpoint detection, email security, and identity protection in one integrated platform. This combination enables security teams to achieve complete visibility across their digital estate while maintaining operational efficiency through unified workflows and shared context across security tools, as detailed in the [Microsoft Unified Security Operations documentation](https://learn.microsoft.com/en-us/security/operations/siem-xdr-overview).
 
-Azure Logic Apps integration provides the critical automation layer that transforms reactive security operations into proactive, intelligent response systems. The serverless automation platform enables organizations to implement consistent response procedures, reduce mean time to response (MTTR), and free security analysts to focus on high-value investigative work rather than manual tasks. Logic Apps' extensive connector ecosystem allows integration with virtually any system in the security stack, enabling comprehensive incident response workflows that span multiple tools and platforms. For comprehensive automation guidance, review the [Azure Logic Apps security automation patterns](https://docs.microsoft.com/en-us/azure/logic-apps/logic-apps-securing-a-logic-app).
+Azure Logic Apps integration provides the critical automation layer that transforms reactive security operations into proactive, intelligent response systems. The serverless automation platform enables organizations to implement consistent response procedures, reduce mean time to response (MTTR), and free security analysts to focus on high-value investigative work rather than manual tasks. Logic Apps' extensive connector ecosystem allows integration with virtually any system in the security stack, enabling comprehensive incident response workflows that span multiple tools and platforms. For comprehensive automation guidance, review the [Azure Logic Apps security automation patterns](https://learn.microsoft.com/en-us/azure/logic-apps/logic-apps-securing-a-logic-app).
 
-Azure Monitor Workbooks enhance security operations by providing real-time visibility into security metrics, trends, and operational performance through customizable, interactive dashboards. These workbooks enable security leaders to track key performance indicators (KPIs), identify patterns in threat activity, and demonstrate the effectiveness of security investments to stakeholders. The ability to combine data from multiple sources creates a single pane of glass for security operations, improving situational awareness and enabling data-driven decision making. Implementation should follow the [Azure Monitor Workbooks best practices](https://docs.microsoft.com/en-us/azure/azure-monitor/visualize/workbooks-overview) for optimal performance and user experience.
+Azure Monitor Workbooks enhance security operations by providing real-time visibility into security metrics, trends, and operational performance through customizable, interactive dashboards. These workbooks enable security leaders to track key performance indicators (KPIs), identify patterns in threat activity, and demonstrate the effectiveness of security investments to stakeholders. The ability to combine data from multiple sources creates a single pane of glass for security operations, improving situational awareness and enabling data-driven decision making. Implementation should follow the [Azure Monitor Workbooks best practices](https://learn.microsoft.com/en-us/azure/azure-monitor/visualize/workbooks-overview) for optimal performance and user experience.
 
 > **Tip**: Implement gradual automation rollout by starting with low-risk response actions and progressively adding more sophisticated automated responses as confidence in the system grows. Monitor automation performance using Azure Monitor metrics and continuously refine playbooks based on operational experience and threat landscape changes.
 
@@ -700,4 +700,9 @@ Extend this automated security incident response system by implementing these ad
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

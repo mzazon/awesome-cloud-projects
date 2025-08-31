@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Firebase App Distribution, Cloud Build, Firebase Test Lab, Cloud Source Repositories
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: mobile, ci-cd, testing, app-distribution, firebase
 recipe-generator-version: 1.3
@@ -74,7 +74,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud Project with Firebase enabled and appropriate permissions for Cloud Build, Firebase, and source repositories
-2. gcloud CLI v2 installed and configured (or use Google Cloud Shell)
+2. gcloud CLI and Firebase CLI installed and configured (or use Google Cloud Shell)
 3. Basic understanding of mobile app development (Android/iOS) and CI/CD concepts
 4. Firebase project configured with mobile app registration (Android and/or iOS)
 5. Estimated cost: $15-30 USD for testing resources during recipe completion (Test Lab device time, build minutes)
@@ -84,9 +84,10 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for the project
+# Set environment variables for GCP resources
 export PROJECT_ID="mobile-cicd-$(date +%s | tail -c 7)"
 export REGION="us-central1"
+export ZONE="us-central1-a"
 export FIREBASE_PROJECT_ID="${PROJECT_ID}"
 
 # Generate unique suffix for resource naming
@@ -97,6 +98,7 @@ export REPO_NAME="mobile-source-${RANDOM_SUFFIX}"
 # Set default project and region
 gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
+gcloud config set compute/zone ${ZONE}
 
 # Enable required Google Cloud APIs
 gcloud services enable cloudbuild.googleapis.com
@@ -105,15 +107,20 @@ gcloud services enable firebase.googleapis.com
 gcloud services enable testing.googleapis.com
 gcloud services enable artifactregistry.googleapis.com
 
+# Create the Firebase project first
+gcloud projects create ${PROJECT_ID} \
+    --name="Mobile CI/CD Pipeline"
+
+# Wait for project creation to complete
+sleep 10
+
+# Set billing account if needed (replace with your billing account)
+# gcloud billing projects link ${PROJECT_ID} \
+#     --billing-account=YOUR-BILLING-ACCOUNT-ID
+
 # Initialize Firebase project
 firebase login --no-localhost
-firebase projects:create ${FIREBASE_PROJECT_ID} \
-    --display-name "Mobile CI/CD Pipeline"
-
-# Link Firebase project to Google Cloud
-gcloud projects add-iam-policy-binding ${PROJECT_ID} \
-    --member="serviceAccount:firebase-service-account@${PROJECT_ID}.iam.gserviceaccount.com" \
-    --role="roles/firebase.admin"
+firebase projects:addfirebase ${PROJECT_ID}
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Firebase project: ${FIREBASE_PROJECT_ID}"
@@ -150,10 +157,11 @@ echo "✅ Firebase project: ${FIREBASE_PROJECT_ID}"
    # Set Firebase project context
    firebase use ${FIREBASE_PROJECT_ID}
    
-   # Initialize Firebase in the repository
-   firebase init --project=${FIREBASE_PROJECT_ID}
+   # Initialize Firebase in the repository with minimal prompts
+   echo "N" | echo "N" | firebase init \
+       --project=${FIREBASE_PROJECT_ID}
    
-   # Enable App Distribution in Firebase console programmatically
+   # Create Android app in Firebase
    gcloud firebase apps create android \
        --display-name="${APP_NAME} Android" \
        --package-name="com.example.${APP_NAME//-/}" \
@@ -201,14 +209,60 @@ echo "✅ Firebase project: ${FIREBASE_PROJECT_ID}"
    </manifest>
    EOF
    
-   # Create Gradle build configuration
+   # Create app-level Gradle build configuration
+   cat > android/app/build.gradle << 'EOF'
+   plugins {
+       id 'com.android.application'
+       id 'com.google.gms.google-services'
+       id 'com.google.firebase.appdistribution'
+   }
+   
+   android {
+       compileSdk 34
+       namespace 'com.example.app'
+       
+       defaultConfig {
+           applicationId "com.example.app"
+           minSdk 21
+           targetSdk 34
+           versionCode 1
+           versionName "1.0"
+           
+           testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+       }
+       
+       buildTypes {
+           debug {
+               debuggable true
+           }
+           release {
+               minifyEnabled false
+               proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+           }
+       }
+   }
+   
+   dependencies {
+       implementation 'androidx.appcompat:appcompat:1.6.1'
+       implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+       testImplementation 'junit:junit:4.13.2'
+       androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+       androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
+   }
+   EOF
+   
+   # Create project-level Gradle build configuration
    cat > android/build.gradle << 'EOF'
    buildscript {
        dependencies {
-           classpath 'com.android.tools.build:gradle:7.4.0'
-           classpath 'com.google.gms:google-services:4.3.14'
-           classpath 'com.google.firebase:firebase-appdistribution-gradle:4.0.0'
+           classpath 'com.android.tools.build:gradle:8.1.2'
+           classpath 'com.google.gms:google-services:4.4.0'
+           classpath 'com.google.firebase:firebase-appdistribution-gradle:4.2.0'
        }
+   }
+   
+   plugins {
+       id 'com.android.application' version '8.1.2' apply false
    }
    
    allprojects {
@@ -217,6 +271,50 @@ echo "✅ Firebase project: ${FIREBASE_PROJECT_ID}"
            mavenCentral()
        }
    }
+   EOF
+   
+   # Create basic MainActivity
+   cat > android/app/src/main/java/com/example/app/MainActivity.java << 'EOF'
+   package com.example.app;
+   
+   import androidx.appcompat.app.AppCompatActivity;
+   import android.os.Bundle;
+   
+   public class MainActivity extends AppCompatActivity {
+       @Override
+       protected void onCreate(Bundle savedInstanceState) {
+           super.onCreate(savedInstanceState);
+           setContentView(R.layout.activity_main);
+       }
+   }
+   EOF
+   
+   # Create layout file
+   mkdir -p android/app/src/main/res/layout
+   cat > android/app/src/main/res/layout/activity_main.xml << 'EOF'
+   <?xml version="1.0" encoding="utf-8"?>
+   <androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+       xmlns:app="http://schemas.android.com/apk/res-auto"
+       android:layout_width="match_parent"
+       android:layout_height="match_parent">
+   
+       <TextView
+           android:layout_width="wrap_content"
+           android:layout_height="wrap_content"
+           android:text="Hello CI/CD!"
+           app:layout_constraintBottom_toBottomOf="parent"
+           app:layout_constraintEnd_toEndOf="parent"
+           app:layout_constraintStart_toStartOf="parent"
+           app:layout_constraintTop_toTopOf="parent" />
+   
+   </androidx.constraintlayout.widget.ConstraintLayout>
+   EOF
+   
+   # Create string resources
+   cat > android/app/src/main/res/values/strings.xml << 'EOF'
+   <resources>
+       <string name="app_name">Mobile CI/CD</string>
+   </resources>
    EOF
    
    echo "✅ Mobile application structure created"
@@ -232,10 +330,6 @@ echo "✅ Firebase project: ${FIREBASE_PROJECT_ID}"
    # Create comprehensive Cloud Build configuration
    cat > cloudbuild.yaml << 'EOF'
    steps:
-   # Install dependencies and prepare build environment
-   - name: 'gcr.io/cloud-builders/git'
-     args: ['clone', 'https://github.com/GoogleCloudPlatform/buildpack-samples.git']
-   
    # Build Android application
    - name: 'gcr.io/cloud-builders/gradle'
      dir: 'android'
@@ -342,7 +436,7 @@ echo "✅ Firebase project: ${FIREBASE_PROJECT_ID}"
        orientation: portrait
    EOF
    
-   # Create test configuration for automated testing
+   # Create Firebase configuration for automated testing
    cat > .firebaserc << EOF
    {
      "projects": {
@@ -552,4 +646,9 @@ Extend this mobile CI/CD workflow by implementing these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: amazon-personalize, s3, lambda, eventbridge
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: machine-learning, recommendation-systems, personalization, collaborative-filtering, content-based-filtering, a-b-testing, batch-processing, real-time-inference, advanced
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ E-commerce and content platforms struggle with declining user engagement and con
 
 ## Solution
 
-Implement a comprehensive recommendation system using Amazon Personalize that combines multiple ML algorithms and recommendation strategies to deliver personalized experiences. This solution creates multiple recommendation models (User-Personalization, Similar-Items, Trending-Now), implements both real-time and batch inference capabilities, and includes A/B testing framework for continuous optimization, all while automatically handling model training, deployment, and scaling without requiring deep ML expertise.
+Implement a comprehensive recommendation system using Amazon Personalize that combines multiple ML algorithms and recommendation strategies to deliver personalized experiences. This solution creates multiple recommendation models (User-Personalization-v2, Similar-Items, Trending-Now), implements both real-time and batch inference capabilities, and includes A/B testing framework for continuous optimization, all while automatically handling model training, deployment, and scaling without requiring deep ML expertise.
 
 ## Architecture Diagram
 
@@ -146,7 +146,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 
 1. **Create IAM Service Role for Amazon Personalize**:
 
-   Amazon Personalize requires service-linked roles to access your S3 data and perform training operations. IAM roles enable secure, temporary credential delegation following the principle of least privilege, ensuring the service accesses only the specific resources it needs. This security foundation is critical for production ML systems handling sensitive user data.
+   Amazon Personalize requires service-linked roles to access your S3 data and perform training operations. IAM roles enable secure, temporary credential delegation following the principle of least privilege, ensuring the service accesses only the specific resources it needs. This security foundation is critical for production ML systems handling sensitive user data and follows AWS Well-Architected Framework security principles.
 
    ```bash
    # Create comprehensive trust policy
@@ -306,7 +306,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 
 3. **Create Dataset Group and Schemas**:
 
-   Dataset groups organize related datasets and serve as containers for training multiple recommendation models. Schemas define the structure and data types for your training data, enabling Amazon Personalize to understand which fields represent users, items, timestamps, and interaction values. Proper schema design is crucial for feature engineering and algorithm performance.
+   Dataset groups organize related datasets and serve as containers for training multiple recommendation models. Schemas define the structure and data types for your training data, enabling Amazon Personalize to understand which fields represent users, items, timestamps, and interaction values. Proper schema design is crucial for feature engineering and algorithm performance optimization.
 
    ```bash
    # Create dataset group
@@ -452,14 +452,14 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 
 5. **Create Multiple ML Solutions for Different Recommendation Types**:
 
-   Amazon Personalize offers multiple pre-built algorithms (recipes) optimized for different recommendation scenarios. User-Personalization leverages collaborative filtering for individual preferences, Similar-Items provides content-based recommendations, Trending-Now identifies viral content, and Popularity-Count handles cold-start scenarios. Creating multiple solutions enables comprehensive recommendation coverage and A/B testing opportunities.
+   Amazon Personalize offers multiple pre-built algorithms (recipes) optimized for different recommendation scenarios. User-Personalization-v2 leverages transformer-based architecture for individual preferences, Similar-Items provides content-based recommendations, Trending-Now identifies viral content, and Popularity-Count handles cold-start scenarios. Creating multiple solutions enables comprehensive recommendation coverage and A/B testing opportunities.
 
    ```bash
-   # Create User-Personalization solution for collaborative filtering
+   # Create User-Personalization-v2 solution for collaborative filtering
    aws personalize create-solution \
        --name ${USER_PERSONALIZATION_SOLUTION} \
        --dataset-group-arn ${DATASET_GROUP_ARN} \
-       --recipe-arn arn:aws:personalize:::recipe/aws-user-personalization \
+       --recipe-arn arn:aws:personalize:::recipe/aws-user-personalization-v2 \
        --solution-config '{
            "algorithmHyperParameters": {
                "hidden_dimension": "100",
@@ -498,14 +498,14 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    echo "✅ Created multiple ML solutions for different recommendation types"
    ```
 
-   Four distinct recommendation solutions are now configured, each optimized for specific business use cases. The User-Personalization solution includes hyperparameter tuning for neural network depth and recency weighting, while other solutions use optimized default configurations for their respective algorithms.
+   Four distinct recommendation solutions are now configured, each optimized for specific business use cases. The User-Personalization-v2 solution uses the latest transformer architecture with enhanced performance and lower latency compared to the original User-Personalization recipe, while other solutions use optimized default configurations for their respective algorithms.
 
 6. **Train Solution Versions (Models)**:
 
    Solution versions represent trained machine learning models created from your data and algorithm configurations. Amazon Personalize uses distributed training infrastructure to build neural networks that learn user preferences, item relationships, and interaction patterns. Training mode 'FULL' creates entirely new models, while 'UPDATE' performs incremental learning for existing models.
 
    ```bash
-   # Train User-Personalization model
+   # Train User-Personalization-v2 model
    aws personalize create-solution-version \
        --solution-arn ${USER_PERSONALIZATION_ARN} \
        --training-mode FULL
@@ -525,12 +525,19 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
        --solution-arn ${POPULARITY_ARN} \
        --training-mode FULL
    
-   # Generate solution version ARNs with timestamp
-   TIMESTAMP=$(date +%s)
-   export USER_PERSONALIZATION_VERSION_ARN="${USER_PERSONALIZATION_ARN}/version/${TIMESTAMP}"
-   export SIMILAR_ITEMS_VERSION_ARN="${SIMILAR_ITEMS_ARN}/version/${TIMESTAMP}"
-   export TRENDING_NOW_VERSION_ARN="${TRENDING_NOW_ARN}/version/${TIMESTAMP}"
-   export POPULARITY_VERSION_ARN="${POPULARITY_ARN}/version/${TIMESTAMP}"
+   # Get the latest solution version ARNs
+   export USER_PERSONALIZATION_VERSION_ARN=$(aws personalize list-solution-versions \
+       --solution-arn ${USER_PERSONALIZATION_ARN} \
+       --query 'solutionVersions[0].solutionVersionArn' --output text)
+   export SIMILAR_ITEMS_VERSION_ARN=$(aws personalize list-solution-versions \
+       --solution-arn ${SIMILAR_ITEMS_ARN} \
+       --query 'solutionVersions[0].solutionVersionArn' --output text)
+   export TRENDING_NOW_VERSION_ARN=$(aws personalize list-solution-versions \
+       --solution-arn ${TRENDING_NOW_ARN} \
+       --query 'solutionVersions[0].solutionVersionArn' --output text)
+   export POPULARITY_VERSION_ARN=$(aws personalize list-solution-versions \
+       --solution-arn ${POPULARITY_ARN} \
+       --query 'solutionVersions[0].solutionVersionArn' --output text)
    
    echo "⏳ Model training started - this will take 60-90 minutes"
    echo "✅ All solution versions created for training"
@@ -566,7 +573,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    }
    
    # Wait for all solution versions to be active
-   wait_for_solution_version ${USER_PERSONALIZATION_VERSION_ARN} "User-Personalization"
+   wait_for_solution_version ${USER_PERSONALIZATION_VERSION_ARN} "User-Personalization-v2"
    wait_for_solution_version ${SIMILAR_ITEMS_VERSION_ARN} "Similar-Items"
    wait_for_solution_version ${TRENDING_NOW_VERSION_ARN} "Trending-Now"
    wait_for_solution_version ${POPULARITY_VERSION_ARN} "Popularity-Count"
@@ -609,37 +616,18 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 
    ```bash
    # Create filter for excluding purchased items
-   cat > exclude-purchased-filter.json << EOF
-   {
-       "filterExpression": "EXCLUDE ItemID WHERE Interactions.EVENT_TYPE IN (\"purchase\")"
-   }
-   EOF
-   
-   # Create filter for category-based recommendations
-   cat > category-filter.json << EOF
-   {
-       "filterExpression": "INCLUDE ItemID WHERE Items.CATEGORY IN (\$CATEGORY)"
-   }
-   EOF
-   
-   # Create filter for price range
-   cat > price-filter.json << EOF
-   {
-       "filterExpression": "INCLUDE ItemID WHERE Items.PRICE >= \$MIN_PRICE AND Items.PRICE <= \$MAX_PRICE"
-   }
-   EOF
-   
-   # Create filters
    aws personalize create-filter \
        --name exclude-purchased-${RANDOM_SUFFIX} \
        --dataset-group-arn ${DATASET_GROUP_ARN} \
        --filter-expression "EXCLUDE ItemID WHERE Interactions.EVENT_TYPE IN (\"purchase\")"
    
+   # Create filter for category-based recommendations
    aws personalize create-filter \
        --name category-filter-${RANDOM_SUFFIX} \
        --dataset-group-arn ${DATASET_GROUP_ARN} \
        --filter-expression "INCLUDE ItemID WHERE Items.CATEGORY IN (\$CATEGORY)"
    
+   # Create filter for price range
    aws personalize create-filter \
        --name price-filter-${RANDOM_SUFFIX} \
        --dataset-group-arn ${DATASET_GROUP_ARN} \
@@ -950,10 +938,13 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
         --role-name LambdaRecommendationRole-${RANDOM_SUFFIX} \
         --query Role.Arn --output text)
     
+    # Wait for IAM role propagation
+    sleep 10
+    
     # Create Lambda function with environment variables
     aws lambda create-function \
         --function-name comprehensive-recommendation-api-${RANDOM_SUFFIX} \
-        --runtime python3.9 \
+        --runtime python3.12 \
         --role ${LAMBDA_ROLE_ARN} \
         --handler recommendation-service.lambda_handler \
         --zip-file fileb://recommendation-service.zip \
@@ -974,28 +965,13 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
     echo "✅ Deployed Lambda function with comprehensive recommendation logic"
     ```
 
-    The serverless recommendation API is now live with auto-scaling capabilities and integrated monitoring. The function can handle concurrent requests across multiple recommendation strategies while maintaining security best practices through least-privilege IAM permissions and encrypted environment variable storage.
+    The serverless recommendation API is now live with auto-scaling capabilities and integrated monitoring. The function uses Python 3.12 runtime for enhanced performance and can handle concurrent requests across multiple recommendation strategies while maintaining security best practices through least-privilege IAM permissions.
 
 11. **Create Batch Inference Jobs for Offline Processing**:
 
     Batch inference enables cost-effective offline recommendation generation for email campaigns, data analytics, and system initialization. Unlike real-time campaigns, batch jobs process large user lists asynchronously, making them ideal for periodic recommendation updates and analysis workloads that don't require immediate responses.
 
     ```bash
-    # Create batch inference job for User-Personalization
-    aws personalize create-batch-inference-job \
-        --job-name user-personalization-batch-${RANDOM_SUFFIX} \
-        --solution-version-arn ${USER_PERSONALIZATION_VERSION_ARN} \
-        --job-input s3DataSource="{
-            \"path\": \"s3://${BUCKET_NAME}/batch-input/users-batch.json\",
-            \"kmsKeyArn\": \"\"
-        }" \
-        --job-output s3DataDestination="{
-            \"path\": \"s3://${BUCKET_NAME}/batch-output/user-personalization/\",
-            \"kmsKeyArn\": \"\"
-        }" \
-        --role-arn ${PERSONALIZE_ROLE_ARN} \
-        --num-results 25
-    
     # Create sample batch input file
     cat > batch-input.json << EOF
     {"userId": "user_0001"}
@@ -1010,6 +986,21 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
         --key batch-input/ --body /dev/null
     
     aws s3 cp batch-input.json s3://${BUCKET_NAME}/batch-input/users-batch.json
+    
+    # Create batch inference job for User-Personalization-v2
+    aws personalize create-batch-inference-job \
+        --job-name user-personalization-batch-${RANDOM_SUFFIX} \
+        --solution-version-arn ${USER_PERSONALIZATION_VERSION_ARN} \
+        --job-input s3DataSource="{
+            \"path\": \"s3://${BUCKET_NAME}/batch-input/users-batch.json\",
+            \"kmsKeyArn\": \"\"
+        }" \
+        --job-output s3DataDestination="{
+            \"path\": \"s3://${BUCKET_NAME}/batch-output/user-personalization/\",
+            \"kmsKeyArn\": \"\"
+        }" \
+        --role-arn ${PERSONALIZE_ROLE_ARN} \
+        --num-results 25
     
     echo "✅ Created batch inference job for offline processing"
     ```
@@ -1090,7 +1081,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
     
     aws lambda create-function \
         --function-name personalize-retraining-${RANDOM_SUFFIX} \
-        --runtime python3.9 \
+        --runtime python3.12 \
         --role ${LAMBDA_ROLE_ARN} \
         --handler retraining-automation.lambda_handler \
         --zip-file fileb://retraining-automation.zip \
@@ -1125,7 +1116,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 1. **Test Multiple Recommendation Types**:
 
    ```bash
-   # Test User-Personalization recommendations
+   # Test User-Personalization-v2 recommendations
    aws personalize-runtime get-recommendations \
        --campaign-arn ${USER_PERSONALIZATION_CAMPAIGN_ARN} \
        --user-id user_0001 \
@@ -1347,15 +1338,15 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 
 ## Discussion
 
-This comprehensive recipe demonstrates how to build a production-ready recommendation system using Amazon Personalize that goes beyond basic implementations. The solution showcases multiple recommendation algorithms including collaborative filtering (User-Personalization), content-based filtering (Similar-Items), trending content identification (Trending-Now), and popularity-based recommendations. Each algorithm serves different use cases: User-Personalization for individual user preferences, Similar-Items for cross-selling opportunities, Trending-Now for viral content promotion, and Popularity-Count for new user cold-start scenarios.
+This comprehensive recipe demonstrates how to build a production-ready recommendation system using Amazon Personalize that goes beyond basic implementations. The solution showcases multiple recommendation algorithms including the latest User-Personalization-v2 recipe with transformer-based architecture, Similar-Items for content-based recommendations, Trending-Now for viral content identification, and Popularity-Count for cold-start scenarios. Each algorithm serves different use cases: User-Personalization-v2 provides enhanced performance and lower latency for individual user preferences, Similar-Items enables cross-selling opportunities, Trending-Now promotes viral content, and Popularity-Count handles new user scenarios.
 
 The architecture implements sophisticated A/B testing capabilities that automatically distribute traffic across different recommendation strategies, allowing continuous optimization of recommendation quality and business metrics. The system collects performance metrics including response times, recommendation accuracy, and user engagement rates, enabling data-driven decisions about algorithm performance. This approach is essential for production systems where different recommendation strategies may perform better for different user segments or business contexts.
 
-Advanced filtering capabilities demonstrate how to incorporate business rules and constraints into machine learning recommendations. The implementation shows price range filtering, category-based recommendations, and purchased item exclusion, which are critical for real-world e-commerce applications. These filters can be dynamically applied based on user context, inventory availability, or promotional campaigns, providing flexibility that pure ML approaches lack.
+Advanced filtering capabilities demonstrate how to incorporate business rules and constraints into machine learning recommendations. The implementation shows price range filtering, category-based recommendations, and purchased item exclusion, which are critical for real-world e-commerce applications. These filters can be dynamically applied based on user context, inventory availability, or promotional campaigns, providing flexibility that pure ML approaches lack. For more information on recommendation filters, see the [Amazon Personalize Developer Guide](https://docs.aws.amazon.com/personalize/latest/dg/filter-real-time-recommendations.html).
 
-The solution addresses both real-time and batch processing requirements through dual inference modes. Real-time campaigns provide sub-second recommendation responses for interactive applications, while batch inference jobs enable efficient offline processing for email campaigns, product catalog updates, and analytical workloads. The automated retraining pipeline ensures models stay current with evolving user behavior and new product introductions, using incremental learning to minimize training costs while maintaining recommendation quality.
+The solution addresses both real-time and batch processing requirements through dual inference modes. Real-time campaigns provide sub-second recommendation responses for interactive applications, while batch inference jobs enable efficient offline processing for email campaigns, product catalog updates, and analytical workloads. The automated retraining pipeline ensures models stay current with evolving user behavior and new product introductions, using incremental learning to minimize training costs while maintaining recommendation quality. This architecture follows the AWS Well-Architected Framework principles for operational excellence and performance efficiency.
 
-> **Tip**: Monitor recommendation diversity metrics alongside accuracy to prevent filter bubbles. Use Amazon Personalize's exploration weight parameter to balance exploitation of known preferences with exploration of new items.
+> **Tip**: Monitor recommendation diversity metrics alongside accuracy to prevent filter bubbles. Use Amazon Personalize's exploration weight parameter to balance exploitation of known preferences with exploration of new items, and consider implementing promotions for new items based on creation timestamps.
 
 ## Challenge
 
@@ -1373,4 +1364,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

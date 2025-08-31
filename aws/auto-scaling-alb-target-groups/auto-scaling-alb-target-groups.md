@@ -1,26 +1,25 @@
 ---
 title: Auto Scaling with Load Balancers
 id: bf3464f7
-category: networking-content-delivery
+category: networking
 difficulty: 300
 subject: aws
 services: Application Load Balancer, Auto Scaling, EC2, CloudWatch
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: auto-scaling, load-balancer, target-groups, networking, scaling
 recipe-generator-version: 1.3
 ---
 
-# Auto Scaling with Load Balancers
-
+# Auto Scaling with Application Load Balancers and Target Groups
 
 ## Problem
 
-Organizations running web applications face unpredictable traffic patterns that require dynamic resource scaling to maintain performance while controlling costs. Manual scaling approaches are reactive, error-prone, and cannot respond quickly enough to sudden traffic spikes or efficiently scale down during low-demand periods. Traditional load balancing setups often lack sophisticated health checking and traffic distribution capabilities needed for modern cloud-native applications. Companies need automated scaling solutions that can intelligently distribute load across healthy instances while maintaining application availability during scaling events.
+Organizations running web applications face unpredictable traffic patterns that require dynamic resource scaling to maintain performance while controlling costs. Manual scaling approaches are reactive, error-prone, and cannot respond quickly enough to sudden traffic spikes or efficiently scale down during low-demand periods. Traditional load balancing setups often lack sophisticated health checking and traffic distribution capabilities needed for modern cloud-native applications.
 
 ## Solution
 
@@ -140,7 +139,7 @@ echo "ASG Name: $ASG_NAME"
 
 1. **Create Security Group for Web Application**:
 
-   Security Groups act as virtual firewalls that control inbound and outbound traffic to your EC2 instances. In an auto scaling environment, properly configured security groups are essential for maintaining consistent security posture across dynamically launched instances. This security group will allow web traffic while restricting access to only necessary ports, implementing the principle of least privilege that's fundamental to AWS security best practices.
+   Security Groups act as virtual firewalls that control inbound and outbound traffic to your EC2 instances. In an auto scaling environment, properly configured security groups are essential for maintaining consistent security posture across dynamically launched instances. This security group will allow web traffic while restricting access to only necessary ports, implementing the principle of least privilege that's fundamental to [AWS security best practices](https://docs.aws.amazon.com/security/latest/userguide/security_iam_service-with-iam.html).
 
    ```bash
    # Create security group for web servers
@@ -308,7 +307,7 @@ echo "ASG Name: $ASG_NAME"
    echo "✅ Created launch template: $LT_NAME"
    ```
 
-   The launch template now contains all configuration needed to launch web servers automatically. The user data script installs Apache, creates a demo web page with instance metadata, and includes CPU load testing functionality. The template also configures IMDSv2 (Instance Metadata Service version 2) for enhanced security, requiring tokens for metadata access. This template serves as the foundation for consistent, automated instance deployment across your Auto Scaling Group.
+   The launch template now contains all configuration needed to launch web servers automatically. The user data script installs Apache, creates a demo web page with instance metadata, and includes CPU load testing functionality. The template also configures [IMDSv2 (Instance Metadata Service version 2)](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html) for enhanced security, requiring tokens for metadata access. This template serves as the foundation for consistent, automated instance deployment across your Auto Scaling Group.
 
 3. **Create Application Load Balancer**:
 
@@ -443,11 +442,14 @@ echo "ASG Name: $ASG_NAME"
        --target-tracking-configuration file://cpu-target-tracking.json
    
    # Create ALB request count target tracking policy
-   # Get the resource label for the target group
-   RESOURCE_LABEL=$(aws elbv2 describe-target-groups \
-       --target-group-arns $TG_ARN \
-       --query 'TargetGroups[0].TargetGroupArn' --output text | \
-       sed 's/.*loadbalancer\///g' | sed 's/targetgroup/targetgroup/g')
+   # Get the ALB suffix from the ALB ARN
+   ALB_SUFFIX=$(echo $ALB_ARN | cut -d/ -f2-)
+   
+   # Get the target group suffix from the target group ARN 
+   TG_SUFFIX=$(echo $TG_ARN | cut -d: -f6 | cut -d/ -f2-)
+   
+   # Construct resource label in correct format: app/alb-name/alb-id/targetgroup/tg-name/tg-id
+   RESOURCE_LABEL="${ALB_SUFFIX}/${TG_SUFFIX}"
    
    cat > alb-target-tracking.json << EOF
    {
@@ -503,7 +505,7 @@ echo "ASG Name: $ASG_NAME"
 
 9. **Configure CloudWatch Monitoring and Alarms**:
 
-   CloudWatch provides the observability foundation for auto scaling by collecting metrics and triggering alarms when thresholds are exceeded. Detailed monitoring at 1-minute intervals enables faster scaling responses compared to basic 5-minute monitoring. The comprehensive metric collection provides visibility into scaling group health and performance, while alarms enable proactive notification of potential issues before they impact users.
+   CloudWatch provides the observability foundation for auto scaling by collecting metrics and triggering alarms when thresholds are exceeded. [Detailed monitoring](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-cloudwatch-monitoring.html) at 1-minute intervals enables faster scaling responses compared to basic 5-minute monitoring. The comprehensive metric collection provides visibility into scaling group health and performance, while alarms enable proactive notification of potential issues before they impact users.
 
    ```bash
    # Enable detailed monitoring for Auto Scaling Group
@@ -529,6 +531,9 @@ echo "ASG Name: $ASG_NAME"
        --dimensions Name=AutoScalingGroupName,Value=$ASG_NAME
    
    # Create CloudWatch alarm for unhealthy target count
+   ALB_FULL_NAME=$(echo $ALB_ARN | cut -d/ -f2- | cut -d/ -f1-2)
+   TG_FULL_NAME=$(echo $TG_ARN | cut -d: -f6)
+   
    aws cloudwatch put-metric-alarm \
        --alarm-name "${ASG_NAME}-unhealthy-targets" \
        --alarm-description "Unhealthy targets in target group" \
@@ -539,8 +544,8 @@ echo "ASG Name: $ASG_NAME"
        --threshold 1 \
        --comparison-operator GreaterThanOrEqualToThreshold \
        --evaluation-periods 2 \
-       --dimensions Name=TargetGroup,Value=$(echo $TG_ARN | sed 's/.*\///g') \
-                    Name=LoadBalancer,Value=$(echo $ALB_ARN | sed 's/.*loadbalancer\///g')
+       --dimensions Name=TargetGroup,Value=${TG_FULL_NAME} \
+                    Name=LoadBalancer,Value=${ALB_FULL_NAME}
    
    echo "✅ Configured CloudWatch monitoring and alarms"
    ```
@@ -675,7 +680,7 @@ echo "ASG Name: $ASG_NAME"
    
    # Wait for instances to terminate
    echo "Waiting for instances to terminate..."
-   aws autoscaling wait group-not-exists --auto-scaling-group-names $ASG_NAME || true
+   sleep 60
    
    # Delete scheduled actions
    aws autoscaling delete-scheduled-action \
@@ -750,11 +755,11 @@ echo "ASG Name: $ASG_NAME"
 
 This recipe demonstrates a comprehensive auto scaling architecture that combines multiple AWS services to create a resilient, self-healing web application infrastructure. The solution addresses key challenges in modern cloud applications including automatic capacity management, intelligent load distribution, and proactive health monitoring.
 
-**Auto Scaling Integration** with Application Load Balancers provides sophisticated traffic management capabilities beyond simple round-robin distribution. The ELB health check integration ensures that only healthy instances receive traffic, while the deregistration delay allows graceful connection draining during scale-in events. This prevents service disruption during automated scaling activities and maintains application availability.
+**Auto Scaling Integration** with Application Load Balancers provides sophisticated traffic management capabilities beyond simple round-robin distribution. The ELB health check integration ensures that only healthy instances receive traffic, while the deregistration delay allows graceful connection draining during scale-in events. This prevents service disruption during automated scaling activities and maintains application availability. For more details, see the [AWS Well-Architected Framework reliability pillar](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html).
 
-**Target Tracking Scaling Policies** offer a significant improvement over traditional step scaling approaches by automatically calculating the required capacity changes to maintain target metrics. The CPU utilization policy responds to compute demand, while the ALB request count policy scales based on actual application load. This dual-metric approach provides more responsive scaling that adapts to different traffic patterns and application behaviors.
+**Target Tracking Scaling Policies** offer a significant improvement over traditional step scaling approaches by automatically calculating the required capacity changes to maintain target metrics. The CPU utilization policy responds to compute demand, while the ALB request count policy scales based on actual application load. This dual-metric approach provides more responsive scaling that adapts to different traffic patterns and application behaviors. The [target tracking scaling documentation](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html) provides comprehensive guidance on optimizing these policies.
 
-**Scheduled Scaling Actions** complement reactive scaling policies by proactively adjusting capacity based on predictable traffic patterns. This approach reduces response time during known peak periods and helps optimize costs by scaling down during low-demand hours. The combination of scheduled and reactive scaling creates a comprehensive capacity management strategy that handles both predictable and unexpected load changes.
+**Scheduled Scaling Actions** complement reactive scaling policies by proactively adjusting capacity based on predictable traffic patterns. This approach reduces response time during known peak periods and helps optimize costs by scaling down during low-demand hours. The combination of scheduled and reactive scaling creates a comprehensive capacity management strategy that handles both predictable and unexpected load changes, following [AWS cost optimization best practices](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html).
 
 The architecture demonstrates AWS best practices including multi-AZ deployment for high availability, security group isolation, and comprehensive monitoring integration. The launch template approach enables consistent instance configuration while supporting rolling updates and blue-green deployment strategies for application updates.
 
@@ -766,16 +771,23 @@ The architecture demonstrates AWS best practices including multi-AZ deployment f
 
 Extend this solution by implementing these enhancements:
 
-1. **Predictive Scaling**: Implement AWS Auto Scaling predictive scaling to forecast traffic patterns and pre-scale infrastructure before demand increases, reducing response time during traffic spikes.
+1. **Predictive Scaling**: Implement [AWS Auto Scaling predictive scaling](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-predictive-scaling.html) to forecast traffic patterns and pre-scale infrastructure before demand increases, reducing response time during traffic spikes.
 
 2. **Multi-Tier Auto Scaling**: Extend the architecture to include application and database tiers with separate Auto Scaling Groups, implementing cross-tier scaling coordination using Lambda functions and CloudWatch events.
 
 3. **Blue-Green Deployment Integration**: Implement automated blue-green deployments using multiple target groups and Route 53 weighted routing to enable zero-downtime application updates with automatic rollback capabilities.
 
-4. **Cost Optimization**: Add Spot Instance integration with mixed instance types and sizes, implementing intelligent bid management and fallback strategies to maximize cost savings while maintaining availability.
+4. **Cost Optimization**: Add [Spot Instance integration](https://docs.aws.amazon.com/autoscaling/ec2/userguide/auto-scaling-mixed-instances-groups.html) with mixed instance types and sizes, implementing intelligent bid management and fallback strategies to maximize cost savings while maintaining availability.
 
 5. **Advanced Health Checks**: Implement custom health check endpoints with application-specific metrics, database connectivity validation, and dependency service availability checks to improve scaling decision accuracy.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

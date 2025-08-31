@@ -1,0 +1,1058 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Service Mesh Cost Analytics with VPC Lattice and Cost Explorer - 
+  Automated cost analytics platform that combines VPC Lattice monitoring 
+  capabilities with Cost Explorer APIs to provide comprehensive service mesh cost insights.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - CostCenter
+      - Label:
+          default: "VPC Lattice Configuration"
+        Parameters:
+          - ServiceNetworkName
+          - DemoServiceName
+          - CreateSampleService
+      - Label:
+          default: "Analytics Configuration"
+        Parameters:
+          - AnalyticsRetentionDays
+          - CostAnalysisSchedule
+          - EnableAlerts
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - KMSKeyId
+          - VPCId
+          - SubnetIds
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      CostCenter:
+        default: "Cost Center"
+      ServiceNetworkName:
+        default: "Service Network Name"
+      DemoServiceName:
+        default: "Demo Service Name"
+      CreateSampleService:
+        default: "Create Sample Service"
+      AnalyticsRetentionDays:
+        default: "Analytics Data Retention (Days)"
+      CostAnalysisSchedule:
+        default: "Cost Analysis Schedule"
+      EnableAlerts:
+        default: "Enable Cost Alerts"
+      KMSKeyId:
+        default: "KMS Key ID (Optional)"
+      VPCId:
+        default: "VPC ID (Optional)"
+      SubnetIds:
+        default: "Subnet IDs (Optional)"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: "lattice-cost-analytics"
+    Description: "Name of the project for resource tagging and identification"
+    AllowedPattern: "^[a-zA-Z0-9-]+$"
+    ConstraintDescription: "Must contain only alphanumeric characters and hyphens"
+    MinLength: 3
+    MaxLength: 50
+
+  Environment:
+    Type: String
+    Default: "demo"
+    AllowedValues:
+      - "dev"
+      - "test"
+      - "staging"
+      - "demo"
+      - "prod"
+    Description: "Environment designation for resource tagging"
+
+  CostCenter:
+    Type: String
+    Default: "engineering"
+    Description: "Cost center for billing allocation"
+    MinLength: 3
+    MaxLength: 50
+
+  ServiceNetworkName:
+    Type: String
+    Default: "cost-demo-network"
+    Description: "Name for the VPC Lattice service network"
+    AllowedPattern: "^[a-zA-Z0-9-]+$"
+    ConstraintDescription: "Must contain only alphanumeric characters and hyphens"
+    MinLength: 3
+    MaxLength: 50
+
+  DemoServiceName:
+    Type: String
+    Default: "demo-service"
+    Description: "Name for the demo VPC Lattice service"
+    AllowedPattern: "^[a-zA-Z0-9-]+$"
+    ConstraintDescription: "Must contain only alphanumeric characters and hyphens"
+    MinLength: 3
+    MaxLength: 50
+
+  CreateSampleService:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Whether to create a sample VPC Lattice service for testing"
+
+  AnalyticsRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 30
+    MaxValue: 2555  # 7 years maximum
+    Description: "Number of days to retain analytics data in S3"
+
+  CostAnalysisSchedule:
+    Type: String
+    Default: "rate(1 day)"
+    AllowedValues:
+      - "rate(1 hour)"
+      - "rate(6 hours)"
+      - "rate(12 hours)"
+      - "rate(1 day)"
+      - "rate(7 days)"
+    Description: "Schedule for automated cost analysis execution"
+
+  EnableAlerts:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable SNS alerts for cost anomalies and high usage"
+
+  KMSKeyId:
+    Type: String
+    Default: ""
+    Description: "Optional KMS Key ID for S3 encryption (leave empty for default AES256)"
+
+  VPCId:
+    Type: String
+    Default: ""
+    Description: "Optional VPC ID for Lambda function (leave empty for default VPC)"
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: "Optional subnet IDs for Lambda function (leave empty for default)"
+
+# Conditional Resource Creation
+Conditions:
+  CreateSampleServiceCondition: !Equals [!Ref CreateSampleService, "true"]
+  EnableAlertsCondition: !Equals [!Ref EnableAlerts, "true"]
+  UseCustomKMSKey: !Not [!Equals [!Ref KMSKeyId, ""]]
+  UseCustomVPC: !Not [!Equals [!Ref VPCId, ""]]
+  UseCustomSubnets: !Not [!Equals [!Join ["", !Ref SubnetIds], ""]]
+
+# Resources
+Resources:
+  # S3 Bucket for Analytics Data Storage
+  AnalyticsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-analytics-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If 
+                - UseCustomKMSKey
+                - "aws:kms"
+                - "AES256"
+              KMSMasterKeyID: !If
+                - UseCustomKMSKey
+                - !Ref KMSKeyId
+                - !Ref AWS::NoValue
+            BucketKeyEnabled: !If
+              - UseCustomKMSKey
+              - true
+              - !Ref AWS::NoValue
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AnalyticsDataLifecycle
+            Status: Enabled
+            ExpirationInDays: !Ref AnalyticsRetentionDays
+            NoncurrentVersionExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: "Analytics Data Storage"
+
+  # S3 Bucket Policy for Enhanced Security
+  AnalyticsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AnalyticsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "${AnalyticsBucket}/*"
+              - !Ref AnalyticsBucket
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CostAnalyticsRole.Arn
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:DeleteObject"
+            Resource: !Sub "${AnalyticsBucket}/*"
+
+  # CloudWatch Log Groups
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-cost-processor"
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/s3/${ProjectName}-analytics-access"
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda Function
+  CostAnalyticsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-analytics-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "aws:RequestedRegion": !Ref AWS::Region
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - !If
+          - UseCustomVPC
+          - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: CostAnalyticsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Cost Explorer Permissions
+              - Effect: Allow
+                Action:
+                  - "ce:GetCostAndUsage"
+                  - "ce:GetUsageReport"
+                  - "ce:ListCostCategoryDefinitions"
+                  - "ce:GetCostCategories"
+                  - "ce:GetRecommendations"
+                  - "ce:GetDimensionValues"
+                  - "ce:GetReservationCoverage"
+                  - "ce:GetReservationPurchaseRecommendation"
+                  - "ce:GetReservationUtilization"
+                Resource: "*"
+              # CloudWatch Permissions
+              - Effect: Allow
+                Action:
+                  - "cloudwatch:GetMetricStatistics"
+                  - "cloudwatch:GetMetricData"
+                  - "cloudwatch:ListMetrics"
+                  - "cloudwatch:PutMetricData"
+                  - "cloudwatch:PutDashboard"
+                  - "cloudwatch:GetDashboard"
+                Resource: "*"
+              # VPC Lattice Permissions
+              - Effect: Allow
+                Action:
+                  - "vpc-lattice:GetService"
+                  - "vpc-lattice:GetServiceNetwork"
+                  - "vpc-lattice:ListServices"
+                  - "vpc-lattice:ListServiceNetworks"
+                  - "vpc-lattice:ListServiceNetworkServiceAssociations"
+                  - "vpc-lattice:GetServiceNetworkServiceAssociation"
+                Resource: "*"
+              # S3 Permissions
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !Sub "${AnalyticsBucket}/*"
+                  - !Ref AnalyticsBucket
+              # SNS Permissions (for alerts)
+              - !If
+                - EnableAlertsCondition
+                - Effect: Allow
+                  Action:
+                    - "sns:Publish"
+                  Resource: !Ref CostAlertsTopicArn
+                - !Ref AWS::NoValue
+              # KMS Permissions (if using custom key)
+              - !If
+                - UseCustomKMSKey
+                - Effect: Allow
+                  Action:
+                    - "kms:Decrypt"
+                    - "kms:GenerateDataKey"
+                  Resource: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KMSKeyId}"
+                - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # SNS Topic for Cost Alerts
+  CostAlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableAlertsCondition
+    Properties:
+      TopicName: !Sub "${ProjectName}-cost-alerts"
+      DisplayName: "VPC Lattice Cost Analytics Alerts"
+      KmsMasterKeyId: !If
+        - UseCustomKMSKey
+        - !Ref KMSKeyId
+        - "alias/aws/sns"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Store SNS Topic ARN in SSM Parameter for easy reference
+  CostAlertsTopicArn:
+    Type: AWS::SSM::Parameter
+    Condition: EnableAlertsCondition
+    Properties:
+      Name: !Sub "/${ProjectName}/sns/cost-alerts-topic-arn"
+      Type: String
+      Value: !Ref CostAlertsTopic
+      Description: "SNS Topic ARN for cost alerts"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Lambda Function for Cost Processing
+  CostProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-cost-processor"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CostAnalyticsRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrencyLimit: 5
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref AnalyticsBucket
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          SNS_TOPIC_ARN: !If
+            - EnableAlertsCondition
+            - !Ref CostAlertsTopic
+            - ""
+          ENABLE_ALERTS: !Ref EnableAlerts
+      VpcConfig: !If
+        - UseCustomVPC
+        - SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds: !If
+            - UseCustomSubnets
+            - !Ref SubnetIds
+            - []
+        - !Ref AWS::NoValue
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+          from decimal import Decimal
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              VPC Lattice Cost Analytics Processor
+              
+              This function collects VPC Lattice metrics from CloudWatch,
+              retrieves cost data from Cost Explorer API, and generates
+              comprehensive analytics reports stored in S3.
+              """
+              
+              # Initialize AWS clients
+              ce_client = boto3.client('ce')
+              cw_client = boto3.client('cloudwatch')
+              s3_client = boto3.client('s3')
+              lattice_client = boto3.client('vpc-lattice')
+              
+              # Get environment variables
+              bucket_name = os.environ['BUCKET_NAME']
+              project_name = os.environ['PROJECT_NAME']
+              environment = os.environ['ENVIRONMENT']
+              sns_topic_arn = os.environ.get('SNS_TOPIC_ARN', '')
+              enable_alerts = os.environ.get('ENABLE_ALERTS', 'false').lower() == 'true'
+              
+              # Calculate date range for cost analysis (last 7 days)
+              end_date = datetime.datetime.now().date()
+              start_date = end_date - datetime.timedelta(days=7)
+              
+              try:
+                  logger.info(f"Starting cost analytics for period: {start_date} to {end_date}")
+                  
+                  # Get VPC Lattice service networks
+                  service_networks_response = lattice_client.list_service_networks()
+                  service_networks = service_networks_response.get('items', [])
+                  
+                  logger.info(f"Found {len(service_networks)} VPC Lattice service networks")
+                  
+                  cost_data = {}
+                  metrics_data = {}
+                  
+                  # Query Cost Explorer for VPC Lattice related costs
+                  try:
+                      cost_response = ce_client.get_cost_and_usage(
+                          TimePeriod={
+                              'Start': start_date.strftime('%Y-%m-%d'),
+                              'End': end_date.strftime('%Y-%m-%d')
+                          },
+                          Granularity='DAILY',
+                          Metrics=['BlendedCost', 'UsageQuantity'],
+                          GroupBy=[
+                              {'Type': 'DIMENSION', 'Key': 'SERVICE'},
+                              {'Type': 'DIMENSION', 'Key': 'REGION'}
+                          ],
+                          Filter={
+                              'Or': [
+                                  {
+                                      'Dimensions': {
+                                          'Key': 'SERVICE',
+                                          'Values': ['Amazon Virtual Private Cloud']
+                                      }
+                                  },
+                                  {
+                                      'Dimensions': {
+                                          'Key': 'SERVICE',
+                                          'Values': ['VPC Lattice', 'Amazon VPC Lattice']
+                                      }
+                                  }
+                              ]
+                          }
+                      )
+                      
+                      # Process cost data
+                      for result in cost_response['ResultsByTime']:
+                          date = result['TimePeriod']['Start']
+                          for group in result['Groups']:
+                              service = group['Keys'][0]
+                              region = group['Keys'][1]
+                              amount = float(group['Metrics']['BlendedCost']['Amount'])
+                              
+                              cost_data[f"{date}_{service}_{region}"] = {
+                                  'date': date,
+                                  'service': service,
+                                  'region': region,
+                                  'cost': amount,
+                                  'currency': group['Metrics']['BlendedCost']['Unit']
+                              }
+                      
+                      logger.info(f"Collected cost data for {len(cost_data)} service-region-date combinations")
+                      
+                  except Exception as e:
+                      logger.warning(f"Cost Explorer query failed: {str(e)}")
+                      # Continue with metrics collection even if cost data fails
+                  
+                  # Get VPC Lattice CloudWatch metrics
+                  for network in service_networks:
+                      network_id = network['id']
+                      network_name = network.get('name', network_id)
+                      
+                      try:
+                          # Get request count metrics for service network
+                          metric_response = cw_client.get_metric_statistics(
+                              Namespace='AWS/VpcLattice',
+                              MetricName='TotalRequestCount',
+                              Dimensions=[
+                                  {'Name': 'ServiceNetwork', 'Value': network_id}
+                              ],
+                              StartTime=datetime.datetime.combine(start_date, datetime.time.min),
+                              EndTime=datetime.datetime.combine(end_date, datetime.time.min),
+                              Period=86400,  # Daily
+                              Statistics=['Sum']
+                          )
+                          
+                          total_requests = sum([point['Sum'] for point in metric_response['Datapoints']])
+                          
+                          # Get additional metrics
+                          connection_metric = cw_client.get_metric_statistics(
+                              Namespace='AWS/VpcLattice',
+                              MetricName='ActiveConnectionCount',
+                              Dimensions=[
+                                  {'Name': 'ServiceNetwork', 'Value': network_id}
+                              ],
+                              StartTime=datetime.datetime.combine(start_date, datetime.time.min),
+                              EndTime=datetime.datetime.combine(end_date, datetime.time.min),
+                              Period=86400,
+                              Statistics=['Average', 'Maximum']
+                          )
+                          
+                          avg_connections = sum([point['Average'] for point in connection_metric['Datapoints']]) / max(len(connection_metric['Datapoints']), 1)
+                          max_connections = max([point['Maximum'] for point in connection_metric['Datapoints']], default=0)
+                          
+                          metrics_data[network_id] = {
+                              'network_name': network_name,
+                              'request_count': total_requests,
+                              'avg_connections': avg_connections,
+                              'max_connections': max_connections
+                          }
+                          
+                          logger.info(f"Collected metrics for network {network_name}: {total_requests} requests")
+                          
+                      except Exception as e:
+                          logger.warning(f"Failed to collect metrics for network {network_id}: {str(e)}")
+                          metrics_data[network_id] = {
+                              'network_name': network_name,
+                              'request_count': 0,
+                              'avg_connections': 0,
+                              'max_connections': 0,
+                              'error': str(e)
+                          }
+                  
+                  # Calculate summary metrics
+                  total_cost = sum([item['cost'] for item in cost_data.values()])
+                  total_requests = sum([item['request_count'] for item in metrics_data.values()])
+                  cost_per_request = total_cost / total_requests if total_requests > 0 else 0
+                  
+                  # Combine cost and metrics data
+                  analytics_report = {
+                      'report_date': end_date.isoformat(),
+                      'time_period': {
+                          'start': start_date.isoformat(),
+                          'end': end_date.isoformat()
+                      },
+                      'project_name': project_name,
+                      'environment': environment,
+                      'cost_data': cost_data,
+                      'metrics_data': metrics_data,
+                      'summary': {
+                          'total_cost': total_cost,
+                          'total_requests': total_requests,
+                          'cost_per_request': cost_per_request,
+                          'service_networks_count': len(service_networks),
+                          'cost_data_points': len(cost_data),
+                          'metrics_data_points': len(metrics_data)
+                      }
+                  }
+                  
+                  # Store analytics report in S3
+                  report_key = f"cost-reports/{end_date.isoformat()}_lattice_analytics.json"
+                  s3_client.put_object(
+                      Bucket=bucket_name,
+                      Key=report_key,
+                      Body=json.dumps(analytics_report, indent=2, default=str),
+                      ContentType='application/json',
+                      ServerSideEncryption='AES256'
+                  )
+                  
+                  logger.info(f"Analytics report saved to s3://{bucket_name}/{report_key}")
+                  
+                  # Create CloudWatch custom metrics
+                  custom_metrics = [
+                      {
+                          'MetricName': 'TotalCost',
+                          'Value': total_cost,
+                          'Unit': 'None',
+                          'Dimensions': [
+                              {'Name': 'Project', 'Value': project_name},
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      },
+                      {
+                          'MetricName': 'TotalRequests',
+                          'Value': total_requests,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'Project', 'Value': project_name},
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      },
+                      {
+                          'MetricName': 'CostPerRequest',
+                          'Value': cost_per_request,
+                          'Unit': 'None',
+                          'Dimensions': [
+                              {'Name': 'Project', 'Value': project_name},
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      },
+                      {
+                          'MetricName': 'ServiceNetworksCount',
+                          'Value': len(service_networks),
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'Project', 'Value': project_name},
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      }
+                  ]
+                  
+                  cw_client.put_metric_data(
+                      Namespace='VPCLattice/CostAnalytics',
+                      MetricData=custom_metrics
+                  )
+                  
+                  logger.info(f"Published {len(custom_metrics)} custom metrics to CloudWatch")
+                  
+                  # Send alert if costs are high and alerts are enabled
+                  if enable_alerts and sns_topic_arn and total_cost > 10.0:  # Alert if cost > $10
+                      try:
+                          sns_client = boto3.client('sns')
+                          alert_message = {
+                              'alert_type': 'high_cost',
+                              'total_cost': total_cost,
+                              'cost_per_request': cost_per_request,
+                              'total_requests': total_requests,
+                              'period': f"{start_date} to {end_date}",
+                              'report_location': f"s3://{bucket_name}/{report_key}"
+                          }
+                          
+                          sns_client.publish(
+                              TopicArn=sns_topic_arn,
+                              Subject=f"VPC Lattice Cost Alert - {project_name}",
+                              Message=json.dumps(alert_message, indent=2)
+                          )
+                          
+                          logger.info(f"Cost alert sent for total cost: ${total_cost:.2f}")
+                          
+                      except Exception as e:
+                          logger.error(f"Failed to send SNS alert: {str(e)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Cost analytics completed successfully',
+                          'report_location': f's3://{bucket_name}/{report_key}',
+                          'summary': analytics_report['summary']
+                      }, default=str)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing cost analytics: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: "Cost Analytics Processing"
+
+  # Lambda Security Group (if using custom VPC)
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseCustomVPC
+    Properties:
+      GroupDescription: "Security group for VPC Lattice cost analytics Lambda function"
+      VpcId: !Ref VPCId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "HTTPS outbound for AWS API calls"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: "HTTP outbound for metadata service"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Name
+          Value: !Sub "${ProjectName}-lambda-sg"
+
+  # EventBridge Rule for Scheduled Execution
+  CostAnalysisScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-cost-analysis-schedule"
+      Description: "Scheduled trigger for VPC Lattice cost analysis"
+      ScheduleExpression: !Ref CostAnalysisSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostProcessorFunction.Arn
+          Id: "CostAnalysisLambdaTarget"
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+
+  # IAM Role for EventBridge to invoke Lambda
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt CostProcessorFunction.Arn
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CostAnalysisScheduleRule.Arn
+
+  # VPC Lattice Service Network (Sample)
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Condition: CreateSampleServiceCondition
+    Properties:
+      Name: !Sub "${ServiceNetworkName}-${AWS::AccountId}"
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: "Demo Service Network for Cost Analytics"
+
+  # VPC Lattice Service (Sample)
+  DemoService:
+    Type: AWS::VpcLattice::Service
+    Condition: CreateSampleServiceCondition
+    Properties:
+      Name: !Sub "${DemoServiceName}-${AWS::AccountId}"
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ServiceType
+          Value: "demo"
+
+  # Service Network Service Association
+  ServiceNetworkServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Condition: CreateSampleServiceCondition
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      ServiceIdentifier: !Ref DemoService
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard
+  CostAnalyticsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "VPCLattice-CostAnalytics-${ProjectName}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "VPCLattice/CostAnalytics", "TotalCost", "Project", "${ProjectName}", "Environment", "${Environment}" ],
+                  [ ".", "TotalRequests", ".", ".", ".", "." ]
+                ],
+                "period": 86400,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Cost and Traffic Overview - ${ProjectName}",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "VPCLattice/CostAnalytics", "CostPerRequest", "Project", "${ProjectName}", "Environment", "${Environment}" ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Cost Per Request Efficiency - ${ProjectName}",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "VPCLattice/CostAnalytics", "ServiceNetworksCount", "Project", "${ProjectName}", "Environment", "${Environment}" ]
+                ],
+                "period": 86400,
+                "stat": "Maximum",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Service Networks Count - ${ProjectName}",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-cost-processor'\n| fields @timestamp, @message\n| filter @message like /Cost analytics completed successfully/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Cost Analytics Executions - ${ProjectName}",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Cost Monitoring
+  HighCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlertsCondition
+    Properties:
+      AlarmName: !Sub "${ProjectName}-high-cost-alarm"
+      AlarmDescription: "Alert when VPC Lattice costs exceed threshold"
+      MetricName: TotalCost
+      Namespace: VPCLattice/CostAnalytics
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 50.0  # Alert if daily cost exceeds $50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Project
+          Value: !Ref ProjectName
+        - Name: Environment
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref CostAlertsTopic
+      TreatMissingData: notBreaching
+
+  LowEfficiencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlertsCondition
+    Properties:
+      AlarmName: !Sub "${ProjectName}-low-efficiency-alarm"
+      AlarmDescription: "Alert when cost per request is too high"
+      MetricName: CostPerRequest
+      Namespace: VPCLattice/CostAnalytics
+      Statistic: Average
+      Period: 86400
+      EvaluationPeriods: 2
+      Threshold: 0.01  # Alert if cost per request exceeds $0.01
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref CostAlertsTopic
+      TreatMissingData: notBreaching
+
+# Stack Outputs
+Outputs:
+  AnalyticsBucketName:
+    Description: "S3 bucket name for analytics data storage"
+    Value: !Ref AnalyticsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-analytics-bucket"
+
+  AnalyticsBucketArn:
+    Description: "S3 bucket ARN for analytics data storage"
+    Value: !GetAtt AnalyticsBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-analytics-bucket-arn"
+
+  CostProcessorFunctionArn:
+    Description: "Lambda function ARN for cost processing"
+    Value: !GetAtt CostProcessorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-cost-processor-arn"
+
+  CostProcessorFunctionName:
+    Description: "Lambda function name for cost processing"
+    Value: !Ref CostProcessorFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-cost-processor-name"
+
+  CostAnalyticsRoleArn:
+    Description: "IAM role ARN for cost analytics"
+    Value: !GetAtt CostAnalyticsRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-analytics-role-arn"
+
+  DashboardURL:
+    Description: "CloudWatch dashboard URL for cost analytics"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=VPCLattice-CostAnalytics-${ProjectName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-dashboard-url"
+
+  ServiceNetworkId:
+    Condition: CreateSampleServiceCondition
+    Description: "VPC Lattice service network ID"
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub "${AWS::StackName}-service-network-id"
+
+  ServiceNetworkArn:
+    Condition: CreateSampleServiceCondition
+    Description: "VPC Lattice service network ARN"
+    Value: !GetAtt ServiceNetwork.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-service-network-arn"
+
+  DemoServiceId:
+    Condition: CreateSampleServiceCondition
+    Description: "Demo VPC Lattice service ID"
+    Value: !Ref DemoService
+    Export:
+      Name: !Sub "${AWS::StackName}-demo-service-id"
+
+  DemoServiceArn:
+    Condition: CreateSampleServiceCondition
+    Description: "Demo VPC Lattice service ARN"
+    Value: !GetAtt DemoService.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-demo-service-arn"
+
+  CostAlertsTopicArn:
+    Condition: EnableAlertsCondition
+    Description: "SNS topic ARN for cost alerts"
+    Value: !Ref CostAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-cost-alerts-topic-arn"
+
+  EventBridgeRuleArn:
+    Description: "EventBridge rule ARN for scheduled cost analysis"
+    Value: !GetAtt CostAnalysisScheduleRule.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-schedule-rule-arn"
+
+  LambdaLogGroupName:
+    Description: "CloudWatch log group name for Lambda function"
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-lambda-log-group"
+
+  ProjectConfiguration:
+    Description: "Project configuration summary"
+    Value: !Sub |
+      Project: ${ProjectName}
+      Environment: ${Environment}
+      Cost Center: ${CostCenter}
+      Region: ${AWS::Region}
+      Analysis Schedule: ${CostAnalysisSchedule}
+      Alerts Enabled: ${EnableAlerts}

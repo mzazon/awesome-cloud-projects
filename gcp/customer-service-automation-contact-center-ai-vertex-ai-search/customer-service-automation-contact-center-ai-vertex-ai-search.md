@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Contact Center AI, Vertex AI Search, Cloud Run, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: contact-center, ai, search, customer-service, automation, conversational-ai, nlp
 recipe-generator-version: 1.3
@@ -291,7 +291,6 @@ import os
 import json
 from flask import Flask, request, jsonify
 from google.cloud import discoveryengine
-from google.oauth2 import service_account
 import logging
 
 app = Flask(__name__)
@@ -420,12 +419,12 @@ if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 EOF
    
-   # Create requirements.txt
+   # Create requirements.txt with updated versions
    cat > /tmp/customer-service-api/requirements.txt <<EOF
-Flask==2.3.3
-google-cloud-discoveryengine==0.11.11
-google-auth==2.23.3
-gunicorn==21.2.0
+Flask==3.0.3
+google-cloud-discoveryengine==0.13.9
+google-auth==2.34.0
+gunicorn==22.0.0
 EOF
    
    # Create Dockerfile
@@ -756,6 +755,7 @@ EOF
    rm -rf /tmp/customer-service-api
    rm -rf /tmp/agent-dashboard
    rm -rf /tmp/knowledge-base
+   rm -f /tmp/conversation-config.json
    
    # Optionally disable APIs (only if not needed for other projects)
    # gcloud services disable contactcenteraiplatform.googleapis.com
@@ -794,4 +794,9 @@ Extend this intelligent customer service automation solution by implementing the
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

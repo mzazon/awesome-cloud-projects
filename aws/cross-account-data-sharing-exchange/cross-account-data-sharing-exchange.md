@@ -4,12 +4,12 @@ id: f22b06e2
 category: analytics
 difficulty: 300
 subject: aws
-services: Data Exchange, S3, IAM, Lambda
+services: Data Exchange, S3, IAM, EventBridge
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: analytics, data-exchange, cross-account, security, automation
 recipe-generator-version: 1.3
@@ -52,6 +52,7 @@ graph TB
     end
     
     subgraph "Monitoring & Governance"
+        EB[EventBridge]
         CW[CloudWatch]
         CT[CloudTrail]
         IAM[IAM Roles]
@@ -71,7 +72,8 @@ graph TB
     LAMBDA_PROV-->DX
     LAMBDA_SUB-->ENTITLED_DS
     
-    DX-->CW
+    DX-->EB
+    EB-->CW
     DX-->CT
     IAM-->DS
     IAM-->ENTITLED_DS
@@ -89,6 +91,8 @@ graph TB
 3. Understanding of IAM roles, S3 bucket policies, and cross-account access
 4. Familiarity with JSON configuration and AWS CLI operations
 5. Estimated cost: $50-100/month for data transfer and storage (varies by data volume)
+
+> **Note**: This recipe requires jq for JSON parsing. Install jq if not available: `sudo yum install jq` (Amazon Linux) or `brew install jq` (macOS).
 
 ## Preparation
 
@@ -110,12 +114,18 @@ export SUBSCRIBER_BUCKET="data-exchange-subscriber-${RANDOM_SUFFIX}"
 export SUBSCRIBER_ACCOUNT_ID="123456789012"  # Replace with actual subscriber account
 
 # Create foundational S3 bucket for data provider
-aws s3 mb s3://$PROVIDER_BUCKET
+aws s3 mb s3://$PROVIDER_BUCKET --region $AWS_REGION
 
 # Enable versioning for data consistency
 aws s3api put-bucket-versioning \
     --bucket $PROVIDER_BUCKET \
     --versioning-configuration Status=Enabled
+
+# Enable server-side encryption for security
+aws s3api put-bucket-encryption \
+    --bucket $PROVIDER_BUCKET \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
 
 echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
 ```
@@ -135,7 +145,10 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
            {
                "Effect": "Allow",
                "Principal": {
-                   "Service": "dataexchange.amazonaws.com"
+                   "Service": [
+                       "dataexchange.amazonaws.com",
+                       "lambda.amazonaws.com"
+                   ]
                },
                "Action": "sts:AssumeRole"
            }
@@ -148,10 +161,15 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
        --role-name DataExchangeProviderRole \
        --assume-role-policy-document file://data-exchange-trust-policy.json
    
-   # Attach necessary permissions
+   # Attach necessary permissions for Data Exchange
    aws iam attach-role-policy \
        --role-name DataExchangeProviderRole \
        --policy-arn arn:aws:iam::aws:policy/AWSDataExchangeProviderFullAccess
+   
+   # Attach Lambda execution permissions
+   aws iam attach-role-policy \
+       --role-name DataExchangeProviderRole \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
    echo "✅ Created IAM role for Data Exchange operations"
    ```
@@ -160,26 +178,27 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
 
 2. **Create and Upload Sample Data Assets**:
 
-   Data assets form the foundation of any Data Exchange offering, representing the actual files and information that will be shared with subscribers. Creating realistic sample data helps demonstrate your data sharing capabilities and provides subscribers with a clear understanding of the data structure and content format they will receive.
+   Data assets form the foundation of any Data Exchange offering, representing the actual files and information shared with subscribers. Creating realistic sample data helps demonstrate data sharing capabilities and provides subscribers with a understanding of the data structure and content format they will receive.
 
    ```bash
    # Create sample data files
    mkdir -p sample-data
    
-   # Generate sample customer analytics data
-   cat > sample-data/customer-analytics.csv << 'EOF'
+   # Generate sample customer analytics data with current date
+   CURRENT_DATE=$(date '+%Y-%m-%d')
+   cat > sample-data/customer-analytics.csv << EOF
    customer_id,purchase_date,amount,category,region
-   C001,2024-01-15,150.50,electronics,us-east
-   C002,2024-01-16,89.99,books,us-west
-   C003,2024-01-17,299.99,clothing,eu-central
-   C004,2024-01-18,45.75,home,us-east
-   C005,2024-01-19,199.99,electronics,asia-pacific
+   C001,$CURRENT_DATE,150.50,electronics,us-east
+   C002,$CURRENT_DATE,89.99,books,us-west
+   C003,$CURRENT_DATE,299.99,clothing,eu-central
+   C004,$CURRENT_DATE,45.75,home,us-east
+   C005,$CURRENT_DATE,199.99,electronics,asia-pacific
    EOF
    
    # Generate sample sales data
-   cat > sample-data/sales-summary.json << 'EOF'
+   cat > sample-data/sales-summary.json << EOF
    {
-       "report_date": "2024-01-31",
+       "report_date": "$CURRENT_DATE",
        "total_sales": 785.72,
        "transaction_count": 5,
        "top_category": "electronics",
@@ -213,11 +232,11 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
    echo "✅ Created data set with ID: $DATASET_ID"
    ```
 
-   The data set is now created and ready for revision management. This foundational step establishes the container structure that will organize all related data assets and enable efficient subscriber discovery through the Data Exchange catalog.
+   The data set is now created and ready for revision management. This foundational step establishes the container structure that organizes all related data assets and enables efficient subscriber discovery through the Data Exchange catalog.
 
 4. **Create Initial Revision and Import Assets**:
 
-   Revisions in AWS Data Exchange enable versioning of your data assets, allowing you to publish updates while maintaining historical versions. The import process securely transfers your S3-hosted data into the Data Exchange service, where it becomes available for sharing with authorized subscribers. This versioning capability ensures data lineage and enables rollback to previous versions if needed.
+   Revisions in AWS Data Exchange enable versioning of data assets, allowing you to publish updates while maintaining historical versions. The import process securely transfers S3-hosted data into the Data Exchange service, where it becomes available for sharing with authorized subscribers. This versioning capability ensures data lineage and enables rollback to previous versions if needed.
 
    ```bash
    # Create a new revision
@@ -293,19 +312,22 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
    Data grants establish secure, time-limited access permissions for specific AWS accounts. This mechanism ensures that only authorized accounts can access your data, and access automatically expires based on your specified timeline, maintaining data governance and compliance.
 
    ```bash
-   # Create data grant for subscriber account
+   # Create data grant for subscriber account with future expiration
+   EXPIRY_DATE=$(date -d '+1 year' '+%Y-%m-%dT23:59:59Z')
+   
    DATA_GRANT_RESPONSE=$(aws dataexchange create-data-grant \
        --name "Analytics Data Grant for Account $SUBSCRIBER_ACCOUNT_ID" \
        --description "Cross-account data sharing grant for analytics data" \
        --dataset-id $DATASET_ID \
        --recipient-account-id $SUBSCRIBER_ACCOUNT_ID \
-       --ends-at "2024-12-31T23:59:59Z")
+       --ends-at "$EXPIRY_DATE")
    
    # Extract data grant ID
    export DATA_GRANT_ID=$(echo $DATA_GRANT_RESPONSE | \
        jq -r '.Id')
    
    echo "✅ Created data grant with ID: $DATA_GRANT_ID"
+   echo "Grant expires on: $EXPIRY_DATE"
    echo "Share this grant ID with the subscriber: $DATA_GRANT_ID"
    ```
 
@@ -321,48 +343,65 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
    import json
    import boto3
    import os
+   import logging
+   
+   logger = logging.getLogger()
+   logger.setLevel(logging.INFO)
    
    def lambda_handler(event, context):
-       sns = boto3.client('sns')
+       logger.info(f"Received event: {json.dumps(event)}")
        
-       # Parse the Data Exchange event
-       detail = event.get('detail', {})
-       event_name = detail.get('eventName', 'Unknown')
-       dataset_id = detail.get('dataSetId', 'Unknown')
-       
-       message = f"""
-       AWS Data Exchange Event: {event_name}
-       Dataset ID: {dataset_id}
-       Timestamp: {event.get('time', 'Unknown')}
-       
-       Event Details: {json.dumps(detail, indent=2)}
-       """
-       
-       # Send notification (requires SNS topic ARN)
-       topic_arn = os.environ.get('SNS_TOPIC_ARN')
-       if topic_arn:
-           sns.publish(
-               TopicArn=topic_arn,
-               Message=message,
-               Subject=f'Data Exchange Event: {event_name}'
-           )
-       
-       return {
-           'statusCode': 200,
-           'body': json.dumps('Notification sent successfully')
-       }
+       try:
+           # Parse the Data Exchange event
+           detail = event.get('detail', {})
+           event_name = detail.get('eventName', 'Unknown')
+           dataset_id = detail.get('dataSetId', 'Unknown')
+           
+           message = f"""
+           AWS Data Exchange Event: {event_name}
+           Dataset ID: {dataset_id}
+           Timestamp: {event.get('time', 'Unknown')}
+           
+           Event Details: {json.dumps(detail, indent=2)}
+           """
+           
+           logger.info(f"Processing Data Exchange event: {event_name}")
+           
+           # Send notification to SNS if topic ARN is configured
+           topic_arn = os.environ.get('SNS_TOPIC_ARN')
+           if topic_arn:
+               sns = boto3.client('sns')
+               sns.publish(
+                   TopicArn=topic_arn,
+                   Message=message,
+                   Subject=f'Data Exchange Event: {event_name}'
+               )
+               logger.info("Notification sent to SNS topic")
+           
+           return {
+               'statusCode': 200,
+               'body': json.dumps('Notification processed successfully')
+           }
+           
+       except Exception as e:
+           logger.error(f"Error processing event: {str(e)}")
+           return {
+               'statusCode': 500,
+               'body': json.dumps(f'Error: {str(e)}')
+           }
    EOF
    
    # Create deployment package
    zip notification-lambda.zip notification-lambda.py
    
-   # Create Lambda function
+   # Create Lambda function with latest Python runtime
    aws lambda create-function \
        --function-name DataExchangeNotificationHandler \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::$PROVIDER_ACCOUNT_ID:role/DataExchangeProviderRole \
        --handler notification-lambda.lambda_handler \
        --zip-file fileb://notification-lambda.zip \
+       --timeout 60 \
        --description "Handles Data Exchange events and notifications"
    
    echo "✅ Created notification Lambda function"
@@ -378,7 +417,11 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
        --name DataExchangeEventRule \
        --event-pattern '{
            "source": ["aws.dataexchange"],
-           "detail-type": ["Data Exchange Asset Import State Change"]
+           "detail-type": [
+               "Data Exchange Asset Import State Change",
+               "Data Exchange Revision State Change",
+               "Data Exchange Data Grant State Change"
+           ]
        }' \
        --description "Captures Data Exchange events for notifications"
    
@@ -398,7 +441,7 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
    echo "✅ Configured EventBridge integration for automated notifications"
    ```
 
-   The EventBridge rule is now configured to capture Data Exchange events and automatically trigger Lambda functions for notification processing. This integration provides comprehensive monitoring of all data sharing activities, enabling proactive response to operational events and subscriber activities. Learn more about [EventBridge Data Exchange events](https://docs.aws.amazon.com/eventbridge/latest/ref/events-ref-dataexchange.html).
+   The EventBridge rule is now configured to capture Data Exchange events and automatically trigger Lambda functions for notification processing. This integration provides comprehensive monitoring of all data sharing activities, enabling proactive response to operational events and subscriber activities. Learn more about [EventBridge Data Exchange events](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-service-event.html).
 
 9. **Create Subscriber Access Script (for subscriber account)**:
 
@@ -424,19 +467,27 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
    aws dataexchange accept-data-grant \
        --data-grant-id $DATA_GRANT_ID
    
+   # Wait a moment for grant processing
+   sleep 5
+   
    # List entitled data sets
    ENTITLED_DATASETS=$(aws dataexchange list-data-sets \
        --origin ENTITLED \
        --query 'DataSets[0].Id' \
        --output text)
    
+   if [ "$ENTITLED_DATASETS" = "None" ] || [ -z "$ENTITLED_DATASETS" ]; then
+       echo "Error: No entitled datasets found"
+       exit 1
+   fi
+   
    echo "Entitled to data set: $ENTITLED_DATASETS"
    
    # Create subscriber S3 bucket if it doesn't exist
-   aws s3 mb s3://$SUBSCRIBER_BUCKET 2>/dev/null || true
+   aws s3 mb s3://$SUBSCRIBER_BUCKET 2>/dev/null || echo "Bucket already exists or accessible"
    
    # Export entitled assets to subscriber bucket
-   aws dataexchange create-job \
+   EXPORT_JOB=$(aws dataexchange create-job \
        --type EXPORT_ASSETS_TO_S3 \
        --details "{
            \"ExportAssetsToS3JobDetails\": {
@@ -449,9 +500,15 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
                    }
                ]
            }
-       }"
+       }")
    
-   echo "✅ Data grant accepted and export job initiated"
+   EXPORT_JOB_ID=$(echo $EXPORT_JOB | jq -r '.Id')
+   echo "Export job initiated with ID: $EXPORT_JOB_ID"
+   
+   # Wait for export job to complete
+   aws dataexchange wait job-completed --job-id $EXPORT_JOB_ID
+   
+   echo "✅ Data grant accepted and export job completed"
    EOF
    
    chmod +x subscriber-access-script.sh
@@ -468,79 +525,97 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
     cat > update-lambda.py << 'EOF'
     import json
     import boto3
-    from datetime import datetime, timedelta
-    import csv
+    from datetime import datetime
     import random
+    import logging
+    
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
     
     def lambda_handler(event, context):
-        dataexchange = boto3.client('dataexchange')
-        s3 = boto3.client('s3')
+        logger.info(f"Starting automated data update: {json.dumps(event)}")
         
-        dataset_id = event.get('dataset_id')
-        bucket_name = event.get('bucket_name')
-        
-        if not dataset_id or not bucket_name:
-            return {
-                'statusCode': 400,
-                'body': json.dumps('Missing required parameters')
-            }
-        
-        # Generate updated sample data
-        current_date = datetime.now().strftime('%Y-%m-%d')
-        updated_data = []
-        
-        for i in range(1, 6):
-            updated_data.append([
-                f'C{i:03d}',
-                current_date,
-                f'{random.uniform(50, 300):.2f}',
-                random.choice(['electronics', 'books', 'clothing', 'home']),
-                random.choice(['us-east', 'us-west', 'eu-central', 'asia-pacific'])
-            ])
-        
-        # Upload updated data to S3
-        csv_content = 'customer_id,purchase_date,amount,category,region\n'
-        for row in updated_data:
-            csv_content += ','.join(row) + '\n'
-        
-        s3.put_object(
-            Bucket=bucket_name,
-            Key=f'analytics-data/customer-analytics-{current_date}.csv',
-            Body=csv_content
-        )
-        
-        # Create new revision
-        revision_response = dataexchange.create_revision(
-            DataSetId=dataset_id,
-            Comment=f'Automated update - {current_date}'
-        )
-        
-        revision_id = revision_response['Id']
-        
-        # Import new assets
-        import_job = dataexchange.create_job(
-            Type='IMPORT_ASSETS_FROM_S3',
-            Details={
-                'ImportAssetsFromS3JobDetails': {
-                    'DataSetId': dataset_id,
-                    'RevisionId': revision_id,
-                    'AssetSources': [
-                        {
-                            'Bucket': bucket_name,
-                            'Key': f'analytics-data/customer-analytics-{current_date}.csv'
-                        }
-                    ]
+        try:
+            dataexchange = boto3.client('dataexchange')
+            s3 = boto3.client('s3')
+            
+            dataset_id = event.get('dataset_id')
+            bucket_name = event.get('bucket_name')
+            
+            if not dataset_id or not bucket_name:
+                raise ValueError('Missing required parameters: dataset_id or bucket_name')
+            
+            # Generate updated sample data
+            current_date = datetime.now().strftime('%Y-%m-%d')
+            updated_data = []
+            
+            for i in range(1, 6):
+                updated_data.append([
+                    f'C{i:03d}',
+                    current_date,
+                    f'{random.uniform(50, 300):.2f}',
+                    random.choice(['electronics', 'books', 'clothing', 'home']),
+                    random.choice(['us-east', 'us-west', 'eu-central', 'asia-pacific'])
+                ])
+            
+            # Upload updated data to S3
+            csv_content = 'customer_id,purchase_date,amount,category,region\n'
+            for row in updated_data:
+                csv_content += ','.join(row) + '\n'
+            
+            s3_key = f'analytics-data/customer-analytics-{current_date}.csv'
+            s3.put_object(
+                Bucket=bucket_name,
+                Key=s3_key,
+                Body=csv_content,
+                ServerSideEncryption='AES256'
+            )
+            
+            logger.info(f"Uploaded new data file: {s3_key}")
+            
+            # Create new revision
+            revision_response = dataexchange.create_revision(
+                DataSetId=dataset_id,
+                Comment=f'Automated update - {current_date}'
+            )
+            
+            revision_id = revision_response['Id']
+            logger.info(f"Created revision: {revision_id}")
+            
+            # Import new assets
+            import_job = dataexchange.create_job(
+                Type='IMPORT_ASSETS_FROM_S3',
+                Details={
+                    'ImportAssetsFromS3JobDetails': {
+                        'DataSetId': dataset_id,
+                        'RevisionId': revision_id,
+                        'AssetSources': [
+                            {
+                                'Bucket': bucket_name,
+                                'Key': s3_key
+                            }
+                        ]
+                    }
                 }
+            )
+            
+            logger.info(f"Started import job: {import_job['Id']}")
+            
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'revision_id': revision_id,
+                    'import_job_id': import_job['Id'],
+                    'date': current_date
+                })
             }
-        )
-        
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'revision_id': revision_id,
-                'import_job_id': import_job['Id']
-            })
-        }
+            
+        except Exception as e:
+            logger.error(f"Error in automated update: {str(e)}")
+            return {
+                'statusCode': 500,
+                'body': json.dumps(f'Error: {str(e)}')
+            }
     EOF
     
     # Create deployment package
@@ -549,11 +624,12 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
     # Create Lambda function
     aws lambda create-function \
         --function-name DataExchangeAutoUpdate \
-        --runtime python3.9 \
+        --runtime python3.12 \
         --role arn:aws:iam::$PROVIDER_ACCOUNT_ID:role/DataExchangeProviderRole \
         --handler update-lambda.lambda_handler \
         --zip-file fileb://update-lambda.zip \
-        --timeout 60 \
+        --timeout 300 \
+        --memory-size 256 \
         --description "Automatically updates data sets with new revisions"
     
     echo "✅ Created automated data update Lambda function"
@@ -568,7 +644,8 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
     aws events put-rule \
         --name DataExchangeAutoUpdateSchedule \
         --schedule-expression "rate(24 hours)" \
-        --description "Triggers daily data updates for Data Exchange"
+        --description "Triggers daily data updates for Data Exchange" \
+        --state ENABLED
     
     # Add Lambda function as target with input
     aws events put-targets \
@@ -596,17 +673,18 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
         --log-group-name /aws/dataexchange/operations \
         --retention-in-days 30
     
-    # Create CloudWatch alarm for failed data grants
+    # Create CloudWatch alarm for Lambda function errors
     aws cloudwatch put-metric-alarm \
-        --alarm-name "DataExchangeFailedGrants" \
-        --alarm-description "Alert when data grants fail" \
-        --metric-name "FailedDataGrants" \
-        --namespace "AWS/DataExchange" \
+        --alarm-name "DataExchangeLambdaErrors" \
+        --alarm-description "Alert when Lambda functions encounter errors" \
+        --metric-name "Errors" \
+        --namespace "AWS/Lambda" \
         --statistic Sum \
         --period 300 \
         --threshold 1 \
         --comparison-operator GreaterThanOrEqualToThreshold \
-        --evaluation-periods 1
+        --evaluation-periods 1 \
+        --dimensions Name=FunctionName,Value=DataExchangeAutoUpdate
     
     # Create custom metric filter for Lambda errors
     aws logs put-metric-filter \
@@ -615,6 +693,18 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
         --filter-pattern "ERROR" \
         --metric-transformations \
             metricName=DataExchangeLambdaErrors,metricNamespace=CustomMetrics,metricValue=1
+    
+    # Create alarm for failed import jobs
+    aws cloudwatch put-metric-alarm \
+        --alarm-name "DataExchangeFailedImports" \
+        --alarm-description "Alert when data import jobs fail" \
+        --metric-name "DataExchangeLambdaErrors" \
+        --namespace "CustomMetrics" \
+        --statistic Sum \
+        --period 300 \
+        --threshold 1 \
+        --comparison-operator GreaterThanOrEqualToThreshold \
+        --evaluation-periods 1
     
     echo "✅ Configured monitoring and alerting"
     ```
@@ -636,9 +726,10 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
    # List revisions in the data set
    aws dataexchange list-revisions --data-set-id $DATASET_ID
    
-   # List assets in the revision
-   aws dataexchange list-data-set-revisions \
-       --data-set-id $DATASET_ID
+   # List assets in the latest revision
+   aws dataexchange list-revision-assets \
+       --data-set-id $DATASET_ID \
+       --revision-id $REVISION_ID
    ```
 
 3. Test data grant creation and access:
@@ -666,6 +757,9 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
    ```bash
    # Check EventBridge rules
    aws events list-rules --name-prefix DataExchange
+   
+   # List targets for each rule
+   aws events list-targets-by-rule --rule DataExchangeEventRule
    ```
 
 ## Cleanup
@@ -705,16 +799,19 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
 3. Remove CloudWatch resources:
 
    ```bash
-   # Delete CloudWatch alarm
+   # Delete CloudWatch alarms
    aws cloudwatch delete-alarms \
-       --alarm-names DataExchangeFailedGrants
+       --alarm-names DataExchangeLambdaErrors DataExchangeFailedImports
    
    # Delete log groups
    aws logs delete-log-group \
        --log-group-name /aws/dataexchange/operations
    
    aws logs delete-log-group \
-       --log-group-name /aws/lambda/DataExchangeAutoUpdate
+       --log-group-name /aws/lambda/DataExchangeAutoUpdate 2>/dev/null || true
+   
+   aws logs delete-log-group \
+       --log-group-name /aws/lambda/DataExchangeNotificationHandler 2>/dev/null || true
    
    echo "✅ Deleted CloudWatch resources"
    ```
@@ -724,7 +821,7 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
    ```bash
    # Delete data grant (if applicable)
    aws dataexchange delete-data-grant \
-       --data-grant-id $DATA_GRANT_ID
+       --data-grant-id $DATA_GRANT_ID 2>/dev/null || echo "Data grant already deleted or expired"
    
    # Delete data set (this also deletes revisions and assets)
    aws dataexchange delete-data-set \
@@ -745,6 +842,10 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
        --role-name DataExchangeProviderRole \
        --policy-arn arn:aws:iam::aws:policy/AWSDataExchangeProviderFullAccess
    
+   aws iam detach-role-policy \
+       --role-name DataExchangeProviderRole \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
    aws iam delete-role --role-name DataExchangeProviderRole
    
    # Clean up local files
@@ -759,13 +860,13 @@ echo "✅ Preparation completed with bucket: $PROVIDER_BUCKET"
 
 ## Discussion
 
-AWS Data Exchange revolutionizes enterprise data sharing by providing a secure, scalable, and compliant platform for cross-account data distribution. This solution addresses critical business challenges including data sovereignty, access controls, and audit requirements while eliminating traditional barriers to secure data collaboration. The service integrates seamlessly with existing AWS infrastructure, leveraging [IAM permissions](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_boundaries.html) and [S3 storage capabilities](https://docs.aws.amazon.com/s3/index.html) for comprehensive data management.
+AWS Data Exchange revolutionizes enterprise data sharing by providing a secure, scalable, and compliant platform for cross-account data distribution. This solution addresses critical business challenges including data sovereignty, access controls, and audit requirements while eliminating traditional barriers to secure data collaboration. The service integrates seamlessly with existing AWS infrastructure, leveraging [IAM permissions](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html) and [S3 storage capabilities](https://docs.aws.amazon.com/s3/latest/userguide/Welcome.html) for comprehensive data management.
 
-The architecture leverages AWS Data Exchange's native integration with IAM for fine-grained access controls, ensuring that only authorized accounts can access specific data sets. The automated revision management system enables real-time data updates without manual intervention, while the [EventBridge integration](https://docs.aws.amazon.com/data-exchange/latest/userguide/configuring-provider-generated-notifications-using-amazon-eventbridge.html) provides comprehensive monitoring and notification capabilities. This approach significantly reduces operational overhead compared to traditional ETL-based data sharing methods.
+The architecture leverages AWS Data Exchange's native integration with IAM for fine-grained access controls, ensuring that only authorized accounts can access specific data sets. The automated revision management system enables real-time data updates without manual intervention, while the [EventBridge integration](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-service-event.html) provides comprehensive monitoring and notification capabilities. This approach significantly reduces operational overhead compared to traditional ETL-based data sharing methods while following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/) principles.
 
 The solution's security model implements defense-in-depth principles through multiple layers of access controls, encryption at rest and in transit, and comprehensive audit logging via [CloudTrail](https://docs.aws.amazon.com/cloudtrail/latest/userguide/cloudtrail-user-guide.html). Organizations can establish data sharing agreements with explicit expiration dates, ensuring compliance with data retention policies and regulatory requirements. The automated notification system ensures stakeholders are immediately informed of data availability, access grants, and any operational issues.
 
-Cost optimization is achieved through intelligent data lifecycle management, where organizations pay only for active data grants and actual data transfer volumes. The serverless architecture using [Lambda functions](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html) eliminates infrastructure management overhead while providing automatic scaling based on demand.
+Cost optimization is achieved through intelligent data lifecycle management, where organizations pay only for active data grants and actual data transfer volumes. The serverless architecture using [Lambda functions](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html) eliminates infrastructure management overhead while providing automatic scaling based on demand, supporting the latest [Python 3.12 runtime](https://docs.aws.amazon.com/lambda/latest/dg/lambda-python.html) for improved performance and security.
 
 > **Tip**: Implement data quality validation before creating new revisions to ensure subscribers receive high-quality, consistent data. Consider using [AWS Glue DataBrew](https://docs.aws.amazon.com/databrew/latest/dg/what-is.html) for automated data profiling and quality assessment.
 
@@ -785,4 +886,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

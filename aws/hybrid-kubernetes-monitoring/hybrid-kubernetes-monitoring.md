@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: Amazon EKS, AWS Fargate, Amazon CloudWatch, AWS Systems Manager
 estimated-time: 150 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: kubernetes, hybrid, monitoring, observability, containers, cloudwatch, eks
 recipe-generator-version: 1.3
@@ -85,7 +85,7 @@ graph TB
 
 1. AWS account with appropriate permissions for EKS, CloudWatch, Fargate, and Systems Manager
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
-3. kubectl installed (version 1.28 or later)
+3. kubectl installed (version 1.30 or later)
 4. On-premises infrastructure with network connectivity to AWS via Direct Connect or Site-to-Site VPN
 5. Basic understanding of Kubernetes concepts and container orchestration
 6. Estimated cost: $150-300/month for cluster, Fargate tasks, CloudWatch metrics, and hybrid node charges
@@ -329,6 +329,10 @@ echo "✅ VPC and subnets created for hybrid EKS cluster"
        --filter "Name=tag:Name,Values=${VPC_NAME}-nat-gw-1" \
        --query 'NatGateways[0].NatGatewayId' --output text)
    
+   # Wait for NAT gateway to become available
+   echo "Waiting for NAT gateway to become available..."
+   aws ec2 wait nat-gateway-available --nat-gateway-ids ${NAT_GW_1}
+   
    # Create route table for private subnets
    aws ec2 create-route-table \
        --vpc-id ${VPC_ID} \
@@ -393,8 +397,7 @@ echo "✅ VPC and subnets created for hybrid EKS cluster"
    if [ -z "$(aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList[?contains(Arn, '${OIDC_ID}')].Arn" --output text)" ]; then
        aws iam create-open-id-connect-provider \
            --url ${OIDC_ISSUER} \
-           --client-id-list sts.amazonaws.com \
-           --thumbprint-list 9e99a48a9960b14926bb7f3b02e22da2b0ab7280
+           --client-id-list sts.amazonaws.com
    fi
    
    # Create IAM role for CloudWatch Observability add-on
@@ -428,7 +431,6 @@ echo "✅ VPC and subnets created for hybrid EKS cluster"
    aws eks create-addon \
        --cluster-name ${CLUSTER_NAME} \
        --addon-name amazon-cloudwatch-observability \
-       --addon-version v2.1.0-eksbuild.1 \
        --service-account-role-arn $(aws iam get-role \
            --role-name CloudWatchObservabilityRole-${RANDOM_SUFFIX} \
            --query 'Role.Arn' --output text) \
@@ -983,4 +985,11 @@ Extend this hybrid monitoring solution by implementing these advanced capabiliti
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

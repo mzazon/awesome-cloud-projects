@@ -1,0 +1,438 @@
+# Infrastructure Manager Configuration for Social Media Video Creation with Veo 3 and Vertex AI
+# This configuration deploys a complete serverless video generation pipeline using Google's Veo 3 model
+# and Vertex AI for automated content creation and quality validation
+
+# Copyright 2025 Google Inc. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 (the "License")
+
+# Define input parameters for the deployment
+imports:
+  - path: main.yaml.jinja
+    name: video-creation-template
+
+resources:
+  # Deploy the main video creation infrastructure
+  - name: social-media-video-creation-stack
+    type: video-creation-template
+    properties:
+      # Project and location configuration
+      project: "{{ env['project'] }}"
+      region: us-central1
+      zone: us-central1-a
+      
+      # Resource naming configuration with unique suffix
+      resource_suffix: "{{ env['deployment'] }}"
+      
+      # Storage configuration for video files
+      storage_configuration:
+        bucket_location: US-CENTRAL1
+        storage_class: STANDARD
+        versioning_enabled: true
+        lifecycle_rules:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              isLive: false
+        
+      # Cloud Functions configuration
+      functions_configuration:
+        # Video generator function settings
+        generator:
+          runtime: python311
+          memory: 512MB
+          timeout: 540s
+          max_instances: 10
+          min_instances: 0
+          ingress_settings: ALLOW_ALL
+          environment_variables:
+            VERTEX_AI_REGION: us-central1
+            VIDEO_OUTPUT_FORMAT: mp4
+            DEFAULT_ASPECT_RATIO: "9:16"
+            DEFAULT_DURATION: 8
+        
+        # Quality validator function settings  
+        validator:
+          runtime: python311
+          memory: 1GB
+          timeout: 300s
+          max_instances: 5
+          min_instances: 0
+          ingress_settings: ALLOW_ALL
+          environment_variables:
+            ANALYSIS_MODEL: gemini-2.0-flash-exp
+            FRAME_ANALYSIS_COUNT: 3
+            QUALITY_THRESHOLD: 7
+        
+        # Operation monitor function settings
+        monitor:
+          runtime: python311
+          memory: 256MB
+          timeout: 60s
+          max_instances: 10
+          min_instances: 0
+          ingress_settings: ALLOW_ALL
+          environment_variables:
+            POLLING_INTERVAL: 10
+            MAX_RETRY_ATTEMPTS: 30
+      
+      # IAM and security configuration
+      security_configuration:
+        # Service account for Cloud Functions
+        service_account_roles:
+          - roles/storage.objectAdmin
+          - roles/aiplatform.user
+          - roles/logging.logWriter
+          - roles/monitoring.metricWriter
+          - roles/cloudfunctions.invoker
+        
+        # Additional IAM bindings for cross-service communication
+        additional_bindings:
+          - members:
+              - "allUsers"
+            role: "roles/cloudfunctions.invoker"
+            condition:
+              title: "Public access for HTTP triggers"
+              description: "Allow public access to HTTP-triggered functions"
+      
+      # Monitoring and logging configuration
+      observability_configuration:
+        # Cloud Logging configuration
+        logging:
+          retention_days: 30
+          log_level: INFO
+          structured_logging: true
+        
+        # Cloud Monitoring configuration  
+        monitoring:
+          enable_profiler: false
+          custom_metrics: true
+          notification_channels: []
+          alerting_policies:
+            - display_name: "High Function Error Rate"
+              conditions:
+                - display_name: "Function error rate > 5%"
+                  condition_threshold:
+                    filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/execution_count"'
+                    comparison: COMPARISON_GREATER_THAN
+                    threshold_value: 0.05
+              alert_strategy:
+                auto_close: 86400s
+        
+        # Error reporting configuration
+        error_reporting:
+          enabled: true
+          notification_email: ""
+
+---
+# Jinja2 template for Infrastructure Manager deployment
+# This template creates all necessary resources for the video creation pipeline
+
+# Template metadata
+info:
+  title: Social Media Video Creation Infrastructure
+  description: Complete serverless pipeline for AI-powered video generation using Veo 3 and Vertex AI
+  version: 1.0.0
+
+# Import required schemas for Google Cloud resources
+imports:
+  - path: https://www.googleapis.com/deploymentmanager/v2/types/gcp-types/servicemanagement-v1:servicemanagement.yaml
+    name: servicemanagement.yaml
+  - path: https://www.googleapis.com/deploymentmanager/v2/types/gcp-types/storage-v1:storage.yaml  
+    name: storage.yaml
+  - path: https://www.googleapis.com/deploymentmanager/v2/types/gcp-types/cloudfunctions-v1:cloudfunctions.yaml
+    name: cloudfunctions.yaml
+  - path: https://www.googleapis.com/deploymentmanager/v2/types/gcp-types/iam-v1:iam.yaml
+    name: iam.yaml
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-storage-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: storage.googleapis.com
+      
+  - name: enable-functions-api  
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudfunctions.googleapis.com
+      
+  - name: enable-vertex-ai-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable  
+    properties:
+      serviceName: aiplatform.googleapis.com
+      
+  - name: enable-cloud-build-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudbuild.googleapis.com
+      
+  - name: enable-logging-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: logging.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: monitoring.googleapis.com
+
+  # Create Cloud Storage bucket for video storage and metadata
+  - name: social-videos-bucket-{{ properties['resource_suffix'] }}
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: social-videos-{{ properties['resource_suffix'] }}
+      location: {{ properties['storage_configuration']['bucket_location'] }}
+      storageClass: {{ properties['storage_configuration']['storage_class'] }}
+      versioning:
+        enabled: {{ properties['storage_configuration']['versioning_enabled'] }}
+      lifecycle:
+        rule: {{ properties['storage_configuration']['lifecycle_rules'] }}
+      # Enable uniform bucket-level access for better security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Configure CORS for web access if needed
+      cors:
+        - origin: ['*']
+          method: ['GET', 'POST', 'PUT']
+          responseHeader: ['Content-Type', 'Access-Control-Allow-Origin']
+          maxAgeSeconds: 3600
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Create service account for Cloud Functions
+  - name: video-creation-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: video-creation-sa-{{ properties['resource_suffix'] }}
+      displayName: Video Creation Service Account
+      description: Service account for video generation and validation functions
+      
+  # Grant necessary IAM roles to service account
+  {% for role in properties['security_configuration']['service_account_roles'] %}
+  - name: video-creation-sa-binding-{{ loop.index }}
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ properties['project'] }}
+      role: {{ role }}
+      member: serviceAccount:$(ref.video-creation-service-account.email)
+    metadata:
+      dependsOn:
+        - video-creation-service-account
+  {% endfor %}
+
+  # Deploy Cloud Function for video generation
+  - name: video-generator-function-{{ properties['resource_suffix'] }}
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: {{ properties['region'] }}
+      function: video-generator-{{ properties['resource_suffix'] }}
+      sourceArchiveUrl: gs://{{ properties['project'] }}-function-source/video-generator.zip
+      entryPoint: generate_video
+      runtime: {{ properties['functions_configuration']['generator']['runtime'] }}
+      availableMemoryMb: {{ properties['functions_configuration']['generator']['memory'].replace('MB', '') }}
+      timeout: {{ properties['functions_configuration']['generator']['timeout'] }}
+      maxInstances: {{ properties['functions_configuration']['generator']['max_instances'] }}
+      minInstances: {{ properties['functions_configuration']['generator']['min_instances'] }}
+      ingressSettings: {{ properties['functions_configuration']['generator']['ingress_settings'] }}
+      
+      # Configure HTTP trigger for the function
+      httpsTrigger:
+        securityLevel: SECURE_OPTIONAL
+        
+      # Set environment variables for the function
+      environmentVariables:
+        BUCKET_NAME: social-videos-{{ properties['resource_suffix'] }}
+        GCP_PROJECT: {{ properties['project'] }}
+        {% for key, value in properties['functions_configuration']['generator']['environment_variables'].items() %}
+        {{ key }}: {{ value }}
+        {% endfor %}
+        
+      # Configure service account for the function
+      serviceAccountEmail: $(ref.video-creation-service-account.email)
+      
+      # Configure VPC connector if needed (optional)
+      # vpcConnector: projects/{{ properties['project'] }}/locations/{{ properties['region'] }}/connectors/vpc-connector
+      
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - social-videos-bucket-{{ properties['resource_suffix'] }}
+        - video-creation-service-account
+
+  # Deploy Cloud Function for content quality validation  
+  - name: content-validator-function-{{ properties['resource_suffix'] }}
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: {{ properties['region'] }}
+      function: validator-{{ properties['resource_suffix'] }}
+      sourceArchiveUrl: gs://{{ properties['project'] }}-function-source/validator.zip
+      entryPoint: validate_content
+      runtime: {{ properties['functions_configuration']['validator']['runtime'] }}
+      availableMemoryMb: {{ properties['functions_configuration']['validator']['memory'].replace('GB', '024').replace('MB', '') }}
+      timeout: {{ properties['functions_configuration']['validator']['timeout'] }}
+      maxInstances: {{ properties['functions_configuration']['validator']['max_instances'] }}
+      minInstances: {{ properties['functions_configuration']['validator']['min_instances'] }}
+      ingressSettings: {{ properties['functions_configuration']['validator']['ingress_settings'] }}
+      
+      # Configure HTTP trigger
+      httpsTrigger:
+        securityLevel: SECURE_OPTIONAL
+        
+      # Set environment variables
+      environmentVariables:
+        BUCKET_NAME: social-videos-{{ properties['resource_suffix'] }}
+        GCP_PROJECT: {{ properties['project'] }}
+        {% for key, value in properties['functions_configuration']['validator']['environment_variables'].items() %}
+        {{ key }}: {{ value }}
+        {% endfor %}
+        
+      # Configure service account
+      serviceAccountEmail: $(ref.video-creation-service-account.email)
+      
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - social-videos-bucket-{{ properties['resource_suffix'] }}
+        - video-creation-service-account
+
+  # Deploy Cloud Function for operation monitoring
+  - name: operation-monitor-function-{{ properties['resource_suffix'] }}
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: {{ properties['region'] }}
+      function: monitor-{{ properties['resource_suffix'] }}
+      sourceArchiveUrl: gs://{{ properties['project'] }}-function-source/monitor.zip
+      entryPoint: monitor_operations
+      runtime: {{ properties['functions_configuration']['monitor']['runtime'] }}
+      availableMemoryMb: {{ properties['functions_configuration']['monitor']['memory'].replace('MB', '') }}
+      timeout: {{ properties['functions_configuration']['monitor']['timeout'] }}
+      maxInstances: {{ properties['functions_configuration']['monitor']['max_instances'] }}
+      minInstances: {{ properties['functions_configuration']['monitor']['min_instances'] }}
+      ingressSettings: {{ properties['functions_configuration']['monitor']['ingress_settings'] }}
+      
+      # Configure HTTP trigger
+      httpsTrigger:
+        securityLevel: SECURE_OPTIONAL
+        
+      # Set environment variables  
+      environmentVariables:
+        BUCKET_NAME: social-videos-{{ properties['resource_suffix'] }}
+        GCP_PROJECT: {{ properties['project'] }}
+        {% for key, value in properties['functions_configuration']['monitor']['environment_variables'].items() %}
+        {{ key }}: {{ value }}
+        {% endfor %}
+        
+      # Configure service account
+      serviceAccountEmail: $(ref.video-creation-service-account.email)
+      
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - social-videos-bucket-{{ properties['resource_suffix'] }}
+        - video-creation-service-account
+
+  # Create Cloud Monitoring alert policy for high error rates
+  {% if properties['observability_configuration']['monitoring']['alerting_policies'] %}
+  {% for policy in properties['observability_configuration']['monitoring']['alerting_policies'] %}
+  - name: alert-policy-{{ loop.index }}-{{ properties['resource_suffix'] }}
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: {{ policy['display_name'] }}
+      documentation:
+        content: "Alert policy for video creation pipeline monitoring"
+        mimeType: text/markdown
+      conditions: {{ policy['conditions'] }}
+      alertStrategy: {{ policy['alert_strategy'] }}
+      enabled: true
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+  {% endfor %}
+  {% endif %}
+
+# Define outputs for external consumption
+outputs:
+  # Storage bucket information
+  - name: bucket-name
+    description: Name of the Cloud Storage bucket for videos
+    value: social-videos-{{ properties['resource_suffix'] }}
+    
+  - name: bucket-url  
+    description: URL of the Cloud Storage bucket
+    value: gs://social-videos-{{ properties['resource_suffix'] }}
+
+  # Cloud Function endpoints
+  - name: video-generator-url
+    description: HTTP trigger URL for video generator function
+    value: $(ref.video-generator-function-{{ properties['resource_suffix'] }}.httpsTrigger.url)
+    
+  - name: validator-url
+    description: HTTP trigger URL for content validator function  
+    value: $(ref.content-validator-function-{{ properties['resource_suffix'] }}.httpsTrigger.url)
+    
+  - name: monitor-url
+    description: HTTP trigger URL for operation monitor function
+    value: $(ref.operation-monitor-function-{{ properties['resource_suffix'] }}.httpsTrigger.url)
+
+  # Service account information
+  - name: service-account-email
+    description: Email of the service account used by functions
+    value: $(ref.video-creation-service-account.email)
+    
+  # Project and region information
+  - name: project-id
+    description: Google Cloud project ID
+    value: {{ properties['project'] }}
+    
+  - name: deployment-region
+    description: Deployment region for resources
+    value: {{ properties['region'] }}
+
+  # Example usage information
+  - name: example-curl-command
+    description: Example curl command to generate a video
+    value: |
+      curl -X POST $(ref.video-generator-function-{{ properties['resource_suffix'] }}.httpsTrigger.url) \
+        -H "Content-Type: application/json" \
+        -d '{
+          "prompt": "A colorful sunset over a mountain landscape with gentle clouds moving across the sky",
+          "duration": 8,
+          "aspect_ratio": "9:16"
+        }'
+
+# Additional metadata for Infrastructure Manager
+metadata:
+  version: 1.0.0
+  description: Infrastructure Manager configuration for Social Media Video Creation with Veo 3 and Vertex AI
+  author: Google Cloud Recipe Generator
+  tags:
+    - video-generation
+    - ai
+    - serverless
+    - vertex-ai
+    - veo-3
+    - social-media
+  # Dependencies and prerequisites
+  prerequisites:
+    - Vertex AI API access
+    - Veo 3 model access (requires waitlist approval)
+    - Cloud Functions quota for concurrent executions
+    - Cloud Storage quota for video files
+  # Estimated costs (monthly for moderate usage)
+  estimated_costs:
+    currency: USD
+    compute: 50-150  # Cloud Functions execution
+    storage: 10-30   # Cloud Storage for videos
+    ai_services: 100-300  # Veo 3 and Vertex AI API calls
+    networking: 5-15  # Data transfer
+    total_range: 165-495
+  # Security considerations
+  security_notes:
+    - Functions use service accounts with least privilege access
+    - Storage bucket uses uniform bucket-level access
+    - HTTP triggers are public but can be secured with authentication
+    - All data is encrypted at rest and in transit
+    - Consider implementing rate limiting for production use

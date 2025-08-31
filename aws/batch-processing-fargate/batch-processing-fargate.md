@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: AWS Batch, Fargate, IAM, CloudWatch
 estimated-time: 150 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: batch-processing, fargate, serverless, containers
 recipe-generator-version: 1.3
@@ -90,7 +90,7 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of containerization and batch processing concepts
 4. Docker knowledge for container image creation
-5. VPC with private subnets and security groups configured
+5. VPC with subnets and security groups configured (default VPC is acceptable for testing)
 6. Estimated cost: $0.50-$2.00 for completing this tutorial (varies by region and resource usage)
 
 > **Note**: Fargate pricing is based on vCPU and memory resources consumed per second with a 1-minute minimum. Clean up resources promptly to minimize costs.
@@ -139,7 +139,7 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
 
 1. **Create IAM Execution Role for Fargate Tasks**:
 
-   IAM execution roles are essential for Fargate tasks to securely interact with AWS services on your behalf. The [task execution role](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html) grants the Fargate service permission to pull container images from ECR, write logs to CloudWatch, and retrieve secrets from AWS Secrets Manager. This follows the principle of least privilege by providing only the minimum permissions required for task execution.
+   IAM execution roles are essential for Fargate tasks to securely interact with AWS services on your behalf. The [task execution role](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html) grants the Fargate service permission to pull container images from ECR, write logs to CloudWatch, and retrieve secrets from AWS Secrets Manager. This follows the AWS Well-Architected Framework principle of least privilege by providing only the minimum permissions required for task execution.
 
    ```bash
    # Create trust policy for ECS tasks
@@ -176,7 +176,7 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
    echo "✅ Created execution role: ${EXECUTION_ROLE_ARN}"
    ```
 
-   The execution role is now configured with the necessary permissions for Fargate task execution. This role enables secure container orchestration without exposing long-term credentials to your application code.
+   The execution role is now configured with the necessary permissions for Fargate task execution. This role enables secure container orchestration without exposing long-term credentials to your application code, following AWS security best practices.
 
 2. **Create ECR Repository and Sample Container Image**:
 
@@ -258,7 +258,7 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
    echo "✅ Container image built and pushed: ${CONTAINER_IMAGE_URI}"
    ```
 
-   Your custom container image is now available in ECR and ready for batch processing. This image contains your business logic and will be executed by Fargate tasks when jobs are submitted to the queue.
+   Your custom container image is now available in ECR with automated vulnerability scanning enabled. This image contains your business logic and will be executed by Fargate tasks when jobs are submitted to the queue. ECR's integration with AWS security services ensures your container images meet security compliance requirements.
 
 3. **Create Fargate Compute Environment**:
 
@@ -276,8 +276,7 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
        "maxvCpus": 256,
        "subnets": ["${SUBNET_IDS//,/\",\"}"],
        "securityGroupIds": ["${SECURITY_GROUP_ID}"]
-     },
-     "serviceRole": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/aws-service-role/batch.amazonaws.com/AWSServiceRoleForBatch"
+     }
    }
    EOF
    
@@ -293,7 +292,7 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
    echo "✅ Compute environment created: ${BATCH_COMPUTE_ENV_NAME}"
    ```
 
-   The Fargate compute environment is operational and can now provision serverless containers for batch processing. AWS Batch will automatically manage capacity and scaling based on job queue demand.
+   The Fargate compute environment is operational and ready to provision serverless containers for batch processing. AWS Batch will automatically manage capacity and scaling based on job queue demand, leveraging the AWS service-linked role for Batch operations.
 
 4. **Create Job Queue**:
 
@@ -315,9 +314,24 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
    echo "✅ Job queue created: ${BATCH_JOB_QUEUE_NAME}"
    ```
 
-   The job queue is configured and ready to accept batch job submissions. Jobs submitted to this queue will be scheduled for execution on the Fargate compute environment based on resource availability and queue priority.
+   The job queue is configured and ready to accept batch job submissions. Jobs submitted to this queue will be scheduled for execution on the Fargate compute environment based on resource availability and queue priority settings.
 
-5. **Register Job Definition**:
+5. **Create CloudWatch Log Group**:
+
+   [Amazon CloudWatch Logs](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/Working-with-log-groups-and-streams.html) provides centralized logging for batch job execution, enabling real-time monitoring, debugging, and operational insights. Log groups organize log streams from multiple job executions, making it easy to track job progress, identify failures, and analyze performance patterns across your batch processing workloads.
+
+   ```bash
+   # Create log group for batch jobs
+   aws logs create-log-group \
+       --log-group-name "/aws/batch/job" \
+       --retention-in-days 7
+   
+   echo "✅ CloudWatch log group created: /aws/batch/job"
+   ```
+
+   The log group is configured to capture all batch job output with a 7-day retention policy, providing operational visibility while managing storage costs. All job execution logs will be automatically streamed to this centralized location for monitoring and troubleshooting.
+
+6. **Register Job Definition**:
 
    Job definitions serve as blueprints that specify how batch jobs should be executed. They define container specifications, resource requirements (vCPU and memory), execution role permissions, and logging configuration. For Fargate tasks, job definitions also configure network settings and platform capabilities, ensuring consistent job execution across different runs.
 
@@ -363,22 +377,7 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
    echo "✅ Job definition registered: ${BATCH_JOB_DEFINITION_NAME}"
    ```
 
-   The job definition template is registered and can be used to submit multiple batch jobs with consistent configuration. This ensures reproducible execution environments and simplifies job submission workflows.
-
-6. **Create CloudWatch Log Group**:
-
-   [Amazon CloudWatch Logs](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Container-Insights-EKS-logs.html) provides centralized logging for batch job execution, enabling real-time monitoring, debugging, and operational insights. Log groups organize log streams from multiple job executions, making it easy to track job progress, identify failures, and analyze performance patterns across your batch processing workloads.
-
-   ```bash
-   # Create log group for batch jobs
-   aws logs create-log-group \
-       --log-group-name "/aws/batch/job" \
-       --retention-in-days 7
-   
-   echo "✅ CloudWatch log group created: /aws/batch/job"
-   ```
-
-   The log group is configured to capture all batch job output with a 7-day retention policy, providing operational visibility while managing storage costs. All job execution logs will be automatically streamed to this centralized location.
+   The job definition template is registered and ready for job submissions. This configuration ensures reproducible execution environments with precise resource allocation and comprehensive logging integration.
 
 7. **Submit Test Batch Job**:
 
@@ -450,9 +449,9 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
            --job-queue ${BATCH_JOB_QUEUE_NAME} \
            --job-definition ${BATCH_JOB_DEFINITION_NAME})
        
-       JOB_ID=$(echo ${JOB_RESPONSE} | jq -r '.jobId')
-       JOB_IDS+=("${JOB_ID}")
-       echo "📝 Submitted job ${i}: ${JOB_ID}"
+       JOB_ID_PARALLEL=$(echo ${JOB_RESPONSE} | jq -r '.jobId')
+       JOB_IDS+=("${JOB_ID_PARALLEL}")
+       echo "📝 Submitted job ${i}: ${JOB_ID_PARALLEL}"
    done
    
    # Monitor all jobs
@@ -482,7 +481,7 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
     echo "📝 This job will start after job ${JOB_ID} completes"
     ```
 
-    The dependent job demonstrates AWS Batch's workflow orchestration capabilities, automatically managing job execution order based on dependency relationships. This enables reliable multi-step data processing pipelines.
+    The dependent job demonstrates AWS Batch's workflow orchestration capabilities, automatically managing job execution order based on dependency relationships. This enables reliable multi-step data processing pipelines with built-in error handling.
 
 ## Validation & Testing
 
@@ -492,7 +491,8 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
    # Check compute environment status
    aws batch describe-compute-environments \
        --compute-environments ${BATCH_COMPUTE_ENV_NAME} \
-       --query 'computeEnvironments[0].{Name:computeEnvironmentName,State:state,Status:status}'
+       --query 'computeEnvironments[0].{Name:computeEnvironmentName,State:state,Status:status}' \
+       --output table
    ```
 
    Expected output: State should be "ENABLED" and Status should be "VALID"
@@ -503,7 +503,8 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
    # Verify job queue configuration
    aws batch describe-job-queues \
        --job-queues ${BATCH_JOB_QUEUE_NAME} \
-       --query 'jobQueues[0].{Name:jobQueueName,State:state,Priority:priority}'
+       --query 'jobQueues[0].{Name:jobQueueName,State:state,Priority:priority}' \
+       --output table
    ```
 
    Expected output: State should be "ENABLED" with priority 1
@@ -517,12 +518,14 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
        --output text)
    
    # View job logs
-   if [ "${LOG_STREAM}" != "None" ]; then
+   if [ "${LOG_STREAM}" != "None" ] && [ "${LOG_STREAM}" != "null" ]; then
        echo "📋 Job execution logs:"
        aws logs get-log-events \
            --log-group-name "/aws/batch/job" \
            --log-stream-name ${LOG_STREAM} \
            --query 'events[].message' --output text
+   else
+       echo "📋 Log stream not yet available or job still pending"
    fi
    ```
 
@@ -531,7 +534,8 @@ echo "✅ Using subnets: ${SUBNET_IDS}"
    ```bash
    # Verify resource allocation
    aws batch describe-jobs --jobs ${JOB_ID} \
-       --query 'jobs[0].{vCPUs:attempts[0].taskProperties.containers[0].resourceRequirements[?type==`VCPU`].value|[0],Memory:attempts[0].taskProperties.containers[0].resourceRequirements[?type==`MEMORY`].value|[0]}'
+       --query 'jobs[0].{vCPUs:attempts[0].taskProperties.containers[0].resourceRequirements[?type==`VCPU`].value|[0],Memory:attempts[0].taskProperties.containers[0].resourceRequirements[?type==`MEMORY`].value|[0]}' \
+       --output table
    ```
 
    Expected output: Should show 0.25 vCPUs and 512 MB memory
@@ -644,11 +648,11 @@ AWS Batch with Fargate orchestration represents a paradigm shift in batch proces
 
 The serverless nature of Fargate eliminates the operational overhead associated with managing EC2 instances, including patching, security updates, and capacity planning. Organizations can focus entirely on their batch processing logic while AWS handles the underlying infrastructure. The pay-per-use model ensures cost efficiency, as you only pay for the exact compute resources consumed during job execution, without idle time costs.
 
-Fargate's resource allocation model allows for precise rightsizing of compute resources, supporting fractional vCPUs (0.25, 0.5, 1.0) and memory configurations from 512 MB to 30 GB. This granular control enables cost optimization for diverse workload requirements. The platform automatically handles job queuing, resource allocation, and fault tolerance, making it suitable for both simple data processing tasks and complex computational workloads.
+Fargate's resource allocation model allows for precise rightsizing of compute resources, supporting fractional vCPUs (0.25, 0.5, 1.0) and memory configurations from 512 MB to 30 GB. This granular control enables cost optimization for diverse workload requirements. The platform automatically handles job queuing, resource allocation, and fault tolerance, making it suitable for both simple data processing tasks and complex computational workloads. See the [AWS Batch User Guide](https://docs.aws.amazon.com/batch/latest/userguide/what-is-batch.html) for detailed service capabilities.
 
-> **Tip**: Use AWS Batch job arrays for processing large datasets by splitting work across multiple parallel jobs. This approach maximizes throughput while maintaining cost efficiency.
+> **Tip**: Use AWS Batch job arrays for processing large datasets by splitting work across multiple parallel jobs. This approach maximizes throughput while maintaining cost efficiency. See the [AWS Batch job arrays documentation](https://docs.aws.amazon.com/batch/latest/userguide/array_jobs.html) for implementation details.
 
-The integration with other AWS services enhances the platform's capabilities. CloudWatch provides comprehensive monitoring and logging, while IAM enables fine-grained access control. The ability to use custom container images from ECR allows teams to package their specific runtime environments and dependencies, ensuring consistency across development and production environments.
+The integration with other AWS services enhances the platform's capabilities following the AWS Well-Architected Framework principles. CloudWatch provides comprehensive monitoring and logging, while IAM enables fine-grained access control. The ability to use custom container images from ECR allows teams to package their specific runtime environments and dependencies, ensuring consistency across development and production environments. For additional best practices, see the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
 ## Challenge
 
@@ -666,4 +670,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

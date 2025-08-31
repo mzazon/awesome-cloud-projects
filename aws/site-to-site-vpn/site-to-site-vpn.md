@@ -4,12 +4,12 @@ id: 3d167f7d
 category: networking
 difficulty: 300
 subject: aws
-services: site-to-site,vpn,vpc,ec2,cloudwatch
+services: VPN, VPC, EC2, CloudWatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-25
 passed-qa: null
 tags: networking,vpn,bgp,hybrid-cloud,security
 recipe-generator-version: 1.3
@@ -606,15 +606,15 @@ EOF
 
 ## Discussion
 
-AWS Site-to-Site VPN provides a cost-effective solution for establishing secure connectivity between on-premises networks and AWS VPCs. The implementation uses IPsec tunnels for encryption and BGP for dynamic routing, ensuring both security and reliability. The architecture creates two redundant tunnels for high availability, with automatic failover capabilities when one tunnel experiences issues.
+AWS Site-to-Site VPN provides a cost-effective solution for establishing secure connectivity between on-premises networks and AWS VPCs. The implementation uses IPsec tunnels for encryption and BGP for dynamic routing, ensuring both security and reliability. The architecture creates two redundant tunnels for high availability, with automatic failover capabilities when one tunnel experiences issues. Each VPN connection supports Internet Key Exchange version 2 (IKEv2), NAT traversal, and 4-byte ASN configurations for advanced networking requirements.
 
-Key design decisions include using BGP routing instead of static routes for automatic route propagation and failover. The virtual private gateway serves as the AWS-side VPN endpoint, while the customer gateway represents your on-premises device. Route propagation enables automatic advertisement of on-premises routes to AWS route tables, simplifying network management and ensuring connectivity as network topologies change.
+Key design decisions include using BGP routing instead of static routes for automatic route propagation and failover. The virtual private gateway serves as the AWS-side VPN endpoint, while the customer gateway represents your on-premises device. Route propagation enables automatic advertisement of on-premises routes to AWS route tables, simplifying network management and ensuring connectivity as network topologies change. The solution supports both IPv4 and IPv6 traffic, with configurable tunnel options including inside IP addresses, pre-shared keys, and startup actions.
 
-Security considerations include proper IPsec configuration with strong encryption algorithms, regular monitoring of tunnel health, and implementation of appropriate security group rules. The solution supports both IPv4 and IPv6 traffic, with configurable tunnel options including inside IP addresses, pre-shared keys, and startup actions. CloudWatch monitoring provides visibility into connection status, traffic patterns, and performance metrics.
+Security considerations include proper IPsec configuration with strong encryption algorithms, regular monitoring of tunnel health, and implementation of appropriate security group rules. AWS Site-to-Site VPN supports additional encryption options including AES 256-bit encryption, SHA-2 hashing, and additional Diffie-Hellman groups for enhanced security. CloudWatch monitoring provides visibility into connection status, traffic patterns, and performance metrics, enabling proactive management and troubleshooting.
 
-> **Warning**: VPN connections incur hourly charges regardless of usage. Monitor costs through AWS Cost Explorer and implement proper cleanup procedures for test environments.
+> **Warning**: VPN connections incur hourly charges regardless of usage. Monitor costs through AWS Cost Explorer and implement proper cleanup procedures for test environments. As of 2025, pricing is approximately $0.05 per VPN connection-hour plus data transfer charges.
 
-For production deployments, consider implementing multiple VPN connections across different Availability Zones, using AWS Direct Connect as a primary connection with VPN as backup, and establishing proper monitoring and alerting for tunnel failures. The solution scales to support multiple on-premises locations through additional customer gateways and VPN connections.
+For production deployments, consider implementing multiple VPN connections across different Availability Zones, using AWS Direct Connect as a primary connection with VPN as backup, and establishing proper monitoring and alerting for tunnel failures. The solution scales to support multiple on-premises locations through additional customer gateways and VPN connections. For enhanced performance, consider AWS Accelerated Site-to-Site VPN which uses AWS Global Accelerator to improve performance and reduce packet loss. Reference the [AWS Site-to-Site VPN User Guide](https://docs.aws.amazon.com/vpn/latest/s2svpn/) for complete implementation details and best practices.
 
 ## Challenge
 
@@ -628,8 +628,15 @@ Extend this solution by implementing these enhancements:
 
 4. **Advanced Monitoring and Alerting**: Create comprehensive CloudWatch alarms for tunnel failures, route propagation issues, and performance degradation with automated remediation workflows.
 
-5. **Hybrid DNS Resolution**: Implement Route 53 Resolver for seamless DNS resolution between on-premises and AWS environments, including conditional forwarding rules.
+5. **Hybrid DNS Resolution**: Implement Route 53 Resolver for seamless DNS resolution between on-premises and AWS environments, including conditional forwarding rules and private hosted zones.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

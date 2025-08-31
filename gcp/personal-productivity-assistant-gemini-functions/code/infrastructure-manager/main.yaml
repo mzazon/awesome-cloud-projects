@@ -1,0 +1,470 @@
+# Infrastructure Manager Configuration for Personal Productivity Assistant
+# This configuration deploys a complete AI-powered email processing system
+# using Vertex AI Gemini 2.5 Flash, Cloud Functions, and supporting services
+
+imports:
+  - path: main.jinja
+
+resources:
+  # Main deployment resource that orchestrates all components
+  - name: productivity-assistant-deployment
+    type: main.jinja
+    properties:
+      # Project configuration
+      project_id: $(ref.project-setup.projectId)
+      region: "us-central1"
+      zone: "us-central1-a"
+      
+      # Resource naming configuration
+      resource_prefix: "productivity-assistant"
+      environment: "production"
+      
+      # Service enablement configuration
+      enable_apis: true
+      required_apis:
+        - "cloudfunctions.googleapis.com"
+        - "aiplatform.googleapis.com"
+        - "firestore.googleapis.com"
+        - "pubsub.googleapis.com"
+        - "cloudscheduler.googleapis.com"
+        - "gmail.googleapis.com"
+        - "cloudbuild.googleapis.com"
+        - "logging.googleapis.com"
+        - "monitoring.googleapis.com"
+      
+      # Firestore configuration
+      firestore_config:
+        location_id: "us-central1"
+        type: "FIRESTORE_NATIVE"
+        app_engine_integration_mode: "DISABLED"
+        concurrency_mode: "OPTIMISTIC"
+        point_in_time_recovery_enablement: "POINT_IN_TIME_RECOVERY_ENABLED"
+        delete_protection_state: "DELETE_PROTECTION_ENABLED"
+      
+      # Pub/Sub configuration
+      pubsub_config:
+        topic_name: "email-processing-topic"
+        subscription_name: "email-processing-sub"
+        message_retention_duration: "604800s"  # 7 days
+        ack_deadline_seconds: 600
+        enable_exactly_once_delivery: true
+        retry_policy:
+          minimum_backoff: "10s"
+          maximum_backoff: "600s"
+      
+      # Cloud Functions configuration
+      functions_config:
+        # Main email processing function
+        email_processor:
+          name: "email-processor"
+          runtime: "python312"
+          entry_point: "process_email"
+          source_archive_url: "gs://gcf-sources-$(ref.project-setup.projectId)-us-central1/email-processor.zip"
+          memory_mb: 1024
+          timeout: "300s"
+          environment_variables:
+            GCP_PROJECT: "$(ref.project-setup.projectId)"
+            VERTEX_AI_LOCATION: "us-central1"
+            LOG_LEVEL: "INFO"
+          max_instances: 100
+          min_instances: 0
+          available_cpu: "1"
+          ingress_settings: "ALLOW_ALL"
+          vpc_connector: null
+          
+        # Scheduled email processing function
+        scheduled_processor:
+          name: "scheduled-email-processor"
+          runtime: "python312"
+          entry_point: "process_scheduled_emails"
+          source_archive_url: "gs://gcf-sources-$(ref.project-setup.projectId)-us-central1/scheduled-processor.zip"
+          memory_mb: 512
+          timeout: "180s"
+          environment_variables:
+            GCP_PROJECT: "$(ref.project-setup.projectId)"
+            VERTEX_AI_LOCATION: "us-central1"
+            LOG_LEVEL: "INFO"
+          max_instances: 10
+          min_instances: 0
+          available_cpu: "0.5"
+          event_trigger:
+            event_type: "google.pubsub.topic.publish"
+            resource: "projects/$(ref.project-setup.projectId)/topics/email-processing-topic"
+      
+      # Cloud Scheduler configuration
+      scheduler_config:
+        job_name: "email-processing-schedule"
+        description: "Scheduled email processing for productivity assistant"
+        schedule: "*/15 * * * *"  # Every 15 minutes
+        time_zone: "America/New_York"
+        pubsub_target:
+          topic_name: "projects/$(ref.project-setup.projectId)/topics/email-processing-topic"
+          data: "eyJ0cmlnZ2VyIjoic2NoZWR1bGVkIn0="  # Base64 encoded: {"trigger":"scheduled"}
+        retry_config:
+          retry_count: 3
+          max_retry_duration: "1800s"
+          min_backoff_duration: "5s"
+          max_backoff_duration: "3600s"
+          max_doublings: 2
+      
+      # Cloud Storage configuration for function source code
+      storage_config:
+        bucket_name: "gcf-sources-$(ref.project-setup.projectId)-us-central1"
+        location: "US-CENTRAL1"
+        storage_class: "STANDARD"
+        uniform_bucket_level_access: true
+        versioning_enabled: true
+        lifecycle_rules:
+          - action: "Delete"
+            condition:
+              age: 30
+              matches_storage_class: ["STANDARD"]
+        public_access_prevention: "enforced"
+      
+      # IAM configuration
+      iam_config:
+        # Service account for Cloud Functions
+        function_service_account:
+          account_id: "productivity-functions-sa"
+          display_name: "Productivity Assistant Functions Service Account"
+          description: "Service account for Cloud Functions in productivity assistant"
+        
+        # Custom roles and bindings
+        custom_roles:
+          - role_id: "productivityAssistantProcessor"
+            title: "Productivity Assistant Processor"
+            description: "Custom role for email processing functions"
+            permissions:
+              - "aiplatform.endpoints.predict"
+              - "aiplatform.models.predict"
+              - "firestore.documents.create"
+              - "firestore.documents.get"
+              - "firestore.documents.list"
+              - "firestore.documents.update"
+              - "pubsub.messages.publish"
+              - "pubsub.topics.publish"
+              - "logging.logEntries.create"
+              - "monitoring.metricDescriptors.create"
+              - "monitoring.timeSeries.create"
+        
+        # IAM policy bindings
+        bindings:
+          - role: "roles/cloudfunctions.invoker"
+            members:
+              - "allUsers"  # For HTTP trigger (can be restricted in production)
+          - role: "projects/$(ref.project-setup.projectId)/roles/productivityAssistantProcessor"
+            members:
+              - "serviceAccount:productivity-functions-sa@$(ref.project-setup.projectId).iam.gserviceaccount.com"
+          - role: "roles/vertex-ai.user"
+            members:
+              - "serviceAccount:productivity-functions-sa@$(ref.project-setup.projectId).iam.gserviceaccount.com"
+      
+      # Monitoring and alerting configuration
+      monitoring_config:
+        # Notification channels
+        notification_channels:
+          - display_name: "Email Alerts"
+            type: "email"
+            labels:
+              email_address: "admin@example.com"  # Replace with actual email
+        
+        # Alert policies
+        alert_policies:
+          - display_name: "Function Error Rate Alert"
+            documentation:
+              content: "Alert when Cloud Function error rate exceeds threshold"
+            conditions:
+              - display_name: "Function error rate high"
+                condition_threshold:
+                  filter: 'resource.type="cloud_function" AND resource.label.function_name=~"email-processor|scheduled-email-processor"'
+                  comparison: "COMPARISON_GREATER_THAN"
+                  threshold_value: 0.1  # 10% error rate
+                  duration: "300s"
+                  aggregations:
+                    - alignment_period: "60s"
+                      per_series_aligner: "ALIGN_RATE"
+                      cross_series_reducer: "REDUCE_MEAN"
+                      group_by_fields:
+                        - "resource.label.function_name"
+          
+          - display_name: "Vertex AI Quota Alert"
+            documentation:
+              content: "Alert when approaching Vertex AI quota limits"
+            conditions:
+              - display_name: "High API usage"
+                condition_threshold:
+                  filter: 'resource.type="consumed_api" AND resource.label.service="aiplatform.googleapis.com"'
+                  comparison: "COMPARISON_GREATER_THAN"
+                  threshold_value: 800  # 80% of typical quota
+                  duration: "300s"
+                  aggregations:
+                    - alignment_period: "300s"
+                      per_series_aligner: "ALIGN_RATE"
+                      cross_series_reducer: "REDUCE_SUM"
+      
+      # Security configuration
+      security_config:
+        # Security policy for functions
+        function_security:
+          ingress_settings: "ALLOW_ALL"  # Restrict in production
+          egress_settings: "PRIVATE_RANGES_ONLY"
+          vpc_connector: null  # Can be configured for VPC access
+        
+        # Firestore security rules (will be set separately)
+        firestore_rules: |
+          rules_version = '2';
+          service cloud.firestore {
+            match /databases/{database}/documents {
+              // Allow read/write access to email analysis documents
+              match /email_analysis/{document} {
+                allow read, write: if request.auth != null;
+              }
+              
+              // Allow read/write access to scheduled runs
+              match /scheduled_runs/{document} {
+                allow read, write: if request.auth != null;
+              }
+              
+              // Allow read access to user preferences
+              match /user_preferences/{userId} {
+                allow read, write: if request.auth != null && request.auth.uid == userId;
+              }
+            }
+          }
+      
+      # Labels for resource organization
+      labels:
+        application: "productivity-assistant"
+        environment: "production"
+        team: "ai-engineering"
+        cost-center: "engineering"
+        data-classification: "sensitive"
+
+  # Project setup resource (if creating new project)
+  - name: project-setup
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: "productivity-assistant-$(ref.random-suffix.value)"
+      name: "Personal Productivity Assistant"
+      labels:
+        application: "productivity-assistant"
+        environment: "production"
+
+  # Random suffix generator for unique resource names
+  - name: random-suffix
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: "us-central1"
+      function:
+        name: "suffix-generator"
+        description: "Generates random suffix for resource naming"
+        sourceArchiveUrl: "gs://gcf-sources-$(ref.project-setup.projectId)-us-central1/suffix-generator.zip"
+
+# Template file content (main.jinja)
+---
+# Jinja2 template for Infrastructure Manager deployment
+# This template creates all resources needed for the productivity assistant
+
+# Import schema for validation
+schema: |
+  info:
+    title: Personal Productivity Assistant Template
+    description: Deploys AI-powered email processing system with Vertex AI
+
+  imports:
+    - path: project-apis.jinja
+    - path: firestore.jinja
+    - path: pubsub.jinja
+    - path: functions.jinja
+    - path: scheduler.jinja
+    - path: storage.jinja
+    - path: iam.jinja
+    - path: monitoring.jinja
+
+  required:
+    - project_id
+    - region
+
+  properties:
+    project_id:
+      type: string
+      description: Google Cloud Project ID
+    region:
+      type: string
+      description: Default region for resources
+      default: "us-central1"
+    resource_prefix:
+      type: string
+      description: Prefix for resource names
+      default: "productivity-assistant"
+
+# Main template content
+resources:
+  # Enable required APIs
+  {% for api in properties['required_apis'] %}
+  - name: "{{ api | replace('.', '-') }}-api"
+    type: project-apis.jinja
+    properties:
+      project_id: "{{ properties['project_id'] }}"
+      api_name: "{{ api }}"
+  {% endfor %}
+
+  # Create Firestore database
+  - name: firestore-database
+    type: firestore.jinja
+    properties:
+      project_id: "{{ properties['project_id'] }}"
+      config: "{{ properties['firestore_config'] }}"
+    depends_on:
+      - firestore-googleapis-com-api
+
+  # Create Pub/Sub resources
+  - name: pubsub-resources
+    type: pubsub.jinja
+    properties:
+      project_id: "{{ properties['project_id'] }}"
+      config: "{{ properties['pubsub_config'] }}"
+    depends_on:
+      - pubsub-googleapis-com-api
+
+  # Create Cloud Storage bucket for function source
+  - name: storage-bucket
+    type: storage.jinja
+    properties:
+      project_id: "{{ properties['project_id'] }}"
+      config: "{{ properties['storage_config'] }}"
+
+  # Create IAM resources
+  - name: iam-resources
+    type: iam.jinja
+    properties:
+      project_id: "{{ properties['project_id'] }}"
+      config: "{{ properties['iam_config'] }}"
+
+  # Create Cloud Functions
+  - name: cloud-functions
+    type: functions.jinja
+    properties:
+      project_id: "{{ properties['project_id'] }}"
+      region: "{{ properties['region'] }}"
+      config: "{{ properties['functions_config'] }}"
+    depends_on:
+      - cloudfunctions-googleapis-com-api
+      - pubsub-resources
+      - iam-resources
+      - storage-bucket
+
+  # Create Cloud Scheduler job
+  - name: scheduler-job
+    type: scheduler.jinja
+    properties:
+      project_id: "{{ properties['project_id'] }}"
+      region: "{{ properties['region'] }}"
+      config: "{{ properties['scheduler_config'] }}"
+    depends_on:
+      - cloudscheduler-googleapis-com-api
+      - pubsub-resources
+
+  # Create monitoring and alerting
+  - name: monitoring-setup
+    type: monitoring.jinja
+    properties:
+      project_id: "{{ properties['project_id'] }}"
+      config: "{{ properties['monitoring_config'] }}"
+    depends_on:
+      - cloud-functions
+      - monitoring-googleapis-com-api
+
+outputs:
+  # Function URLs and endpoints
+  email_processor_url:
+    description: "URL for the email processing Cloud Function"
+    value: "$(ref.cloud-functions.email_processor_url)"
+
+  scheduled_processor_name:
+    description: "Name of the scheduled email processor function"
+    value: "$(ref.cloud-functions.scheduled_processor_name)"
+
+  # Pub/Sub resources
+  pubsub_topic:
+    description: "Pub/Sub topic for email processing"
+    value: "$(ref.pubsub-resources.topic_name)"
+
+  pubsub_subscription:
+    description: "Pub/Sub subscription for email processing"
+    value: "$(ref.pubsub-resources.subscription_name)"
+
+  # Storage resources
+  source_bucket:
+    description: "Cloud Storage bucket for function source code"
+    value: "$(ref.storage-bucket.bucket_name)"
+
+  # Firestore database
+  firestore_database:
+    description: "Firestore database for data storage"
+    value: "$(ref.firestore-database.database_name)"
+
+  # IAM resources
+  function_service_account:
+    description: "Service account for Cloud Functions"
+    value: "$(ref.iam-resources.function_service_account_email)"
+
+  # Scheduler job
+  scheduler_job_name:
+    description: "Cloud Scheduler job for periodic processing"
+    value: "$(ref.scheduler-job.job_name)"
+
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: "{{ properties['project_id'] }}"
+
+  region:
+    description: "Primary region for resources"
+    value: "{{ properties['region'] }}"
+
+  # Monitoring resources
+  notification_channels:
+    description: "Notification channels for alerting"
+    value: "$(ref.monitoring-setup.notification_channels)"
+
+  alert_policies:
+    description: "Alert policies for monitoring"
+    value: "$(ref.monitoring-setup.alert_policies)"
+
+  # Instructions for next steps
+  deployment_instructions:
+    description: "Next steps after deployment"
+    value: |
+      Deployment complete! Next steps:
+      1. Upload function source code to: gs://$(ref.storage-bucket.bucket_name)/
+      2. Configure OAuth credentials for Gmail API access
+      3. Update Firestore security rules if needed
+      4. Test function endpoints with sample data
+      5. Configure notification email addresses for alerts
+      6. Run the Gmail integration helper to process emails
+
+  # Cost optimization notes
+  cost_optimization_notes:
+    description: "Recommendations for cost optimization"
+    value: |
+      Cost optimization recommendations:
+      1. Monitor Vertex AI API usage and adjust accordingly
+      2. Set appropriate Cloud Function scaling limits
+      3. Use Cloud Scheduler efficiently (current: every 15 minutes)
+      4. Enable Cloud Storage lifecycle policies for old function versions
+      5. Monitor Firestore read/write operations
+      6. Consider using sustained use discounts for consistent workloads
+
+  # Security recommendations
+  security_recommendations:
+    description: "Security best practices to implement"
+    value: |
+      Security recommendations:
+      1. Restrict Cloud Function ingress to specific IP ranges in production
+      2. Enable VPC Service Controls for additional network security
+      3. Regularly rotate OAuth credentials and service account keys
+      4. Review and update Firestore security rules based on usage patterns
+      5. Enable audit logging for all API calls
+      6. Implement proper error handling to avoid information disclosure
+      7. Use Secret Manager for storing sensitive configuration data

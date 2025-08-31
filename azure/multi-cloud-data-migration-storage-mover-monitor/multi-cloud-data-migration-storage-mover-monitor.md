@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Storage Mover, Azure Blob Storage, Azure Monitor, Azure Logic Apps
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-migration, multi-cloud, storage, aws-s3, azure-blob, automation, monitoring
 recipe-generator-version: 1.3
@@ -36,7 +36,7 @@ graph TB
     subgraph "Azure Environment"
         subgraph "Migration Services"
             ASM[Azure Storage Mover]
-            ARC[Azure Arc Multicloud Connector]
+            CONNECTOR[Multicloud Connector]
         end
         
         subgraph "Storage Layer"
@@ -56,8 +56,8 @@ graph TB
         end
     end
     
-    S3 --> ARC
-    ARC --> ASM
+    S3 --> CONNECTOR
+    CONNECTOR --> ASM
     ASM --> BLOB
     ASM --> MONITOR
     MONITOR --> LOGS
@@ -75,10 +75,10 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions for Storage Mover, Azure Monitor, and Logic Apps
-2. AWS account with S3 bucket containing source data
+2. AWS account with S3 bucket containing source data and appropriate access credentials
 3. Azure CLI v2.50.0 or later installed and configured
 4. AWS CLI configured with appropriate S3 permissions
-5. Microsoft.StorageMover and Microsoft.HybridCompute resource providers registered
+5. Microsoft.StorageMover, Microsoft.HybridCompute, and Microsoft.Insights resource providers registered
 6. Estimated cost: $50-200/month depending on data volume and monitoring frequency
 
 > **Note**: Azure Storage Mover's cloud-to-cloud migration feature is currently in preview. Review the [latest service limitations](https://docs.microsoft.com/en-us/azure/storage-mover/cloud-to-cloud-migration) before proceeding with production workloads.
@@ -86,18 +86,25 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables
-export RESOURCE_GROUP="rg-migration-demo"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-migration-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
-export STORAGE_ACCOUNT_NAME="stmigration$(openssl rand -hex 4)"
-export STORAGE_MOVER_NAME="sm-migration-$(openssl rand -hex 3)"
-export LOG_WORKSPACE_NAME="log-migration-$(openssl rand -hex 3)"
-export LOGIC_APP_NAME="logic-migration-$(openssl rand -hex 3)"
+export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+
+# Generate unique suffix for resource names
+RANDOM_SUFFIX=$(openssl rand -hex 3)
+
+# Set resource names with unique suffix
+export STORAGE_ACCOUNT_NAME="stmigration${RANDOM_SUFFIX}"
+export STORAGE_MOVER_NAME="sm-migration-${RANDOM_SUFFIX}"
+export LOG_WORKSPACE_NAME="log-migration-${RANDOM_SUFFIX}"
+export LOGIC_APP_NAME="logic-migration-${RANDOM_SUFFIX}"
+export MULTICLOUD_CONNECTOR_NAME="aws-connector-${RANDOM_SUFFIX}"
+
+# AWS configuration (replace with your values)
 export AWS_S3_BUCKET="your-source-s3-bucket"
 export AWS_ACCOUNT_ID="your-aws-account-id"
-
-# Generate unique suffix for resources
-RANDOM_SUFFIX=$(openssl rand -hex 3)
+export AWS_REGION="us-east-1"
 
 # Create resource group
 az group create \
@@ -155,7 +162,7 @@ echo "✅ Environment prepared successfully"
        --sku pergb2018 \
        --retention-time 30
    
-   # Get workspace ID and key
+   # Get workspace ID for later use
    WORKSPACE_ID=$(az monitor log-analytics workspace show \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${LOG_WORKSPACE_NAME} \
@@ -184,26 +191,27 @@ echo "✅ Environment prepared successfully"
 
    The Storage Mover resource provides the foundation for managing multi-cloud data transfers. It maintains connection state, migration job history, and integration with Azure monitoring services for comprehensive visibility.
 
-4. **Configure Azure Arc Multicloud Connector**:
+4. **Create Multicloud Connector for AWS Access**:
 
-   Azure Arc extends Azure management capabilities to external cloud environments. The multicloud connector enables secure, authenticated access to AWS S3 resources from Azure services, facilitating seamless data transfer while maintaining security and compliance requirements.
+   The multicloud connector enables secure, authenticated access to AWS S3 resources from Azure services. This component establishes the trust relationship between Azure and AWS environments, facilitating seamless data transfer while maintaining security and compliance requirements.
 
    ```bash
-   # Create multicloud connector for AWS
-   az connectedmachine extension create \
+   # Create multicloud connector for AWS S3 access
+   az arc multicloud connector create \
        --resource-group ${RESOURCE_GROUP} \
-       --machine-name ${STORAGE_MOVER_NAME} \
-       --name AzureStorageMoverConnector \
-       --publisher Microsoft.StorageMover \
-       --type StorageMoverConnector \
-       --settings '{
-           "cloudProvider": "AWS",
-           "accountId": "'${AWS_ACCOUNT_ID}'",
-           "region": "us-east-1",
-           "serviceType": "S3"
-       }'
+       --name ${MULTICLOUD_CONNECTOR_NAME} \
+       --location ${LOCATION} \
+       --aws-cloud-provider accountId=${AWS_ACCOUNT_ID} \
+       --public-cloud-connectors-enabled true \
+       --tags purpose=migration cloud-provider=aws
    
-   echo "✅ Azure Arc multicloud connector configured"
+   echo "✅ Multicloud connector created: ${MULTICLOUD_CONNECTOR_NAME}"
+   
+   # Wait for connector to be fully provisioned
+   az arc multicloud connector wait \
+       --resource-group ${RESOURCE_GROUP} \
+       --name ${MULTICLOUD_CONNECTOR_NAME} \
+       --created
    ```
 
    The multicloud connector establishes secure connectivity between Azure and AWS environments, enabling Storage Mover to access S3 buckets while maintaining proper authentication and authorization boundaries.
@@ -213,15 +221,22 @@ echo "✅ Environment prepared successfully"
    Endpoints define the source and destination locations for data migration. The source endpoint connects to AWS S3 through the multicloud connector, while the target endpoint references the Azure Blob Storage account created earlier.
 
    ```bash
+   # Create container in target storage account first
+   az storage container create \
+       --name "migrated-data" \
+       --account-name ${STORAGE_ACCOUNT_NAME} \
+       --account-key ${STORAGE_ACCOUNT_KEY} \
+       --public-access off
+   
    # Create AWS S3 source endpoint
    az storage-mover endpoint create \
        --resource-group ${RESOURCE_GROUP} \
        --storage-mover-name ${STORAGE_MOVER_NAME} \
        --name "aws-s3-source" \
-       --endpoint-type AzureStorageContainer \
        --properties '{
-           "containerName": "'${AWS_S3_BUCKET}'",
-           "storageAccountResourceId": "/subscriptions/'$(az account show --query id -o tsv)'/resourceGroups/'${RESOURCE_GROUP}'/providers/Microsoft.Storage/storageAccounts/'${STORAGE_ACCOUNT_NAME}'"
+           "endpointType": "AmazonS3",
+           "bucketName": "'${AWS_S3_BUCKET}'",
+           "region": "'${AWS_REGION}'"
        }'
    
    # Create Azure Blob target endpoint
@@ -229,10 +244,10 @@ echo "✅ Environment prepared successfully"
        --resource-group ${RESOURCE_GROUP} \
        --storage-mover-name ${STORAGE_MOVER_NAME} \
        --name "azure-blob-target" \
-       --endpoint-type AzureStorageContainer \
        --properties '{
+           "endpointType": "AzureStorageBlobContainer",
            "containerName": "migrated-data",
-           "storageAccountResourceId": "/subscriptions/'$(az account show --query id -o tsv)'/resourceGroups/'${RESOURCE_GROUP}'/providers/Microsoft.Storage/storageAccounts/'${STORAGE_ACCOUNT_NAME}'"
+           "storageAccountResourceId": "/subscriptions/'${SUBSCRIPTION_ID}'/resourceGroups/'${RESOURCE_GROUP}'/providers/Microsoft.Storage/storageAccounts/'${STORAGE_ACCOUNT_NAME}'"
        }'
    
    echo "✅ Source and target endpoints created"
@@ -240,55 +255,93 @@ echo "✅ Environment prepared successfully"
 
    The endpoints establish the migration path from AWS S3 to Azure Blob Storage, with proper authentication and resource linking to ensure secure, efficient data transfer.
 
-6. **Create Logic App for Migration Automation**:
+6. **Create Logic App Workflow Definition File**:
 
-   Azure Logic Apps provides workflow automation capabilities for the migration process. This Logic App will orchestrate migration jobs, handle error scenarios, and coordinate with monitoring systems to provide comprehensive migration management.
+   Azure Logic Apps provides workflow automation capabilities for the migration process. We'll first create the workflow definition file that orchestrates migration jobs and coordinates with monitoring systems.
 
    ```bash
-   # Create Logic App for migration automation
-   az logic app create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${LOGIC_APP_NAME} \
-       --location ${LOCATION} \
-       --definition '{
-           "$schema": "https://schema.management.azure.com/schemas/2016-06-01/Microsoft.Logic.json",
-           "contentVersion": "1.0.0.0",
-           "parameters": {},
-           "triggers": {
-               "manual": {
-                   "type": "Request",
-                   "kind": "Http"
-               }
-           },
-           "actions": {
-               "StartMigration": {
-                   "type": "Http",
-                   "inputs": {
-                       "method": "POST",
-                       "uri": "https://management.azure.com/subscriptions/'$(az account show --query id -o tsv)'/resourceGroups/'${RESOURCE_GROUP}'/providers/Microsoft.StorageMover/storageMovers/'${STORAGE_MOVER_NAME}'/jobs",
-                       "headers": {
-                           "Content-Type": "application/json"
-                       },
-                       "body": {
-                           "properties": {
-                               "sourceEndpoint": "aws-s3-source",
-                               "targetEndpoint": "azure-blob-target",
-                               "copyMode": "Mirror"
+   # Create workflow definition file for Logic App
+   cat > migration-workflow.json << 'EOF'
+   {
+       "$schema": "https://schema.management.azure.com/schemas/2016-06-01/Microsoft.Logic.json",
+       "contentVersion": "1.0.0.0",
+       "parameters": {},
+       "triggers": {
+           "manual": {
+               "type": "Request",
+               "kind": "Http",
+               "inputs": {
+                   "schema": {
+                       "type": "object",
+                       "properties": {
+                           "action": {
+                               "type": "string"
                            }
                        }
                    }
                }
            }
-       }'
+       },
+       "actions": {
+           "CheckMigrationStatus": {
+               "type": "Http",
+               "inputs": {
+                   "method": "GET",
+                   "uri": "https://management.azure.com/subscriptions/SUBSCRIPTION_ID/resourceGroups/RESOURCE_GROUP/providers/Microsoft.StorageMover/storageMovers/STORAGE_MOVER_NAME/projects/migration-project/jobDefinitions/initial-migration/jobRuns",
+                   "headers": {
+                       "Content-Type": "application/json"
+                   },
+                   "authentication": {
+                       "type": "ManagedServiceIdentity"
+                   }
+               }
+           },
+           "SendNotification": {
+               "type": "Http",
+               "inputs": {
+                   "method": "POST",
+                   "uri": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+                   "body": {
+                       "text": "Migration status update: @{body('CheckMigrationStatus')}"
+                   }
+               },
+               "runAfter": {
+                   "CheckMigrationStatus": ["Succeeded"]
+               }
+           }
+       }
+   }
+   EOF
+   
+   # Replace placeholders with actual values
+   sed -i "s/SUBSCRIPTION_ID/${SUBSCRIPTION_ID}/g" migration-workflow.json
+   sed -i "s/RESOURCE_GROUP/${RESOURCE_GROUP}/g" migration-workflow.json
+   sed -i "s/STORAGE_MOVER_NAME/${STORAGE_MOVER_NAME}/g" migration-workflow.json
+   
+   echo "✅ Logic App workflow definition created"
+   ```
+
+   The workflow definition creates a simple HTTP-triggered Logic App that can check migration status and send notifications, providing the foundation for migration automation.
+
+7. **Create Logic App for Migration Automation**:
+
+   ```bash
+   # Create Logic App with workflow definition
+   az logic workflow create \
+       --resource-group ${RESOURCE_GROUP} \
+       --name ${LOGIC_APP_NAME} \
+       --location ${LOCATION} \
+       --definition @migration-workflow.json \
+       --tags purpose=migration-automation
    
    echo "✅ Logic App created: ${LOGIC_APP_NAME}"
    ```
 
-   The Logic App provides automated migration orchestration with HTTP triggers for manual or scheduled execution. It integrates with Storage Mover APIs to initiate and manage migration jobs programmatically.
+   The Logic App provides automated migration orchestration with HTTP triggers for manual or scheduled execution. It integrates with Storage Mover APIs to monitor and manage migration jobs programmatically.
 
-7. **Configure Azure Monitor Alerts**:
+8. **Configure Azure Monitor Alerts**:
 
-   Azure Monitor alerts provide proactive notification of migration events, including job completion, failures, and performance anomalies. These alerts integrate with Logic Apps to enable automated response to migration events.
+   Azure Monitor alerts provide proactive notification of migration events, including job completion, failures, and performance anomalies. These alerts integrate with the Logic App to enable automated response to migration events.
 
    ```bash
    # Create action group for notifications
@@ -303,9 +356,9 @@ echo "✅ Environment prepared successfully"
        --resource-group ${RESOURCE_GROUP} \
        --name "migration-job-failure" \
        --description "Alert when migration job fails" \
-       --scopes "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.StorageMover/storageMovers/${STORAGE_MOVER_NAME}" \
-       --condition "count Microsoft.StorageMover/storageMovers JobStatus Failed >= 1" \
-       --action-groups "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/actionGroups/migration-alerts" \
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.StorageMover/storageMovers/${STORAGE_MOVER_NAME}" \
+       --condition "count 'Job Status' == 'Failed' > 0" \
+       --action "migration-alerts" \
        --evaluation-frequency 5m \
        --window-size 5m
    
@@ -314,9 +367,9 @@ echo "✅ Environment prepared successfully"
        --resource-group ${RESOURCE_GROUP} \
        --name "migration-job-success" \
        --description "Alert when migration job completes successfully" \
-       --scopes "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.StorageMover/storageMovers/${STORAGE_MOVER_NAME}" \
-       --condition "count Microsoft.StorageMover/storageMovers JobStatus Succeeded >= 1" \
-       --action-groups "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/actionGroups/migration-alerts" \
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.StorageMover/storageMovers/${STORAGE_MOVER_NAME}" \
+       --condition "count 'Job Status' == 'Succeeded' > 0" \
+       --action "migration-alerts" \
        --evaluation-frequency 5m \
        --window-size 5m
    
@@ -325,19 +378,19 @@ echo "✅ Environment prepared successfully"
 
    The alert configuration provides real-time notification of migration events, enabling rapid response to both successful completions and failure scenarios. The 5-minute evaluation frequency ensures timely detection of migration state changes.
 
-8. **Create Migration Job and Start Transfer**:
+9. **Create Migration Project and Job Definition**:
 
-   The migration job defines the specific data transfer task from AWS S3 to Azure Blob Storage. This job configuration specifies source and target endpoints, transfer options, and monitoring parameters to ensure successful data migration.
+   The migration project organizes related migration tasks, while the job definition specifies the exact source-to-target mapping and migration settings for the AWS S3 to Azure Blob Storage transfer.
 
    ```bash
-   # Create container in target storage account
-   az storage container create \
-       --name "migrated-data" \
-       --account-name ${STORAGE_ACCOUNT_NAME} \
-       --account-key ${STORAGE_ACCOUNT_KEY} \
-       --public-access off
+   # Create migration project
+   az storage-mover project create \
+       --resource-group ${RESOURCE_GROUP} \
+       --storage-mover-name ${STORAGE_MOVER_NAME} \
+       --name "s3-to-blob-migration" \
+       --description "Migration project for AWS S3 to Azure Blob Storage"
    
-   # Create migration job
+   # Create job definition
    az storage-mover job-definition create \
        --resource-group ${RESOURCE_GROUP} \
        --storage-mover-name ${STORAGE_MOVER_NAME} \
@@ -348,17 +401,27 @@ echo "✅ Environment prepared successfully"
        --copy-mode "Mirror" \
        --description "Initial migration from AWS S3 to Azure Blob Storage"
    
-   # Start migration job
-   az storage-mover job-run start \
-       --resource-group ${RESOURCE_GROUP} \
-       --storage-mover-name ${STORAGE_MOVER_NAME} \
-       --project-name "s3-to-blob-migration" \
-       --job-definition-name "initial-migration"
-   
-   echo "✅ Migration job started successfully"
+   echo "✅ Migration project and job definition created"
    ```
 
-   The migration job is now active and transferring data from AWS S3 to Azure Blob Storage. The Mirror copy mode ensures complete data synchronization, including metadata and access control information where applicable.
+   The project structure provides organization for complex migrations while the job definition establishes the specific migration parameters and endpoints for data transfer.
+
+10. **Start Migration Job**:
+
+    The migration job executes the defined data transfer from AWS S3 to Azure Blob Storage using the configured endpoints and settings.
+
+    ```bash
+    # Start migration job
+    az storage-mover job-run start \
+        --resource-group ${RESOURCE_GROUP} \
+        --storage-mover-name ${STORAGE_MOVER_NAME} \
+        --project-name "s3-to-blob-migration" \
+        --job-definition-name "initial-migration"
+    
+    echo "✅ Migration job started successfully"
+    ```
+
+    The migration job is now active and transferring data from AWS S3 to Azure Blob Storage. The Mirror copy mode ensures complete data synchronization, including metadata and access control information where applicable.
 
 ## Validation & Testing
 
@@ -378,12 +441,12 @@ echo "✅ Environment prepared successfully"
 
    ```bash
    # Check migration job status
-   az storage-mover job-run show \
+   az storage-mover job-run list \
        --resource-group ${RESOURCE_GROUP} \
        --storage-mover-name ${STORAGE_MOVER_NAME} \
        --project-name "s3-to-blob-migration" \
        --job-definition-name "initial-migration" \
-       --query "{status: status, progress: progress, startTime: startTime}"
+       --query "[0].{status:status,progress:progress,startTime:startTime}"
    ```
 
    Expected output: Migration status with progress percentage and start time
@@ -408,7 +471,7 @@ echo "✅ Environment prepared successfully"
    az monitor metrics alert show \
        --resource-group ${RESOURCE_GROUP} \
        --name "migration-job-failure" \
-       --query "{enabled: enabled, condition: condition}"
+       --query "{enabled:enabled,condition:condition}"
    ```
 
    Expected output: Alert rule configuration with enabled status
@@ -420,7 +483,7 @@ echo "✅ Environment prepared successfully"
    az monitor log-analytics query \
        --workspace ${WORKSPACE_ID} \
        --analytics-query "
-           StorageMoverLogs_CL
+           StorageMoverJobRuns_CL
            | where TimeGenerated > ago(1h)
            | where JobName_s == 'initial-migration'
            | project TimeGenerated, JobStatus_s, TransferredBytes_d, TotalFiles_d
@@ -435,12 +498,12 @@ echo "✅ Environment prepared successfully"
 1. **Stop and Remove Migration Jobs**:
 
    ```bash
-   # Stop running migration job
+   # Stop running migration job if still active
    az storage-mover job-run stop \
        --resource-group ${RESOURCE_GROUP} \
        --storage-mover-name ${STORAGE_MOVER_NAME} \
        --project-name "s3-to-blob-migration" \
-       --job-definition-name "initial-migration"
+       --job-definition-name "initial-migration" || true
    
    echo "✅ Migration job stopped"
    ```
@@ -465,11 +528,11 @@ echo "✅ Environment prepared successfully"
    echo "✅ Azure Monitor alerts removed"
    ```
 
-3. **Remove Storage Mover and Related Resources**:
+3. **Remove Logic App and Storage Mover Resources**:
 
    ```bash
    # Delete Logic App
-   az logic app delete \
+   az logic workflow delete \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
        --yes
@@ -480,7 +543,13 @@ echo "✅ Environment prepared successfully"
        --name ${STORAGE_MOVER_NAME} \
        --yes
    
-   echo "✅ Storage Mover resources removed"
+   # Delete multicloud connector
+   az arc multicloud connector delete \
+       --resource-group ${RESOURCE_GROUP} \
+       --name ${MULTICLOUD_CONNECTOR_NAME} \
+       --yes
+   
+   echo "✅ Logic App and Storage Mover resources removed"
    ```
 
 4. **Remove Storage Account and Log Analytics Workspace**:
@@ -509,6 +578,9 @@ echo "✅ Environment prepared successfully"
        --name ${RESOURCE_GROUP} \
        --yes \
        --no-wait
+   
+   # Clean up local files
+   rm -f migration-workflow.json
    
    echo "✅ Resource group deletion initiated: ${RESOURCE_GROUP}"
    echo "Note: Deletion may take several minutes to complete"
@@ -542,4 +614,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

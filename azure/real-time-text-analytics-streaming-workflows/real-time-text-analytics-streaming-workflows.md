@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Cognitive Services, Azure Event Hubs, Azure Logic Apps, Azure Storage
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cognitive-services, text-analytics, event-streaming, workflow-automation, real-time-processing
 recipe-generator-version: 1.3
@@ -92,13 +92,13 @@ graph TB
 4. Familiarity with REST API concepts and webhook patterns
 5. Estimated cost: $15-25 per day for testing (delete resources after completion to avoid ongoing charges)
 
-> **Note**: Azure Cognitive Services Text Analytics provides pre-built AI models that eliminate the need for custom machine learning development. The service automatically handles model updates and scaling, making it ideal for production content processing scenarios.
+> **Note**: Azure Cognitive Services Language service provides pre-built AI models that eliminate the need for custom machine learning development. The service automatically handles model updates and scaling, making it ideal for production content processing scenarios.
 
 ## Preparation
 
 ```bash
-# Set environment variables for consistent resource naming
-export RESOURCE_GROUP="rg-content-processing-demo"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-content-processing-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -133,7 +133,6 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
        --location ${LOCATION} \
        --kind TextAnalytics \
        --sku S \
-       --custom-domain ${COGNITIVE_SERVICE} \
        --yes
    
    # Get the API key and endpoint
@@ -395,12 +394,21 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
              }
            },
            "method": "post",
-           "path": "/text/analytics/v3.0/languages",
+           "path": "/language/:analyze-text",
+           "queries": {
+             "api-version": "2024-11-01"
+           },
            "body": {
-             "documents": [{
-               "id": "1",
-               "text": "@body('Parse_Event_Content')?['content']"
-             }]
+             "kind": "LanguageDetection",
+             "parameters": {
+               "modelVersion": "latest"
+             },
+             "analysisInput": {
+               "documents": [{
+                 "id": "1",
+                 "text": "@body('Parse_Event_Content')?['content']"
+               }]
+             }
            }
          },
          "runAfter": {
@@ -416,13 +424,22 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
              }
            },
            "method": "post",
-           "path": "/text/analytics/v3.0/sentiment",
+           "path": "/language/:analyze-text",
+           "queries": {
+             "api-version": "2024-11-01"
+           },
            "body": {
-             "documents": [{
-               "id": "1",
-               "text": "@body('Parse_Event_Content')?['content']",
-               "language": "@first(body('Detect_Language')?['documents'])?['detectedLanguage']?['iso6391Name']"
-             }]
+             "kind": "SentimentAnalysis",
+             "parameters": {
+               "modelVersion": "latest"
+             },
+             "analysisInput": {
+               "documents": [{
+                 "id": "1",
+                 "text": "@body('Parse_Event_Content')?['content']",
+                 "language": "@first(body('Detect_Language')?['results']?['documents'])?['detectedLanguage']?['iso6391Name']"
+               }]
+             }
            }
          },
          "runAfter": {
@@ -438,13 +455,22 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
              }
            },
            "method": "post",
-           "path": "/text/analytics/v3.0/keyPhrases",
+           "path": "/language/:analyze-text",
+           "queries": {
+             "api-version": "2024-11-01"
+           },
            "body": {
-             "documents": [{
-               "id": "1",
-               "text": "@body('Parse_Event_Content')?['content']",
-               "language": "@first(body('Detect_Language')?['documents'])?['detectedLanguage']?['iso6391Name']"
-             }]
+             "kind": "KeyPhraseExtraction",
+             "parameters": {
+               "modelVersion": "latest"
+             },
+             "analysisInput": {
+               "documents": [{
+                 "id": "1",
+                 "text": "@body('Parse_Event_Content')?['content']",
+                 "language": "@first(body('Detect_Language')?['results']?['documents'])?['detectedLanguage']?['iso6391Name']"
+               }]
+             }
            }
          },
          "runAfter": {
@@ -460,18 +486,19 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
              }
            },
            "method": "post",
-           "path": "/datasets/default/files",
+           "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent('default'))}/files",
            "queries": {
              "folderPath": "/processed-insights",
-             "name": "analysis-@{utcNow('yyyyMMddHHmmss')}.json"
+             "name": "analysis-@{utcNow('yyyyMMddHHmmss')}.json",
+             "queryParametersSingleEncoded": true
            },
            "body": {
              "timestamp": "@utcNow()",
              "source": "@body('Parse_Event_Content')?['source']",
-             "language": "@first(body('Detect_Language')?['documents'])?['detectedLanguage']?['name']",
-             "sentiment": "@first(body('Analyze_Sentiment')?['documents'])?['sentiment']",
-             "confidence": "@first(body('Analyze_Sentiment')?['documents'])?['confidenceScores']",
-             "keyPhrases": "@first(body('Extract_Key_Phrases')?['documents'])?['keyPhrases']",
+             "language": "@first(body('Detect_Language')?['results']?['documents'])?['detectedLanguage']?['name']",
+             "sentiment": "@first(body('Analyze_Sentiment')?['results']?['documents'])?['sentiment']",
+             "confidence": "@first(body('Analyze_Sentiment')?['results']?['documents'])?['confidenceScores']",
+             "keyPhrases": "@first(body('Extract_Key_Phrases')?['results']?['documents'])?['keyPhrases']",
              "originalContent": "@body('Parse_Event_Content')?['content']"
            }
          },
@@ -485,7 +512,7 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
          "expression": {
            "and": [{
              "equals": [
-               "@first(body('Analyze_Sentiment')?['documents'])?['sentiment']",
+               "@first(body('Analyze_Sentiment')?['results']?['documents'])?['sentiment']",
                "negative"
              ]
            }]
@@ -504,7 +531,7 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
                "body": {
                  "To": "admin@company.com",
                  "Subject": "Negative Sentiment Alert",
-                 "Body": "Negative sentiment detected in content from @{body('Parse_Event_Content')?['source']}. Key phrases: @{join(first(body('Extract_Key_Phrases')?['documents'])?['keyPhrases'], ', ')}"
+                 "Body": "Negative sentiment detected in content from @{body('Parse_Event_Content')?['source']}. Key phrases: @{join(first(body('Extract_Key_Phrases')?['results']?['documents'])?['keyPhrases'], ', ')}"
                }
              }
            }
@@ -597,15 +624,21 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
 2. **Test Cognitive Services Language Resource**:
 
    ```bash
-   # Test sentiment analysis endpoint
-   curl -X POST "${COGNITIVE_ENDPOINT}/text/analytics/v3.1/sentiment" \
+   # Test sentiment analysis endpoint using current API
+   curl -X POST "${COGNITIVE_ENDPOINT}/language/:analyze-text?api-version=2024-11-01" \
        -H "Ocp-Apim-Subscription-Key: ${COGNITIVE_KEY}" \
        -H "Content-Type: application/json" \
        -d '{
-         "documents": [{
-           "id": "1",
-           "text": "I love Azure Cognitive Services! This is amazing technology."
-         }]
+         "kind": "SentimentAnalysis",
+         "parameters": {
+           "modelVersion": "latest"
+         },
+         "analysisInput": {
+           "documents": [{
+             "id": "1",
+             "text": "I love Azure Cognitive Services! This is amazing technology."
+           }]
+         }
        }'
    ```
 
@@ -635,17 +668,17 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
        {
            "content": "This product is absolutely fantastic! Excellent customer service.",
            "source": "product-review",
-           "timestamp": "2025-07-12T10:00:00Z"
+           "timestamp": "2025-07-23T10:00:00Z"
        },
        {
            "content": "Very disappointed with the service. Poor quality and late delivery.",
            "source": "customer-feedback",
-           "timestamp": "2025-07-12T10:05:00Z"
+           "timestamp": "2025-07-23T10:05:00Z"
        },
        {
            "content": "The new features are interesting but need more documentation.",
            "source": "user-forum",
-           "timestamp": "2025-07-12T10:10:00Z"
+           "timestamp": "2025-07-23T10:10:00Z"
        }
    ]
    
@@ -766,15 +799,15 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
 
 ## Discussion
 
-Azure Cognitive Services Text Analytics combined with Event Hubs and Logic Apps creates a powerful, scalable content processing platform that transforms unstructured text into actionable business intelligence. This serverless architecture automatically scales to handle varying content volumes while maintaining consistent processing latency, making it ideal for real-time sentiment monitoring, content moderation, and customer feedback analysis. The [Azure Cognitive Services Language documentation](https://docs.microsoft.com/en-us/azure/cognitive-services/language-service/) provides comprehensive guidance on advanced text analytics capabilities including custom entity recognition and opinion mining.
+Azure Cognitive Services Language service combined with Event Hubs and Logic Apps creates a powerful, scalable content processing platform that transforms unstructured text into actionable business intelligence. This serverless architecture automatically scales to handle varying content volumes while maintaining consistent processing latency, making it ideal for real-time sentiment monitoring, content moderation, and customer feedback analysis. The [Azure AI Language service documentation](https://learn.microsoft.com/en-us/azure/ai-services/language-service/) provides comprehensive guidance on advanced text analytics capabilities including custom entity recognition and opinion mining.
 
-Event-driven processing patterns enable natural decoupling between content sources and processing logic, allowing independent scaling and evolution of system components. Azure Event Hubs' partition-based architecture supports parallel processing while Logic Apps provides visual workflow orchestration without requiring custom code development. This combination follows [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles by ensuring reliability, security, and cost optimization through managed services and automatic scaling capabilities.
+Event-driven processing patterns enable natural decoupling between content sources and processing logic, allowing independent scaling and evolution of system components. Azure Event Hubs' partition-based architecture supports parallel processing while Logic Apps provides visual workflow orchestration without requiring custom code development. This combination follows [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles by ensuring reliability, security, and cost optimization through managed services and automatic scaling capabilities.
 
-The multi-modal approach supports diverse content types and sources, from social media streams to document uploads, enabling comprehensive content intelligence across enterprise applications. Integration with Azure Storage provides both hot path processing for immediate insights and cold path analytics for historical trend analysis. For advanced scenarios, consider implementing [Azure Stream Analytics](https://docs.microsoft.com/en-us/azure/stream-analytics/) for complex event processing and [Azure Synapse Analytics](https://docs.microsoft.com/en-us/azure/synapse-analytics/) for large-scale data warehousing and machine learning model training.
+The multi-modal approach supports diverse content types and sources, from social media streams to document uploads, enabling comprehensive content intelligence across enterprise applications. Integration with Azure Storage provides both hot path processing for immediate insights and cold path analytics for historical trend analysis. For advanced scenarios, consider implementing [Azure Stream Analytics](https://learn.microsoft.com/en-us/azure/stream-analytics/) for complex event processing and [Azure Synapse Analytics](https://learn.microsoft.com/en-us/azure/synapse-analytics/) for large-scale data warehousing and machine learning model training.
 
-From a cost perspective, the consumption-based pricing model ensures you only pay for actual processing and storage usage. The serverless nature of Logic Apps and the pay-per-transaction model of Cognitive Services provide predictable costs that scale with business value. For detailed cost optimization strategies, review the [Azure Cost Management documentation](https://docs.microsoft.com/en-us/azure/cost-management-billing/) and implement budget alerts to monitor spending across the content processing pipeline.
+From a cost perspective, the consumption-based pricing model ensures you only pay for actual processing and storage usage. The serverless nature of Logic Apps and the pay-per-transaction model of Cognitive Services provide predictable costs that scale with business value. For detailed cost optimization strategies, review the [Azure Cost Management documentation](https://learn.microsoft.com/en-us/azure/cost-management-billing/) and implement budget alerts to monitor spending across the content processing pipeline.
 
-> **Warning**: Ensure proper data governance and privacy compliance when processing user-generated content. Review [Azure privacy and compliance documentation](https://docs.microsoft.com/en-us/azure/compliance/) to understand data residency, encryption, and regulatory requirements for your industry and geographic regions.
+> **Warning**: Ensure proper data governance and privacy compliance when processing user-generated content. Review [Azure privacy and compliance documentation](https://learn.microsoft.com/en-us/azure/compliance/) to understand data residency, encryption, and regulatory requirements for your industry and geographic regions.
 
 ## Challenge
 
@@ -792,4 +825,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

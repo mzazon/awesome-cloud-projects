@@ -4,12 +4,12 @@ id: 7c8b3a2e
 category: containers
 difficulty: 200
 subject: azure
-services: Azure Web App for Containers, Azure Communication Services, Azure Blob Storage
+services: Azure Web App for Containers, Azure Communication Services, Azure Blob Storage, Azure Container Registry
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers, video-conferencing, real-time-communication, web-apps, call-recording, scalability
 recipe-generator-version: 1.3
@@ -78,8 +78,8 @@ graph TB
 
 ## Prerequisites
 
-1. Azure subscription with appropriate permissions to create Communication Services, Web Apps, and Storage accounts
-2. Azure CLI v2.67.0 or higher installed and configured (or Azure Cloud Shell)
+1. Azure subscription with appropriate permissions to create Communication Services, Web Apps, Container Registry, and Storage accounts
+2. Azure CLI v2.46.0 or higher installed and configured (or Azure Cloud Shell)
 3. Docker installed locally for container development and testing
 4. Basic knowledge of containerization, JavaScript/Node.js, and video conferencing concepts
 5. Git for version control and deployment
@@ -90,8 +90,8 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for consistent resource naming
-export RESOURCE_GROUP="rg-video-conferencing-app"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-video-conferencing-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -551,7 +551,7 @@ echo "✅ Communication Services extension installed"
    # Check application health
    curl -f https://${WEBAPP_URL}/health
    
-   # Expected output: {"status":"healthy","timestamp":"2025-07-12T..."}
+   # Expected output: {"status":"healthy","timestamp":"2025-07-23T..."}
    ```
 
 2. **Test Communication Services Integration**:
@@ -658,19 +658,23 @@ echo "✅ Communication Services extension installed"
        --no-wait
    
    echo "✅ Resource group deletion initiated"
+   echo "Note: Deletion may take several minutes to complete"
+   
+   # Verify deletion (optional)
+   az group exists --name ${RESOURCE_GROUP}
    ```
 
 ## Discussion
 
-Azure Web App for Containers combined with Azure Communication Services provides a powerful platform for building scalable video conferencing applications. This architecture leverages the benefits of containerization while utilizing Azure's managed services for real-time communication capabilities. The solution automatically scales based on demand and provides integrated monitoring through Application Insights.
+Azure Web App for Containers combined with Azure Communication Services provides a powerful platform for building scalable video conferencing applications. This architecture leverages the benefits of containerization while utilizing Azure's managed services for real-time communication capabilities. The solution automatically scales based on demand and provides integrated monitoring through Application Insights, following [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles for reliability and performance efficiency.
 
 The containerized approach offers several advantages including consistent deployment across environments, simplified dependency management, and enhanced security through isolation. Azure Web App for Containers handles the underlying infrastructure while providing features like auto-scaling, load balancing, and integrated monitoring. For comprehensive container deployment strategies, refer to the [Azure App Service documentation](https://docs.microsoft.com/en-us/azure/app-service/containers/) and [container best practices guide](https://docs.microsoft.com/en-us/azure/app-service/configure-custom-container).
 
 Azure Communication Services provides enterprise-grade video calling capabilities with global reach and low latency. The service includes call recording functionality that automatically stores recordings for 24 hours, enabling businesses to implement compliance and training scenarios. The Call Recording APIs support both mixed and unmixed audio/video formats, allowing for flexible post-processing workflows. For detailed information about call recording capabilities, see the [Azure Communication Services Call Recording documentation](https://docs.microsoft.com/en-us/azure/communication-services/concepts/voice-video-calling/call-recording).
 
-From a scalability perspective, this architecture can handle thousands of concurrent users through automatic scaling and load distribution. The combination of Azure Web App for Containers' auto-scaling capabilities and Azure Communication Services' global infrastructure ensures optimal performance during peak usage periods. Cost optimization is achieved through scaling rules that adjust capacity based on actual demand, following [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles for cost optimization and performance efficiency.
+From a scalability perspective, this architecture can handle thousands of concurrent users through automatic scaling and load distribution. The combination of Azure Web App for Containers' auto-scaling capabilities and Azure Communication Services' global infrastructure ensures optimal performance during peak usage periods. Cost optimization is achieved through scaling rules that adjust capacity based on actual demand, and Azure Container Registry provides secure image storage with vulnerability scanning capabilities.
 
-> **Tip**: Implement Event Grid subscriptions to receive notifications when call recordings are ready for download. This enables automated workflows for processing, archiving, or analyzing recorded content. Consider using Azure Functions for processing recording notifications and implementing custom retention policies based on business requirements.
+> **Tip**: Implement Event Grid subscriptions to receive notifications when call recordings are ready for download. This enables automated workflows for processing, archiving, or analyzing recorded content. Consider using Azure Functions for processing recording notifications and implementing custom retention policies based on business requirements with Azure Blob Storage lifecycle management.
 
 ## Challenge
 
@@ -688,4 +692,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

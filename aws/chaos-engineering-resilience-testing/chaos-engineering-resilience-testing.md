@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AWS Fault Injection Service, EventBridge, CloudWatch, SNS
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: chaos-engineering, resilience, fault-injection, monitoring, automation
 recipe-generator-version: 1.3
@@ -90,7 +90,7 @@ graph TB
 1. AWS account with appropriate permissions to create IAM roles, FIS experiments, EventBridge rules, CloudWatch alarms, and SNS topics
 2. AWS CLI v2 installed and configured (or use AWS CloudShell)
 3. Understanding of chaos engineering principles and fault injection concepts
-4. Target resources already deployed (EC2 instances, RDS databases, or ECS tasks) for testing
+4. Target resources already deployed (EC2 instances with SSM agent, RDS databases, or ECS tasks) for testing
 5. Estimated cost: $0.50-$2.00 per hour during active experiments (FIS charges per action minute)
 
 > **Note**: AWS FIS performs real actions on real resources. Always test experiments in non-production environments first before running in production.
@@ -133,7 +133,7 @@ echo "✅ Check your email to confirm SNS subscription"
 
 1. **Create IAM Role for AWS FIS Experiments**:
 
-   AWS FIS requires an IAM role with specific permissions to execute actions on target resources during experiments. This role establishes the security boundary for chaos engineering activities, ensuring experiments can only affect intended resources while maintaining audit trails through CloudTrail. The trust policy allows FIS to assume this role, while the permissions policy grants necessary actions on EC2, RDS, and ECS resources.
+   AWS FIS requires an IAM role with specific permissions to execute actions on target resources during experiments. This role establishes the security boundary for chaos engineering activities, ensuring experiments can only affect intended resources while maintaining audit trails through CloudTrail. The trust policy allows FIS to assume this role, while the permissions policy grants necessary actions on EC2, RDS, and ECS resources following the principle of least privilege.
 
    ```bash
    # Create trust policy for FIS service
@@ -158,19 +158,45 @@ echo "✅ Check your email to confirm SNS subscription"
        --assume-role-policy-document file://fis-trust-policy.json \
        --query Role.Arn --output text)
 
-   # Attach AWS managed policy for FIS
-   aws iam attach-role-policy \
+   # Create custom policy for FIS actions
+   cat > fis-permissions-policy.json << EOF
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "ec2:RebootInstances",
+                   "ec2:StopInstances",
+                   "ec2:TerminateInstances",
+                   "ssm:SendCommand",
+                   "ssm:ListCommandInvocations",
+                   "ssm:DescribeInstanceInformation",
+                   "ecs:UpdateService",
+                   "ecs:DescribeServices",
+                   "rds:RebootDBInstance",
+                   "rds:FailoverDBCluster"
+               ],
+               "Resource": "*"
+           }
+       ]
+   }
+   EOF
+
+   # Attach custom policy to role
+   aws iam put-role-policy \
        --role-name FISExperimentRole-${RANDOM_SUFFIX} \
-       --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
+       --policy-name FISExperimentPolicy \
+       --policy-document file://fis-permissions-policy.json
 
    echo "✅ FIS IAM role created: ${FIS_ROLE_ARN}"
    ```
 
-   The IAM role now has the necessary permissions to execute FIS experiments. The PowerUserAccess policy provides broad permissions for testing; in production, you should create a custom policy with least-privilege permissions specific to your experiment actions and target resources.
+   The IAM role now has the necessary permissions to execute FIS experiments with least-privilege access. This custom policy provides specific permissions for experiment actions while maintaining security boundaries. In production environments, further restrict permissions to specific resource ARNs or tags to limit the blast radius of experiments.
 
 2. **Create CloudWatch Alarms for Stop Conditions**:
 
-   CloudWatch alarms serve as safety mechanisms that automatically halt experiments when metrics exceed defined thresholds. These stop conditions prevent experiments from causing excessive damage or prolonged outages. By monitoring critical application metrics like error rates, latency, and availability, you can ensure experiments stop before crossing acceptable risk boundaries, maintaining the controlled nature of chaos engineering.
+   CloudWatch alarms serve as critical safety mechanisms that automatically halt experiments when metrics exceed defined thresholds. These stop conditions prevent experiments from causing excessive damage or prolonged outages. By monitoring critical application metrics like error rates, latency, and availability, you can ensure experiments stop before crossing acceptable risk boundaries, maintaining the controlled nature of chaos engineering while providing automated circuit breakers.
 
    ```bash
    # Create alarm for high error rate (stop condition)
@@ -198,16 +224,31 @@ echo "✅ Check your email to confirm SNS subscription"
        --evaluation-periods 1 \
        --threshold 90 \
        --comparison-operator GreaterThanThreshold \
+       --treat-missing-data notBreaching \
+       --query AlarmArn --output text)
+
+   # Create alarm for application availability
+   export AVAILABILITY_ALARM_ARN=$(aws cloudwatch put-metric-alarm \
+       --alarm-name "FIS-LowAvailability-${RANDOM_SUFFIX}" \
+       --alarm-description "Stop experiment on low availability" \
+       --metric-name HealthyHostCount \
+       --namespace AWS/ApplicationELB \
+       --statistic Average \
+       --period 60 \
+       --evaluation-periods 1 \
+       --threshold 1 \
+       --comparison-operator LessThanThreshold \
+       --treat-missing-data breaching \
        --query AlarmArn --output text)
 
    echo "✅ CloudWatch alarms created for stop conditions"
    ```
 
-   These alarms now actively monitor your infrastructure metrics. When triggered during an experiment, FIS will automatically stop all actions and roll back where possible, ensuring your chaos engineering practices remain safe and controlled.
+   These alarms now actively monitor your infrastructure metrics with multiple safety layers. The error rate alarm prevents experiments from causing excessive user-facing errors, the CPU alarm guards against resource exhaustion, and the availability alarm ensures minimum service levels are maintained. When any alarm triggers during an experiment, FIS automatically stops all actions and attempts rollback where possible.
 
 3. **Create FIS Experiment Template**:
 
-   The experiment template defines the blueprint for your chaos engineering tests, specifying which actions to perform, which resources to target, and under what conditions to stop. This template approach enables repeatability and version control of experiments. By defining actions like CPU stress, network latency, or instance termination, you create a library of failure scenarios that can be executed on-demand or on schedule to continuously validate system resilience.
+   The experiment template defines the blueprint for chaos engineering tests, specifying which actions to perform, which resources to target, and under what conditions to stop. This template-based approach enables repeatability, version control, and gradual complexity increases. By defining progressive actions like CPU stress followed by instance termination, you create realistic failure scenarios that test both degraded performance and complete failure recovery mechanisms.
 
    ```bash
    # Create experiment template configuration
@@ -218,6 +259,10 @@ echo "✅ Check your email to confirm SNS subscription"
            {
                "source": "aws:cloudwatch:alarm",
                "value": "${ERROR_ALARM_ARN}"
+           },
+           {
+               "source": "aws:cloudwatch:alarm",
+               "value": "${AVAILABILITY_ALARM_ARN}"
            }
        ],
        "targets": {
@@ -232,29 +277,46 @@ echo "✅ Check your email to confirm SNS subscription"
        "actions": {
            "cpu-stress": {
                "actionId": "aws:ssm:send-command",
-               "description": "Inject CPU stress on EC2 instances",
+               "description": "Inject CPU stress to test performance degradation",
                "parameters": {
                    "documentArn": "arn:aws:ssm:${AWS_REGION}::document/AWSFIS-Run-CPU-Stress",
-                   "documentParameters": "{\"DurationSeconds\": \"120\", \"CPU\": \"0\", \"LoadPercent\": \"80\"}",
-                   "duration": "PT3M"
+                   "documentParameters": "{\"DurationSeconds\": \"180\", \"CPU\": \"0\", \"LoadPercent\": \"80\"}",
+                   "duration": "PT4M"
                },
                "targets": {
                    "Instances": "ec2-instances"
                }
            },
-           "terminate-instance": {
-               "actionId": "aws:ec2:terminate-instances",
-               "description": "Terminate EC2 instance to test recovery",
+           "memory-stress": {
+               "actionId": "aws:ssm:send-command",
+               "description": "Inject memory pressure to test resource limits",
+               "parameters": {
+                   "documentArn": "arn:aws:ssm:${AWS_REGION}::document/AWSFIS-Run-Memory-Stress",
+                   "documentParameters": "{\"DurationSeconds\": \"120\", \"Percent\": \"70\"}",
+                   "duration": "PT3M"
+               },
                "targets": {
                    "Instances": "ec2-instances"
                },
                "startAfter": ["cpu-stress"]
+           },
+           "stop-instance": {
+               "actionId": "aws:ec2:stop-instances",
+               "description": "Stop instance to test automatic recovery",
+               "parameters": {
+                   "startInstancesAfterDuration": "PT5M"
+               },
+               "targets": {
+                   "Instances": "ec2-instances"
+               },
+               "startAfter": ["memory-stress"]
            }
        },
        "roleArn": "${FIS_ROLE_ARN}",
        "tags": {
            "Environment": "Testing",
-           "Purpose": "ChaosEngineering"
+           "Purpose": "ChaosEngineering",
+           "CreatedBy": "FISRecipe"
        }
    }
    EOF
@@ -267,11 +329,11 @@ echo "✅ Check your email to confirm SNS subscription"
    echo "✅ FIS experiment template created: ${TEMPLATE_ID}"
    ```
 
-   The experiment template is now ready for execution. This multi-action template first stresses CPU on target instances, then terminates them to test auto-recovery mechanisms. The sequential nature ensures you can observe system behavior under load before simulating complete failure.
+   The experiment template is now ready for execution with a progressive failure injection approach. This multi-action sequence first creates performance degradation through CPU stress, then memory pressure, and finally complete instance failure with automatic restart. This progression allows you to observe system behavior under increasing stress levels and validates recovery mechanisms at each stage.
 
 4. **Configure EventBridge Rules for Experiment Notifications**:
 
-   EventBridge rules capture FIS experiment state changes and route them to appropriate notification channels. This real-time event stream provides visibility into experiment lifecycle, enabling teams to respond quickly to unexpected outcomes. By integrating with SNS, these events can trigger emails, Slack messages, or automated response workflows, creating a comprehensive observability layer for chaos engineering activities.
+   EventBridge rules capture real-time FIS experiment state changes and route them to appropriate notification channels, creating comprehensive observability for chaos engineering activities. This event-driven approach enables immediate response to experiment outcomes and provides audit trails for compliance requirements. The integration with SNS supports multiple notification channels including email, Slack, PagerDuty, and custom webhook endpoints.
 
    ```bash
    # Create EventBridge rule for FIS state changes
@@ -328,11 +390,11 @@ echo "✅ Check your email to confirm SNS subscription"
    echo "✅ EventBridge rule configured for FIS notifications"
    ```
 
-   EventBridge now monitors all FIS experiment state transitions, automatically sending notifications through SNS. This creates an audit trail of all chaos engineering activities and ensures stakeholders remain informed about experiment progress and outcomes.
+   EventBridge now monitors all FIS experiment state transitions, automatically sending real-time notifications through SNS. This creates a complete audit trail of chaos engineering activities and ensures stakeholders remain informed about experiment progress, completion, and any unexpected outcomes requiring immediate attention.
 
 5. **Create Scheduled EventBridge Rule for Automated Testing**:
 
-   Scheduled chaos experiments enable continuous validation of system resilience without manual intervention. By running experiments during off-peak hours or maintenance windows, teams can proactively identify degradation in fault tolerance capabilities. This automation transforms chaos engineering from an occasional practice to an integral part of the reliability engineering workflow, ensuring systems maintain their resilience properties over time.
+   Scheduled chaos experiments enable continuous validation of system resilience without manual intervention, transforming chaos engineering from an ad-hoc practice into systematic reliability validation. EventBridge Scheduler provides more precise scheduling capabilities than traditional cron-based approaches, with built-in retry logic and failure handling. This automation ensures systems maintain their resilience properties over time as code changes, infrastructure updates, and configuration drift occur.
 
    ```bash
    # Create IAM role for EventBridge Scheduler
@@ -365,16 +427,19 @@ echo "✅ Check your email to confirm SNS subscription"
            "Statement": [
                {
                    "Effect": "Allow",
-                   "Action": "fis:StartExperiment",
+                   "Action": [
+                       "fis:StartExperiment",
+                       "fis:GetExperiment"
+                   ],
                    "Resource": [
-                       "arn:aws:fis:*:*:experiment-template/'${TEMPLATE_ID}'",
-                       "arn:aws:fis:*:*:experiment/*"
+                       "arn:aws:fis:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':experiment-template/'${TEMPLATE_ID}'",
+                       "arn:aws:fis:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':experiment/*"
                    ]
                }
            ]
        }'
 
-   # Create EventBridge schedule (runs daily at 2 AM)
+   # Create EventBridge schedule (runs daily at 2 AM UTC)
    aws scheduler create-schedule \
        --name "FIS-DailyChaosTest-${RANDOM_SUFFIX}" \
        --schedule-expression "cron(0 2 * * ? *)" \
@@ -383,16 +448,17 @@ echo "✅ Check your email to confirm SNS subscription"
            "RoleArn": "'${SCHEDULER_ROLE_ARN}'",
            "Input": "{\"experimentTemplateId\": \"'${TEMPLATE_ID}'\"}"
        }' \
-       --flexible-time-window '{"Mode": "OFF"}'
+       --flexible-time-window '{"Mode": "OFF"}' \
+       --description "Daily automated chaos engineering test"
 
    echo "✅ Scheduled EventBridge rule created for daily chaos tests"
    ```
 
-   The automated schedule ensures chaos experiments run consistently, building confidence in system resilience through regular testing. This approach helps teams discover issues introduced by code changes, infrastructure updates, or configuration drift before they impact production availability.
+   The automated schedule ensures chaos experiments run consistently during off-peak hours, building confidence in system resilience through regular testing. This approach helps teams discover issues introduced by code changes, infrastructure updates, or configuration drift before they impact production availability, aligning with modern Site Reliability Engineering practices.
 
 6. **Create CloudWatch Dashboard for Experiment Monitoring**:
 
-   A centralized dashboard provides real-time visibility into chaos experiment impact on system health. By correlating experiment timelines with application metrics, teams can understand how injected failures affect user experience and system performance. This observability is crucial for validating that recovery mechanisms work as designed and for identifying unexpected cascading failures that require architectural improvements.
+   A centralized monitoring dashboard provides real-time visibility into chaos experiment impact on system health and business metrics. By correlating experiment timelines with application performance indicators, infrastructure metrics, and business KPIs, teams can understand the full impact of injected failures. This observability is crucial for validating that recovery mechanisms work as designed and for identifying unexpected cascading failures that require architectural improvements.
 
    ```bash
    # Create CloudWatch dashboard configuration
@@ -401,30 +467,55 @@ echo "✅ Check your email to confirm SNS subscription"
        "widgets": [
            {
                "type": "metric",
+               "x": 0,
+               "y": 0,
+               "width": 12,
+               "height": 6,
                "properties": {
                    "metrics": [
                        ["AWS/FIS", "ExperimentsStarted", {"stat": "Sum"}],
                        [".", "ExperimentsStopped", {"stat": "Sum"}],
-                       [".", "ExperimentsFailed", {"stat": "Sum"}]
+                       [".", "ExperimentsFailed", {"stat": "Sum"}],
+                       [".", "ActionsCompleted", {"stat": "Sum"}]
                    ],
                    "period": 300,
-                   "stat": "Average",
+                   "stat": "Sum",
                    "region": "${AWS_REGION}",
-                   "title": "FIS Experiment Status"
+                   "title": "FIS Experiment Activity",
+                   "view": "timeSeries"
                }
            },
            {
                "type": "metric",
+               "x": 12,
+               "y": 0,
+               "width": 12,
+               "height": 6,
                "properties": {
                    "metrics": [
                        ["AWS/EC2", "CPUUtilization", {"stat": "Average"}],
                        ["AWS/ApplicationELB", "TargetResponseTime", {"stat": "Average"}],
-                       [".", "HTTPCode_Target_4XX_Count", {"stat": "Sum"}]
+                       [".", "HTTPCode_Target_4XX_Count", {"stat": "Sum"}],
+                       [".", "HealthyHostCount", {"stat": "Average"}]
                    ],
                    "period": 60,
                    "stat": "Average",
                    "region": "${AWS_REGION}",
-                   "title": "Application Health During Experiments"
+                   "title": "Application Health During Experiments",
+                   "view": "timeSeries"
+               }
+           },
+           {
+               "type": "log",
+               "x": 0,
+               "y": 6,
+               "width": 24,
+               "height": 6,
+               "properties": {
+                   "query": "SOURCE '/aws/events/rule/FIS-ExperimentStateChanges-${RANDOM_SUFFIX}'\n| fields @timestamp, detail.state.status, detail.experimentTemplateId\n| sort @timestamp desc\n| limit 20",
+                   "region": "${AWS_REGION}",
+                   "title": "Recent FIS Experiment Events",
+                   "view": "table"
                }
            }
        ]
@@ -437,13 +528,14 @@ echo "✅ Check your email to confirm SNS subscription"
        --dashboard-body file://dashboard-config.json
 
    echo "✅ CloudWatch dashboard created: ${DASHBOARD_NAME}"
+   echo "📊 View dashboard: https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=${DASHBOARD_NAME}"
    ```
 
-   The monitoring dashboard now provides a comprehensive view of chaos engineering impact. Teams can observe correlations between experiment actions and system behavior, validating that monitoring and alerting systems properly detect and report failures during controlled chaos scenarios.
+   The monitoring dashboard now provides a comprehensive view of chaos engineering impact with multiple perspectives. The top row shows FIS experiment statistics and application health correlation, while the bottom panel displays recent experiment events for troubleshooting. This multi-dimensional view enables teams to quickly assess experiment success and system resilience.
 
 7. **Run a Manual Test Experiment**:
 
-   Before enabling automated schedules, manually executing experiments allows teams to observe system behavior and validate safety mechanisms. This controlled approach ensures stop conditions work correctly and helps establish baseline expectations for system recovery time. Manual runs also provide opportunities to refine experiment parameters and adjust fault injection intensity based on observed impact.
+   Before enabling automated schedules, manually executing experiments allows teams to observe system behavior, validate safety mechanisms, and establish baseline expectations. This controlled approach ensures stop conditions work correctly and provides opportunities to refine experiment parameters. Manual runs also help build team confidence and establish incident response procedures for unexpected experiment outcomes.
 
    ```bash
    # Start a test experiment
@@ -452,19 +544,35 @@ echo "✅ Check your email to confirm SNS subscription"
        --query experiment.id --output text)
 
    echo "✅ Experiment started: ${EXPERIMENT_ID}"
+   echo "🔗 Monitor in console: https://${AWS_REGION}.console.aws.amazon.com/fis/home?region=${AWS_REGION}#ExperimentDetails:experimentId=${EXPERIMENT_ID}"
 
-   # Monitor experiment status
-   watch -n 5 "aws fis get-experiment \
-       --id ${EXPERIMENT_ID} \
-       --query 'experiment.state.status' --output text"
+   # Monitor experiment status in real-time
+   echo "Monitoring experiment progress..."
+   while true; do
+       EXPERIMENT_STATUS=$(aws fis get-experiment \
+           --id ${EXPERIMENT_ID} \
+           --query 'experiment.state.status' --output text)
+       
+       echo "$(date): Experiment status: ${EXPERIMENT_STATUS}"
+       
+       if [[ "${EXPERIMENT_STATUS}" == "completed" ]] || \
+          [[ "${EXPERIMENT_STATUS}" == "stopped" ]] || \
+          [[ "${EXPERIMENT_STATUS}" == "failed" ]]; then
+           break
+       fi
+       
+       sleep 30
+   done
 
-   # Get detailed experiment results (after completion)
+   # Get detailed experiment results
+   echo "📋 Final experiment results:"
    aws fis get-experiment \
        --id ${EXPERIMENT_ID} \
-       --output json
+       --query 'experiment.{Status:state.status,StartTime:startTime,EndTime:endTime,Actions:actions}' \
+       --output table
    ```
 
-   The manual experiment execution provides immediate feedback on system resilience. Observe how quickly affected services recover, whether alarms trigger appropriately, and if dependent systems handle the failure gracefully. This validation builds confidence before automating regular chaos testing.
+   The manual experiment execution provides immediate feedback on system resilience and experiment effectiveness. Monitor how quickly affected services recover, whether alarms trigger appropriately, and if dependent systems handle the failure gracefully. This validation builds confidence in both your system's resilience and the experiment's safety mechanisms before automating regular chaos testing.
 
 ## Validation & Testing
 
@@ -486,9 +594,14 @@ echo "✅ Check your email to confirm SNS subscription"
    aws events describe-rule \
        --name "FIS-ExperimentStateChanges-${RANDOM_SUFFIX}" \
        --query "[Name,State,EventPattern]" --output table
+
+   # Check scheduler status
+   aws scheduler get-schedule \
+       --name "FIS-DailyChaosTest-${RANDOM_SUFFIX}" \
+       --query "[Name,State,ScheduleExpression]" --output table
    ```
 
-   Expected output: Rule should show State as ENABLED
+   Expected output: Rule should show State as ENABLED, schedule should show State as ENABLED
 
 3. Verify SNS notifications are working:
 
@@ -507,10 +620,10 @@ echo "✅ Check your email to confirm SNS subscription"
    ```bash
    # List recent experiments
    aws fis list-experiments \
-       --query "experiments[?experimentTemplateId=='${TEMPLATE_ID}'].[id,state.status,startTime]" \
+       --query "experiments[?experimentTemplateId=='${TEMPLATE_ID}'].[id,state.status,startTime,endTime]" \
        --output table
 
-   # Check CloudWatch metrics
+   # Check CloudWatch metrics for FIS activity
    aws cloudwatch get-metric-statistics \
        --namespace AWS/FIS \
        --metric-name ExperimentsStarted \
@@ -558,7 +671,8 @@ echo "✅ Check your email to confirm SNS subscription"
    # Delete CloudWatch alarms
    aws cloudwatch delete-alarms \
        --alarm-names "FIS-HighErrorRate-${RANDOM_SUFFIX}" \
-       "FIS-HighCPU-${RANDOM_SUFFIX}"
+       "FIS-HighCPU-${RANDOM_SUFFIX}" \
+       "FIS-LowAvailability-${RANDOM_SUFFIX}"
 
    # Delete CloudWatch dashboard
    aws cloudwatch delete-dashboards \
@@ -570,10 +684,10 @@ echo "✅ Check your email to confirm SNS subscription"
 4. Remove IAM roles and SNS topic:
 
    ```bash
-   # Detach and delete IAM role policies
-   aws iam detach-role-policy \
+   # Delete IAM role policies
+   aws iam delete-role-policy \
        --role-name FISExperimentRole-${RANDOM_SUFFIX} \
-       --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
+       --policy-name FISExperimentPolicy
 
    aws iam delete-role-policy \
        --role-name EventBridgeFISRole-${RANDOM_SUFFIX} \
@@ -592,9 +706,9 @@ echo "✅ Check your email to confirm SNS subscription"
    aws sns delete-topic --topic-arn ${SNS_TOPIC_ARN}
 
    # Clean up temporary files
-   rm -f fis-trust-policy.json eventbridge-trust-policy.json \
-       scheduler-trust-policy.json experiment-template.json \
-       dashboard-config.json
+   rm -f fis-trust-policy.json fis-permissions-policy.json \
+       eventbridge-trust-policy.json scheduler-trust-policy.json \
+       experiment-template.json dashboard-config.json
 
    echo "✅ Cleanup completed"
    ```
@@ -603,24 +717,31 @@ echo "✅ Check your email to confirm SNS subscription"
 
 Implementing chaos engineering with AWS Fault Injection Service transforms resilience testing from a theoretical exercise into a practical, automated discipline. This approach follows the principles outlined in the [AWS Well-Architected Framework Reliability Pillar](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/test-reliability.html), specifically the recommendation to test reliability using fault injection. By systematically introducing controlled failures, teams can validate assumptions about system behavior and discover hidden dependencies that only manifest during failure scenarios.
 
-The integration between FIS and EventBridge creates a powerful automation framework that extends beyond simple scheduling. EventBridge's event-driven architecture enables sophisticated workflows where experiment results can trigger additional actions, such as automatic rollbacks, capacity adjustments, or escalation procedures. This pattern aligns with modern DevOps practices and supports continuous verification of system resilience. For detailed implementation patterns, refer to the [AWS Prescriptive Guidance on Chaos Engineering](https://docs.aws.amazon.com/prescriptive-guidance/latest/chaos-engineering-on-aws/overview.html).
+The integration between FIS and EventBridge creates a powerful automation framework that extends beyond simple scheduling. EventBridge's event-driven architecture enables sophisticated workflows where experiment results can trigger additional actions, such as automatic rollbacks, capacity adjustments, or escalation procedures. This pattern aligns with modern Site Reliability Engineering practices and supports continuous verification of system resilience. For detailed implementation patterns, refer to the [AWS Prescriptive Guidance on Chaos Engineering](https://docs.aws.amazon.com/prescriptive-guidance/latest/chaos-engineering-on-aws/overview.html).
 
-CloudWatch's role in this architecture extends beyond basic monitoring to providing safety mechanisms through stop conditions. These alarms act as circuit breakers, preventing experiments from causing excessive damage while still allowing meaningful failure injection. The ability to define custom metrics and complex alarm conditions enables teams to tailor safety thresholds to their specific application requirements. The [AWS FIS monitoring documentation](https://docs.aws.amazon.com/fis/latest/userguide/monitoring-experiments.html) provides comprehensive guidance on implementing effective monitoring strategies.
+CloudWatch's role in this architecture extends beyond basic monitoring to providing safety mechanisms through stop conditions. These alarms act as circuit breakers, preventing experiments from causing excessive damage while still allowing meaningful failure injection. The comprehensive dashboard correlates experiment activities with business metrics, enabling teams to understand the full impact of failures on user experience. The [AWS FIS User Guide](https://docs.aws.amazon.com/fis/latest/userguide/what-is.html) provides detailed guidance on implementing effective monitoring strategies and defining appropriate stop conditions.
 
-From a cost optimization perspective, scheduled chaos experiments during off-peak hours maximize learning while minimizing business impact. FIS charges only for the duration of actions executed, making it cost-effective for regular testing. Organizations can start with simple experiments and gradually increase complexity as confidence grows. The [AWS FIS pricing model](https://aws.amazon.com/fis/pricing/) supports this incremental approach, allowing teams to control costs while building their chaos engineering capabilities.
+From a cost optimization perspective, scheduled chaos experiments during off-peak hours maximize learning while minimizing business impact. FIS charges only for the duration of actions executed, making it cost-effective for regular testing. Organizations can start with simple experiments and gradually increase complexity as confidence grows. The [AWS FIS pricing model](https://aws.amazon.com/fis/pricing/) supports this incremental approach, allowing teams to control costs while building their chaos engineering capabilities and organizational maturity.
 
-> **Tip**: Start with read-only experiments that observe system state without making changes, then gradually introduce more impactful actions as your team gains experience with chaos engineering practices.
+> **Tip**: Start with read-only experiments that observe system state without making changes, then gradually introduce more impactful actions as your team gains experience with chaos engineering practices and builds confidence in your recovery procedures.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. Create multi-region chaos experiments that validate disaster recovery procedures by failing entire AWS regions and measuring recovery time objectives (RTO)
-2. Implement progressive fault injection using Lambda functions to gradually increase failure intensity based on real-time application health metrics
-3. Build an automated experiment result analyzer using Amazon Bedrock to parse experiment outcomes and generate actionable resilience improvement recommendations
-4. Develop custom FIS actions using Systems Manager documents to simulate application-specific failures like cache poisoning or message queue backlogs
-5. Create a chaos engineering game day automation framework that combines multiple experiment templates into comprehensive failure scenario campaigns
+1. Create multi-region chaos experiments that validate disaster recovery procedures by failing entire AWS regions and measuring recovery time objectives (RTO) using Route 53 health checks
+2. Implement progressive fault injection using Lambda functions that gradually increase failure intensity based on real-time application health metrics and business KPIs
+3. Build an automated experiment result analyzer using Amazon Bedrock to parse experiment outcomes, correlate with business metrics, and generate actionable resilience improvement recommendations
+4. Develop custom FIS actions using Systems Manager documents to simulate application-specific failures like database connection pool exhaustion, cache poisoning, or message queue backlogs
+5. Create a chaos engineering game day automation framework that combines multiple experiment templates into comprehensive failure scenario campaigns with automated runbooks and stakeholder notifications
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

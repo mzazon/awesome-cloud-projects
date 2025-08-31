@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: s3, cloudwatch, iam
 estimated-time: 45 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: storage,s3,intelligent-tiering,lifecycle,cost-optimization
 recipe-generator-version: 1.3
@@ -337,12 +337,19 @@ echo "✅ Environment prepared. Bucket name: ${BUCKET_NAME}"
    # Delete all objects from bucket
    aws s3 rm s3://${BUCKET_NAME} --recursive
    
-   # Remove all object versions
-   aws s3api delete-objects \
+   # Remove all object versions (if any exist)
+   aws s3api list-object-versions \
        --bucket ${BUCKET_NAME} \
-       --delete "$(aws s3api list-object-versions \
+       --query 'Versions[].{Key:Key,VersionId:VersionId}' \
+       --output json > versions.json
+   
+   if [ -s versions.json ] && [ "$(cat versions.json)" != "[]" ]; then
+       aws s3api delete-objects \
            --bucket ${BUCKET_NAME} \
-           --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}')"
+           --delete file://versions.json
+   fi
+   
+   rm -f versions.json
    
    echo "✅ All objects and versions removed"
    ```
@@ -368,8 +375,13 @@ echo "✅ Environment prepared. Bucket name: ${BUCKET_NAME}"
    aws s3api delete-bucket-lifecycle-configuration \
        --bucket ${BUCKET_NAME}
    
+   # Remove metrics configuration
+   aws s3api delete-bucket-metrics-configuration \
+       --bucket ${BUCKET_NAME} \
+       --id "EntireBucket"
+   
    # Delete the bucket
-   aws s3 rb s3://${BUCKET_NAME} --force
+   aws s3 rb s3://${BUCKET_NAME}
    
    echo "✅ S3 bucket and configurations removed"
    ```
@@ -390,9 +402,9 @@ S3 Intelligent Tiering represents a paradigm shift from manual storage managemen
 
 The integration of lifecycle policies with Intelligent Tiering creates a comprehensive data management strategy that addresses both immediate cost optimization and long-term data governance requirements. Organizations typically see 20-68% storage cost reductions within the first quarter of implementation, with the added benefit of simplified operations and reduced administrative overhead. The automatic transition capabilities ensure that performance-critical data remains highly available while infrequently accessed data moves to cost-effective storage tiers without manual intervention.
 
-Security and compliance benefits extend beyond cost savings, as the solution maintains data durability (99.999999999%) while providing detailed access logging and monitoring capabilities. The CloudWatch integration enables data-driven decision making and helps organizations understand their data access patterns, leading to better architectural decisions and further optimization opportunities.
+Security and compliance benefits extend beyond cost savings, as the solution maintains Amazon S3's industry-leading data durability (99.999999999% - 11 9's) while providing detailed access logging and monitoring capabilities. The CloudWatch integration enables data-driven decision making and helps organizations understand their data access patterns, leading to better architectural decisions and further optimization opportunities. This approach follows AWS Well-Architected Framework principles for cost optimization and operational excellence.
 
-> **Tip**: Monitor your storage metrics monthly and adjust lifecycle policies based on actual access patterns shown in CloudWatch metrics for continuous optimization.
+> **Tip**: Monitor your storage metrics monthly and adjust lifecycle policies based on actual access patterns shown in CloudWatch metrics for continuous optimization. See the [AWS S3 User Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intelligent-tiering.html) for additional best practices.
 
 ## Challenge
 
@@ -410,4 +422,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

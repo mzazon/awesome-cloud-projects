@@ -1,21 +1,21 @@
 ---
-title: Enterprise Deployment Pipeline Management with Cloud Build; Cloud Deploy; and Service Catalog
+title: Enterprise Deployment Pipeline Management with Cloud Build, Cloud Deploy, and Service Catalog
 id: 7a8b9c2d
 category: devops
 difficulty: 200
 subject: gcp
 services: Cloud Build, Cloud Deploy, Service Catalog, Google Kubernetes Engine
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ci-cd, deployment, pipeline, enterprise, automation, kubernetes
 recipe-generator-version: 1.3
 ---
 
-# Automating Enterprise Deployment Pipeline Management with Cloud Build, Cloud Deploy, and Service Catalog
+# Enterprise Deployment Pipeline Management with Cloud Build, Cloud Deploy, and Service Catalog
 
 ## Problem
 
@@ -145,20 +145,20 @@ echo "✅ Required APIs enabled"
        --region=${REGION} \
        --enable-network-policy \
        --enable-ip-alias
-   
+
    # Create staging cluster
    gcloud container clusters create-auto ${CLUSTER_NAME}-staging \
        --region=${REGION} \
        --enable-network-policy \
        --enable-ip-alias
-   
+
    # Create production cluster with additional security features
    gcloud container clusters create-auto ${CLUSTER_NAME}-prod \
        --region=${REGION} \
        --enable-network-policy \
        --enable-ip-alias \
        --enable-shielded-nodes
-   
+
    echo "✅ Multi-environment GKE clusters created"
    ```
 
@@ -174,10 +174,10 @@ echo "✅ Required APIs enabled"
        --repository-format=docker \
        --location=${REGION} \
        --description="Enterprise application container images"
-   
+
    # Configure Docker authentication for Artifact Registry
    gcloud auth configure-docker ${REGION}-docker.pkg.dev
-   
+
    echo "✅ Artifact Registry repository created and configured"
    ```
 
@@ -190,14 +190,14 @@ echo "✅ Required APIs enabled"
    ```bash
    # Create repository for pipeline templates and configurations
    gcloud source repos create pipeline-templates
-   
+
    # Create repository for sample application
    gcloud source repos create sample-app
-   
+
    # Clone repositories locally for configuration
    gcloud source repos clone pipeline-templates ./pipeline-templates
    gcloud source repos clone sample-app ./sample-app
-   
+
    echo "✅ Source repositories created and cloned"
    ```
 
@@ -210,7 +210,7 @@ echo "✅ Required APIs enabled"
    ```bash
    # Create Cloud Deploy pipeline configuration
    cd ./pipeline-templates
-   
+
    cat > clouddeploy.yaml << EOF
    apiVersion: deploy.cloud.google.com/v1
    kind: DeliveryPipeline
@@ -250,10 +250,10 @@ echo "✅ Required APIs enabled"
    gke:
      cluster: projects/${PROJECT_ID}/locations/${REGION}/clusters/${CLUSTER_NAME}-prod
    EOF
-   
+
    # Apply the Cloud Deploy configuration
    gcloud deploy apply --file=clouddeploy.yaml --region=${REGION}
-   
+
    echo "✅ Cloud Deploy pipeline configured"
    ```
 
@@ -274,13 +274,13 @@ echo "✅ Required APIs enabled"
      - '-t'
      - '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/\${_SERVICE_NAME}:\${SHORT_SHA}'
      - '.'
-   
+
    # Push the container image to Artifact Registry
    - name: 'gcr.io/cloud-builders/docker'
      args:
      - 'push'
      - '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/\${_SERVICE_NAME}:\${SHORT_SHA}'
-   
+
    # Create Kubernetes manifests
    - name: 'gcr.io/cloud-builders/gke-deploy'
      args:
@@ -291,7 +291,7 @@ echo "✅ Required APIs enabled"
      - '--version=\${SHORT_SHA}'
      - '--namespace=\${_NAMESPACE}'
      - '--output=output'
-   
+
    # Create Cloud Deploy release
    - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
      entrypoint: 'gcloud'
@@ -303,16 +303,16 @@ echo "✅ Required APIs enabled"
      - '--delivery-pipeline=enterprise-pipeline'
      - '--region=${REGION}'
      - '--source=output'
-   
+
    substitutions:
      _SERVICE_NAME: 'sample-app'
      _NAMESPACE: 'default'
-   
+
    options:
      logging: CLOUD_LOGGING_ONLY
      machineType: 'E2_STANDARD_4'
    EOF
-   
+
    echo "✅ Cloud Build template created"
    ```
 
@@ -325,13 +325,13 @@ echo "✅ Required APIs enabled"
    ```bash
    # Create sample application
    cd ../sample-app
-   
+
    # Create simple Node.js application
    cat > app.js << EOF
    const express = require('express');
    const app = express();
    const port = process.env.PORT || 3000;
-   
+
    app.get('/', (req, res) => {
      res.json({
        message: 'Enterprise Sample Application',
@@ -339,16 +339,16 @@ echo "✅ Required APIs enabled"
        version: process.env.APP_VERSION || '1.0.0'
      });
    });
-   
+
    app.get('/health', (req, res) => {
      res.status(200).json({ status: 'healthy' });
    });
-   
+
    app.listen(port, () => {
      console.log(\`Server running on port \${port}\`);
    });
    EOF
-   
+
    # Create package.json
    cat > package.json << EOF
    {
@@ -364,7 +364,7 @@ echo "✅ Required APIs enabled"
      }
    }
    EOF
-   
+
    # Create Dockerfile
    cat > Dockerfile << EOF
    FROM node:18-alpine
@@ -376,7 +376,7 @@ echo "✅ Required APIs enabled"
    USER node
    CMD ["npm", "start"]
    EOF
-   
+
    echo "✅ Sample application created"
    ```
 
@@ -389,7 +389,7 @@ echo "✅ Required APIs enabled"
    ```bash
    # Create Kubernetes manifests directory
    mkdir -p k8s
-   
+
    # Create deployment manifest
    cat > k8s/deployment.yaml << EOF
    apiVersion: apps/v1
@@ -449,7 +449,7 @@ echo "✅ Required APIs enabled"
        targetPort: 3000
      type: ClusterIP
    EOF
-   
+
    echo "✅ Kubernetes manifests created"
    ```
 
@@ -465,20 +465,20 @@ echo "✅ Required APIs enabled"
    git add .
    git commit -m "Initial pipeline templates and configurations"
    git push origin main
-   
+
    # Return to sample app and set up build trigger
    cd ../sample-app
    git add .
    git commit -m "Initial sample application"
    git push origin main
-   
+
    # Create Cloud Build trigger for the sample application
    gcloud builds triggers create cloud-source-repositories \
        --repo=sample-app \
        --branch-pattern="main" \
        --build-config=../pipeline-templates/cloudbuild-template.yaml \
        --description="Enterprise deployment pipeline trigger"
-   
+
    echo "✅ Build trigger created and configured"
    ```
 
@@ -492,25 +492,25 @@ echo "✅ Required APIs enabled"
    # Create service account for Cloud Build
    gcloud iam service-accounts create cloudbuild-deploy \
        --display-name="Cloud Build Deploy Service Account"
-   
+
    # Grant necessary permissions for Cloud Build to deploy
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:cloudbuild-deploy@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/clouddeploy.operator"
-   
+
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:cloudbuild-deploy@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/container.clusterAdmin"
-   
+
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:cloudbuild-deploy@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/artifactregistry.writer"
-   
+
    # Configure Cloud Build to use the service account
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:${PROJECT_ID}@cloudbuild.gserviceaccount.com" \
        --role="roles/iam.serviceAccountUser"
-   
+
    echo "✅ IAM permissions configured for deployment pipeline"
    ```
 
@@ -527,17 +527,18 @@ echo "✅ Required APIs enabled"
     git add app.js
     git commit -m "Test pipeline deployment - $(date)"
     git push origin main
-    
+
     # Monitor the build progress
     echo "Monitoring Cloud Build execution..."
-    gcloud builds list --ongoing --format="table(id,status,source.repoSource.repoName)"
-    
+    gcloud builds list --ongoing \
+        --format="table(id,status,source.repoSource.repoName)"
+
     # Check Cloud Deploy pipeline status
     echo "Checking Cloud Deploy pipeline status..."
     gcloud deploy delivery-pipelines describe enterprise-pipeline \
         --region=${REGION} \
         --format="table(name,condition)"
-    
+
     echo "✅ Deployment pipeline test initiated"
     echo "Monitor progress in Cloud Console:"
     echo "https://console.cloud.google.com/cloud-build/builds"
@@ -552,7 +553,8 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # Check cluster status
-   gcloud container clusters list --format="table(name,status,location)"
+   gcloud container clusters list \
+       --format="table(name,status,location)"
    ```
 
    Expected output: Three clusters (dev, staging, prod) in "RUNNING" status
@@ -561,7 +563,8 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # List container images in repository
-   gcloud artifacts docker images list ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}
+   gcloud artifacts docker images list \
+       ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}
    ```
 
    Expected output: Container images with various tags representing build versions
@@ -579,11 +582,12 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # Get GKE cluster credentials for development environment
-   gcloud container clusters get-credentials ${CLUSTER_NAME}-dev --region=${REGION}
-   
+   gcloud container clusters get-credentials ${CLUSTER_NAME}-dev \
+       --region=${REGION}
+
    # Check deployed application status
    kubectl get deployments,services,pods -l app=sample-app
-   
+
    # Test application endpoint
    kubectl port-forward service/sample-app-service 8080:80 &
    curl http://localhost:8080/health
@@ -597,10 +601,13 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # Delete all GKE clusters
-   gcloud container clusters delete ${CLUSTER_NAME}-dev --region=${REGION} --quiet
-   gcloud container clusters delete ${CLUSTER_NAME}-staging --region=${REGION} --quiet
-   gcloud container clusters delete ${CLUSTER_NAME}-prod --region=${REGION} --quiet
-   
+   gcloud container clusters delete ${CLUSTER_NAME}-dev \
+       --region=${REGION} --quiet
+   gcloud container clusters delete ${CLUSTER_NAME}-staging \
+       --region=${REGION} --quiet
+   gcloud container clusters delete ${CLUSTER_NAME}-prod \
+       --region=${REGION} --quiet
+
    echo "✅ GKE clusters deleted"
    ```
 
@@ -608,8 +615,9 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # Delete Cloud Deploy pipeline
-   gcloud deploy delivery-pipelines delete enterprise-pipeline --region=${REGION} --quiet
-   
+   gcloud deploy delivery-pipelines delete enterprise-pipeline \
+       --region=${REGION} --quiet
+
    echo "✅ Cloud Deploy pipeline deleted"
    ```
 
@@ -617,12 +625,13 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # Delete Artifact Registry repository
-   gcloud artifacts repositories delete ${REPO_NAME} --location=${REGION} --quiet
-   
+   gcloud artifacts repositories delete ${REPO_NAME} \
+       --location=${REGION} --quiet
+
    # Delete build triggers
    gcloud builds triggers list --format="value(id)" | \
        xargs -I {} gcloud builds triggers delete {} --quiet
-   
+
    echo "✅ Build resources cleaned up"
    ```
 
@@ -632,10 +641,11 @@ echo "✅ Required APIs enabled"
    # Delete source repositories
    gcloud source repos delete pipeline-templates --quiet
    gcloud source repos delete sample-app --quiet
-   
+
    # Delete service account
-   gcloud iam service-accounts delete cloudbuild-deploy@${PROJECT_ID}.iam.gserviceaccount.com --quiet
-   
+   gcloud iam service-accounts delete \
+       cloudbuild-deploy@${PROJECT_ID}.iam.gserviceaccount.com --quiet
+
    echo "✅ Source repositories and service accounts removed"
    ```
 
@@ -671,4 +681,9 @@ Extend this enterprise deployment pipeline system by implementing these enhancem
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,421 @@
+# Google Cloud Infrastructure Manager Configuration
+# Timezone Converter API with Cloud Functions
+# This configuration deploys a serverless timezone conversion API using Google Cloud Functions
+
+# Metadata and configuration information
+metadata:
+  name: timezone-converter-api
+  description: "Serverless timezone conversion API using Cloud Functions"
+  labels:
+    environment: "production"
+    application: "timezone-converter"
+    component: "serverless-api"
+
+# Input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID where resources will be created"
+    
+  region:
+    type: string
+    description: "Google Cloud region for deploying the Cloud Function"
+    default: "us-central1"
+    
+  # Function configuration
+  function_name:
+    type: string
+    description: "Name of the Cloud Function"
+    default: "timezone-converter"
+    
+  function_memory:
+    type: string
+    description: "Memory allocation for the Cloud Function"
+    default: "256MB"
+    
+  function_timeout:
+    type: string
+    description: "Timeout for the Cloud Function in seconds"  
+    default: "60s"
+    
+  runtime:
+    type: string
+    description: "Runtime environment for the Cloud Function"
+    default: "python312"
+    
+  # Source code configuration
+  source_archive_bucket:
+    type: string
+    description: "Cloud Storage bucket containing the function source code"
+    
+  source_archive_object:
+    type: string
+    description: "Cloud Storage object path to the function source archive"
+    default: "timezone-converter-source.zip"
+    
+  # Security and access configuration
+  allow_unauthenticated:
+    type: bool
+    description: "Allow unauthenticated access to the function"
+    default: true
+    
+  # Monitoring and logging configuration
+  enable_monitoring:
+    type: bool
+    description: "Enable Cloud Monitoring for the function"
+    default: true
+    
+  log_level:
+    type: string
+    description: "Logging level for the function"
+    default: "INFO"
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudfunctions.googleapis.com
+      
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudbuild.googleapis.com
+      
+  - name: logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/logging.googleapis.com
+      
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/monitoring.googleapis.com
+
+  # Cloud Storage bucket for function source code (if not provided)
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.project_id)-timezone-converter-source
+      location: $(var.region)
+      storageClass: REGIONAL
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              isLive: false
+      labels:
+        application: timezone-converter
+        component: source-storage
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+
+  # IAM Service Account for Cloud Function
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(var.function_name)-sa
+      displayName: "Timezone Converter Function Service Account"
+      description: "Service account for the timezone converter Cloud Function"
+      project: $(var.project_id)
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+
+  # IAM binding for the service account to invoke the function
+  - name: function-sa-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(var.project_id)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - serviceAccount:$(ref.function-service-account.email)
+          - role: roles/logging.logWriter
+            members:
+              - serviceAccount:$(ref.function-service-account.email)
+          - role: roles/monitoring.metricWriter
+            members:
+              - serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # Cloud Function (2nd generation)
+  - name: timezone-converter-function
+    type: gcp-types/cloudfunctions2-v1:projects.locations.functions
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      functionId: $(var.function_name)
+      function:
+        description: "Serverless API for converting timestamps between timezones"
+        buildConfig:
+          runtime: $(var.runtime)
+          entryPoint: "convert_timezone"
+          source:
+            storageSource:
+              bucket: $(var.source_archive_bucket)
+              object: $(var.source_archive_object)
+          environmentVariables:
+            GOOGLE_FUNCTION_NAME: $(var.function_name)
+            LOG_LEVEL: $(var.log_level)
+        serviceConfig:
+          maxInstanceCount: 100
+          minInstanceCount: 0
+          availableMemory: $(var.function_memory)
+          timeoutSeconds: $(var.function_timeout)
+          environmentVariables:
+            FUNCTION_REGION: $(var.region)
+            FUNCTION_NAME: $(var.function_name)
+          serviceAccountEmail: $(ref.function-service-account.email)
+          ingressSettings: ALLOW_ALL
+          allTrafficOnLatestRevision: true
+        labels:
+          application: timezone-converter
+          component: api-function
+          runtime: $(var.runtime)
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - cloudbuild-api
+        - function-service-account
+        - function-sa-invoker-binding
+
+  # IAM binding to allow unauthenticated access (if enabled)
+  - name: function-public-access
+    type: gcp-types/cloudfunctions2-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.timezone-converter-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - timezone-converter-function
+    condition: $(var.allow_unauthenticated)
+
+  # Cloud Monitoring Uptime Check (if monitoring is enabled)
+  - name: function-uptime-check
+    type: gcp-types/monitoring-v1:projects.uptimeCheckConfigs
+    properties:
+      parent: projects/$(var.project_id)
+      uptimeCheckConfig:
+        displayName: "Timezone Converter API Uptime Check"
+        monitoredResource:
+          type: uptime_url
+          labels:
+            host: $(var.region)-$(var.project_id).cloudfunctions.net
+            project_id: $(var.project_id)
+        httpCheck:
+          path: /$(var.function_name)
+          port: 443
+          useSsl: true
+          requestMethod: GET
+          headers:
+            Content-Type: application/json
+        timeout: 10s
+        period: 300s
+        selectedRegions:
+          - USA
+          - EUROPE
+          - ASIA_PACIFIC
+    metadata:
+      dependsOn:
+        - timezone-converter-function
+        - monitoring-api
+    condition: $(var.enable_monitoring)
+
+  # Cloud Monitoring Alert Policy for function errors
+  - name: function-error-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(var.project_id)
+      alertPolicy:
+        displayName: "Timezone Converter Function Errors"
+        documentation:
+          content: "Alert when the timezone converter function experiences errors"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "Function error rate"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" resource.label.function_name="$(var.function_name)" metric.type="cloudfunctions.googleapis.com/function/execution_count" metric.label.status!="ok"'
+              comparison: COMPARISON_GT
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        combiner: OR
+        enabled: true
+        notificationChannels: []
+    metadata:
+      dependsOn:
+        - timezone-converter-function
+        - monitoring-api
+    condition: $(var.enable_monitoring)
+
+  # Cloud Logging Log Sink for function logs (optional structured logging)
+  - name: function-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/$(var.project_id)
+      sinkId: timezone-converter-function-sink
+      sink:
+        name: timezone-converter-function-sink
+        description: "Log sink for timezone converter function"
+        filter: 'resource.type="cloud_function" resource.labels.function_name="$(var.function_name)"'
+        destination: storage.googleapis.com/$(ref.function-source-bucket.name)/logs
+        includeChildren: false
+    metadata:
+      dependsOn:
+        - timezone-converter-function
+        - function-source-bucket
+        - logging-api
+
+# Output values for reference and integration
+outputs:
+  # Function information
+  function_name:
+    description: "Name of the deployed Cloud Function"
+    value: $(ref.timezone-converter-function.name)
+    
+  function_url:
+    description: "HTTP trigger URL for the Cloud Function"
+    value: $(ref.timezone-converter-function.serviceConfig.uri)
+    
+  function_region:
+    description: "Region where the function is deployed"
+    value: $(var.region)
+    
+  # Service account information
+  service_account_email:
+    description: "Email of the function's service account"
+    value: $(ref.function-service-account.email)
+    
+  # Storage information
+  source_bucket:
+    description: "Cloud Storage bucket for function source code"
+    value: $(ref.function-source-bucket.name)
+    
+  # Monitoring information
+  uptime_check_id:
+    description: "ID of the uptime check (if monitoring enabled)"
+    value: $(ref.function-uptime-check.name)
+    condition: $(var.enable_monitoring)
+    
+  alert_policy_id:
+    description: "ID of the error alert policy (if monitoring enabled)"
+    value: $(ref.function-error-alert.name)
+    condition: $(var.enable_monitoring)
+
+  # Usage examples and testing endpoints
+  test_endpoints:
+    description: "Example API endpoints for testing the timezone converter"
+    value:
+      get_request: "$(ref.timezone-converter-function.serviceConfig.uri)?timestamp=2024-06-15T14:30:00&from_timezone=America/Los_Angeles&to_timezone=Asia/Tokyo"
+      post_request: "curl -X POST $(ref.timezone-converter-function.serviceConfig.uri) -H 'Content-Type: application/json' -d '{\"timestamp\": \"2024-06-15T14:30:00\", \"from_timezone\": \"UTC\", \"to_timezone\": \"America/New_York\"}'"
+      current_time: "$(ref.timezone-converter-function.serviceConfig.uri)?from_timezone=UTC&to_timezone=America/New_York"
+
+# Configuration schemas for validation
+schemas:
+  input:
+    type: object
+    required:
+      - project_id
+    properties:
+      project_id:
+        type: string
+        pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        description: "Valid Google Cloud Project ID"
+      region:
+        type: string
+        enum:
+          - us-central1
+          - us-east1
+          - us-west1
+          - europe-west1
+          - europe-west3
+          - asia-east1
+          - asia-northeast1
+        description: "Supported Google Cloud regions"
+      function_memory:
+        type: string
+        enum:
+          - 128MB
+          - 256MB
+          - 512MB
+          - 1024MB
+          - 2048MB
+        description: "Valid memory allocations for Cloud Functions"
+      runtime:
+        type: string
+        enum:
+          - python38
+          - python39
+          - python310
+          - python311
+          - python312
+        description: "Supported Python runtimes"
+
+# Deployment configuration and best practices
+deployment:
+  # Deployment order and dependencies
+  phases:
+    - name: "api-enablement"
+      resources:
+        - cloudfunctions-api
+        - cloudbuild-api
+        - logging-api
+        - monitoring-api
+    - name: "infrastructure"
+      resources:
+        - function-source-bucket
+        - function-service-account
+        - function-sa-invoker-binding
+    - name: "function-deployment"
+      resources:
+        - timezone-converter-function
+        - function-public-access
+    - name: "monitoring-setup"
+      resources:
+        - function-uptime-check
+        - function-error-alert
+        - function-log-sink
+
+  # Security considerations
+  security:
+    - description: "Service account follows principle of least privilege"
+      validation: "Verify service account only has necessary IAM roles"
+    - description: "Function source code should be stored securely"
+      validation: "Ensure source bucket has appropriate access controls"
+    - description: "Consider authentication for production usage"
+      validation: "Review allow_unauthenticated setting for production"
+
+  # Cost optimization
+  cost_optimization:
+    - description: "Function scales to zero when not in use"
+      benefit: "No charges for idle time"
+    - description: "Source bucket lifecycle management"
+      benefit: "Automatic cleanup of old source versions"
+    - description: "Monitoring alerts prevent unexpected costs"
+      benefit: "Early detection of unusual usage patterns"
+
+  # Performance considerations
+  performance:
+    - description: "2nd generation Cloud Functions provide better performance"
+      benefit: "Faster cold starts and better resource utilization"
+    - description: "Regional deployment reduces latency"
+      benefit: "Lower latency for users in the same region"
+    - description: "Optimized memory allocation"
+      benefit: "Right-sized resources for timezone calculations"

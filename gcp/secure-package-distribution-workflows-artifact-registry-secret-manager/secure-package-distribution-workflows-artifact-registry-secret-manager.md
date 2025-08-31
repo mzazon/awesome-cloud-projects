@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: artifact-registry, secret-manager, cloud-scheduler, cloud-tasks
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: package-distribution, security, automation, ci-cd, container-registry
 recipe-generator-version: 1.3
@@ -82,7 +82,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and appropriate IAM permissions
-2. gcloud CLI v400.0.0 or later installed and authenticated
+2. gcloud CLI v450.0.0 or later installed and authenticated
 3. Basic understanding of container images, package management, and CI/CD pipelines
 4. Docker installed locally for testing container workflows
 5. Estimated cost: $5-15 per month for storage, compute, and API calls (varies by usage)
@@ -92,12 +92,12 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for the project
+# Set environment variables for GCP resources
 export PROJECT_ID=$(gcloud config get-value project)
 export REGION="us-central1"
 export ZONE="us-central1-a"
 
-# Generate unique identifiers for resources
+# Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 export REPO_NAME="secure-packages-${RANDOM_SUFFIX}"
 export SECRET_NAME="registry-credentials-${RANDOM_SUFFIX}"
@@ -108,6 +108,7 @@ export FUNCTION_NAME="package-distributor-${RANDOM_SUFFIX}"
 gcloud config set project ${PROJECT_ID}
 gcloud config set artifacts/location ${REGION}
 gcloud config set compute/region ${REGION}
+gcloud config set compute/zone ${ZONE}
 
 # Enable required APIs
 echo "Enabling required Google Cloud APIs..."
@@ -237,6 +238,11 @@ echo "✅ Repository name: ${REPO_NAME}"
        --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
        --role="roles/cloudtasks.enqueuer"
    
+   # Grant logging permissions for audit trails
+   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+       --role="roles/logging.logWriter"
+   
    echo "✅ Service account created with appropriate permissions"
    ```
 
@@ -253,13 +259,13 @@ echo "✅ Repository name: ${REPO_NAME}"
    
    # Create requirements.txt for Python dependencies
    cat <<EOF > requirements.txt
-   google-cloud-artifactregistry==1.11.3
-   google-cloud-secret-manager==2.18.1
-   google-cloud-tasks==2.16.1
-   google-cloud-logging==3.8.0
-   docker==6.1.3
+   google-cloud-artifactregistry==1.12.0
+   google-cloud-secret-manager==2.20.0
+   google-cloud-tasks==2.16.4
+   google-cloud-logging==3.9.0
+   docker==7.0.0
    requests==2.31.0
-   google-auth==2.23.4
+   google-auth==2.25.2
    EOF
    
    # Create the main function code
@@ -267,6 +273,7 @@ echo "✅ Repository name: ${REPO_NAME}"
    import json
    import logging
    import os
+   import time
    from google.cloud import secretmanager
    from google.cloud import tasks_v2
    from google.cloud import logging as cloud_logging
@@ -284,6 +291,7 @@ echo "✅ Repository name: ${REPO_NAME}"
            # Parse request data
            request_json = request.get_json(silent=True)
            if not request_json:
+               logger.error("No JSON body provided in request")
                return {'error': 'No JSON body provided'}, 400
            
            package_name = request_json.get('package_name')
@@ -291,6 +299,7 @@ echo "✅ Repository name: ${REPO_NAME}"
            target_environment = request_json.get('environment', 'development')
            
            if not package_name:
+               logger.error("package_name is required but not provided")
                return {'error': 'package_name is required'}, 400
            
            logger.info(f"Starting distribution of {package_name}:{package_version} to {target_environment}")
@@ -298,11 +307,13 @@ echo "✅ Repository name: ${REPO_NAME}"
            # Retrieve credentials from Secret Manager
            credentials = get_environment_credentials(target_environment)
            if not credentials:
+               logger.error(f"Failed to retrieve credentials for environment: {target_environment}")
                return {'error': f'Failed to retrieve credentials for {target_environment}'}, 500
            
            # Get distribution configuration
            config = get_distribution_config()
            if not config:
+               logger.error("Failed to retrieve distribution configuration")
                return {'error': 'Failed to retrieve distribution configuration'}, 500
            
            # Perform package distribution
@@ -320,7 +331,7 @@ echo "✅ Repository name: ${REPO_NAME}"
                return {'error': result['error']}, 500
                
        except Exception as e:
-           logger.error(f"Unexpected error: {str(e)}")
+           logger.error(f"Unexpected error in distribute_package: {str(e)}")
            return {'error': f'Internal server error: {str(e)}'}, 500
    
    def get_environment_credentials(environment):
@@ -332,6 +343,7 @@ echo "✅ Repository name: ${REPO_NAME}"
            response = client.access_secret_version(request={"name": secret_name})
            credentials = response.payload.data.decode("UTF-8")
            
+           logger.info(f"Successfully retrieved credentials for environment: {environment}")
            return credentials
        except Exception as e:
            logger.error(f"Failed to retrieve credentials for {environment}: {str(e)}")
@@ -346,7 +358,9 @@ echo "✅ Repository name: ${REPO_NAME}"
            response = client.access_secret_version(request={"name": secret_name})
            config_json = response.payload.data.decode("UTF-8")
            
-           return json.loads(config_json)
+           config = json.loads(config_json)
+           logger.info("Successfully retrieved distribution configuration")
+           return config
        except Exception as e:
            logger.error(f"Failed to retrieve distribution config: {str(e)}")
            return None
@@ -354,10 +368,12 @@ echo "✅ Repository name: ${REPO_NAME}"
    def perform_distribution(package_name, package_version, environment, credentials, config):
        """Perform the actual package distribution."""
        try:
-           # Simulate package distribution logic
+           # Get environment configuration
            env_config = config['environments'].get(environment)
            if not env_config:
-               return {'success': False, 'error': f'No configuration for environment {environment}'}
+               error_msg = f'No configuration for environment {environment}'
+               logger.error(error_msg)
+               return {'success': False, 'error': error_msg}
            
            # Here you would implement actual distribution logic
            # This could include:
@@ -369,8 +385,11 @@ echo "✅ Repository name: ${REPO_NAME}"
            logger.info(f"Distributing to endpoint: {env_config['endpoint']}")
            logger.info(f"Using timeout: {env_config['timeout']} seconds")
            
+           # Simulate distribution process
+           logger.info(f"Processing package {package_name}:{package_version}")
+           
            # Simulate successful distribution
-           return {
+           result = {
                'success': True,
                'package': f"{package_name}:{package_version}",
                'environment': environment,
@@ -378,13 +397,18 @@ echo "✅ Repository name: ${REPO_NAME}"
                'timestamp': str(int(time.time()))
            }
            
+           logger.info(f"Distribution completed successfully: {result}")
+           return result
+           
        except Exception as e:
-           return {'success': False, 'error': str(e)}
+           error_msg = f"Distribution failed with error: {str(e)}"
+           logger.error(error_msg)
+           return {'success': False, 'error': error_msg}
    EOF
    
    # Deploy the Cloud Function
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime=python311 \
+       --runtime=python312 \
        --trigger=http \
        --entry-point=distribute_package \
        --service-account=${SERVICE_ACCOUNT_EMAIL} \
@@ -495,7 +519,8 @@ echo "✅ Repository name: ${REPO_NAME}"
    {
      "displayName": "Package Distribution Failures",
      "documentation": {
-       "content": "Alert when package distribution failures exceed threshold"
+       "content": "Alert when package distribution failures exceed threshold",
+       "mimeType": "text/markdown"
      },
      "conditions": [
        {
@@ -552,8 +577,7 @@ echo "✅ Repository name: ${REPO_NAME}"
    ```bash
    # Verify secrets are accessible
    gcloud secrets versions access latest \
-       --secret="${SECRET_NAME}-dev" \
-       --format="get(payload.data)" | base64 -d
+       --secret="${SECRET_NAME}-dev"
    
    # Check secret metadata and labels
    gcloud secrets describe ${SECRET_NAME}-dev \
@@ -598,9 +622,41 @@ echo "✅ Repository name: ${REPO_NAME}"
 
    Expected output: Scheduled jobs showing proper configuration and successful manual execution.
 
+5. **Verify Monitoring Configuration**:
+
+   ```bash
+   # Check log-based metrics
+   gcloud logging metrics list \
+       --filter="name:package_distribution_failures OR name:package_distribution_success" \
+       --format="table(name,description)"
+   
+   # Check alerting policies
+   gcloud alpha monitoring policies list \
+       --filter="displayName:Package Distribution Failures" \
+       --format="table(displayName,enabled)"
+   ```
+
+   Expected output: Created metrics and alerting policies displayed in tabular format.
+
 ## Cleanup
 
-1. **Remove Cloud Scheduler Jobs**:
+1. **Remove Cloud Monitoring Resources**:
+
+   ```bash
+   # Delete alerting policies
+   gcloud alpha monitoring policies list \
+       --filter="displayName:Package Distribution Failures" \
+       --format="value(name)" | \
+       xargs -I {} gcloud alpha monitoring policies delete {} --quiet
+   
+   # Delete log-based metrics
+   gcloud logging metrics delete package_distribution_failures --quiet
+   gcloud logging metrics delete package_distribution_success --quiet
+   
+   echo "✅ Monitoring resources deleted"
+   ```
+
+2. **Remove Cloud Scheduler Jobs**:
 
    ```bash
    # Delete all scheduler jobs
@@ -619,7 +675,7 @@ echo "✅ Repository name: ${REPO_NAME}"
    echo "✅ Cloud Scheduler jobs deleted"
    ```
 
-2. **Remove Cloud Tasks Queues**:
+3. **Remove Cloud Tasks Queues**:
 
    ```bash
    # Delete task queues
@@ -634,7 +690,7 @@ echo "✅ Repository name: ${REPO_NAME}"
    echo "✅ Cloud Tasks queues deleted"
    ```
 
-3. **Delete Cloud Function and Source**:
+4. **Delete Cloud Function and Source**:
 
    ```bash
    # Delete the Cloud Function
@@ -649,7 +705,7 @@ echo "✅ Repository name: ${REPO_NAME}"
    echo "✅ Cloud Function and source files deleted"
    ```
 
-4. **Remove Secret Manager Secrets**:
+5. **Remove Secret Manager Secrets**:
 
    ```bash
    # Delete all secrets
@@ -661,7 +717,7 @@ echo "✅ Repository name: ${REPO_NAME}"
    echo "✅ Secret Manager secrets deleted"
    ```
 
-5. **Remove IAM Service Account and Artifact Registry Repositories**:
+6. **Remove IAM Service Account and Artifact Registry Repositories**:
 
    ```bash
    # Delete service account
@@ -711,4 +767,9 @@ Extend this secure package distribution system with these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,21 +1,21 @@
 ---
-title: Automating Reserved Instance Managementexisting_folder_name
+title: Automating Reserved Instance Management
 id: 66b26dd7
 category: cloud financial management
 difficulty: 300
 subject: aws
-services: cost,explorer,lambda,eventbridge,sns
+services: cost-explorer,lambda,eventbridge,sns
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: cost,explorer,lambda,eventbridge,sns,automation
+tags: cost-explorer,lambda,eventbridge,sns,automation,reserved-instances
 recipe-generator-version: 1.3
 ---
 
-# Automating Reserved Instance Managementexisting_folder_name
+# Automating Reserved Instance Management
 
 ## Problem
 
@@ -91,7 +91,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with Cost Explorer enabled and appropriate permissions for Cost Explorer API, Lambda, EventBridge, SNS, S3, and DynamoDB
+1. AWS account with Cost Explorer enabled and appropriate permissions for Cost Explorer API, Lambda, EventBridge, SNS, S3, DynamoDB, and EC2
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic knowledge of AWS cost management concepts and Reserved Instances
 4. Existing Reserved Instances in your account (or ability to create test RIs)
@@ -120,7 +120,7 @@ export DYNAMODB_TABLE_NAME="ri-tracking-${RANDOM_SUFFIX}"
 
 # Enable Cost Explorer if not already enabled
 aws ce get-cost-and-usage \
-    --time-period Start=2024-01-01,End=2024-01-02 \
+    --time-period Start=2025-01-01,End=2025-01-02 \
     --granularity MONTHLY \
     --metrics BlendedCost > /dev/null 2>&1 || \
     echo "Cost Explorer needs to be enabled in the AWS Console"
@@ -133,7 +133,7 @@ aws sns create-topic --name ${SNS_TOPIC_NAME} \
     --query TopicArn --output text > topic_arn.txt
 export SNS_TOPIC_ARN=$(cat topic_arn.txt)
 
-echo "Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
+echo "✅ Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
 ```
 
 ## Steps
@@ -166,7 +166,7 @@ echo "Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
 
 2. **Create IAM Role for Lambda Functions**:
 
-   IAM roles provide secure, temporary credential delegation that enables Lambda functions to access AWS services without hardcoded access keys. This security model follows the principle of least privilege, granting only the specific permissions required for Cost Explorer API calls, S3 operations, DynamoDB access, and SNS publishing. The role-based approach ensures credentials are automatically rotated and managed by AWS, reducing security risks while maintaining operational flexibility.
+   IAM roles provide secure, temporary credential delegation that enables Lambda functions to access AWS services without hardcoded access keys. This security model follows the principle of least privilege, granting only the specific permissions required for Cost Explorer API calls, S3 operations, DynamoDB access, SNS publishing, and EC2 reserved instance queries. The role-based approach ensures credentials are automatically rotated and managed by AWS, reducing security risks while maintaining operational flexibility.
 
    ```bash
    # Create trust policy for Lambda
@@ -219,6 +219,13 @@ echo "Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
            {
                "Effect": "Allow",
                "Action": [
+                   "ec2:DescribeReservedInstances"
+               ],
+               "Resource": "*"
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
                    "s3:GetObject",
                    "s3:PutObject",
                    "s3:DeleteObject"
@@ -260,7 +267,7 @@ echo "Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
    echo "✅ IAM role created: ${PROJECT_NAME}-lambda-role"
    ```
 
-   The IAM role is now configured with comprehensive permissions for Cost Explorer operations, storage access, and notification publishing. This security foundation enables the Lambda functions to operate autonomously while maintaining strict access controls and audit trails for compliance requirements.
+   The IAM role is now configured with comprehensive permissions for Cost Explorer operations, EC2 reserved instance queries, storage access, and notification publishing. This security foundation enables the Lambda functions to operate autonomously while maintaining strict access controls and audit trails for compliance requirements.
 
 3. **Create RI Utilization Analysis Lambda Function**:
 
@@ -378,7 +385,7 @@ echo "Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-ri-utilization \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-lambda-role \
        --handler ri_utilization_analysis.lambda_handler \
        --zip-file fileb://ri-utilization-function.zip \
@@ -434,7 +441,7 @@ echo "Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
            total_estimated_savings = 0
            
            # Process EC2 recommendations
-           for recommendation in ec2_response['Recommendations']:
+           for recommendation in ec2_response.get('Recommendations', []):
                rec_data = {
                    'service': 'EC2',
                    'instance_type': recommendation['InstanceDetails']['EC2InstanceDetails']['InstanceType'],
@@ -449,7 +456,7 @@ echo "Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
                total_estimated_savings += rec_data['estimated_monthly_savings']
            
            # Process RDS recommendations
-           for recommendation in rds_response['Recommendations']:
+           for recommendation in rds_response.get('Recommendations', []):
                rec_data = {
                    'service': 'RDS',
                    'instance_type': recommendation['InstanceDetails']['RDSInstanceDetails']['InstanceType'],
@@ -526,7 +533,7 @@ echo "Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-ri-recommendations \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-lambda-role \
        --handler ri_recommendations.lambda_handler \
        --zip-file fileb://ri-recommendations-function.zip \
@@ -552,7 +559,6 @@ echo "Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
    import os
    
    def lambda_handler(event, context):
-       ce = boto3.client('ce')
        ec2 = boto3.client('ec2')
        dynamodb = boto3.resource('dynamodb')
        sns = boto3.client('sns')
@@ -655,7 +661,7 @@ echo "Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-ri-monitoring \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-lambda-role \
        --handler ri_monitoring.lambda_handler \
        --zip-file fileb://ri-monitoring-function.zip \
@@ -930,13 +936,13 @@ echo "Setup complete. SNS Topic ARN: ${SNS_TOPIC_ARN}"
 
 ## Discussion
 
-This Reserved Instance management automation solution addresses the critical challenge of RI optimization at scale. The architecture leverages AWS Cost Explorer APIs to provide programmatic access to utilization data, recommendations, and cost analysis capabilities that would otherwise require manual intervention through the AWS console.
+This Reserved Instance management automation solution addresses the critical challenge of RI optimization at scale by leveraging [AWS Cost Explorer APIs](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-what-is.html) to provide programmatic access to utilization data, recommendations, and cost analysis capabilities that would otherwise require manual intervention through the AWS console.
 
-The solution implements three key automation workflows: utilization monitoring identifies underperforming RIs with threshold-based alerting, recommendation generation provides data-driven purchase guidance using AWS's machine learning algorithms, and expiration tracking ensures proactive renewal planning. The EventBridge scheduling system ensures consistent execution without manual oversight, while the combination of S3 storage and DynamoDB provides both historical reporting and real-time tracking capabilities.
+The solution implements three key automation workflows: utilization monitoring identifies underperforming RIs with threshold-based alerting, recommendation generation provides data-driven purchase guidance using AWS's machine learning algorithms, and expiration tracking ensures proactive renewal planning. The EventBridge scheduling system ensures consistent execution without manual oversight, while the combination of S3 storage and DynamoDB provides both historical reporting and real-time tracking capabilities following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles for cost optimization.
 
-The SNS notification system enables immediate response to optimization opportunities, while the modular Lambda architecture allows for easy customization and extension. Organizations can adjust utilization thresholds, modify scheduling frequencies, or add additional services like ElastiCache and RDS to the monitoring scope. The solution also supports cost allocation through comprehensive tagging and provides audit trails for compliance requirements.
+The SNS notification system enables immediate response to optimization opportunities, while the modular Lambda architecture allows for easy customization and extension. Organizations can adjust utilization thresholds, modify scheduling frequencies, or add additional services like ElastiCache and RDS to the monitoring scope. The solution also supports cost allocation through comprehensive tagging and provides audit trails for compliance requirements as outlined in the [Cost Explorer API best practices](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-api-best-practices.html).
 
-> **Tip**: Monitor your Cost Explorer API usage to avoid unexpected charges - the first 1,000 API calls per month are free, but additional calls cost $0.01 each.
+> **Tip**: Monitor your Cost Explorer API usage to avoid unexpected charges - the first 1,000 API calls per month are free, but additional calls cost $0.01 each as documented in the [Cost Explorer pricing guide](https://aws.amazon.com/aws-cost-management/pricing/).
 
 ## Challenge
 
@@ -954,4 +960,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

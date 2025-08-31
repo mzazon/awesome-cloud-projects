@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Firebase Studio, Gemini Code Assist, Cloud Storage, Eventarc
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai-development, automation, firebase, gemini, eventarc, cloud-storage, agentic-ai, devops
 recipe-generator-version: 1.3
@@ -73,7 +73,7 @@ graph TB
 4. Basic knowledge of JavaScript/TypeScript, Firebase, and event-driven architectures
 5. Estimated cost: $10-20 for testing resources (Cloud Storage, Functions, Eventarc)
 
-> **Note**: Firebase Studio is currently in preview and requires access through the Firebase console. Gemini Code Assist provides enhanced AI capabilities for development automation.
+> **Note**: Firebase Studio is an agentic cloud-based development environment that unifies Project IDX with specialized AI agents. Gemini Code Assist provides enhanced AI capabilities for development automation.
 
 ## Preparation
 
@@ -114,7 +114,7 @@ echo "✅ Project configured: ${PROJECT_ID}"
 
 1. **Create Development Artifact Storage System**:
 
-   Google Cloud Storage provides the foundation for storing development artifacts with versioning and lifecycle management. This bucket will serve as the central repository for AI-generated code, templates, and deployment artifacts, enabling automated workflows triggered by file changes.
+   Google Cloud Storage provides the foundation for storing development artifacts with versioning and lifecycle management. This bucket will serve as the central repository for AI-generated code, templates, and deployment artifacts, enabling automated workflows triggered by file changes while maintaining complete audit trails.
 
    ```bash
    # Create Cloud Storage bucket for development artifacts
@@ -137,7 +137,7 @@ echo "✅ Project configured: ${PROJECT_ID}"
 
 2. **Set Up Pub/Sub Topic for Development Events**:
 
-   Pub/Sub provides the messaging backbone for event-driven development workflows. This topic will receive notifications about code generation, reviews, and deployment events, enabling decoupled communication between Firebase Studio, Gemini Code Assist, and automation services.
+   Pub/Sub provides the messaging backbone for event-driven development workflows. This topic will receive notifications about code generation, reviews, and deployment events, enabling decoupled communication between Firebase Studio, Gemini Code Assist, and automation services with guaranteed message delivery.
 
    ```bash
    # Create Pub/Sub topic for development events
@@ -151,11 +151,11 @@ echo "✅ Project configured: ${PROJECT_ID}"
    echo "✅ Development event messaging system created"
    ```
 
-   The messaging system enables reliable, asynchronous communication between development tools and automation services, ensuring that all code generation and review events are captured and processed appropriately.
+   The messaging system enables reliable, asynchronous communication between development tools and automation services, ensuring that all code generation and review events are captured and processed appropriately with built-in retry logic.
 
 3. **Deploy Intelligent Code Review Automation Function**:
 
-   Cloud Functions provides serverless execution for AI-powered code review automation. This function integrates with Gemini Code Assist to perform intelligent code analysis, security scanning, and automated testing whenever new code artifacts are generated.
+   Cloud Functions provides serverless execution for AI-powered code review automation. This function integrates with Gemini Code Assist to perform intelligent code analysis, security scanning, and automated testing whenever new code artifacts are generated, implementing comprehensive quality gates.
 
    ```bash
    # Create function source directory
@@ -278,9 +278,11 @@ echo "✅ Project configured: ${PROJECT_ID}"
    }
    EOF
    
-   # Deploy the code review function
+   # Deploy the code review function with Eventarc trigger
    gcloud functions deploy ${FUNCTION_NAME} \
+       --gen2 \
        --runtime nodejs20 \
+       --trigger-location=${REGION} \
        --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" \
        --trigger-event-filters="bucket=${BUCKET_NAME}" \
        --source . \
@@ -294,11 +296,11 @@ echo "✅ Project configured: ${PROJECT_ID}"
    echo "✅ Intelligent code review automation deployed"
    ```
 
-   The code review function now provides comprehensive AI-powered analysis including syntax validation, security scanning, performance checks, and best practices enforcement, automatically triggering whenever new code artifacts are uploaded to Cloud Storage.
+   The code review function now provides comprehensive AI-powered analysis including syntax validation, security scanning, performance checks, and best practices enforcement, automatically triggering whenever new code artifacts are uploaded to Cloud Storage with built-in integration to Firebase Studio workflows.
 
 4. **Configure Eventarc Trigger for Development Workflow**:
 
-   Eventarc provides declarative event routing that connects Cloud Storage events to our automation pipeline. This configuration ensures that every code artifact upload triggers the intelligent review process, creating a seamless development workflow with automatic quality gates.
+   Eventarc provides declarative event routing that connects Cloud Storage events to our automation pipeline. This configuration ensures that every code artifact upload triggers the intelligent review process, creating a seamless development workflow with automatic quality gates and reliability through retry mechanisms.
 
    ```bash
    # Create Eventarc trigger for storage events
@@ -313,18 +315,18 @@ echo "✅ Project configured: ${PROJECT_ID}"
    echo "✅ Development workflow trigger configured"
    ```
 
-   Eventarc now automatically routes storage events to the code review function, enabling real-time processing of development artifacts with built-in retry logic and dead letter queue support for reliable workflow execution.
+   Eventarc now automatically routes storage events to the code review function, enabling real-time processing of development artifacts with built-in retry logic and dead letter queue support for reliable workflow execution across the Firebase Studio development ecosystem.
 
 5. **Create Firebase Studio Development Workspace**:
 
-   Firebase Studio provides an agentic development environment that combines code generation, testing, and deployment capabilities. Setting up a workspace with proper templates and AI assistance enables rapid prototyping and full-stack application development with minimal manual intervention.
+   Firebase Studio provides an agentic cloud-based development environment that combines code generation, testing, and deployment capabilities. Setting up a workspace with proper templates and AI assistance enables rapid prototyping and full-stack application development with minimal manual intervention through browser-based access.
 
    ```bash
    # Create workspace configuration directory
    mkdir -p firebase-studio-workspace
    cd firebase-studio-workspace
    
-   # Create workspace configuration
+   # Create workspace configuration using Nix
    cat > dev.nix << 'EOF'
    { pkgs, ... }: {
      packages = [
@@ -410,11 +412,11 @@ echo "✅ Project configured: ${PROJECT_ID}"
    echo "✅ Firebase Studio workspace configured with AI assistance"
    ```
 
-   The Firebase Studio workspace now provides a complete development environment with AI assistance enabled, custom templates for rapid application scaffolding, and automated integration with the code review pipeline for seamless development workflows.
+   The Firebase Studio workspace now provides a complete development environment with AI assistance enabled through Nix configuration, custom templates for rapid application scaffolding, and automated integration with the code review pipeline for seamless development workflows accessible from any browser.
 
 6. **Configure Gemini Code Assist Integration**:
 
-   Gemini Code Assist provides advanced AI coding capabilities including code generation, completion, and intelligent suggestions. Configuring the integration with Firebase Studio enables developers to leverage natural language prompts for generating complete application components with automated testing and deployment.
+   Gemini Code Assist provides advanced AI coding capabilities including code generation, completion, and intelligent suggestions. Configuring the integration with Firebase Studio enables developers to leverage natural language prompts for generating complete application components with automated testing and deployment through the unified development environment.
 
    ```bash
    # Create Gemini Code Assist configuration
@@ -426,7 +428,7 @@ echo "✅ Project configured: ${PROJECT_ID}"
    {
      "geminiCodeAssist": {
        "enabled": true,
-       "model": "gemini-2.5-flash",
+       "model": "gemini-2.0-flash",
        "features": {
          "codeGeneration": true,
          "codeCompletion": true,
@@ -517,7 +519,7 @@ echo "✅ Project configured: ${PROJECT_ID}"
      return (
        <div className="ai-generated-app">
          <h1>AI-Generated Application</h1>
-         <p>Generated from prompt: {prompt}</p>
+         <p>Generated from prompt: ${prompt}</p>
          {data && <pre>{JSON.stringify(data, null, 2)}</pre>}
        </div>
      );
@@ -639,11 +641,11 @@ echo "✅ Project configured: ${PROJECT_ID}"
    echo "✅ Gemini Code Assist integration configured with automated workflows"
    ```
 
-   Gemini Code Assist is now integrated with the development workflow, providing AI-powered code generation, automated testing, and intelligent deployment configuration based on natural language prompts and project requirements.
+   Gemini Code Assist is now integrated with the development workflow, providing AI-powered code generation capabilities that work seamlessly with Firebase Studio's browser-based environment. The integration enables natural language to code transformation with automated testing and intelligent deployment configuration generation.
 
 7. **Set Up Development Workflow Monitoring**:
 
-   Cloud Monitoring provides observability for the entire development workflow, tracking code generation performance, review automation metrics, and deployment success rates. This monitoring system enables continuous optimization of the AI-powered development pipeline with real-time insights and alerting.
+   Cloud Monitoring provides observability for the entire development workflow, tracking code generation performance, review automation metrics, and deployment success rates. This monitoring system enables continuous optimization of the AI-powered development pipeline with real-time insights and proactive alerting for workflow health.
 
    ```bash
    # Create monitoring dashboard configuration
@@ -718,7 +720,7 @@ echo "✅ Project configured: ${PROJECT_ID}"
    echo "✅ Development workflow monitoring configured"
    ```
 
-   The monitoring system now tracks key metrics for the AI-powered development workflow, providing insights into code generation efficiency, review automation performance, and overall system health with automated alerting for proactive issue resolution.
+   The monitoring system now tracks key metrics for the AI-powered development workflow, providing insights into code generation efficiency, review automation performance, and overall system health with automated alerting for proactive issue resolution across Firebase Studio workspaces.
 
 ## Validation & Testing
 
@@ -827,30 +829,35 @@ echo "✅ Project configured: ${PROJECT_ID}"
 
 ## Discussion
 
-This recipe demonstrates how to build an intelligent development workflow automation system using Google Cloud's latest AI and event-driven technologies. Firebase Studio provides an agentic development environment that goes beyond traditional IDEs by incorporating AI assistance directly into the development process. When combined with Gemini Code Assist, developers can generate entire applications using natural language prompts, dramatically reducing time-to-market and improving code quality through automated reviews.
+This recipe demonstrates how to build an intelligent development workflow automation system using Google Cloud's latest AI and event-driven technologies. Firebase Studio provides an agentic cloud-based development environment that goes beyond traditional IDEs by incorporating AI assistance directly into the development process through a browser-based virtual machine environment powered by Google Cloud. When combined with Gemini Code Assist, developers can generate entire applications using natural language prompts, dramatically reducing time-to-market and improving code quality through automated reviews.
 
-The architecture leverages Cloud Storage as a central artifact repository, enabling version control and audit trails for all AI-generated code. Eventarc provides the event-driven backbone that automatically triggers code reviews and deployments based on storage events, creating a seamless pipeline that requires minimal manual intervention. This approach aligns with Google Cloud's architecture best practices by implementing loose coupling between services and enabling independent scaling of each component.
+The architecture leverages Cloud Storage as a central artifact repository, enabling version control and audit trails for all AI-generated code. Eventarc provides the event-driven backbone that automatically triggers code reviews and deployments based on storage events, creating a seamless pipeline that requires minimal manual intervention. This approach aligns with Google Cloud's architecture best practices by implementing loose coupling between services and enabling independent scaling of each component while supporting the collaborative nature of modern development workflows.
 
-The integration of Gemini Code Assist with Firebase Studio represents a significant advancement in developer productivity tools. The AI can understand context from the entire codebase, generate production-ready code with proper error handling and testing, and even suggest architectural improvements. The automated code review system provides comprehensive analysis including security scanning, performance optimization, and best practices enforcement, ensuring that AI-generated code meets enterprise quality standards.
+The integration of Gemini Code Assist with Firebase Studio represents a significant advancement in developer productivity tools. The AI can understand context from the entire codebase, generate production-ready code with proper error handling and testing, and even suggest architectural improvements through natural language interaction. The automated code review system provides comprehensive analysis including security scanning, performance optimization, and best practices enforcement, ensuring that AI-generated code meets enterprise quality standards and follows Google Cloud security recommendations.
 
-From a cost optimization perspective, this solution uses serverless technologies that scale to zero when not in use, making it highly cost-effective for teams of any size. The event-driven architecture ensures that resources are only consumed when actual development work is occurring, while Cloud Monitoring provides insights for continuous optimization of the workflow efficiency.
+From a cost optimization perspective, this solution uses serverless technologies that scale to zero when not in use, making it highly cost-effective for teams of any size. The event-driven architecture ensures that resources are only consumed when actual development work is occurring, while Cloud Monitoring provides insights for continuous optimization of the workflow efficiency. Firebase Studio's browser-based nature eliminates the need for local development environment setup and maintenance costs.
 
-> **Tip**: Configure Firebase Studio workspaces with custom templates and AI prompts specific to your organization's coding standards and architectural patterns. This ensures consistent code generation that aligns with your team's practices and reduces the need for manual adjustments.
+> **Tip**: Configure Firebase Studio workspaces with custom templates and AI prompts specific to your organization's coding standards and architectural patterns. This ensures consistent code generation that aligns with your team's practices and reduces the need for manual adjustments. See the [Firebase Studio documentation](https://firebase.google.com/docs/studio) for detailed configuration guidance.
 
 ## Challenge
 
 Extend this intelligent development workflow automation by implementing these enhancements:
 
-1. **Multi-Environment Deployment Pipeline**: Integrate Cloud Deploy and Cloud Build to create automated staging and production deployment workflows with AI-powered rollback decisions based on monitoring metrics and user feedback.
+1. **Multi-Environment Deployment Pipeline**: Integrate Cloud Deploy and Cloud Build to create automated staging and production deployment workflows with AI-powered rollback decisions based on monitoring metrics and user feedback collected through Firebase Studio's preview capabilities.
 
-2. **Advanced Code Quality Gates**: Implement integration with Cloud Code Analysis API and third-party security scanning tools to create comprehensive quality gates that include performance testing, accessibility compliance, and license compatibility checking.
+2. **Advanced Code Quality Gates**: Implement integration with Cloud Code Analysis API and third-party security scanning tools to create comprehensive quality gates that include performance testing, accessibility compliance, and license compatibility checking within the Firebase Studio environment.
 
-3. **Cross-Platform Code Generation**: Extend Gemini Code Assist to generate native mobile applications for iOS and Android alongside web applications, with automated testing on Firebase Test Lab and deployment to app stores.
+3. **Cross-Platform Code Generation**: Extend Gemini Code Assist to generate native mobile applications for iOS and Android alongside web applications, with automated testing on Firebase Test Lab and deployment to app stores directly from Firebase Studio workspaces.
 
-4. **Intelligent Resource Optimization**: Build AI-powered infrastructure right-sizing recommendations using Cloud Recommender API and Vertex AI to automatically optimize resource allocation based on application performance patterns and usage analytics.
+4. **Intelligent Resource Optimization**: Build AI-powered infrastructure right-sizing recommendations using Cloud Recommender API and Vertex AI to automatically optimize resource allocation based on application performance patterns and usage analytics derived from Firebase Studio telemetry.
 
-5. **Collaborative AI Development**: Implement real-time collaboration features using Firebase Realtime Database where multiple developers can work with AI assistance simultaneously, with intelligent conflict resolution and code merge suggestions powered by Gemini models.
+5. **Collaborative AI Development**: Implement real-time collaboration features using Firebase Realtime Database where multiple developers can work with AI assistance simultaneously in shared Firebase Studio workspaces, with intelligent conflict resolution and code merge suggestions powered by Gemini models.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

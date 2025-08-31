@@ -4,12 +4,12 @@ id: e7d1fbfa
 category: serverless
 difficulty: 300
 subject: aws
-services: amazon-comprehend, s3, lambda, iam
+services: comprehend, s3, lambda, iam
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: nlp, machine-learning, text-analysis, sentiment-analysis, serverless, comprehend, lambda
 recipe-generator-version: 1.3
@@ -433,6 +433,8 @@ echo "✅ Uploaded sample data to S3"
 
 6. **Create Batch Processing Scripts**:
 
+   Batch processing scripts orchestrate multiple concurrent Comprehend analysis jobs to process large datasets efficiently. These scripts manage job lifecycle including submission, monitoring, and result collection. The asynchronous nature of batch jobs enables cost-effective analysis of thousands of documents while freeing up resources for other operations.
+
    ```bash
    # Create batch processing script
    cat > batch-analysis.py << 'EOF'
@@ -828,11 +830,11 @@ echo "✅ Uploaded sample data to S3"
 
 ## Discussion
 
-Amazon Comprehend provides a powerful and accessible entry point into natural language processing without requiring deep machine learning expertise. The service offers both pre-trained models for common NLP tasks and the ability to train custom models for domain-specific requirements. The architecture demonstrated in this recipe shows how to implement both real-time processing through Lambda functions and batch processing for large document sets.
+Amazon Comprehend provides a powerful and accessible entry point into natural language processing without requiring deep machine learning expertise. The service offers both pre-trained models for common NLP tasks and the ability to train custom models for domain-specific requirements. The architecture demonstrated in this recipe shows how to implement both real-time processing through Lambda functions and batch processing for large document sets, following AWS Well-Architected Framework principles for operational excellence and cost optimization.
 
 The key advantage of using Amazon Comprehend is its seamless integration with other AWS services. Text data can be ingested from S3, processed through Lambda functions, and results can be stored back in S3 for further analysis or visualization. This serverless approach scales automatically based on demand and eliminates the need to manage underlying infrastructure. The service supports multiple languages and provides confidence scores for all predictions, enabling applications to handle edge cases appropriately.
 
-For production deployments, consider implementing additional features like data validation, error handling, and result caching. The batch processing capabilities are particularly valuable for analyzing large volumes of historical data, while the real-time API is ideal for interactive applications and immediate feedback scenarios. Custom classification models can be trained to recognize company-specific categories, making the solution highly adaptable to different business contexts.
+For production deployments, consider implementing additional features like data validation, error handling, and result caching. The batch processing capabilities are particularly valuable for analyzing large volumes of historical data, while the real-time API is ideal for interactive applications and immediate feedback scenarios. Custom classification models can be trained to recognize company-specific categories, making the solution highly adaptable to different business contexts. See the [Amazon Comprehend Developer Guide](https://docs.aws.amazon.com/comprehend/latest/dg/what-is.html) for additional implementation patterns and [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) guidance.
 
 > **Tip**: Use Amazon Comprehend's targeted sentiment analysis for more granular insights when analyzing product reviews or customer feedback, as it provides entity-level sentiment rather than just document-level sentiment.
 
@@ -852,4 +854,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

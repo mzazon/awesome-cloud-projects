@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Backup and DR Service, Cloud SQL, Cloud Scheduler, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: disaster-recovery, backup, cloud-sql, automation, failover
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Enterprise organizations running mission-critical applications on Google Cloud S
 
 ## Solution
 
-This solution implements a comprehensive automated disaster recovery system leveraging Google Cloud's Backup and DR Service alongside Cloud SQL's advanced disaster recovery capabilities. The architecture combines backup vault storage for immutable backups, cross-region read replicas for automated failover, and intelligent orchestration through Cloud Functions and Cloud Scheduler to ensure seamless database continuity with minimal human intervention.
+This solution implements a comprehensive automated disaster recovery system leveraging Google Cloud's Backup and DR Service alongside Cloud SQL's cross-region disaster recovery capabilities. The architecture combines backup vault storage for immutable backups, cross-region read replicas for automated failover, and intelligent orchestration through Cloud Functions and Cloud Scheduler to ensure seamless database continuity with minimal human intervention.
 
 ## Architecture Diagram
 
@@ -154,14 +154,12 @@ echo "Database instance: ${DB_INSTANCE_NAME}"
    gcloud backup-dr backup-vaults create ${BACKUP_VAULT_PRIMARY} \
        --location=${PRIMARY_REGION} \
        --description="Primary backup vault for disaster recovery" \
-       --effective-time=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
        --backup-minimum-enforced-retention-duration=30d
    
    # Create backup vault in secondary region
    gcloud backup-dr backup-vaults create ${BACKUP_VAULT_SECONDARY} \
        --location=${SECONDARY_REGION} \
        --description="Secondary backup vault for cross-region DR" \
-       --effective-time=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
        --backup-minimum-enforced-retention-duration=30d
    
    echo "✅ Backup vaults created in both regions with 30-day retention"
@@ -171,7 +169,7 @@ echo "Database instance: ${DB_INSTANCE_NAME}"
 
 3. **Create Disaster Recovery Replica in Secondary Region**:
 
-   Cross-region disaster recovery replicas enable rapid failover to a secondary region when the primary region becomes unavailable. The DR replica maintains near real-time synchronization with the primary database and can be promoted to become the new primary instance during disaster scenarios.
+   Cross-region disaster recovery replicas enable rapid failover to a secondary region when the primary region becomes unavailable. The DR replica maintains near real-time synchronization with the primary database through asynchronous replication and can be promoted to become the new primary instance during disaster scenarios.
 
    ```bash
    # Create cross-region disaster recovery replica
@@ -180,21 +178,16 @@ echo "Database instance: ${DB_INSTANCE_NAME}"
        --region=${SECONDARY_REGION} \
        --tier=db-custom-2-8192 \
        --availability-type=ZONAL \
-       --replica-type=READ \
-       --enable-bin-log
+       --replica-type=READ
    
-   # Assign the replica as a designated DR replica
-   gcloud sql instances patch ${DR_REPLICA_NAME} \
-       --replica-type=FAILOVER
-   
-   echo "✅ DR replica created and configured for automated failover"
+   echo "✅ DR replica created and configured for disaster recovery"
    ```
 
-   The disaster recovery replica is now established and designated for failover operations. This replica continuously receives updates from the primary instance through asynchronous replication, ensuring that it maintains a current copy of your data that can be activated quickly during disaster recovery scenarios.
+   The disaster recovery replica is now established and ready for failover operations. This replica continuously receives updates from the primary instance through asynchronous replication, ensuring that it maintains a current copy of your data that can be promoted quickly during disaster recovery scenarios using the `gcloud sql instances promote-replica` command.
 
 4. **Create Backup Plans for Automated Protection**:
 
-   Backup plans define the scheduling, retention, and storage policies for protecting your Cloud SQL instances. These plans automate the backup process, ensuring consistent data protection without manual intervention while supporting both operational recovery and long-term retention requirements.
+   Backup plans define the scheduling, retention, and storage policies for protecting your Cloud SQL instances. These plans use the correct backup rule syntax with proper retention configuration and backup scheduling parameters that automate the backup process consistently.
 
    ```bash
    # Create backup plan for the primary instance
@@ -202,8 +195,7 @@ echo "Database instance: ${DB_INSTANCE_NAME}"
        --location=${PRIMARY_REGION} \
        --backup-vault=projects/${PROJECT_ID}/locations/${PRIMARY_REGION}/backupVaults/${BACKUP_VAULT_PRIMARY} \
        --resource-type=cloudsql.googleapis.com/Instance \
-       --backup-rule-backup-retention-days=30 \
-       --backup-rule-backup-frequency="0 2 * * *"
+       --backup-rule=rule-id=daily-backup,retention-days=30,recurrence=DAILY,backup-window-start=2,backup-window-end=8
    
    # Associate the backup plan with the Cloud SQL instance
    gcloud backup-dr backup-plan-associations create \
@@ -215,7 +207,7 @@ echo "Database instance: ${DB_INSTANCE_NAME}"
    echo "✅ Automated backup plan configured with daily backups"
    ```
 
-   The backup plan is now active and will automatically create daily backups of your Cloud SQL instance. These backups are stored in the immutable backup vault, providing both point-in-time recovery capabilities and long-term data retention for compliance and audit requirements.
+   The backup plan is now active and will automatically create daily backups of your Cloud SQL instance during the specified backup window. These backups are stored in the immutable backup vault, providing both point-in-time recovery capabilities and long-term data retention for compliance and audit requirements.
 
 5. **Implement Disaster Recovery Orchestration Functions**:
 
@@ -271,10 +263,10 @@ def check_instance_health(client, project_id, instance_name):
         return {'healthy': False, 'error': str(e)}
 
 def initiate_failover(client, project_id, replica_name):
-    """Initiate failover to the disaster recovery replica."""
+    """Initiate failover by promoting the disaster recovery replica."""
     try:
         # Promote the DR replica to become the new primary
-        operation = client.failover_replica(
+        operation = client.promote_replica(
             project=project_id,
             instance=replica_name
         )
@@ -291,7 +283,7 @@ EOF
    # Create requirements file for the function
    cat > dr-functions/requirements.txt << 'EOF'
 functions-framework==3.5.0
-google-cloud-sql==1.7.0
+google-cloud-sql==1.8.0
 google-cloud-monitoring==2.16.0
 google-cloud-pubsub==2.18.4
 EOF
@@ -451,8 +443,7 @@ EOF
        --location=${SECONDARY_REGION} \
        --backup-vault=projects/${PROJECT_ID}/locations/${SECONDARY_REGION}/backupVaults/${BACKUP_VAULT_SECONDARY} \
        --resource-type=cloudsql.googleapis.com/Instance \
-       --backup-rule-backup-retention-days=30 \
-       --backup-rule-backup-frequency="0 3 * * *"
+       --backup-rule=rule-id=daily-backup-dr,retention-days=30,recurrence=DAILY,backup-window-start=3,backup-window-end=9
    
    # Create Cloud Function for cross-region backup monitoring
    cat > dr-functions/backup_monitor.py << 'EOF'
@@ -557,14 +548,13 @@ EOF
    # Create test database for simulation
    gcloud sql databases create test-dr-db --instance=${DB_INSTANCE_NAME}
    
-   # Simulate failover (test mode)
+   # Simulate failover by promoting replica (test mode)
    echo "Simulating disaster recovery failover..."
-   gcloud sql instances failover ${DB_INSTANCE_NAME} \
-       --async
+   gcloud sql instances promote-replica ${DR_REPLICA_NAME}
    
-   # Check failover status
+   # Check promotion status
    gcloud sql operations list \
-       --instance=${DB_INSTANCE_NAME} \
+       --instance=${DR_REPLICA_NAME} \
        --limit=1 \
        --format="table(name,operationType,status,startTime)"
    ```
@@ -669,7 +659,7 @@ This comprehensive disaster recovery solution demonstrates the power of Google C
 
 **Google Cloud Backup and DR Service** forms the foundation of this solution by providing immutable backup vaults that protect against both accidental deletion and malicious attacks like ransomware. The service's backup vault technology ensures that once data is written, it cannot be modified or deleted before the retention period expires, providing a critical security layer for your backup strategy. This aligns with Google Cloud's [zero-trust security model](https://cloud.google.com/security/zero-trust) and helps organizations meet stringent compliance requirements.
 
-**Cloud SQL Enterprise Plus edition** enables advanced disaster recovery features including cross-region disaster recovery replicas and automated failover capabilities. The write endpoint feature automatically redirects database connections to the promoted replica during failover operations, minimizing application changes required during disaster recovery scenarios. According to [Google Cloud's disaster recovery documentation](https://cloud.google.com/sql/docs/mysql/intro-to-cloud-sql-disaster-recovery), this approach can achieve Recovery Time Objectives (RTO) of minutes rather than hours compared to backup-based recovery methods.
+**Cloud SQL Enterprise Plus edition** enables advanced disaster recovery features including cross-region disaster recovery replicas and automated failover capabilities. Cross-region read replicas can be promoted to become standalone primary instances during disaster scenarios, minimizing application changes required during disaster recovery operations. According to [Google Cloud's disaster recovery documentation](https://cloud.google.com/sql/docs/mysql/intro-to-cloud-sql-disaster-recovery), this approach can achieve Recovery Time Objectives (RTO) of minutes rather than hours compared to backup-based recovery methods.
 
 The orchestration layer built with **Cloud Functions** provides intelligent automation that can respond to failure conditions faster than human operators. By integrating with Cloud Monitoring and Pub/Sub, the system can detect anomalies and initiate recovery procedures automatically, significantly reducing the mean time to recovery (MTTR). This automated approach follows [Google's Site Reliability Engineering principles](https://cloud.google.com/blog/products/management-tools/sre-fundamentals-slis-slas-and-error-budgets) for building resilient systems.
 
@@ -693,4 +683,9 @@ Extend this disaster recovery solution by implementing these advanced enhancemen
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

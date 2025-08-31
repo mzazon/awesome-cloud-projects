@@ -1,0 +1,626 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Blue-Green Deployments with VPC Lattice and Lambda - Zero-downtime deployment strategy using weighted target groups for gradual traffic shifting'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'ecommerce-api'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MaxLength: 20
+
+  BlueEnvironmentVersion:
+    Type: String
+    Default: '1.0.0'
+    Description: 'Version identifier for the blue (current production) environment'
+
+  GreenEnvironmentVersion:
+    Type: String
+    Default: '2.0.0'
+    Description: 'Version identifier for the green (new deployment) environment'
+
+  InitialBlueTrafficWeight:
+    Type: Number
+    Default: 90
+    MinValue: 0
+    MaxValue: 100
+    Description: 'Initial percentage of traffic to route to blue environment (0-100)'
+
+  InitialGreenTrafficWeight:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 100
+    Description: 'Initial percentage of traffic to route to green environment (0-100)'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: 'Lambda function memory allocation in MB'
+
+  ErrorThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Error count threshold for CloudWatch alarms'
+
+  DurationThreshold:
+    Type: Number
+    Default: 10000
+    MinValue: 1000
+    MaxValue: 30000
+    Description: 'Duration threshold in milliseconds for CloudWatch alarms'
+
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: 'Deployment environment'
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'production']
+  EnableDetailedMonitoring: !Equals [!Ref Environment, 'production']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # IAM ROLE FOR LAMBDA FUNCTIONS
+  # ---------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VPCLatticeInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Blue-Green Deployment Lambda Execution'
+
+  # ---------------------------------------------------------------------------
+  # BLUE ENVIRONMENT LAMBDA FUNCTION
+  # ---------------------------------------------------------------------------
+  BlueLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-blue-${AWS::StackName}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          ENVIRONMENT: 'blue'
+          VERSION: !Ref BlueEnvironmentVersion
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import os
+
+          def lambda_handler(event, context):
+              """
+              Blue environment Lambda function - stable production version
+              Handles requests with consistent, tested functionality
+              """
+              # Get environment variables
+              environment = os.environ.get('ENVIRONMENT', 'blue')
+              version = os.environ.get('VERSION', '1.0.0')
+              project_name = os.environ.get('PROJECT_NAME', 'ecommerce-api')
+              
+              # Create response data
+              response_data = {
+                  'environment': environment,
+                  'version': version,
+                  'project': project_name,
+                  'message': f'Hello from {environment.title()} Environment!',
+                  'timestamp': int(time.time()),
+                  'request_id': context.aws_request_id,
+                  'function_name': context.function_name,
+                  'remaining_time_ms': context.get_remaining_time_in_millis(),
+                  'status': 'healthy'
+              }
+              
+              # Log request for monitoring
+              print(f"Blue environment processing request: {context.aws_request_id}")
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'X-Environment': environment,
+                      'X-Version': version,
+                      'X-Function-Name': context.function_name
+                  },
+                  'body': json.dumps(response_data, indent=2)
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-blue-function'
+        - Key: Environment
+          Value: 'blue'
+        - Key: Deployment
+          Value: 'blue-green'
+        - Key: Version
+          Value: !Ref BlueEnvironmentVersion
+
+  # ---------------------------------------------------------------------------
+  # GREEN ENVIRONMENT LAMBDA FUNCTION
+  # ---------------------------------------------------------------------------
+  GreenLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-green-${AWS::StackName}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          ENVIRONMENT: 'green'
+          VERSION: !Ref GreenEnvironmentVersion
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import os
+
+          def lambda_handler(event, context):
+              """
+              Green environment Lambda function - new version being deployed
+              Contains new features and enhancements being tested in production
+              """
+              # Get environment variables
+              environment = os.environ.get('ENVIRONMENT', 'green')
+              version = os.environ.get('VERSION', '2.0.0')
+              project_name = os.environ.get('PROJECT_NAME', 'ecommerce-api')
+              
+              # Create enhanced response data with new features
+              response_data = {
+                  'environment': environment,
+                  'version': version,
+                  'project': project_name,
+                  'message': f'Hello from {environment.title()} Environment!',
+                  'timestamp': int(time.time()),
+                  'request_id': context.aws_request_id,
+                  'function_name': context.function_name,
+                  'remaining_time_ms': context.get_remaining_time_in_millis(),
+                  'status': 'healthy',
+                  # New features in green environment
+                  'new_feature': 'Enhanced response with additional metadata',
+                  'performance_metrics': {
+                      'memory_used_mb': context.memory_limit_in_mb,
+                      'execution_time_ms': 0  # Will be calculated at end
+                  },
+                  'deployment_info': {
+                      'deployment_type': 'blue-green',
+                      'canary_enabled': True,
+                      'traffic_shifting': 'gradual'
+                  }
+              }
+              
+              # Log request for monitoring
+              print(f"Green environment processing request: {context.aws_request_id}")
+              print(f"New feature active: Enhanced metadata response")
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'X-Environment': environment,
+                      'X-Version': version,
+                      'X-Function-Name': context.function_name,
+                      'X-New-Features': 'enhanced-metadata'
+                  },
+                  'body': json.dumps(response_data, indent=2)
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-green-function'
+        - Key: Environment
+          Value: 'green'
+        - Key: Deployment
+          Value: 'blue-green'
+        - Key: Version
+          Value: !Ref GreenEnvironmentVersion
+
+  # ---------------------------------------------------------------------------
+  # VPC LATTICE SERVICE NETWORK
+  # ---------------------------------------------------------------------------
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub '${ProjectName}-network-${AWS::StackName}'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-service-network'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Blue-Green Deployment Networking'
+
+  # ---------------------------------------------------------------------------
+  # BLUE TARGET GROUP
+  # ---------------------------------------------------------------------------
+  BlueTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-blue-tg-${AWS::StackName}'
+      Type: LAMBDA
+      Targets:
+        - Id: !Ref BlueLambdaFunction
+      HealthCheck:
+        Enabled: true
+        HealthCheckIntervalSeconds: 30
+        HealthCheckTimeoutSeconds: 5
+        HealthyThresholdCount: 2
+        UnhealthyThresholdCount: 3
+        Matcher:
+          HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-blue-target-group'
+        - Key: Environment
+          Value: 'blue'
+        - Key: Purpose
+          Value: 'Blue Environment Target Group'
+
+  # ---------------------------------------------------------------------------
+  # GREEN TARGET GROUP
+  # ---------------------------------------------------------------------------
+  GreenTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-green-tg-${AWS::StackName}'
+      Type: LAMBDA
+      Targets:
+        - Id: !Ref GreenLambdaFunction
+      HealthCheck:
+        Enabled: true
+        HealthCheckIntervalSeconds: 30
+        HealthCheckTimeoutSeconds: 5
+        HealthyThresholdCount: 2
+        UnhealthyThresholdCount: 3
+        Matcher:
+          HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-green-target-group'
+        - Key: Environment
+          Value: 'green'
+        - Key: Purpose
+          Value: 'Green Environment Target Group'
+
+  # ---------------------------------------------------------------------------
+  # VPC LATTICE SERVICE
+  # ---------------------------------------------------------------------------
+  LatticeService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub '${ProjectName}-service-${AWS::StackName}'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lattice-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Blue-Green Deployment Service'
+
+  # ---------------------------------------------------------------------------
+  # SERVICE NETWORK ASSOCIATION
+  # ---------------------------------------------------------------------------
+  ServiceNetworkAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      ServiceIdentifier: !Ref LatticeService
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-service-association'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # HTTP LISTENER WITH WEIGHTED ROUTING
+  # ---------------------------------------------------------------------------
+  HttpListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref LatticeService
+      Name: 'http-listener'
+      Protocol: HTTP
+      Port: 80
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref BlueTargetGroup
+              Weight: !Ref InitialBlueTrafficWeight
+            - TargetGroupIdentifier: !Ref GreenTargetGroup
+              Weight: !Ref InitialGreenTrafficWeight
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-http-listener'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # LAMBDA PERMISSIONS FOR VPC LATTICE
+  # ---------------------------------------------------------------------------
+  BlueLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BlueLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: vpc-lattice.amazonaws.com
+      SourceArn: !GetAtt BlueTargetGroup.Arn
+
+  GreenLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GreenLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: vpc-lattice.amazonaws.com
+      SourceArn: !GetAtt GreenTargetGroup.Arn
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS FOR GREEN ENVIRONMENT MONITORING
+  # ---------------------------------------------------------------------------
+  GreenEnvironmentErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-green-error-rate-${AWS::StackName}'
+      AlarmDescription: 'Monitor error rate for green environment deployment'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GreenLambdaFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DeploymentAlarmTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-green-error-alarm'
+        - Key: Environment
+          Value: 'green'
+        - Key: Purpose
+          Value: 'Deployment Monitoring'
+
+  GreenEnvironmentDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-green-duration-${AWS::StackName}'
+      AlarmDescription: 'Monitor duration for green environment deployment'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref DurationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GreenLambdaFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DeploymentAlarmTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-green-duration-alarm'
+        - Key: Environment
+          Value: 'green'
+        - Key: Purpose
+          Value: 'Performance Monitoring'
+
+  # ---------------------------------------------------------------------------
+  # SNS TOPIC FOR DEPLOYMENT ALERTS
+  # ---------------------------------------------------------------------------
+  DeploymentAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-deployment-alarms-${AWS::StackName}'
+      DisplayName: 'Blue-Green Deployment Alarms'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-deployment-alarms'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Deployment Monitoring'
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUPS
+  # ---------------------------------------------------------------------------
+  BlueLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-blue-${AWS::StackName}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-blue-logs'
+        - Key: Environment
+          Value: 'blue'
+
+  GreenLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-green-${AWS::StackName}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-green-logs'
+        - Key: Environment
+          Value: 'green'
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Service Information
+  ServiceNetworkId:
+    Description: 'VPC Lattice Service Network ID'
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-service-network-id'
+
+  ServiceNetworkArn:
+    Description: 'VPC Lattice Service Network ARN'
+    Value: !GetAtt ServiceNetwork.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-service-network-arn'
+
+  LatticeServiceId:
+    Description: 'VPC Lattice Service ID'
+    Value: !Ref LatticeService
+    Export:
+      Name: !Sub '${AWS::StackName}-lattice-service-id'
+
+  LatticeServiceArn:
+    Description: 'VPC Lattice Service ARN'
+    Value: !GetAtt LatticeService.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lattice-service-arn'
+
+  ServiceEndpoint:
+    Description: 'VPC Lattice Service DNS Endpoint'
+    Value: !GetAtt LatticeService.DnsEntry.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-service-endpoint'
+
+  ServiceEndpointUrl:
+    Description: 'Full HTTPS URL for the VPC Lattice Service'
+    Value: !Sub 'https://${LatticeService.DnsEntry.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-service-url'
+
+  # Lambda Function Information
+  BlueLambdaFunctionName:
+    Description: 'Blue environment Lambda function name'
+    Value: !Ref BlueLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-blue-function-name'
+
+  BlueLambdaFunctionArn:
+    Description: 'Blue environment Lambda function ARN'
+    Value: !GetAtt BlueLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-blue-function-arn'
+
+  GreenLambdaFunctionName:
+    Description: 'Green environment Lambda function name'
+    Value: !Ref GreenLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-green-function-name'
+
+  GreenLambdaFunctionArn:
+    Description: 'Green environment Lambda function ARN'
+    Value: !GetAtt GreenLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-green-function-arn'
+
+  # Target Group Information
+  BlueTargetGroupArn:
+    Description: 'Blue target group ARN'
+    Value: !GetAtt BlueTargetGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-blue-target-group-arn'
+
+  GreenTargetGroupArn:
+    Description: 'Green target group ARN'
+    Value: !GetAtt GreenTargetGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-green-target-group-arn'
+
+  # Traffic Distribution
+  CurrentBlueTrafficWeight:
+    Description: 'Current percentage of traffic routed to blue environment'
+    Value: !Ref InitialBlueTrafficWeight
+
+  CurrentGreenTrafficWeight:
+    Description: 'Current percentage of traffic routed to green environment'
+    Value: !Ref InitialGreenTrafficWeight
+
+  # Monitoring Information
+  DeploymentAlarmTopicArn:
+    Description: 'SNS Topic ARN for deployment alarms'
+    Value: !Ref DeploymentAlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-alarm-topic-arn'
+
+  # Useful Commands
+  TestCommand:
+    Description: 'Command to test the service endpoint'
+    Value: !Sub 'curl -s https://${LatticeService.DnsEntry.DomainName} | jq'
+
+  UpdateTrafficWeightsCommand:
+    Description: 'CLI command template to update traffic weights'
+    Value: !Sub |
+      aws vpc-lattice update-listener --service-identifier ${LatticeService} --listener-identifier ${HttpListener} --default-action '{"forward":{"targetGroups":[{"targetGroupIdentifier":"${BlueTargetGroup}","weight":NEW_BLUE_WEIGHT},{"targetGroupIdentifier":"${GreenTargetGroup}","weight":NEW_GREEN_WEIGHT}]}}'
+
+  MonitoringDashboardUrl:
+    Description: 'CloudWatch dashboard URL for monitoring both environments'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-deployment-dashboard'
+
+  # Deployment Information
+  DeploymentConfiguration:
+    Description: 'Current deployment configuration summary'
+    Value: !Sub |
+      Project: ${ProjectName}
+      Blue Version: ${BlueEnvironmentVersion} (${InitialBlueTrafficWeight}% traffic)
+      Green Version: ${GreenEnvironmentVersion} (${InitialGreenTrafficWeight}% traffic)
+      Environment: ${Environment}
+      Service Endpoint: https://${LatticeService.DnsEntry.DomainName}

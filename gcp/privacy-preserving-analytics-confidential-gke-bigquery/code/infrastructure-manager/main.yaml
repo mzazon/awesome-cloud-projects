@@ -1,0 +1,599 @@
+# Infrastructure Manager Configuration for Privacy-Preserving Analytics
+# Recipe: Privacy-Preserving Analytics with Confidential GKE and BigQuery
+# This configuration deploys a complete privacy-preserving analytics solution using
+# Confidential Computing technologies including Confidential GKE, BigQuery with CMEK,
+# Cloud KMS encryption, and Vertex AI for secure machine learning.
+
+metadata:
+  name: privacy-preserving-analytics
+  labels:
+    solution: privacy-analytics
+    security-level: confidential
+    compliance: hipaa-gdpr-ready
+
+# Input variables for customizable deployment
+variables:
+  project_id:
+    description: "Google Cloud Project ID for deployment"
+    type: string
+    required: true
+  
+  region:
+    description: "Primary deployment region"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Deployment zone for Confidential GKE cluster"
+    type: string
+    default: "us-central1-a"
+    
+  cluster_name:
+    description: "Name for the Confidential GKE cluster"
+    type: string
+    default: "confidential-analytics-cluster"
+    
+  keyring_name:
+    description: "Name for the Cloud KMS key ring"
+    type: string
+    default: "analytics-encryption-keyring"
+    
+  encryption_key_name:
+    description: "Name for the encryption key"
+    type: string
+    default: "analytics-encryption-key"
+    
+  dataset_name:
+    description: "BigQuery dataset name for sensitive analytics"
+    type: string
+    default: "sensitive_analytics_data"
+    
+  bucket_name:
+    description: "Cloud Storage bucket name for ML training data"
+    type: string
+    required: true
+    
+  node_count:
+    description: "Number of confidential nodes in the GKE cluster"
+    type: integer
+    default: 2
+    minimum: 1
+    maximum: 10
+    
+  machine_type:
+    description: "Machine type for Confidential GKE nodes"
+    type: string
+    default: "n2d-standard-4"
+    
+  enable_vertex_ai:
+    description: "Enable Vertex AI resources for ML training"
+    type: boolean
+    default: true
+
+# Required APIs for the privacy-preserving analytics solution
+resources:
+  # Enable Google Cloud APIs required for the solution
+  - name: container-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/container.googleapis.com
+      
+  - name: bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/bigquery.googleapis.com
+      
+  - name: cloudkms-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudkms.googleapis.com
+      
+  - name: aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/aiplatform.googleapis.com
+      
+  - name: compute-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/compute.googleapis.com
+      
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+
+  # Cloud KMS Key Ring for encryption management
+  - name: analytics-keyring
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      keyRingId: ${keyring_name}
+    depends_on:
+      - cloudkms-api
+
+  # Cloud KMS Encryption Key for data protection
+  - name: analytics-encryption-key
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    properties:
+      parent: $(ref.analytics-keyring.name)
+      cryptoKeyId: ${encryption_key_name}
+      purpose: ENCRYPT_DECRYPT
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+      # Key rotation policy for enhanced security
+      rotationPeriod: 7776000s  # 90 days
+      nextRotationTime: "2025-08-01T00:00:00Z"
+    depends_on:
+      - analytics-keyring
+
+  # Service Account for Confidential GKE cluster operations
+  - name: gke-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: confidential-gke-sa
+      displayName: "Confidential GKE Service Account"
+      description: "Service account for Confidential GKE cluster with minimal required permissions"
+      serviceAccount:
+        description: "Service account for privacy-preserving analytics cluster"
+
+  # IAM bindings for GKE service account - minimal required permissions
+  - name: gke-sa-node-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/container.nodeServiceAccount
+      member: serviceAccount:$(ref.gke-service-account.email)
+
+  - name: gke-sa-registry-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/storage.objectViewer
+      member: serviceAccount:$(ref.gke-service-account.email)
+
+  - name: gke-sa-monitoring-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.gke-service-account.email)
+
+  # Confidential GKE Cluster with hardware-based encryption
+  - name: confidential-analytics-cluster
+    type: gcp-types/container-v1:projects.zones.clusters
+    properties:
+      parent: projects/${project_id}/locations/${zone}
+      cluster:
+        name: ${cluster_name}
+        description: "Confidential GKE cluster for privacy-preserving analytics"
+        location: ${zone}
+        
+        # Initial node pool configuration
+        initialNodeCount: ${node_count}
+        
+        # Network configuration for security
+        ipAllocationPolicy:
+          useIpAliases: true
+          
+        # Security and confidential computing configuration
+        confidentialNodes:
+          enabled: true
+        
+        # Node configuration with confidential computing
+        nodeConfig:
+          machineType: ${machine_type}
+          diskSizeGb: 100
+          diskType: pd-ssd
+          
+          # Enable confidential nodes with SEV encryption
+          confidentialNodes:
+            enabled: true
+          
+          # Service account with minimal permissions
+          serviceAccount: $(ref.gke-service-account.email)
+          
+          # OAuth scopes for secure access
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+            - https://www.googleapis.com/auth/bigquery
+            - https://www.googleapis.com/auth/cloudkms
+            
+          # Security context and hardening
+          shieldedInstanceConfig:
+            enableSecureBoot: true
+            enableIntegrityMonitoring: true
+            
+          # Disk encryption with customer-managed key
+          bootDiskKmsKey: $(ref.analytics-encryption-key.name)
+          
+          # Node metadata for security
+          metadata:
+            disable-legacy-endpoints: "true"
+            
+          # Network tags for firewall rules
+          tags:
+            - confidential-analytics
+            - privacy-preserving
+            
+        # Cluster-level security configurations
+        masterAuth:
+          clientCertificateConfig:
+            issueClientCertificate: false
+            
+        # Network policy for micro-segmentation
+        networkPolicy:
+          enabled: true
+          provider: CALICO
+          
+        # IP alias configuration for better networking
+        ipAllocationPolicy:
+          useIpAliases: true
+          clusterSecondaryRangeName: pods
+          servicesSecondaryRangeName: services
+          
+        # Private cluster configuration
+        privateClusterConfig:
+          enablePrivateNodes: true
+          enablePrivateEndpoint: false
+          masterIpv4CidrBlock: "172.16.0.0/28"
+          
+        # Master authorized networks (restrict access)
+        masterAuthorizedNetworksConfig:
+          enabled: true
+          cidrBlocks:
+            - cidrBlock: "0.0.0.0/0"
+              displayName: "All networks (restrict in production)"
+              
+        # Logging and monitoring configuration
+        loggingService: logging.googleapis.com/kubernetes
+        monitoringService: monitoring.googleapis.com/kubernetes
+        
+        # Workload Identity for secure pod-to-GCP authentication
+        workloadIdentityConfig:
+          workloadPool: ${project_id}.svc.id.goog
+          
+        # Cluster resource labels
+        resourceLabels:
+          environment: privacy-analytics
+          security-level: confidential
+          compliance: regulated
+          
+    depends_on:
+      - container-api
+      - gke-service-account
+      - analytics-encryption-key
+
+  # BigQuery dataset with customer-managed encryption
+  - name: sensitive-analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      projectId: ${project_id}
+      datasetId: ${dataset_name}
+      location: ${region}
+      
+      # Dataset configuration
+      description: "Privacy-preserving analytics dataset with CMEK encryption"
+      
+      # Customer-managed encryption configuration
+      defaultEncryptionConfiguration:
+        kmsKeyName: $(ref.analytics-encryption-key.name)
+        
+      # Access control and security
+      access:
+        - role: OWNER
+          userByEmail: $(ref.bigquery-service-account.email)
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+          
+      # Dataset labels for organization
+      labels:
+        environment: privacy-analytics
+        encryption: cmek
+        compliance: regulated
+        
+      # Default table expiration (optional, remove for permanent data)
+      defaultTableExpirationMs: "7776000000"  # 90 days
+      
+    depends_on:
+      - bigquery-api
+      - analytics-encryption-key
+
+  # Service Account for BigQuery operations
+  - name: bigquery-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: bigquery-analytics-sa
+      displayName: "BigQuery Analytics Service Account"
+      description: "Service account for BigQuery analytics operations with CMEK"
+
+  # IAM bindings for BigQuery service account
+  - name: bigquery-sa-data-editor
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.bigquery-service-account.email)
+
+  - name: bigquery-sa-job-user
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/bigquery.jobUser
+      member: serviceAccount:$(ref.bigquery-service-account.email)
+
+  - name: bigquery-sa-kms-decrypt
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/cloudkms.cryptoKeyEncrypterDecrypter
+      member: serviceAccount:$(ref.bigquery-service-account.email)
+
+  # Cloud Storage bucket for ML training data with encryption
+  - name: ml-training-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${bucket_name}
+      location: ${region}
+      storageClass: STANDARD
+      
+      # Bucket encryption with customer-managed key
+      encryption:
+        defaultKmsKeyName: $(ref.analytics-encryption-key.name)
+        
+      # Versioning for data protection
+      versioning:
+        enabled: true
+        
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              
+      # Uniform bucket-level access for security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+          
+      # Bucket labels
+      labels:
+        environment: privacy-analytics
+        purpose: ml-training
+        encryption: cmek
+        
+    depends_on:
+      - storage-api
+      - analytics-encryption-key
+
+  # Service Account for Vertex AI operations (conditional)
+  - name: vertex-ai-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: vertex-ai-analytics-sa
+      displayName: "Vertex AI Analytics Service Account"
+      description: "Service account for Vertex AI ML training with encryption"
+    condition: ${enable_vertex_ai}
+
+  # IAM bindings for Vertex AI service account (conditional)
+  - name: vertex-sa-ai-platform-user
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.vertex-ai-service-account.email)
+    condition: ${enable_vertex_ai}
+
+  - name: vertex-sa-storage-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.vertex-ai-service-account.email)
+    condition: ${enable_vertex_ai}
+
+  - name: vertex-sa-kms-decrypt
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/cloudkms.cryptoKeyEncrypterDecrypter
+      member: serviceAccount:$(ref.vertex-ai-service-account.email)
+    condition: ${enable_vertex_ai}
+
+  # Sample BigQuery table for patient analytics (with schema)
+  - name: patient-analytics-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${project_id}
+      datasetId: $(ref.sensitive-analytics-dataset.datasetId)
+      tableId: patient_analytics
+      
+      # Table schema for healthcare analytics
+      schema:
+        fields:
+          - name: patient_id
+            type: STRING
+            mode: REQUIRED
+            description: "Anonymized patient identifier"
+          - name: age
+            type: INTEGER
+            mode: REQUIRED
+            description: "Patient age in years"
+          - name: diagnosis
+            type: STRING
+            mode: REQUIRED
+            description: "Primary diagnosis category"
+          - name: treatment_cost
+            type: FLOAT
+            mode: REQUIRED
+            description: "Treatment cost in USD"
+          - name: region
+            type: STRING
+            mode: REQUIRED
+            description: "Geographic region"
+          - name: admission_date
+            type: DATE
+            mode: REQUIRED
+            description: "Hospital admission date"
+            
+      # Table description and metadata
+      description: "Encrypted patient analytics data for privacy-preserving analysis"
+      
+      # Table labels
+      labels:
+        data-type: healthcare
+        privacy-level: sensitive
+        encryption: cmek
+        
+    depends_on:
+      - sensitive-analytics-dataset
+
+  # VPC network for Confidential GKE (optional enhanced security)
+  - name: confidential-network
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: confidential-analytics-network
+      description: "Private network for confidential analytics workloads"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    depends_on:
+      - compute-api
+
+  # Subnet for Confidential GKE cluster
+  - name: confidential-subnet
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: confidential-analytics-subnet
+      description: "Subnet for confidential GKE cluster"
+      network: $(ref.confidential-network.selfLink)
+      ipCidrRange: "10.0.0.0/24"
+      region: ${region}
+      
+      # Secondary ranges for pods and services
+      secondaryIpRanges:
+        - rangeName: pods
+          ipCidrRange: "10.1.0.0/16"
+        - rangeName: services
+          ipCidrRange: "10.2.0.0/16"
+          
+      # Enable private Google access
+      privateIpGoogleAccess: true
+      
+    depends_on:
+      - confidential-network
+
+  # Firewall rules for secure access
+  - name: confidential-firewall-internal
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: confidential-internal-access
+      description: "Allow internal communication within confidential network"
+      network: $(ref.confidential-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      
+      # Allow internal network communication
+      sourceRanges:
+        - "10.0.0.0/8"
+        
+      allowed:
+        - IPProtocol: tcp
+          ports: ["1-65535"]
+        - IPProtocol: udp
+          ports: ["1-65535"]
+        - IPProtocol: icmp
+          
+      targetTags:
+        - confidential-analytics
+        
+    depends_on:
+      - confidential-network
+
+# Outputs for integration and verification
+outputs:
+  # Cluster information
+  cluster_name:
+    description: "Name of the Confidential GKE cluster"
+    value: $(ref.confidential-analytics-cluster.name)
+    
+  cluster_endpoint:
+    description: "Confidential GKE cluster endpoint"
+    value: $(ref.confidential-analytics-cluster.endpoint)
+    
+  cluster_ca_certificate:
+    description: "Cluster CA certificate for kubectl configuration"
+    value: $(ref.confidential-analytics-cluster.masterAuth.clusterCaCertificate)
+    
+  # Encryption key information
+  kms_key_name:
+    description: "Full resource name of the encryption key"
+    value: $(ref.analytics-encryption-key.name)
+    
+  kms_keyring_name:
+    description: "Full resource name of the key ring"
+    value: $(ref.analytics-keyring.name)
+    
+  # BigQuery dataset information
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for analytics"
+    value: $(ref.sensitive-analytics-dataset.datasetId)
+    
+  bigquery_dataset_location:
+    description: "BigQuery dataset location"
+    value: $(ref.sensitive-analytics-dataset.location)
+    
+  # Storage bucket information
+  ml_bucket_name:
+    description: "Cloud Storage bucket for ML training data"
+    value: $(ref.ml-training-bucket.name)
+    
+  ml_bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: gs://$(ref.ml-training-bucket.name)
+    
+  # Service account information
+  gke_service_account_email:
+    description: "Email of the GKE service account"
+    value: $(ref.gke-service-account.email)
+    
+  bigquery_service_account_email:
+    description: "Email of the BigQuery service account"
+    value: $(ref.bigquery-service-account.email)
+    
+  vertex_ai_service_account_email:
+    description: "Email of the Vertex AI service account"
+    value: $(ref.vertex-ai-service-account.email)
+    condition: ${enable_vertex_ai}
+    
+  # Network information
+  network_name:
+    description: "Name of the confidential analytics network"
+    value: $(ref.confidential-network.name)
+    
+  subnet_name:
+    description: "Name of the confidential analytics subnet"
+    value: $(ref.confidential-subnet.name)
+    
+  # Connection commands for quick access
+  kubectl_connection_command:
+    description: "Command to connect kubectl to the confidential cluster"
+    value: gcloud container clusters get-credentials ${cluster_name} --zone=${zone} --project=${project_id}
+    
+  bigquery_connection_info:
+    description: "BigQuery dataset connection information"
+    value: "Dataset: ${project_id}:$(ref.sensitive-analytics-dataset.datasetId), Location: ${region}, Encryption: CMEK"
+    
+  # Security compliance information
+  security_features:
+    description: "Security features enabled in this deployment"
+    value: "Confidential Computing (SEV), CMEK Encryption, Private GKE, Workload Identity, Network Policies"
+    
+  compliance_standards:
+    description: "Compliance standards supported by this configuration"
+    value: "HIPAA, GDPR, SOC 2, FedRAMP moderate (with additional configurations)"

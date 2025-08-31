@@ -1,0 +1,842 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Traffic Analytics with VPC Lattice and OpenSearch - A comprehensive solution for 
+  real-time service mesh observability. This template deploys OpenSearch Service,
+  Kinesis Data Firehose, Lambda transformation functions, and VPC Lattice resources
+  to capture, process, and analyze traffic data in real-time.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - EnvironmentName
+          - ProjectName
+      - Label:
+          default: "OpenSearch Configuration"
+        Parameters:
+          - OpenSearchInstanceType
+          - OpenSearchInstanceCount
+          - OpenSearchVolumeSize
+          - OpenSearchEngineVersion
+      - Label:
+          default: "VPC Lattice Configuration"
+        Parameters:
+          - CreateDemoService
+          - ServiceNetworkAuthType
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Firehose Configuration"
+        Parameters:
+          - FirehoseBufferSize
+          - FirehoseBufferInterval
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      OpenSearchInstanceType:
+        default: "OpenSearch Instance Type"
+      OpenSearchInstanceCount:
+        default: "OpenSearch Instance Count"
+      OpenSearchVolumeSize:
+        default: "EBS Volume Size (GB)"
+      OpenSearchEngineVersion:
+        default: "OpenSearch Engine Version"
+      CreateDemoService:
+        default: "Create Demo VPC Lattice Service"
+      ServiceNetworkAuthType:
+        default: "Service Network Auth Type"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      FirehoseBufferSize:
+        default: "Firehose Buffer Size (MB)"
+      FirehoseBufferInterval:
+        default: "Firehose Buffer Interval (seconds)"
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name used for resource naming and tagging
+    AllowedPattern: ^[a-z0-9\-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    
+  ProjectName:
+    Type: String
+    Default: traffic-analytics
+    Description: Project name used for resource naming and tagging
+    AllowedPattern: ^[a-z0-9\-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    
+  OpenSearchInstanceType:
+    Type: String
+    Default: t3.small.search
+    Description: Instance type for OpenSearch domain
+    AllowedValues:
+      - t3.small.search
+      - t3.medium.search
+      - m6g.large.search
+      - m6g.xlarge.search
+      - c6g.large.search
+      - c6g.xlarge.search
+    ConstraintDescription: Must be a valid OpenSearch instance type
+    
+  OpenSearchInstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 3
+    Description: Number of instances in the OpenSearch domain
+    
+  OpenSearchVolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 10
+    MaxValue: 100
+    Description: EBS volume size for each OpenSearch instance (GB)
+    
+  OpenSearchEngineVersion:
+    Type: String
+    Default: OpenSearch_2.11
+    Description: OpenSearch engine version
+    AllowedValues:
+      - OpenSearch_2.11
+      - OpenSearch_2.9
+      - OpenSearch_2.7
+    ConstraintDescription: Must be a supported OpenSearch version
+    
+  CreateDemoService:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create a demo VPC Lattice service for testing
+    
+  ServiceNetworkAuthType:
+    Type: String
+    Default: AWS_IAM
+    AllowedValues: [AWS_IAM, NONE]
+    Description: Authentication type for VPC Lattice service network
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 300
+    Description: Lambda function timeout in seconds
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024]
+    Description: Lambda function memory size in MB
+    
+  FirehoseBufferSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 5
+    Description: Firehose buffer size in MB
+    
+  FirehoseBufferInterval:
+    Type: Number
+    Default: 60
+    MinValue: 60
+    MaxValue: 900
+    Description: Firehose buffer interval in seconds
+
+Conditions:
+  ShouldCreateDemoService: !Equals [!Ref CreateDemoService, 'true']
+  IsProductionSize: !Not [!Equals [!Ref OpenSearchInstanceType, 't3.small.search']]
+
+Resources:
+  # =====================================================
+  # S3 Bucket for Firehose Backup and Error Records
+  # =====================================================
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${EnvironmentName}-backup-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref FirehoseLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-backup"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "Firehose backup and error records"
+
+  # =====================================================
+  # CloudWatch Log Groups
+  # =====================================================
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${EnvironmentName}-transform"
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-lambda-logs"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/kinesisfirehose/${ProjectName}-${EnvironmentName}-stream"
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-firehose-logs"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================================================
+  # IAM Roles and Policies
+  # =====================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvironmentName}-lambda-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${EnvironmentName}-transform*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-lambda-role"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvironmentName}-firehose-delivery-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OpenSearchDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:DescribeDomain
+                  - es:DescribeDomains
+                  - es:DescribeDomainConfig
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                Resource: !GetAtt OpenSearchDomain.DomainArn
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                Resource: !Sub "${OpenSearchDomain.DomainArn}/*"
+        - PolicyName: S3DeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt BackupBucket.Arn
+                  - !Sub "${BackupBucket.Arn}/*"
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !GetAtt TransformFunction.Arn
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt FirehoseLogGroup.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-firehose-role"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================================================
+  # Lambda Function for Data Transformation
+  # =====================================================
+  TransformFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvironmentName}-transform"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Description: Transform VPC Lattice access logs for OpenSearch analytics
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          ENVIRONMENT: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import gzip
+          import datetime
+          import logging
+          import os
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              """
+              Transform VPC Lattice access logs for OpenSearch analytics.
+              Enriches log data with derived fields for better analytics.
+              """
+              logger.info(f"Processing {len(event['records'])} records")
+              output = []
+              
+              for record in event['records']:
+                  try:
+                      # Decode and decompress the data
+                      compressed_payload = base64.b64decode(record['data'])
+                      uncompressed_payload = gzip.decompress(compressed_payload)
+                      log_data = json.loads(uncompressed_payload)
+                      
+                      # Transform and enrich each log entry
+                      for log_entry in log_data.get('logEvents', []):
+                          processed_record = process_log_entry(record['recordId'], log_entry, log_data)
+                          if processed_record:
+                              output.append(processed_record)
+                              
+                  except Exception as e:
+                      logger.error(f"Error processing record {record['recordId']}: {str(e)}")
+                      # If processing fails, mark as processing failure
+                      output.append({
+                          'recordId': record['recordId'],
+                          'result': 'ProcessingFailed'
+                      })
+              
+              logger.info(f"Successfully processed {len(output)} records")
+              return {'records': output}
+
+          def process_log_entry(record_id, log_entry, log_data):
+              """Process individual log entry and add enrichment fields."""
+              try:
+                  # Parse the log message if it's JSON
+                  if log_entry['message'].startswith('{'):
+                      parsed_log = json.loads(log_entry['message'])
+                      
+                      # Add timestamp and enrichment fields
+                      parsed_log['@timestamp'] = datetime.datetime.fromtimestamp(
+                          log_entry['timestamp'] / 1000
+                      ).isoformat()
+                      parsed_log['log_group'] = log_data.get('logGroup', '')
+                      parsed_log['log_stream'] = log_data.get('logStream', '')
+                      
+                      # Add derived fields for analytics
+                      if 'responseCode' in parsed_log:
+                          parsed_log['response_class'] = str(parsed_log['responseCode'])[0] + 'xx'
+                          parsed_log['is_error'] = parsed_log['responseCode'] >= 400
+                          parsed_log['is_success'] = 200 <= parsed_log['responseCode'] < 300
+                      
+                      if 'responseTimeMs' in parsed_log:
+                          parsed_log['response_time_bucket'] = categorize_response_time(
+                              parsed_log['responseTimeMs']
+                          )
+                      
+                      # Add geographical and security context if available
+                      if 'sourceIpPort' in parsed_log:
+                          parsed_log['source_ip'] = parsed_log['sourceIpPort'].split(':')[0]
+                      
+                      if 'userAgent' in parsed_log:
+                          parsed_log['user_agent_category'] = categorize_user_agent(parsed_log['userAgent'])
+                      
+                      output_record = {
+                          'recordId': record_id,
+                          'result': 'Ok',
+                          'data': base64.b64encode(
+                              (json.dumps(parsed_log) + '\n').encode('utf-8')
+                          ).decode('utf-8')
+                      }
+                  else:
+                      # If not JSON, pass through with minimal processing
+                      enhanced_log = {
+                          'message': log_entry['message'],
+                          '@timestamp': datetime.datetime.fromtimestamp(
+                              log_entry['timestamp'] / 1000
+                          ).isoformat(),
+                          'log_group': log_data.get('logGroup', ''),
+                          'log_stream': log_data.get('logStream', ''),
+                          'raw_log': True
+                      }
+                      
+                      output_record = {
+                          'recordId': record_id,
+                          'result': 'Ok',
+                          'data': base64.b64encode(
+                              (json.dumps(enhanced_log) + '\n').encode('utf-8')
+                          ).decode('utf-8')
+                      }
+                  
+                  return output_record
+                  
+              except Exception as e:
+                  logger.error(f"Error processing log entry for record {record_id}: {str(e)}")
+                  return None
+
+          def categorize_response_time(response_time_ms):
+              """Categorize response times for analytics."""
+              if response_time_ms < 100:
+                  return 'fast'
+              elif response_time_ms < 500:
+                  return 'medium'
+              elif response_time_ms < 2000:
+                  return 'slow'
+              else:
+                  return 'very_slow'
+
+          def categorize_user_agent(user_agent):
+              """Categorize user agents for analytics."""
+              user_agent_lower = user_agent.lower()
+              
+              if 'bot' in user_agent_lower or 'crawler' in user_agent_lower:
+                  return 'bot'
+              elif 'mobile' in user_agent_lower or 'android' in user_agent_lower or 'iphone' in user_agent_lower:
+                  return 'mobile'
+              elif 'chrome' in user_agent_lower:
+                  return 'chrome'
+              elif 'firefox' in user_agent_lower:
+                  return 'firefox'
+              elif 'safari' in user_agent_lower:
+                  return 'safari'
+              elif 'edge' in user_agent_lower:
+                  return 'edge'
+              else:
+                  return 'other'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-transform"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================================================
+  # OpenSearch Service Domain
+  # =====================================================
+  OpenSearchDomain:
+    Type: AWS::OpenSearch::Domain
+    Properties:
+      DomainName: !Sub "${ProjectName}-${EnvironmentName}-analytics"
+      EngineVersion: !Ref OpenSearchEngineVersion
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: !Ref OpenSearchInstanceCount
+        DedicatedMasterEnabled: false
+        WarmEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: !Ref OpenSearchVolumeSize
+        Iops: !If [IsProductionSize, 3000, 3000]
+        Throughput: !If [IsProductionSize, 125, 125]
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: "Policy-Min-TLS-1-2-2019-07"
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      EncryptionAtRestOptions:
+        Enabled: true
+      AdvancedSecurityOptions:
+        Enabled: false  # Simplified for demo - enable for production
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "es:*"
+            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-${EnvironmentName}-analytics/*"
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt FirehoseDeliveryRole.Arn
+            Action:
+              - "es:ESHttpPost"
+              - "es:ESHttpPut"
+              - "es:DescribeDomain"
+              - "es:DescribeDomains"
+              - "es:DescribeDomainConfig"
+            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-${EnvironmentName}-analytics/*"
+      AdvancedOptions:
+        "rest.action.multi.allow_explicit_index": "true"
+        "indices.fielddata.cache.size": "20%"
+        "indices.query.bool.max_clause_count": "1024"
+      LogPublishingOptions:
+        INDEX_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !Sub "${OpenSearchLogGroup.Arn}"
+          Enabled: true
+        SEARCH_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !Sub "${OpenSearchLogGroup.Arn}"
+          Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-analytics"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  OpenSearchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/opensearch/domains/${ProjectName}-${EnvironmentName}-analytics"
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-opensearch-logs"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================================================
+  # Kinesis Data Firehose Delivery Stream
+  # =====================================================
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn: 
+      - FirehoseDeliveryRole
+      - OpenSearchDomain
+    Properties:
+      DeliveryStreamName: !Sub "${ProjectName}-${EnvironmentName}-stream"
+      DeliveryStreamType: DirectPut
+      AmazonopensearchserviceDestinationConfiguration:
+        DomainARN: !GetAtt OpenSearchDomain.DomainArn
+        IndexName: vpc-lattice-traffic
+        IndexRotationPeriod: OneDay
+        TypeName: "_doc"
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        BufferingHints:
+          IntervalInSeconds: !Ref FirehoseBufferInterval
+          SizeInMBs: !Ref FirehoseBufferSize
+        RetryOptions:
+          DurationInSeconds: 300
+        S3BackupMode: FailedDocumentsOnly
+        S3Configuration:
+          BucketARN: !GetAtt BackupBucket.Arn
+          Prefix: "firehose-backup/"
+          ErrorOutputPrefix: "firehose-errors/"
+          RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+          BufferingHints:
+            SizeInMBs: !Ref FirehoseBufferSize
+            IntervalInSeconds: !Ref FirehoseBufferInterval
+          CompressionFormat: GZIP
+          CloudWatchLoggingOptions:
+            Enabled: true
+            LogGroupName: !Ref FirehoseLogGroup
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt TransformFunction.Arn
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: 1
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: 60
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-stream"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================================================
+  # VPC Lattice Service Network
+  # =====================================================
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvironmentName}-network"
+      AuthType: !Ref ServiceNetworkAuthType
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-network"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================================================
+  # Demo VPC Lattice Service (Optional)
+  # =====================================================
+  DemoService:
+    Type: AWS::VpcLattice::Service
+    Condition: ShouldCreateDemoService
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvironmentName}-demo-service"
+      AuthType: !Ref ServiceNetworkAuthType
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-demo-service"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DemoServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Condition: ShouldCreateDemoService
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      ServiceIdentifier: !Ref DemoService
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-demo-association"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================================================
+  # VPC Lattice Access Log Subscription
+  # =====================================================
+  AccessLogSubscription:
+    Type: AWS::VpcLattice::AccessLogSubscription
+    DependsOn: DeliveryStream
+    Properties:
+      ResourceIdentifier: !Ref ServiceNetwork
+      DestinationArn: !GetAtt DeliveryStream.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentName}-access-logs"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================================================
+  # CloudWatch Alarms for Monitoring
+  # =====================================================
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvironmentName}-lambda-errors"
+      AlarmDescription: Lambda function errors for traffic transformation
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransformFunction
+      TreatMissingData: notBreaching
+
+  FirehoseDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvironmentName}-firehose-failures"
+      AlarmDescription: Firehose delivery failures to OpenSearch
+      MetricName: DeliveryToAmazonOpenSearchService.Success
+      Namespace: AWS/Kinesis/Firehose
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.95
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value: !Ref DeliveryStream
+      TreatMissingData: notBreaching
+
+  OpenSearchClusterStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvironmentName}-opensearch-status"
+      AlarmDescription: OpenSearch cluster status monitoring
+      MetricName: ClusterStatus.red
+      Namespace: AWS/ES
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DomainName
+          Value: !Ref OpenSearchDomain
+        - Name: ClientId
+          Value: !Ref "AWS::AccountId"
+      TreatMissingData: notBreaching
+
+# =====================================================
+# Outputs
+# =====================================================
+Outputs:
+  OpenSearchDomainEndpoint:
+    Description: OpenSearch domain endpoint for analytics queries
+    Value: !Sub "https://${OpenSearchDomain.DomainEndpoint}"
+    Export:
+      Name: !Sub "${AWS::StackName}-OpenSearchEndpoint"
+      
+  OpenSearchDashboardsURL:
+    Description: OpenSearch Dashboards URL for visualization
+    Value: !Sub "https://${OpenSearchDomain.DomainEndpoint}/_dashboards"
+    Export:
+      Name: !Sub "${AWS::StackName}-DashboardsURL"
+      
+  FirehoseDeliveryStreamArn:
+    Description: Kinesis Data Firehose delivery stream ARN
+    Value: !GetAtt DeliveryStream.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-FirehoseArn"
+      
+  ServiceNetworkArn:
+    Description: VPC Lattice service network ARN
+    Value: !GetAtt ServiceNetwork.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetworkArn"
+      
+  ServiceNetworkId:
+    Description: VPC Lattice service network ID
+    Value: !GetAtt ServiceNetwork.Id
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetworkId"
+      
+  DemoServiceArn:
+    Condition: ShouldCreateDemoService
+    Description: Demo VPC Lattice service ARN (if created)
+    Value: !GetAtt DemoService.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DemoServiceArn"
+      
+  LambdaFunctionArn:
+    Description: Lambda transformation function ARN
+    Value: !GetAtt TransformFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaArn"
+      
+  BackupBucketName:
+    Description: S3 bucket for backup and error records
+    Value: !Ref BackupBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BackupBucket"
+      
+  AccessLogSubscriptionArn:
+    Description: VPC Lattice access log subscription ARN
+    Value: !GetAtt AccessLogSubscription.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AccessLogSubscriptionArn"
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this solution (USD)
+    Value: !If 
+      - IsProductionSize
+      - "$400-800 (production sizing)"
+      - "$150-300 (development sizing)"
+      
+  NextSteps:
+    Description: Next steps after deployment
+    Value: |
+      1. Wait 10-15 minutes for OpenSearch domain to be fully ready
+      2. Access OpenSearch Dashboards to create index patterns
+      3. Generate traffic through your VPC Lattice services
+      4. Monitor CloudWatch alarms for system health
+      5. Create custom dashboards for your specific use cases

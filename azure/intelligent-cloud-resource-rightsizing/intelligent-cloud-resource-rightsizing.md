@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Cost Management, Azure Monitor, Azure Developer CLI, Azure Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-optimization, rightsizing, automation, monitoring, devops
 recipe-generator-version: 1.3
@@ -296,32 +296,37 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
    Azure Logic Apps provides workflow automation capabilities that enable sophisticated resource management workflows triggered by Function App recommendations. Logic Apps can orchestrate complex approval processes, integrate with external systems, and execute resource modifications based on predefined business rules. This visual workflow approach simplifies the creation of automated rightsizing processes while maintaining proper governance and control.
 
    ```bash
+   # Create Logic App workflow definition file
+   cat > logic-workflow.json << 'EOF'
+   {
+     "$schema": "https://schema.management.azure.com/schemas/2016-06-01/workflowdefinition.json#",
+     "contentVersion": "1.0.0.0",
+     "parameters": {},
+     "triggers": {
+       "manual": {
+         "type": "Request",
+         "kind": "Http"
+       }
+     },
+     "actions": {
+       "ProcessRecommendations": {
+         "type": "Http",
+         "inputs": {
+           "method": "POST",
+           "uri": "@parameters('functionUrl')",
+           "body": "@triggerBody()"
+         }
+       }
+     }
+   }
+   EOF
+   
    # Create Logic App
    az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --name ${LOGIC_APP_NAME} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/schemas/2016-06-01/workflowdefinition.json#",
-         "contentVersion": "1.0.0.0",
-         "parameters": {},
-         "triggers": {
-           "manual": {
-             "type": "Request",
-             "kind": "Http"
-           }
-         },
-         "actions": {
-           "ProcessRecommendations": {
-             "type": "Http",
-             "inputs": {
-               "method": "POST",
-               "uri": "@parameters(\"functionUrl\")",
-               "body": "@triggerBody()"
-             }
-           }
-         }
-       }'
+       --definition @logic-workflow.json
    
    # Get Logic App callback URL
    LOGIC_APP_URL=$(az logic workflow show \
@@ -366,6 +371,9 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
          Invoke-RestMethod -Uri $functionUrl -Method Post
    EOF
    
+   # Create environment configuration directory
+   mkdir -p .azure/dev
+   
    # Create environment configuration
    cat > .azure/dev/.env << EOF
    AZURE_RESOURCE_GROUP=${RESOURCE_GROUP}
@@ -390,18 +398,24 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --budget-name "rightsizing-budget" \
        --amount 100 \
        --time-grain Monthly \
-       --time-period start-date="2025-01-01" \
-       --category Cost \
-       --threshold 80 \
-       --contact-emails "admin@company.com"
+       --start-date "2025-08-01" \
+       --end-date "2025-12-31" \
+       --category Cost
+   
+   # Create action group for notifications
+   az monitor action-group create \
+       --resource-group ${RESOURCE_GROUP} \
+       --name "rightsizing-alerts" \
+       --email-receivers name=admin email=admin@company.com
    
    # Create cost alert rule
    az monitor metrics alert create \
        --name "high-cost-alert" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}" \
-       --condition "avg Microsoft.Consumption/Budget/cost > 80" \
-       --description "Alert when resource group costs exceed 80% of budget"
+       --condition "avg Budget \> 80" \
+       --description "Alert when resource group costs exceed 80% of budget" \
+       --action rightsizing-alerts
    
    echo "✅ Cost monitoring alerts configured"
    ```
@@ -453,23 +467,22 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --name "function-error-alert" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Web/sites/${FUNCTION_APP_NAME}" \
-       --condition "total FunctionExecutionCount < 1" \
-       --description "Alert when rightsizing function fails to execute" \
+       --condition "total Http5xx \> 1" \
+       --description "Alert when rightsizing function has HTTP errors" \
        --evaluation-frequency 5m \
-       --window-size 15m
+       --window-size 15m \
+       --action rightsizing-alerts
    
-   # Create custom dashboard for rightsizing metrics
-   az portal dashboard create \
+   # Create alert for budget threshold
+   az monitor metrics alert create \
+       --name "budget-threshold-alert" \
        --resource-group ${RESOURCE_GROUP} \
-       --name "rightsizing-dashboard" \
-       --input-path dashboard.json \
-       --location ${LOCATION}
-   
-   # Configure notification group
-   az monitor action-group create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name "rightsizing-alerts" \
-       --email-receivers name=admin email=admin@company.com
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}" \
+       --condition "total Cost \> 80" \
+       --description "Alert when budget threshold is exceeded" \
+       --evaluation-frequency 1h \
+       --window-size 24h \
+       --action rightsizing-alerts
    
    echo "✅ Monitoring and alerting configured"
    ```
@@ -520,17 +533,14 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
 
    ```bash
    # Check budget status
-   az consumption budget show \
-       --resource-group ${RESOURCE_GROUP} \
-       --budget-name "rightsizing-budget" \
-       --query "{name:name, amount:amount, currentSpend:currentSpend}" \
+   az consumption budget list \
+       --query "[?name=='rightsizing-budget'].{name:name, amount:amount, currentSpend:currentSpend}" \
        --output table
    
    # Verify alert rules
-   az monitor metrics alert show \
+   az monitor metrics alert list \
        --resource-group ${RESOURCE_GROUP} \
-       --name "high-cost-alert" \
-       --query "{name:name, enabled:enabled, condition:criteria}" \
+       --query "[].{name:name, enabled:enabled}" \
        --output table
    ```
 
@@ -645,4 +655,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,467 @@
+# Infrastructure Manager Configuration for Smart Form Processing
+# Recipe: Smart Form Processing with Document AI and Gemini
+# Services: Document AI, Vertex AI Gemini, Cloud Functions, Cloud Storage
+
+# Global configuration
+imports:
+  - path: terraform
+
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "GCP Project ID for the smart form processing system"
+    validation:
+      condition: "length(var.project_id) > 6"
+      error_message: "Project ID must be at least 6 characters long."
+
+  region:
+    type: string
+    description: "GCP region for deploying resources"
+    default: "us-central1"
+    validation:
+      condition: "contains(['us-central1', 'us-east1', 'us-west1', 'europe-west1', 'asia-east1'], var.project_id)"
+      error_message: "Region must be a valid GCP region supporting Document AI and Vertex AI."
+
+  resource_suffix:
+    type: string
+    description: "Unique suffix for resource names to avoid conflicts"
+    default: ""
+    validation:
+      condition: "length(var.resource_suffix) <= 8"
+      error_message: "Resource suffix must be 8 characters or less."
+
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function"
+    default: "1024Mi"
+    validation:
+      condition: "contains(['512Mi', '1024Mi', '2048Mi', '4096Mi'], var.function_memory)"
+      error_message: "Function memory must be 512Mi, 1024Mi, 2048Mi, or 4096Mi."
+
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution"
+    default: "540s"
+
+  enable_logging:
+    type: bool
+    description: "Enable enhanced logging for debugging"
+    default: true
+
+  storage_class:
+    type: string
+    description: "Storage class for Cloud Storage buckets"
+    default: "STANDARD"
+    validation:
+      condition: "contains(['STANDARD', 'NEARLINE', 'COLDLINE'], var.storage_class)"
+      error_message: "Storage class must be STANDARD, NEARLINE, or COLDLINE."
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: documentai_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/documentai.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      description: "Enable Document AI API for form processing capabilities"
+
+  - name: aiplatform_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/aiplatform.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      description: "Enable Vertex AI API for Gemini model access"
+
+  - name: cloudfunctions_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudfunctions.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      description: "Enable Cloud Functions API for serverless processing"
+
+  - name: storage_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      description: "Enable Cloud Storage API for file management"
+
+  - name: cloudbuild_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudbuild.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      description: "Enable Cloud Build API for function deployment"
+
+  - name: eventarc_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/eventarc.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      description: "Enable Eventarc API for event-driven triggers"
+
+  # Cloud Storage bucket for input forms
+  - name: forms_input_bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: forms-input-${resource_suffix}
+      project: ${project_id}
+      location: ${region}
+      storageClass: ${storage_class}
+      versioning:
+        enabled: false
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              matchesStorageClass: [${storage_class}]
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      labels:
+        purpose: "form-input"
+        system: "smart-form-processing"
+        environment: "production"
+    metadata:
+      dependsOn:
+        - storage_api
+      description: "Storage bucket for incoming forms to be processed"
+
+  # Cloud Storage bucket for processed results
+  - name: forms_output_bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: forms-output-${resource_suffix}
+      project: ${project_id}
+      location: ${region}
+      storageClass: ${storage_class}
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              matchesStorageClass: [${storage_class}]
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      labels:
+        purpose: "form-output"
+        system: "smart-form-processing"
+        environment: "production"
+    metadata:
+      dependsOn:
+        - storage_api
+      description: "Storage bucket for processed form results and analytics"
+
+  # Document AI Form Parser Processor
+  - name: document_ai_processor
+    type: gcp-types/documentai-v1:projects.locations.processors
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      processor:
+        displayName: smart-form-processor-${resource_suffix}
+        type: FORM_PARSER_PROCESSOR
+        defaultProcessorVersion:
+          displayName: "Smart Form Processing v1.0"
+    metadata:
+      dependsOn:
+        - documentai_api
+      description: "Document AI processor for intelligent form data extraction"
+
+  # Service Account for Cloud Function
+  - name: function_service_account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: smart-form-function-sa-${resource_suffix}
+      serviceAccount:
+        displayName: "Smart Form Processing Function Service Account"
+        description: "Service account for Cloud Function processing forms with Document AI and Gemini"
+      parent: projects/${project_id}
+    metadata:
+      description: "Dedicated service account with minimal required permissions"
+
+  # IAM binding for Document AI access
+  - name: function_documentai_user
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/documentai.apiUser
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+      description: "Grant Document AI API user permissions to function service account"
+
+  # IAM binding for Vertex AI access
+  - name: function_aiplatform_user
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+      description: "Grant Vertex AI user permissions for Gemini model access"
+
+  # IAM binding for Storage access
+  - name: function_storage_admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+      description: "Grant Storage object admin permissions for file processing"
+
+  # Cloud Function source code bucket
+  - name: function_source_bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: function-source-${resource_suffix}
+      project: ${project_id}
+      location: ${region}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      labels:
+        purpose: "function-source"
+        system: "smart-form-processing"
+    metadata:
+      dependsOn:
+        - storage_api
+      description: "Storage bucket for Cloud Function source code"
+
+  # Cloud Function source code archive
+  - name: function_source_archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.function_source_bucket.name)
+      name: smart-form-processor-source.zip
+      # Note: In production, this would reference actual source code
+      # For Infrastructure Manager, the source code should be uploaded separately
+    metadata:
+      dependsOn:
+        - function_source_bucket
+      description: "Source code archive for the form processing function"
+
+  # Cloud Function for form processing
+  - name: smart_form_processor_function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      functionId: smart-form-processor-${resource_suffix}
+      function:
+        description: "Process forms using Document AI and validate with Gemini"
+        buildConfig:
+          runtime: python312
+          entryPoint: process_form
+          source:
+            storageSource:
+              bucket: $(ref.function_source_bucket.name)
+              object: $(ref.function_source_archive.name)
+        serviceConfig:
+          timeoutSeconds: $(timeoutToSeconds(${function_timeout}))
+          availableMemory: ${function_memory}
+          maxInstanceCount: 10
+          minInstanceCount: 0
+          maxInstanceRequestConcurrency: 1
+          serviceAccountEmail: $(ref.function_service_account.email)
+          environmentVariables:
+            GCP_PROJECT: ${project_id}
+            FUNCTION_REGION: ${region}
+            PROCESSOR_ID: $(ref.document_ai_processor.name | basename)
+            OUTPUT_BUCKET: $(ref.forms_output_bucket.name)
+            ENABLE_LOGGING: ${enable_logging}
+          ingressSettings: ALLOW_INTERNAL_ONLY
+        labels:
+          system: "smart-form-processing"
+          component: "processor"
+    metadata:
+      dependsOn:
+        - cloudfunctions_api
+        - function_service_account
+        - document_ai_processor
+        - forms_output_bucket
+        - function_source_archive
+      description: "Cloud Function that orchestrates form processing pipeline"
+
+  # Eventarc trigger for storage events
+  - name: storage_trigger
+    type: gcp-types/eventarc-v1:projects.locations.triggers
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      triggerId: smart-form-storage-trigger-${resource_suffix}
+      trigger:
+        name: projects/${project_id}/locations/${region}/triggers/smart-form-storage-trigger-${resource_suffix}
+        eventFilters:
+          - attribute: type
+            value: google.cloud.storage.object.v1.finalized
+          - attribute: bucket
+            value: $(ref.forms_input_bucket.name)
+        destination:
+          cloudFunction: $(ref.smart_form_processor_function.name)
+        serviceAccount: $(ref.function_service_account.email)
+        labels:
+          system: "smart-form-processing"
+          component: "trigger"
+    metadata:
+      dependsOn:
+        - eventarc_api
+        - smart_form_processor_function
+        - forms_input_bucket
+        - function_service_account
+      description: "Eventarc trigger that starts processing when forms are uploaded"
+
+  # Cloud Logging sink for function logs (optional)
+  - name: function_log_sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/${project_id}
+      sinkId: smart-form-function-logs-${resource_suffix}
+      sink:
+        name: smart-form-function-logs-${resource_suffix}
+        description: "Export Cloud Function logs for form processing analysis"
+        destination: storage.googleapis.com/$(ref.forms_output_bucket.name)/logs
+        filter: |
+          resource.type="cloud_function"
+          resource.labels.function_name="smart-form-processor-${resource_suffix}"
+        includeChildren: true
+    condition: ${enable_logging}
+    metadata:
+      dependsOn:
+        - smart_form_processor_function
+        - forms_output_bucket
+      description: "Log sink for function execution analysis and debugging"
+
+  # IAM binding for log sink
+  - name: log_sink_writer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${project_id}
+      role: roles/storage.objectCreator
+      member: $(ref.function_log_sink.writerIdentity)
+    condition: ${enable_logging}
+    metadata:
+      dependsOn:
+        - function_log_sink
+      description: "Grant log sink permission to write to storage bucket"
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description: "GCP Project ID where resources were created"
+    value: ${project_id}
+
+  region:
+    description: "GCP region where resources were deployed"
+    value: ${region}
+
+  input_bucket_name:
+    description: "Name of the Cloud Storage bucket for input forms"
+    value: $(ref.forms_input_bucket.name)
+
+  output_bucket_name:
+    description: "Name of the Cloud Storage bucket for processed results"
+    value: $(ref.forms_output_bucket.name)
+
+  input_bucket_url:
+    description: "Full URL for the input bucket"
+    value: gs://$(ref.forms_input_bucket.name)
+
+  output_bucket_url:
+    description: "Full URL for the output bucket"
+    value: gs://$(ref.forms_output_bucket.name)
+
+  document_ai_processor_id:
+    description: "Document AI processor ID for form parsing"
+    value: $(ref.document_ai_processor.name | basename)
+
+  document_ai_processor_name:
+    description: "Full Document AI processor resource name"
+    value: $(ref.document_ai_processor.name)
+
+  function_name:
+    description: "Name of the Cloud Function processing forms"
+    value: $(ref.smart_form_processor_function.name | basename)
+
+  function_url:
+    description: "Full Cloud Function resource name"
+    value: $(ref.smart_form_processor_function.name)
+
+  function_service_account:
+    description: "Service account email used by the Cloud Function"
+    value: $(ref.function_service_account.email)
+
+  trigger_name:
+    description: "Name of the Eventarc trigger"
+    value: $(ref.storage_trigger.name | basename)
+
+  upload_command:
+    description: "Example command to upload a form for processing"
+    value: gsutil cp your-form.pdf gs://$(ref.forms_input_bucket.name)/
+
+  check_results_command:
+    description: "Command to check processing results"
+    value: gsutil ls gs://$(ref.forms_output_bucket.name)/processed/
+
+  resource_labels:
+    description: "Common labels applied to all resources"
+    value:
+      system: "smart-form-processing"
+      managed-by: "infrastructure-manager"
+      recipe: "smart-form-processing-document-ai-gemini"
+
+  estimated_monthly_cost:
+    description: "Estimated monthly cost breakdown (USD)"
+    value:
+      cloud_function: "5-50 (based on executions)"
+      document_ai: "1.50 per 1000 pages"
+      vertex_ai_gemini: "0.25-2.50 per 1M tokens"
+      cloud_storage: "0.20-2.00 per GB"
+      total_estimate: "10-100 for moderate usage"
+
+# Metadata for deployment tracking
+metadata:
+  version: "1.0"
+  recipe_name: "smart-form-processing-document-ai-gemini"
+  recipe_id: "d4f8a2b6"
+  last_updated: "2025-07-12"
+  description: "Infrastructure Manager configuration for intelligent form processing using Document AI and Gemini"
+  tags:
+    - ai
+    - document-processing
+    - serverless
+    - forms
+    - automation
+    - document-ai
+    - gemini
+    - cloud-functions
+  support_url: "https://cloud.google.com/docs/infrastructure-manager"
+  documentation_url: "https://cloud.google.com/document-ai/docs"

@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Container Apps Jobs, Azure Load Testing, Azure Monitor, Azure DevOps
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, testing, automation, containers, performance, ci-cd
 recipe-generator-version: 1.3
@@ -134,11 +134,16 @@ az monitor log-analytics workspace create \
     --workspace-name ${LOG_ANALYTICS_NAME} \
     --location ${LOCATION}
 
-# Get Log Analytics workspace ID
+# Get Log Analytics workspace ID and key
 export LOG_ANALYTICS_ID=$(az monitor log-analytics workspace show \
     --resource-group ${RESOURCE_GROUP} \
     --workspace-name ${LOG_ANALYTICS_NAME} \
     --query customerId --output tsv)
+
+export LOG_ANALYTICS_KEY=$(az monitor log-analytics workspace \
+    get-shared-keys --resource-group ${RESOURCE_GROUP} \
+    --workspace-name ${LOG_ANALYTICS_NAME} \
+    --query primarySharedKey --output tsv)
 
 echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
 
@@ -166,10 +171,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --logs-workspace-id ${LOG_ANALYTICS_ID} \
-       --logs-workspace-key $(az monitor log-analytics workspace \
-           get-shared-keys --resource-group ${RESOURCE_GROUP} \
-           --workspace-name ${LOG_ANALYTICS_NAME} \
-           --query primarySharedKey --output tsv)
+       --logs-workspace-key ${LOG_ANALYTICS_KEY}
    
    echo "✅ Container Apps environment created with monitoring integration"
    ```
@@ -191,7 +193,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --replica-retry-limit 3 \
        --parallelism 3 \
        --replica-completion-count 1 \
-       --image mcr.microsoft.com/dotnet/sdk:7.0 \
+       --image mcr.microsoft.com/dotnet/sdk:8.0 \
        --cpu 1.0 \
        --memory 2Gi \
        --command "/bin/bash" \
@@ -217,7 +219,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --replica-retry-limit 2 \
        --parallelism 2 \
        --replica-completion-count 1 \
-       --image mcr.microsoft.com/dotnet/sdk:7.0 \
+       --image mcr.microsoft.com/dotnet/sdk:8.0 \
        --cpu 1.5 \
        --memory 3Gi \
        --env-vars "TEST_TYPE=integration" "TIMEOUT=3600" \
@@ -296,7 +298,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --replica-retry-limit 2 \
        --parallelism 1 \
        --replica-completion-count 1 \
-       --image mcr.microsoft.com/dotnet/sdk:7.0 \
+       --image mcr.microsoft.com/dotnet/sdk:8.0 \
        --cpu 1.0 \
        --memory 2Gi \
        --env-vars "SECURITY_SCAN_TYPE=full" "REPORT_FORMAT=json" \
@@ -671,4 +673,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

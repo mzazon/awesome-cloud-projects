@@ -1,0 +1,570 @@
+# Infrastructure Manager configuration for Automated Threat Response with Security Command Center
+# This template deploys a comprehensive automated security response system using
+# Security Command Center, Cloud Functions, Pub/Sub, and Cloud Logging
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: infra-manager-config
+data:
+  # Project configuration parameters
+  project_id: ${PROJECT_ID}
+  region: us-central1
+  zone: us-central1-a
+  # Unique suffix for resource names to avoid conflicts
+  random_suffix: ${RANDOM_SUFFIX}
+
+---
+# Enable required Google Cloud APIs for security automation
+resources:
+  # Enable Cloud Functions API
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${PROJECT_ID}/services/cloudfunctions.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Enable Pub/Sub API
+  - name: pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${PROJECT_ID}/services/pubsub.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Enable Cloud Logging API
+  - name: logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${PROJECT_ID}/services/logging.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Enable Cloud Monitoring API
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${PROJECT_ID}/services/monitoring.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Enable Security Command Center API
+  - name: securitycenter-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${PROJECT_ID}/services/securitycenter.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Enable Cloud Build API (required for Cloud Functions deployment)
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${PROJECT_ID}/services/cloudbuild.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Primary Pub/Sub topic for security findings from Security Command Center
+  - name: threat-response-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${PROJECT_ID}/topics/threat-response-topic-${RANDOM_SUFFIX}
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - us-central1
+      retentionConfig:
+        retentionDuration: 604800s  # 7 days retention
+    metadata:
+      dependsOn:
+        - pubsub-api
+
+  # Subscription for primary threat response topic
+  - name: threat-response-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/${PROJECT_ID}/subscriptions/threat-response-sub-${RANDOM_SUFFIX}
+      topic: $(ref.threat-response-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s  # 7 days retention
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.threat-response-dlq-topic.name)
+        maxDeliveryAttempts: 5
+    metadata:
+      dependsOn:
+        - threat-response-topic
+        - threat-response-dlq-topic
+
+  # Dead letter queue topic for failed message processing
+  - name: threat-response-dlq-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${PROJECT_ID}/topics/threat-response-dlq-${RANDOM_SUFFIX}
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - us-central1
+    metadata:
+      dependsOn:
+        - pubsub-api
+
+  # Pub/Sub topic for high-priority remediation actions
+  - name: threat-remediation-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${PROJECT_ID}/topics/threat-remediation-topic
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - us-central1
+    metadata:
+      dependsOn:
+        - pubsub-api
+
+  # Subscription for remediation topic with extended ack deadline
+  - name: threat-remediation-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/${PROJECT_ID}/subscriptions/threat-remediation-sub
+      topic: $(ref.threat-remediation-topic.name)
+      ackDeadlineSeconds: 120  # Extended deadline for complex remediation tasks
+      messageRetentionDuration: 604800s
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+    metadata:
+      dependsOn:
+        - threat-remediation-topic
+
+  # Pub/Sub topic for notification and alerting
+  - name: threat-notification-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${PROJECT_ID}/topics/threat-notification-topic
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - us-central1
+    metadata:
+      dependsOn:
+        - pubsub-api
+
+  # Subscription for notification topic
+  - name: threat-notification-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/${PROJECT_ID}/subscriptions/threat-notification-sub
+      topic: $(ref.threat-notification-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+    metadata:
+      dependsOn:
+        - threat-notification-topic
+
+  # Cloud Logging sink to export Security Command Center findings to Pub/Sub
+  - name: security-findings-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: security-findings-sink-${RANDOM_SUFFIX}
+      destination: pubsub.googleapis.com/$(ref.threat-response-topic.name)
+      filter: |
+        protoPayload.serviceName="securitycenter.googleapis.com" OR 
+        jsonPayload.source="security-center" OR
+        jsonPayload.category="THREAT_DETECTION" OR
+        severity>="WARNING"
+      uniqueWriterIdentity: true
+      includeChildren: true
+    metadata:
+      dependsOn:
+        - threat-response-topic
+        - logging-api
+
+  # IAM binding to allow log sink to publish to Pub/Sub topic
+  - name: log-sink-pubsub-publisher-binding
+    type: gcp-types/pubsub-v1:projects.topics.setIamPolicy
+    properties:
+      resource: $(ref.threat-response-topic.name)
+      policy:
+        bindings:
+          - role: roles/pubsub.publisher
+            members:
+              - $(ref.security-findings-log-sink.writerIdentity)
+    metadata:
+      dependsOn:
+        - security-findings-log-sink
+        - threat-response-topic
+
+  # Service account for Cloud Functions with minimal required permissions
+  - name: security-functions-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: security-functions-sa-${RANDOM_SUFFIX}
+      serviceAccount:
+        displayName: Security Automation Functions Service Account
+        description: Service account for automated security response functions
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+
+  # IAM binding for service account - Security Command Center access
+  - name: sa-securitycenter-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: ${PROJECT_ID}
+      policy:
+        bindings:
+          - role: roles/securitycenter.findingsViewer
+            members:
+              - serviceAccount:$(ref.security-functions-service-account.email)
+          - role: roles/securitycenter.findingsEditor  # For updating findings
+            members:
+              - serviceAccount:$(ref.security-functions-service-account.email)
+    metadata:
+      dependsOn:
+        - security-functions-service-account
+
+  # IAM binding for service account - Pub/Sub access
+  - name: sa-pubsub-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: ${PROJECT_ID}
+      policy:
+        bindings:
+          - role: roles/pubsub.publisher
+            members:
+              - serviceAccount:$(ref.security-functions-service-account.email)
+          - role: roles/pubsub.subscriber
+            members:
+              - serviceAccount:$(ref.security-functions-service-account.email)
+    metadata:
+      dependsOn:
+        - security-functions-service-account
+
+  # IAM binding for service account - Monitoring access
+  - name: sa-monitoring-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: ${PROJECT_ID}
+      policy:
+        bindings:
+          - role: roles/monitoring.metricWriter
+            members:
+              - serviceAccount:$(ref.security-functions-service-account.email)
+          - role: roles/monitoring.alertPolicyEditor
+            members:
+              - serviceAccount:$(ref.security-functions-service-account.email)
+    metadata:
+      dependsOn:
+        - security-functions-service-account
+
+  # IAM binding for service account - Logging access
+  - name: sa-logging-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: ${PROJECT_ID}
+      policy:
+        bindings:
+          - role: roles/logging.logWriter
+            members:
+              - serviceAccount:$(ref.security-functions-service-account.email)
+    metadata:
+      dependsOn:
+        - security-functions-service-account
+
+  # IAM binding for service account - Compute Engine access for VM isolation
+  - name: sa-compute-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: ${PROJECT_ID}
+      policy:
+        bindings:
+          - role: roles/compute.instanceAdmin
+            members:
+              - serviceAccount:$(ref.security-functions-service-account.email)
+          - role: roles/compute.securityAdmin  # For firewall rule management
+            members:
+              - serviceAccount:$(ref.security-functions-service-account.email)
+    metadata:
+      dependsOn:
+        - security-functions-service-account
+
+  # Security Triage Cloud Function - Initial threat analysis and routing
+  - name: security-triage-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${PROJECT_ID}/locations/us-central1
+      function:
+        name: projects/${PROJECT_ID}/locations/us-central1/functions/security-triage
+        description: Security triage function for automated threat analysis and routing
+        runtime: python39
+        availableMemoryMb: 512
+        timeout: 300s
+        entryPoint: main
+        environmentVariables:
+          GCP_PROJECT: ${PROJECT_ID}
+          REMEDIATION_TOPIC: threat-remediation-topic
+          NOTIFICATION_TOPIC: threat-notification-topic
+        serviceAccountEmail: $(ref.security-functions-service-account.email)
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: $(ref.threat-response-topic.name)
+          failurePolicy:
+            retry: {}
+        sourceArchiveUrl: gs://security-functions-source-${PROJECT_ID}/security-triage-source.zip
+        labels:
+          deployment: infrastructure-manager
+          function-type: security-triage
+          environment: production
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - security-functions-service-account
+        - threat-response-topic
+        - threat-remediation-topic
+        - threat-notification-topic
+
+  # Automated Remediation Cloud Function - Execute security response actions
+  - name: automated-remediation-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${PROJECT_ID}/locations/us-central1
+      function:
+        name: projects/${PROJECT_ID}/locations/us-central1/functions/automated-remediation
+        description: Automated remediation function for critical security threats
+        runtime: python39
+        availableMemoryMb: 1024
+        timeout: 540s
+        entryPoint: main
+        environmentVariables:
+          GCP_PROJECT: ${PROJECT_ID}
+        serviceAccountEmail: $(ref.security-functions-service-account.email)
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: $(ref.threat-remediation-topic.name)
+          failurePolicy:
+            retry: {}
+        sourceArchiveUrl: gs://security-functions-source-${PROJECT_ID}/automated-remediation-source.zip
+        labels:
+          deployment: infrastructure-manager
+          function-type: automated-remediation
+          environment: production
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - security-functions-service-account
+        - threat-remediation-topic
+
+  # Security Notification Cloud Function - Handle alerts and human review cases
+  - name: security-notification-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${PROJECT_ID}/locations/us-central1
+      function:
+        name: projects/${PROJECT_ID}/locations/us-central1/functions/security-notification
+        description: Security notification function for alerts and human review
+        runtime: python39
+        availableMemoryMb: 256
+        timeout: 60s
+        entryPoint: main
+        environmentVariables:
+          GCP_PROJECT: ${PROJECT_ID}
+        serviceAccountEmail: $(ref.security-functions-service-account.email)
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: $(ref.threat-notification-topic.name)
+          failurePolicy:
+            retry: {}
+        sourceArchiveUrl: gs://security-functions-source-${PROJECT_ID}/security-notification-source.zip
+        labels:
+          deployment: infrastructure-manager
+          function-type: security-notification
+          environment: production
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - security-functions-service-account
+        - threat-notification-topic
+
+  # Custom metric descriptor for security findings processed
+  - name: security-findings-metric
+    type: gcp-types/monitoring-v1:projects.metricDescriptors
+    properties:
+      name: projects/${PROJECT_ID}/metricDescriptors/custom.googleapis.com/security/findings_processed
+      type: custom.googleapis.com/security/findings_processed
+      metricKind: CUMULATIVE
+      valueType: INT64
+      description: Number of security findings processed by automated system
+      displayName: Security Findings Processed
+      labels:
+        - key: severity
+          valueType: STRING
+          description: Security finding severity level
+        - key: category
+          valueType: STRING
+          description: Security finding category
+        - key: response_action
+          valueType: STRING
+          description: Type of response action taken
+    metadata:
+      dependsOn:
+        - monitoring-api
+
+  # Alert policy for high-priority security findings
+  - name: high-priority-findings-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: High Priority Security Findings Alert
+      documentation:
+        content: |
+          This alert policy monitors for critical security findings processed by the 
+          automated threat response system. It triggers when more than 5 critical 
+          findings are detected within a 5-minute window.
+        mimeType: text/markdown
+      conditions:
+        - displayName: Critical security findings rate
+          conditionThreshold:
+            filter: |
+              metric.type="custom.googleapis.com/security/findings_processed" AND
+              metric.label.severity="CRITICAL"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 5
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      alertStrategy:
+        autoClose: 86400s  # Auto-close after 24 hours
+      enabled: true
+      combiner: OR
+    metadata:
+      dependsOn:
+        - security-findings-metric
+        - monitoring-api
+
+  # Alert policy for remediation function failures
+  - name: remediation-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: Security Remediation Function Failures
+      documentation:
+        content: |
+          This alert policy monitors for failures in the automated remediation
+          function. It triggers when function execution fails multiple times.
+        mimeType: text/markdown
+      conditions:
+        - displayName: Remediation function error rate
+          conditionThreshold:
+            filter: |
+              resource.type="cloud_function" AND
+              resource.label.function_name="automated-remediation" AND
+              metric.type="cloudfunctions.googleapis.com/function/execution_count" AND
+              metric.label.status!="ok"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 3
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      alertStrategy:
+        autoClose: 7200s  # Auto-close after 2 hours
+      enabled: true
+      combiner: OR
+    metadata:
+      dependsOn:
+        - automated-remediation-function
+        - monitoring-api
+
+  # Cloud Storage bucket for function source code (created externally)
+  # Note: This would typically be created and populated outside of this template
+  # as it requires uploading the actual function source code
+
+# Outputs for verification and integration
+outputs:
+  - name: threat_response_topic_name
+    value: $(ref.threat-response-topic.name)
+    description: Primary Pub/Sub topic for security findings
+
+  - name: remediation_topic_name
+    value: $(ref.threat-remediation-topic.name)
+    description: Pub/Sub topic for high-priority remediation actions
+
+  - name: notification_topic_name
+    value: $(ref.threat-notification-topic.name)
+    description: Pub/Sub topic for notifications and alerts
+
+  - name: log_sink_name
+    value: $(ref.security-findings-log-sink.name)
+    description: Cloud Logging sink for Security Command Center findings
+
+  - name: service_account_email
+    value: $(ref.security-functions-service-account.email)
+    description: Service account used by security automation functions
+
+  - name: security_triage_function_name
+    value: $(ref.security-triage-function.name)
+    description: Security triage Cloud Function name
+
+  - name: remediation_function_name
+    value: $(ref.automated-remediation-function.name)
+    description: Automated remediation Cloud Function name
+
+  - name: notification_function_name
+    value: $(ref.security-notification-function.name)
+    description: Security notification Cloud Function name
+
+  - name: custom_metric_name
+    value: $(ref.security-findings-metric.name)
+    description: Custom metric for security findings monitoring
+
+  - name: high_priority_alert_policy
+    value: $(ref.high-priority-findings-alert.name)
+    description: Alert policy for high-priority security findings
+
+# Deployment instructions and notes:
+# 
+# 1. Before deploying this template, create a Cloud Storage bucket and upload
+#    the function source code as ZIP files:
+#    - security-triage-source.zip
+#    - automated-remediation-source.zip  
+#    - security-notification-source.zip
+#
+# 2. Set the required environment variables:
+#    - PROJECT_ID: Your Google Cloud project ID
+#    - RANDOM_SUFFIX: Unique suffix for resource names (e.g., 6-character hex)
+#
+# 3. Deploy using Infrastructure Manager:
+#    gcloud infra-manager deployments apply DEPLOYMENT_NAME \
+#      --location=LOCATION \
+#      --service-account=SERVICE_ACCOUNT \
+#      --local-source=PATH_TO_THIS_DIRECTORY \
+#      --inputs-file=inputs.yaml
+#
+# 4. After deployment, verify all resources are created and functions are active:
+#    - Check Cloud Functions status
+#    - Verify Pub/Sub topics and subscriptions
+#    - Test log sink configuration
+#    - Validate monitoring metrics and alerts
+#
+# 5. Security considerations:
+#    - Service account follows principle of least privilege
+#    - Functions have appropriate timeout and memory limits
+#    - Dead letter queues configured for message reliability
+#    - Comprehensive monitoring and alerting in place
+#    - All communications use secure Google Cloud internal networking
+#
+# 6. Cost optimization:
+#    - Functions use minimal memory allocations based on requirements
+#    - Pub/Sub message retention set to 7 days
+#    - Alert policies configured with appropriate auto-close intervals
+#    - Custom metrics used sparingly to avoid excessive charges

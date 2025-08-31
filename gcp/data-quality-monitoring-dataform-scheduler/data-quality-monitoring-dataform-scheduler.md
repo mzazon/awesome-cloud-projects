@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Dataform, Cloud Scheduler, Cloud Monitoring, BigQuery
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-quality, automation, monitoring, analytics, sql
 recipe-generator-version: 1.3
@@ -489,7 +489,7 @@ echo "✅ APIs enabled for Dataform, Scheduler, Monitoring, and BigQuery"
        --uri="https://dataform.googleapis.com/v1beta1/projects/${PROJECT_ID}/locations/${DATAFORM_REGION}/repositories/${REPOSITORY_ID}/workflowInvocations" \
        --http-method=POST \
        --headers="Content-Type=application/json" \
-       --message-body='{"compilationResult":"projects/'${PROJECT_ID}'/locations/'${DATAFORM_REGION}'/repositories/'${REPOSITORY_ID}'/compilationResults/latest"}' \
+       --message-body="{\"compilationResult\":\"projects/${PROJECT_ID}/locations/${DATAFORM_REGION}/repositories/${REPOSITORY_ID}/compilationResults/latest\"}" \
        --oidc-service-account-email="dataform-scheduler-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
        --oidc-token-audience="https://dataform.googleapis.com/"
    
@@ -524,7 +524,8 @@ echo "✅ APIs enabled for Dataform, Scheduler, Monitoring, and BigQuery"
    EOF
    
    # Create the notification channel
-   gcloud alpha monitoring channels create --channel-content-from-file=notification-channel.json
+   gcloud alpha monitoring channels create \
+       --channel-content-from-file=notification-channel.json
    
    # Get the notification channel ID for alert policy
    NOTIFICATION_CHANNEL=$(gcloud alpha monitoring channels list \
@@ -772,4 +773,9 @@ Extend this data quality monitoring solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

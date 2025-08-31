@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Build, Cloud Deploy, Cloud Source Repositories, Binary Authorization
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ci-cd, code-quality, security-scanning, progressive-delivery, automation
 recipe-generator-version: 1.3
@@ -79,7 +79,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and required APIs access
-2. gcloud CLI installed and configured (version 400.0.0 or later)
+2. gcloud CLI installed and configured (version 450.0.0 or later)
 3. Git command line tool and basic container/Kubernetes knowledge
 4. Understanding of CI/CD concepts and progressive delivery strategies
 5. Estimated cost: $50-100 for running this recipe (includes compute, storage, and networking costs)
@@ -116,6 +116,8 @@ export REPO_NAME="sample-app-${RANDOM_SUFFIX}"
 export CLUSTER_NAME="quality-gates-cluster-${RANDOM_SUFFIX}"
 export PIPELINE_NAME="quality-pipeline-${RANDOM_SUFFIX}"
 export REGISTRY_NAME="app-registry-${RANDOM_SUFFIX}"
+export BUILD_ID=""
+export TRIGGER_ID=""
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Repository name: ${REPO_NAME}"
@@ -403,15 +405,18 @@ steps:
     args:
       - '-c'
       - |
+        # Push image first for scanning
+        docker push gcr.io/$PROJECT_ID/code-quality-app:$COMMIT_SHA
+        # Run vulnerability scan
         gcloud container images scan gcr.io/$PROJECT_ID/code-quality-app:$COMMIT_SHA \
           --format="value(response.scan.analysisCompleted)" \
           --quiet || exit 1
     id: 'container-scan'
     waitFor: ['docker-build']
 
-  # Push Docker image
+  # Tag and push additional image tags
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/code-quality-app:$COMMIT_SHA']
+    args: ['push', 'gcr.io/$PROJECT_ID/code-quality-app:latest']
     id: 'docker-push'
     waitFor: ['container-scan']
 
@@ -645,7 +650,13 @@ EOF
        --branch-pattern="^main$" \
        --build-config=cloudbuild.yaml \
        --substitutions=_REGION=${REGION},_PIPELINE_NAME=${PIPELINE_NAME} \
+       --name="code-quality-trigger-${RANDOM_SUFFIX}" \
        --description="Automated quality pipeline trigger"
+   
+   # Store trigger ID for cleanup
+   TRIGGER_ID=$(gcloud builds triggers list \
+       --filter="name:code-quality-trigger-${RANDOM_SUFFIX}" \
+       --format="value(id)")
    
    # Grant necessary permissions to Cloud Build service account
    PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} \
@@ -803,12 +814,16 @@ EOF
 
    ```bash
    # Delete Cloud Build triggers
-   TRIGGER_ID=$(gcloud builds triggers list \
-       --filter="github.name:${REPO_NAME}" \
-       --format="value(id)")
-   
    if [ -n "${TRIGGER_ID}" ]; then
        gcloud builds triggers delete ${TRIGGER_ID} --quiet
+   else
+       # Fallback: search for trigger by name
+       FALLBACK_TRIGGER_ID=$(gcloud builds triggers list \
+           --filter="name:code-quality-trigger-${RANDOM_SUFFIX}" \
+           --format="value(id)")
+       if [ -n "${FALLBACK_TRIGGER_ID}" ]; then
+           gcloud builds triggers delete ${FALLBACK_TRIGGER_ID} --quiet
+       fi
    fi
    
    echo "✅ Cloud Build triggers deleted"
@@ -842,21 +857,22 @@ EOF
    # Clean up environment variables
    unset PROJECT_ID REGION ZONE RANDOM_SUFFIX
    unset REPO_NAME CLUSTER_NAME PIPELINE_NAME REGISTRY_NAME
+   unset BUILD_ID TRIGGER_ID
    
    echo "✅ All resources cleaned up successfully"
    ```
 
 ## Discussion
 
-This automated code quality pipeline demonstrates how Cloud Build Triggers and Cloud Deploy work together to enforce comprehensive quality standards while enabling rapid, safe deployments. The solution implements multiple layers of validation including unit testing, code linting, security vulnerability scanning, and container analysis before allowing code progression through environments. The progressive delivery strategy using canary deployments with approval gates ensures production stability while maintaining development velocity.
+This automated code quality pipeline demonstrates how Cloud Build Triggers and Cloud Deploy work together to enforce comprehensive quality standards while enabling rapid, safe deployments. The solution implements multiple layers of validation including unit testing, code linting, security vulnerability scanning, and container analysis before allowing code progression through environments. The progressive delivery strategy using canary deployments with approval gates ensures production stability while maintaining development velocity, following Google Cloud's [CI/CD best practices](https://cloud.google.com/architecture/devops/devops-tech-continuous-integration) and [deployment strategies](https://cloud.google.com/deploy/docs/deployment-strategies).
 
-The integration of Binary Authorization adds an essential security layer by preventing unauthorized container images from reaching production environments. This attestation-based approach ensures only verified, scanned containers can be deployed while maintaining audit trails for compliance requirements. Combined with Cloud Deploy's rollback capabilities, organizations can confidently implement continuous deployment knowing that both quality and security guardrails are automatically enforced.
+The integration of Binary Authorization adds an essential security layer by preventing unauthorized container images from reaching production environments. This attestation-based approach ensures only verified, scanned containers can be deployed while maintaining audit trails for compliance requirements, as outlined in Google Cloud's [Binary Authorization documentation](https://cloud.google.com/binary-authorization/docs). Combined with Cloud Deploy's rollback capabilities, organizations can confidently implement continuous deployment knowing that both quality and security guardrails are automatically enforced.
 
-The pipeline architecture supports modern DevOps practices by automating manual processes while preserving necessary control points. Development teams receive immediate feedback on quality issues, security vulnerabilities, and test failures, enabling faster iteration cycles. Operations teams benefit from consistent deployment processes, comprehensive monitoring, and automated rollback capabilities that reduce manual intervention and operational overhead.
+The pipeline architecture supports modern DevOps practices by automating manual processes while preserving necessary control points. Development teams receive immediate feedback on quality issues, security vulnerabilities, and test failures, enabling faster iteration cycles. Operations teams benefit from consistent deployment processes, comprehensive monitoring, and automated rollback capabilities that reduce manual intervention and operational overhead, aligning with Google Cloud's [Well-Architected Framework](https://cloud.google.com/architecture/framework) principles.
 
 > **Tip**: Integrate Cloud Monitoring and Cloud Logging to track pipeline performance metrics and identify optimization opportunities for build times and deployment success rates.
 
-Key implementation considerations include proper IAM configuration for service accounts, network security for GKE clusters, and cost optimization through efficient resource sizing. The solution scales from small development teams to enterprise organizations by adjusting cluster sizes, adding additional quality gates, and incorporating more sophisticated approval workflows. Regular review of security scanning results and quality metrics ensures the pipeline continues meeting evolving requirements while maintaining high development productivity.
+Key implementation considerations include proper IAM configuration for service accounts, network security for GKE clusters, and cost optimization through efficient resource sizing. The solution scales from small development teams to enterprise organizations by adjusting cluster sizes, adding additional quality gates, and incorporating more sophisticated approval workflows. Regular review of security scanning results and quality metrics ensures the pipeline continues meeting evolving requirements while maintaining high development productivity. For additional guidance, refer to the [Google Cloud Security Best Practices](https://cloud.google.com/security/best-practices) documentation.
 
 ## Challenge
 
@@ -874,4 +890,9 @@ Extend this automated code quality pipeline by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

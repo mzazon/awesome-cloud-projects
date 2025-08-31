@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: QLDB, IAM, S3, Kinesis
 estimated-time: 210 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database, ledger, acid, cryptographic-verification, financial-services, audit-trail, immutable-storage
 recipe-generator-version: 1.3
@@ -76,6 +76,8 @@ graph TB
 3. Basic understanding of SQL, JSON, and cryptographic hashing concepts
 4. Familiarity with financial transaction processing and audit requirements
 5. Estimated cost: $10-50 for QLDB usage, S3 storage, and Kinesis streaming (4 hours)
+
+> **Warning**: QLDB announced end-of-support on July 31, 2025. Consider this for long-term projects and evaluate migration options to [Amazon Aurora PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraPostgreSQL.html) or similar solutions.
 
 ## Preparation
 
@@ -212,8 +214,6 @@ echo "✅ Environment prepared successfully"
    ```
 
    The ledger creation process establishes the cryptographic foundation that makes all subsequent data immutable and verifiable. Once active, the ledger automatically maintains a cryptographic audit trail of every transaction using SHA-256 hash chains, enabling regulatory compliance and forensic analysis. This immutable architecture provides the transparency and auditability that financial institutions need to demonstrate compliance with regulations like Sarbanes-Oxley and Basel III. For more information about QLDB's security model, see the [QLDB Security documentation](https://docs.aws.amazon.com/qldb/latest/developerguide/security.html).
-
-   > **Warning**: QLDB announced end-of-support on July 31, 2025. Consider this for long-term projects and evaluate migration options to [Amazon Aurora PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraPostgreSQL.html) or similar solutions.
 
 3. **Create Database Tables and Indexes**:
 
@@ -555,7 +555,7 @@ echo "✅ Environment prepared successfully"
 
 12. **Test Data Verification and Integrity**:
 
-    Regular verification testing ensures that the cryptographic integrity features are working correctly. This testing is essential for maintaining trust in the ledger system.
+    Regular verification testing ensures that the cryptographic integrity features are working correctly and provides confidence in the ledger system's ability to maintain data integrity over time.
 
     ```bash
     # Test digest consistency
@@ -721,28 +721,37 @@ echo "✅ Environment prepared successfully"
 
 ## Discussion
 
-Amazon QLDB provides a unique solution for building ACID-compliant distributed databases with cryptographic verification capabilities. The service uses an immutable, append-only journal that maintains complete transaction history while providing cryptographic proof of data integrity through SHA-256 hashing and Merkle tree structures.
+Amazon QLDB provides a unique solution for building ACID-compliant distributed databases with cryptographic verification capabilities. The service uses an immutable, append-only journal that maintains complete transaction history while providing cryptographic proof of data integrity through SHA-256 hashing and Merkle tree structures. However, it's important to note that AWS announced the end-of-support for QLDB on July 31, 2025, making this technology primarily suitable for short-term projects or educational purposes.
 
-The key architectural advantage of QLDB lies in its journal-first design, where all transactions are first written to an immutable journal before being materialized into queryable tables. This approach ensures that every change to the data is permanently recorded and can be cryptographically verified. The service automatically handles ACID properties through optimistic concurrency control and serializable isolation levels, making it ideal for financial applications requiring strong consistency guarantees.
+The key architectural advantage of QLDB lies in its journal-first design, where all transactions are first written to an immutable journal before being materialized into queryable tables. This approach ensures that every change to the data is permanently recorded and can be cryptographically verified. The service automatically handles ACID properties through optimistic concurrency control and serializable isolation levels, making it ideal for financial applications requiring strong consistency guarantees during its supported lifecycle.
 
 QLDB's integration with AWS services like Kinesis Data Streams and S3 enables real-time data processing and long-term archival strategies. The PartiQL query language provides familiar SQL-like syntax while supporting Amazon Ion's flexible document model, allowing for both structured and semi-structured data storage. The cryptographic verification capabilities through digests and Merkle audit proofs ensure that data integrity can be independently verified, meeting strict regulatory requirements for financial institutions.
 
-Performance considerations include understanding QLDB's transaction limits and optimizing queries with appropriate indexes. The service charges based on I/O requests and storage, making it cost-effective for audit-heavy workloads but potentially expensive for high-throughput transactional systems. For more information about QLDB best practices, see the [Amazon QLDB Developer Guide](https://docs.aws.amazon.com/qldb/latest/developerguide/).
+Performance considerations include understanding QLDB's transaction limits and optimizing queries with appropriate indexes. The service charges based on I/O requests and storage, making it cost-effective for audit-heavy workloads but potentially expensive for high-throughput transactional systems. For organizations planning long-term implementations, consider migrating to Amazon Aurora PostgreSQL or other alternatives as detailed in the [QLDB migration guide](https://aws.amazon.com/blogs/database/migrate-an-amazon-qldb-ledger-to-amazon-aurora-postgresql/). For more information about QLDB best practices, see the [Amazon QLDB Developer Guide](https://docs.aws.amazon.com/qldb/latest/developerguide/).
+
+> **Note**: Given QLDB's announced end-of-support, this recipe serves primarily as educational content for understanding immutable ledger concepts and cryptographic verification in distributed systems.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Region Replication**: Set up cross-region journal streaming to maintain disaster recovery capabilities and improve global data availability.
+1. **Migration Planning**: Design a migration strategy from QLDB to Amazon Aurora PostgreSQL using [AWS DMS](https://aws.amazon.com/dms/) while preserving audit trail integrity and cryptographic verification capabilities.
 
-2. **Advanced Audit Analytics**: Implement real-time fraud detection by analyzing transaction patterns in the Kinesis stream using Amazon Kinesis Data Analytics.
+2. **Advanced Audit Analytics**: Implement real-time fraud detection by analyzing transaction patterns in the Kinesis stream using Amazon Kinesis Data Analytics before the service end-of-support date.
 
 3. **Compliance Automation**: Create automated compliance reports by integrating with AWS Config and AWS Security Hub to monitor data access patterns and generate audit trails.
 
-4. **Smart Contract Integration**: Develop blockchain-like smart contract functionality using AWS Lambda triggers on journal events to automate compliance checks and transaction validations.
+4. **Alternative Ledger Implementation**: Design a similar immutable ledger solution using Amazon Aurora PostgreSQL with custom cryptographic verification to replace QLDB functionality.
 
 5. **Performance Optimization**: Implement caching strategies using Amazon ElastiCache to improve query performance while maintaining data integrity and implementing connection pooling for high-concurrency scenarios.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

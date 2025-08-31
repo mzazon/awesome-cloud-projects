@@ -5,11 +5,11 @@ category: database
 difficulty: 300
 subject: aws
 services: RDS, EventBridge, SNS, Lambda, CloudWatch
-estimated-time: 60 minutes
-recipe-version: 1.2
+estimated-time: 90 minutes
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database, disaster-recovery, rds, cross-region, monitoring, automation
 recipe-generator-version: 1.3
@@ -81,13 +81,16 @@ graph TB
 
 ```bash
 # Set environment variables
-export PRIMARY_REGION=$(aws configure get region)
+export AWS_REGION=$(aws configure get region)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+    --query Account --output text)
+
 read -p "Enter secondary region for DR (e.g., us-west-2): " SECONDARY_REGION
 export SECONDARY_REGION
 
 # List existing RDS instances in primary region
 aws rds describe-db-instances \
-    --region $PRIMARY_REGION \
+    --region $AWS_REGION \
     --query "DBInstances[].{DBInstanceIdentifier:DBInstanceIdentifier,Engine:Engine,Status:DBInstanceStatus}" \
     --output table
 
@@ -97,19 +100,19 @@ export DB_IDENTIFIER
 # Verify that the database exists and get its details
 DB_ARN=$(aws rds describe-db-instances \
     --db-instance-identifier $DB_IDENTIFIER \
-    --region $PRIMARY_REGION \
+    --region $AWS_REGION \
     --query "DBInstances[0].DBInstanceArn" \
     --output text)
 
 if [ -z "$DB_ARN" ]; then
-    echo "❌ Database $DB_IDENTIFIER not found in $PRIMARY_REGION!"
+    echo "❌ Database $DB_IDENTIFIER not found in $AWS_REGION!"
     exit 1
 fi
 
 # Check database engine type
 DB_ENGINE=$(aws rds describe-db-instances \
     --db-instance-identifier $DB_IDENTIFIER \
-    --region $PRIMARY_REGION \
+    --region $AWS_REGION \
     --query "DBInstances[0].Engine" \
     --output text)
 
@@ -119,7 +122,7 @@ if [[ "$DB_ENGINE" != "mysql" && "$DB_ENGINE" != "postgres" ]]; then
     exit 1
 fi
 
-# Generate a random suffix for resource names
+# Generate unique identifiers for resources
 RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --exclude-punctuation --exclude-uppercase \
     --password-length 6 --require-each-included-type \
@@ -132,7 +135,7 @@ export LAMBDA_NAME="rds-dr-manager-${RANDOM_SUFFIX}"
 export DASHBOARD_NAME="rds-dr-dashboard-${RANDOM_SUFFIX}"
 
 echo "✅ Configuration Complete"
-echo "Primary Database: $DB_IDENTIFIER in $PRIMARY_REGION"
+echo "Primary Database: $DB_IDENTIFIER in $AWS_REGION"
 echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
 ```
 
@@ -140,11 +143,13 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
 
 1. **Create cross-region read replica for disaster recovery**:
 
+   Cross-region read replicas provide asynchronous replication of your primary database to a different AWS region. This creates a real-time copy of your data that can be promoted to a standalone database instance during a disaster recovery scenario. The replica maintains near real-time synchronization with the primary database, ensuring minimal data loss during failover.
+
    ```bash
    # Check if the database instance is Multi-AZ
    IS_MULTI_AZ=$(aws rds describe-db-instances \
        --db-instance-identifier $DB_IDENTIFIER \
-       --region $PRIMARY_REGION \
+       --region $AWS_REGION \
        --query "DBInstances[0].MultiAZ" \
        --output text)
        
@@ -154,12 +159,11 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
    aws rds create-db-instance-read-replica \
        --db-instance-identifier $REPLICA_NAME \
        --source-db-instance-identifier $DB_ARN \
-       --source-region $PRIMARY_REGION \
        --region $SECONDARY_REGION \
        --multi-az $IS_MULTI_AZ \
        --db-instance-class $(aws rds describe-db-instances \
            --db-instance-identifier $DB_IDENTIFIER \
-           --region $PRIMARY_REGION \
+           --region $AWS_REGION \
            --query "DBInstances[0].DBInstanceClass" \
            --output text) \
        --tags "Key=Purpose,Value=DisasterRecovery"
@@ -167,17 +171,17 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
    echo "✅ Read replica creation initiated: $REPLICA_NAME in $SECONDARY_REGION"
    ```
 
-   Cross-region read replicas provide asynchronous replication of your primary database to a different AWS region. This creates a real-time copy of your data that can be promoted to a standalone database instance during a disaster recovery scenario. The replica maintains near real-time synchronization with the primary database, ensuring minimal data loss during failover.
-
    RDS read replicas use asynchronous replication, which means there's typically a small lag between the primary and replica databases. This lag is usually measured in seconds but can vary based on network conditions and workload. Monitor replica lag closely using [CloudWatch metrics](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/monitoring-cloudwatch.html) for optimal disaster recovery planning. The [Working with DB instance read replicas](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.html) documentation provides comprehensive guidance on managing read replicas across different database engines.
 
 2. **Create SNS topics for comprehensive monitoring and alerts**:
+
+   SNS topics provide the communication backbone for your disaster recovery solution. By creating topics in both regions, you ensure that notifications can be sent regardless of which region is experiencing issues. This multi-region approach maintains communication channels even during a regional failure.
 
    ```bash
    # Create SNS topic in primary region
    PRIMARY_TOPIC_ARN=$(aws sns create-topic \
        --name $TOPIC_NAME \
-       --region $PRIMARY_REGION \
+       --region $AWS_REGION \
        --query 'TopicArn' \
        --output text)
        
@@ -196,7 +200,7 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
            --topic-arn $PRIMARY_TOPIC_ARN \
            --protocol email \
            --notification-endpoint $EMAIL_ADDRESS \
-           --region $PRIMARY_REGION
+           --region $AWS_REGION
            
        aws sns subscribe \
            --topic-arn $SECONDARY_TOPIC_ARN \
@@ -212,9 +216,9 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
    echo "✅ Created SNS topics for notifications"
    ```
 
-   SNS topics provide the communication backbone for your disaster recovery solution. By creating topics in both regions, you ensure that notifications can be sent regardless of which region is experiencing issues. This multi-region approach maintains communication channels even during a regional failure.
-
 3. **Set up comprehensive CloudWatch alarms for database health monitoring**:
+
+   CloudWatch alarms provide proactive monitoring of your database health and performance. The alarms monitor critical metrics like CPU utilization, replica lag, and connection health. When thresholds are breached, automated notifications are sent through SNS, enabling rapid response to potential issues before they become disasters.
 
    ```bash
    # Create CloudWatch alarm for primary database high CPU usage
@@ -229,7 +233,7 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
        --comparison-operator GreaterThanOrEqualToThreshold \
        --dimensions "Name=DBInstanceIdentifier,Value=$DB_IDENTIFIER" \
        --alarm-actions $PRIMARY_TOPIC_ARN \
-       --region $PRIMARY_REGION
+       --region $AWS_REGION
        
    # Create CloudWatch alarm for replica lag monitoring
    aws cloudwatch put-metric-alarm \
@@ -257,17 +261,17 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
        --comparison-operator LessThanThreshold \
        --dimensions "Name=DBInstanceIdentifier,Value=$DB_IDENTIFIER" \
        --alarm-actions $PRIMARY_TOPIC_ARN \
-       --region $PRIMARY_REGION \
+       --region $AWS_REGION \
        --treat-missing-data notBreaching
    
    echo "✅ Created CloudWatch alarms for database monitoring"
    ```
 
-   CloudWatch alarms provide proactive monitoring of your database health and performance. The alarms monitor critical metrics like CPU utilization, replica lag, and connection health. When thresholds are breached, automated notifications are sent through SNS, enabling rapid response to potential issues before they become disasters.
-
    > **Tip**: Consider implementing additional alarms for metrics such as free storage space, read/write latency, and IOPS. These metrics can help identify performance degradation before it impacts your applications. For comprehensive monitoring guidance, refer to the [RDS monitoring with CloudWatch](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/monitoring-cloudwatch.html) documentation.
 
 4. **Create Lambda function for automated disaster recovery management**:
+
+   The Lambda function serves as the intelligent orchestration layer for disaster recovery operations. It can automatically evaluate database health, initiate failover procedures, and coordinate notifications across your infrastructure team.
 
    ```bash
    # Create IAM role for Lambda function
@@ -288,8 +292,7 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
    
    aws iam create-role \
        --role-name "${LAMBDA_NAME}-role" \
-       --assume-role-policy-document file://lambda-trust-policy.json \
-       --region $PRIMARY_REGION
+       --assume-role-policy-document file://lambda-trust-policy.json
    
    # Create and attach policy for RDS and SNS operations
    cat > lambda-execution-policy.json << EOF
@@ -336,9 +339,9 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
    echo "✅ Created IAM role and policies for Lambda function"
    ```
 
-   The Lambda function serves as the intelligent orchestration layer for disaster recovery operations. It can automatically evaluate database health, initiate failover procedures, and coordinate notifications across your infrastructure team.
-
 5. **Deploy Lambda function with disaster recovery logic**:
+
+   The Lambda function provides intelligent automation for disaster recovery scenarios. It analyzes CloudWatch alarms, evaluates database health, and can initiate appropriate responses including notifications, escalations, and automated recovery procedures.
 
    ```bash
    # Create Lambda function code
@@ -436,35 +439,35 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
    zip dr_manager.zip dr_manager.py
    
    # Deploy Lambda function
-   LAMBDA_ROLE_ARN="arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/${LAMBDA_NAME}-role"
+   LAMBDA_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_NAME}-role"
    
    aws lambda create-function \
        --function-name $LAMBDA_NAME \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler dr_manager.lambda_handler \
        --zip-file fileb://dr_manager.zip \
        --timeout 300 \
        --memory-size 256 \
        --environment Variables="{SNS_TOPIC_ARN=${PRIMARY_TOPIC_ARN}}" \
-       --region $PRIMARY_REGION
+       --region $AWS_REGION
    
    echo "✅ Lambda function deployed for disaster recovery management"
    ```
 
-   The Lambda function provides intelligent automation for disaster recovery scenarios. It analyzes CloudWatch alarms, evaluates database health, and can initiate appropriate responses including notifications, escalations, and automated recovery procedures.
-
    > **Warning**: Automated failover should be carefully tested in non-production environments before implementation. Consider implementing manual approval workflows for production failover scenarios to prevent unintended data loss or service disruption. Review [Multi-AZ deployments](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.html) and [RDS best practices](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_BestPractices.html) before enabling automatic promotion.
 
 6. **Create EventBridge rules to connect alarms with Lambda automation**:
+
+   EventBridge integration enables real-time processing of CloudWatch alarms through your Lambda function. This creates an automated response system that can evaluate and respond to database health events without manual intervention.
 
    ```bash
    # Subscribe Lambda function to SNS topic for alarm processing
    aws sns subscribe \
        --topic-arn $PRIMARY_TOPIC_ARN \
        --protocol lambda \
-       --notification-endpoint "arn:aws:lambda:${PRIMARY_REGION}:$(aws sts get-caller-identity --query Account --output text):function:${LAMBDA_NAME}" \
-       --region $PRIMARY_REGION
+       --notification-endpoint "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_NAME}" \
+       --region $AWS_REGION
    
    # Grant SNS permission to invoke Lambda function
    aws lambda add-permission \
@@ -473,14 +476,14 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
        --action lambda:InvokeFunction \
        --principal sns.amazonaws.com \
        --source-arn $PRIMARY_TOPIC_ARN \
-       --region $PRIMARY_REGION
+       --region $AWS_REGION
    
    echo "✅ EventBridge rules configured for automated alarm processing"
    ```
 
-   EventBridge integration enables real-time processing of CloudWatch alarms through your Lambda function. This creates an automated response system that can evaluate and respond to database health events without manual intervention.
-
 7. **Create comprehensive CloudWatch dashboard for disaster recovery monitoring**:
+
+   The CloudWatch dashboard provides a centralized view of your disaster recovery infrastructure health. It displays key metrics from both primary and replica databases, enabling quick assessment of system status and identification of potential issues.
 
    ```bash
    # Wait for read replica to be available before creating dashboard
@@ -503,7 +506,7 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
            ],
            "view": "timeSeries",
            "stacked": false,
-           "region": "$PRIMARY_REGION",
+           "region": "$AWS_REGION",
            "title": "Database CPU Utilization",
            "period": 300
          }
@@ -532,7 +535,7 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
            ],
            "view": "timeSeries",
            "stacked": false,
-           "region": "$PRIMARY_REGION",
+           "region": "$AWS_REGION",
            "title": "Database Connections",
            "period": 300
          }
@@ -545,13 +548,11 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
    aws cloudwatch put-dashboard \
        --dashboard-name $DASHBOARD_NAME \
        --dashboard-body file://dashboard-config.json \
-       --region $PRIMARY_REGION
+       --region $AWS_REGION
    
    echo "✅ CloudWatch dashboard created: $DASHBOARD_NAME"
-   echo "View dashboard at: https://console.aws.amazon.com/cloudwatch/home?region=${PRIMARY_REGION}#dashboards:name=${DASHBOARD_NAME}"
+   echo "View dashboard at: https://console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=${DASHBOARD_NAME}"
    ```
-
-   The CloudWatch dashboard provides a centralized view of your disaster recovery infrastructure health. It displays key metrics from both primary and replica databases, enabling quick assessment of system status and identification of potential issues.
 
 ## Validation & Testing
 
@@ -593,7 +594,7 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
        --comparison-operator GreaterThanOrEqualToThreshold \
        --dimensions "Name=DBInstanceIdentifier,Value=$DB_IDENTIFIER" \
        --alarm-actions $PRIMARY_TOPIC_ARN \
-       --region $PRIMARY_REGION
+       --region $AWS_REGION
    
    echo "Test alarm created - you should receive a notification within 5 minutes"
    echo "Delete test alarm after verification"
@@ -643,12 +644,12 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
    # Delete CloudWatch alarms
    aws cloudwatch delete-alarms \
        --alarm-names "${DB_IDENTIFIER}-HighCPU" "${REPLICA_NAME}-ReplicaLag" "${DB_IDENTIFIER}-DatabaseConnections" \
-       --region $PRIMARY_REGION
+       --region $AWS_REGION
    
    # Delete Lambda function
    aws lambda delete-function \
        --function-name $LAMBDA_NAME \
-       --region $PRIMARY_REGION
+       --region $AWS_REGION
    
    # Delete IAM role and policies
    aws iam delete-role-policy \
@@ -663,13 +664,13 @@ echo "Read Replica will be created as: $REPLICA_NAME in $SECONDARY_REGION"
 
    ```bash
    # Delete SNS topics
-   aws sns delete-topic --topic-arn $PRIMARY_TOPIC_ARN --region $PRIMARY_REGION
+   aws sns delete-topic --topic-arn $PRIMARY_TOPIC_ARN --region $AWS_REGION
    aws sns delete-topic --topic-arn $SECONDARY_TOPIC_ARN --region $SECONDARY_REGION
    
    # Delete CloudWatch dashboard
    aws cloudwatch delete-dashboards \
        --dashboard-names $DASHBOARD_NAME \
-       --region $PRIMARY_REGION
+       --region $AWS_REGION
    
    # Clean up local files
    rm -f lambda-trust-policy.json lambda-execution-policy.json
@@ -688,6 +689,8 @@ Cost optimization is an important consideration in disaster recovery planning. C
 
 For production implementations, consider extending this foundation with additional features such as automated failover testing, integration with configuration management systems for application connection string updates, and comprehensive runbook automation for disaster recovery procedures. The [Plan for Disaster Recovery](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/plan-for-disaster-recovery-dr.html) guidance and [Disaster recovery options in the cloud](https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-options-in-the-cloud.html) whitepaper provide comprehensive guidance on designing resilient architectures across different disaster recovery strategies.
 
+> **Tip**: Consider implementing Aurora Global Database for MySQL and PostgreSQL workloads requiring faster recovery times. Aurora Global Database provides sub-second data replication and can recover an entire secondary AWS Region in less than 1 minute. For more information, see the [Aurora Global Database documentation](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database.html).
+
 ## Challenge
 
 Extend this disaster recovery solution by implementing these enhancements:
@@ -704,4 +707,11 @@ Extend this disaster recovery solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

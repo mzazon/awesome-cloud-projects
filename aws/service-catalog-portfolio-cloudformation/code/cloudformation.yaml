@@ -1,0 +1,833 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Service Catalog portfolio with CloudFormation templates for enterprise infrastructure governance'
+
+# ==================================================
+# METADATA
+# ==================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Portfolio Configuration"
+        Parameters:
+          - PortfolioDisplayName
+          - PortfolioDescription
+          - PortfolioProviderName
+      - Label:
+          default: "Product Configuration"
+        Parameters:
+          - S3ProductName
+          - LambdaProductName
+          - ProductOwner
+      - Label:
+          default: "Access Control"
+        Parameters:
+          - PrincipalArn
+          - PrincipalType
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - TemplateBucketName
+          - Environment
+    ParameterLabels:
+      PortfolioDisplayName:
+        default: "Portfolio Display Name"
+      PortfolioDescription:
+        default: "Portfolio Description"
+      PortfolioProviderName:
+        default: "Portfolio Provider Name"
+      S3ProductName:
+        default: "S3 Bucket Product Name"
+      LambdaProductName:
+        default: "Lambda Function Product Name"
+      ProductOwner:
+        default: "Product Owner"
+      PrincipalArn:
+        default: "Principal ARN for Portfolio Access"
+      PrincipalType:
+        default: "Principal Type"
+      TemplateBucketName:
+        default: "Template Storage Bucket Name"
+      Environment:
+        default: "Environment Tag"
+
+# ==================================================
+# PARAMETERS
+# ==================================================
+Parameters:
+  PortfolioDisplayName:
+    Type: String
+    Default: 'enterprise-infrastructure-portfolio'
+    Description: 'Display name for the Service Catalog portfolio'
+    MaxLength: 100
+    MinLength: 1
+    ConstraintDescription: 'Portfolio display name must be between 1 and 100 characters'
+
+  PortfolioDescription:
+    Type: String
+    Default: 'Enterprise infrastructure templates for development teams'
+    Description: 'Description for the Service Catalog portfolio'
+    MaxLength: 2000
+    ConstraintDescription: 'Portfolio description must be less than 2000 characters'
+
+  PortfolioProviderName:
+    Type: String
+    Default: 'IT Infrastructure Team'
+    Description: 'Provider name for the Service Catalog portfolio'
+    MaxLength: 50
+    MinLength: 1
+    ConstraintDescription: 'Provider name must be between 1 and 50 characters'
+
+  S3ProductName:
+    Type: String
+    Default: 'managed-s3-bucket'
+    Description: 'Name for the S3 bucket Service Catalog product'
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Product name must be alphanumeric with hyphens, no spaces'
+
+  LambdaProductName:
+    Type: String
+    Default: 'serverless-function'
+    Description: 'Name for the Lambda function Service Catalog product'
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Product name must be alphanumeric with hyphens, no spaces'
+
+  ProductOwner:
+    Type: String
+    Default: 'IT Infrastructure Team'
+    Description: 'Owner name for Service Catalog products'
+    MaxLength: 8191
+    ConstraintDescription: 'Product owner must be less than 8191 characters'
+
+  PrincipalArn:
+    Type: String
+    Description: 'ARN of the IAM user, group, or role to grant portfolio access'
+    AllowedPattern: '^arn:aws:iam::[0-9]{12}:(user|group|role)\/.*'
+    ConstraintDescription: 'Must be a valid IAM ARN for user, group, or role'
+
+  PrincipalType:
+    Type: String
+    Default: 'IAM'
+    AllowedValues: ['IAM']
+    Description: 'Type of principal for portfolio access'
+
+  TemplateBucketName:
+    Type: String
+    Description: 'Name for the S3 bucket to store CloudFormation templates'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    MinLength: 3
+    MaxLength: 63
+    ConstraintDescription: 'Bucket name must be lowercase, 3-63 characters, alphanumeric with hyphens'
+
+  Environment:
+    Type: String
+    Default: 'development'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: 'Environment for resource tagging and configuration'
+
+# ==================================================
+# CONDITIONS
+# ==================================================
+Conditions:
+  IsProductionEnvironment: !Equals [!Ref Environment, 'production']
+
+# ==================================================
+# RESOURCES
+# ==================================================
+Resources:
+  
+  # ==================================================
+  # S3 BUCKET FOR CLOUDFORMATION TEMPLATES
+  # ==================================================
+  TemplateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref TemplateBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref TemplateBucketLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-template-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Service Catalog Template Storage'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # CloudWatch Log Group for S3 bucket events
+  TemplateBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${TemplateBucketName}'
+      RetentionInDays: !If [IsProductionEnvironment, 90, 14]
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-template-bucket-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ==================================================
+  # S3 BUCKET CLOUDFORMATION TEMPLATE
+  # ==================================================
+  S3BucketTemplate:
+    Type: AWS::S3::Object
+    Properties:
+      Bucket: !Ref TemplateBucket
+      Key: 's3-bucket-template.yaml'
+      ContentType: 'application/x-yaml'
+      Body: |
+        AWSTemplateFormatVersion: '2010-09-09'
+        Description: 'Managed S3 bucket with security best practices for Service Catalog'
+        
+        Parameters:
+          BucketName:
+            Type: String
+            Description: 'Name for the S3 bucket'
+            AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+            MinLength: 3
+            MaxLength: 63
+            ConstraintDescription: 'Bucket name must be lowercase alphanumeric with hyphens, 3-63 characters'
+        
+          Environment:
+            Type: String
+            Default: 'development'
+            AllowedValues: ['development', 'staging', 'production']
+            Description: 'Environment for resource tagging and configuration'
+        
+          AccessLogging:
+            Type: String
+            Default: 'Disabled'
+            AllowedValues: ['Enabled', 'Disabled']
+            Description: 'Enable access logging for the S3 bucket'
+        
+        Conditions:
+          EnableAccessLogging: !Equals [!Ref AccessLogging, 'Enabled']
+          IsProduction: !Equals [!Ref Environment, 'production']
+        
+        Resources:
+          S3Bucket:
+            Type: AWS::S3::Bucket
+            Properties:
+              BucketName: !Ref BucketName
+              BucketEncryption:
+                ServerSideEncryptionConfiguration:
+                  - ServerSideEncryptionByDefault:
+                      SSEAlgorithm: AES256
+                    BucketKeyEnabled: true
+              VersioningConfiguration:
+                Status: Enabled
+              PublicAccessBlockConfiguration:
+                BlockPublicAcls: true
+                BlockPublicPolicy: true
+                IgnorePublicAcls: true
+                RestrictPublicBuckets: true
+              LifecycleConfiguration:
+                Rules:
+                  - Id: TransitionToIA
+                    Status: Enabled
+                    Transitions:
+                      - TransitionInDays: !If [IsProduction, 30, 90]
+                        StorageClass: STANDARD_IA
+                  - Id: DeleteIncompleteMultipartUploads
+                    Status: Enabled
+                    AbortIncompleteMultipartUpload:
+                      DaysAfterInitiation: 7
+              LoggingConfiguration: !If
+                - EnableAccessLogging
+                - DestinationBucketName: !Ref AccessLogsBucket
+                  LogFilePrefix: !Sub '${BucketName}-access-logs/'
+                - !Ref 'AWS::NoValue'
+              Tags:
+                - Key: Name
+                  Value: !Ref BucketName
+                - Key: Environment
+                  Value: !Ref Environment
+                - Key: ManagedBy
+                  Value: 'ServiceCatalog'
+                - Key: Purpose
+                  Value: 'Application Data Storage'
+        
+          AccessLogsBucket:
+            Type: AWS::S3::Bucket
+            Condition: EnableAccessLogging
+            Properties:
+              BucketName: !Sub '${BucketName}-access-logs'
+              BucketEncryption:
+                ServerSideEncryptionConfiguration:
+                  - ServerSideEncryptionByDefault:
+                      SSEAlgorithm: AES256
+              PublicAccessBlockConfiguration:
+                BlockPublicAcls: true
+                BlockPublicPolicy: true
+                IgnorePublicAcls: true
+                RestrictPublicBuckets: true
+              LifecycleConfiguration:
+                Rules:
+                  - Id: DeleteAccessLogs
+                    Status: Enabled
+                    ExpirationInDays: !If [IsProduction, 90, 30]
+              Tags:
+                - Key: Name
+                  Value: !Sub '${BucketName}-access-logs'
+                - Key: Environment
+                  Value: !Ref Environment
+                - Key: ManagedBy
+                  Value: 'ServiceCatalog'
+                - Key: Purpose
+                  Value: 'Access Logs Storage'
+        
+        Outputs:
+          BucketName:
+            Description: 'Name of the created S3 bucket'
+            Value: !Ref S3Bucket
+            Export:
+              Name: !Sub '${AWS::StackName}-BucketName'
+          
+          BucketArn:
+            Description: 'ARN of the created S3 bucket'
+            Value: !GetAtt S3Bucket.Arn
+            Export:
+              Name: !Sub '${AWS::StackName}-BucketArn'
+          
+          BucketDomainName:
+            Description: 'Domain name of the created S3 bucket'
+            Value: !GetAtt S3Bucket.DomainName
+            Export:
+              Name: !Sub '${AWS::StackName}-BucketDomainName'
+          
+          BucketRegionalDomainName:
+            Description: 'Regional domain name of the created S3 bucket'
+            Value: !GetAtt S3Bucket.RegionalDomainName
+            Export:
+              Name: !Sub '${AWS::StackName}-BucketRegionalDomainName'
+
+  # ==================================================
+  # LAMBDA FUNCTION CLOUDFORMATION TEMPLATE
+  # ==================================================
+  LambdaFunctionTemplate:
+    Type: AWS::S3::Object
+    Properties:
+      Bucket: !Ref TemplateBucket
+      Key: 'lambda-function-template.yaml'
+      ContentType: 'application/x-yaml'
+      Body: |
+        AWSTemplateFormatVersion: '2010-09-09'
+        Description: 'Managed Lambda function with IAM role and CloudWatch logging for Service Catalog'
+        
+        Parameters:
+          FunctionName:
+            Type: String
+            Description: 'Name for the Lambda function'
+            AllowedPattern: '^[a-zA-Z0-9-_]+$'
+            MinLength: 1
+            MaxLength: 64
+            ConstraintDescription: 'Function name must be alphanumeric with hyphens and underscores, 1-64 characters'
+        
+          Runtime:
+            Type: String
+            Default: 'python3.12'
+            AllowedValues: ['python3.12', 'python3.11', 'nodejs20.x', 'nodejs22.x', 'java21', 'dotnet8']
+            Description: 'Runtime environment for the Lambda function'
+        
+          Environment:
+            Type: String
+            Default: 'development'
+            AllowedValues: ['development', 'staging', 'production']
+            Description: 'Environment for resource tagging and configuration'
+        
+          MemorySize:
+            Type: Number
+            Default: 128
+            MinValue: 128
+            MaxValue: 10240
+            Description: 'Memory allocation for the Lambda function (MB)'
+        
+          Timeout:
+            Type: Number
+            Default: 30
+            MinValue: 1
+            MaxValue: 900
+            Description: 'Timeout for the Lambda function (seconds)'
+        
+        Conditions:
+          IsProduction: !Equals [!Ref Environment, 'production']
+          IsPythonRuntime: !Or
+            - !Equals [!Ref Runtime, 'python3.12']
+            - !Equals [!Ref Runtime, 'python3.11']
+          IsNodeRuntime: !Or
+            - !Equals [!Ref Runtime, 'nodejs20.x']
+            - !Equals [!Ref Runtime, 'nodejs22.x']
+        
+        Resources:
+          LambdaExecutionRole:
+            Type: AWS::IAM::Role
+            Properties:
+              RoleName: !Sub '${FunctionName}-ExecutionRole'
+              AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      Service: lambda.amazonaws.com
+                    Action: sts:AssumeRole
+              ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+              Policies: !If
+                - IsProduction
+                - - PolicyName: 'EnhancedLogging'
+                    PolicyDocument:
+                      Version: '2012-10-17'
+                      Statement:
+                        - Effect: Allow
+                          Action:
+                            - logs:CreateLogStream
+                            - logs:PutLogEvents
+                            - logs:CreateLogGroup
+                          Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}*'
+                - !Ref 'AWS::NoValue'
+              Tags:
+                - Key: Name
+                  Value: !Sub '${FunctionName}-ExecutionRole'
+                - Key: Environment
+                  Value: !Ref Environment
+                - Key: ManagedBy
+                  Value: 'ServiceCatalog'
+                - Key: Purpose
+                  Value: 'Lambda Execution Role'
+        
+          LambdaLogGroup:
+            Type: AWS::Logs::LogGroup
+            Properties:
+              LogGroupName: !Sub '/aws/lambda/${FunctionName}'
+              RetentionInDays: !If [IsProduction, 30, 14]
+              Tags:
+                - Key: Name
+                  Value: !Sub '${FunctionName}-LogGroup'
+                - Key: Environment
+                  Value: !Ref Environment
+                - Key: ManagedBy
+                  Value: 'ServiceCatalog'
+        
+          LambdaFunction:
+            Type: AWS::Lambda::Function
+            DependsOn: LambdaLogGroup
+            Properties:
+              FunctionName: !Ref FunctionName
+              Runtime: !Ref Runtime
+              Handler: !If
+                - IsPythonRuntime
+                - 'index.handler'
+                - !If
+                  - IsNodeRuntime
+                  - 'index.handler'
+                  - 'index.handler'
+              Role: !GetAtt LambdaExecutionRole.Arn
+              MemorySize: !Ref MemorySize
+              Timeout: !Ref Timeout
+              Environment:
+                Variables:
+                  ENVIRONMENT: !Ref Environment
+                  LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+              Code:
+                ZipFile: !If
+                  - IsPythonRuntime
+                  - |
+                    import json
+                    import os
+                    import logging
+                    
+                    # Configure logging
+                    log_level = os.environ.get('LOG_LEVEL', 'INFO')
+                    logging.basicConfig(level=getattr(logging, log_level))
+                    logger = logging.getLogger(__name__)
+                    
+                    def handler(event, context):
+                        logger.info(f'Function executed in {os.environ.get("ENVIRONMENT", "unknown")} environment')
+                        logger.debug(f'Event received: {json.dumps(event)}')
+                        
+                        return {
+                            'statusCode': 200,
+                            'headers': {
+                                'Content-Type': 'application/json'
+                            },
+                            'body': json.dumps({
+                                'message': 'Hello from Service Catalog managed Lambda!',
+                                'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                                'function_name': context.function_name,
+                                'request_id': context.aws_request_id
+                            })
+                        }
+                  - !If
+                    - IsNodeRuntime
+                    - |
+                      const handler = async (event, context) => {
+                          console.log(`Function executed in ${process.env.ENVIRONMENT || 'unknown'} environment`);
+                          console.debug('Event received:', JSON.stringify(event));
+                          
+                          return {
+                              statusCode: 200,
+                              headers: {
+                                  'Content-Type': 'application/json'
+                              },
+                              body: JSON.stringify({
+                                  message: 'Hello from Service Catalog managed Lambda!',
+                                  environment: process.env.ENVIRONMENT || 'unknown',
+                                  functionName: context.functionName,
+                                  requestId: context.awsRequestId
+                              })
+                          };
+                      };
+                      
+                      exports.handler = handler;
+                    - |
+                      // Default handler for other runtimes
+                      exports.handler = async (event, context) => {
+                          return {
+                              statusCode: 200,
+                              body: 'Hello from Service Catalog managed Lambda!'
+                          };
+                      };
+              Tags:
+                - Key: Name
+                  Value: !Ref FunctionName
+                - Key: Environment
+                  Value: !Ref Environment
+                - Key: ManagedBy
+                  Value: 'ServiceCatalog'
+                - Key: Purpose
+                  Value: 'Application Function'
+        
+        Outputs:
+          FunctionName:
+            Description: 'Name of the created Lambda function'
+            Value: !Ref LambdaFunction
+            Export:
+              Name: !Sub '${AWS::StackName}-FunctionName'
+          
+          FunctionArn:
+            Description: 'ARN of the created Lambda function'
+            Value: !GetAtt LambdaFunction.Arn
+            Export:
+              Name: !Sub '${AWS::StackName}-FunctionArn'
+          
+          ExecutionRoleArn:
+            Description: 'ARN of the Lambda execution role'
+            Value: !GetAtt LambdaExecutionRole.Arn
+            Export:
+              Name: !Sub '${AWS::StackName}-ExecutionRoleArn'
+          
+          LogGroupName:
+            Description: 'Name of the CloudWatch log group'
+            Value: !Ref LambdaLogGroup
+            Export:
+              Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  # ==================================================
+  # SERVICE CATALOG LAUNCH ROLE
+  # ==================================================
+  ServiceCatalogLaunchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ServiceCatalogLaunchRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: servicecatalog.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: 'ServiceCatalogLaunchPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for bucket product
+              - Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:PutBucketEncryption
+                  - s3:PutBucketVersioning
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:PutBucketTagging
+                  - s3:PutBucketLifecycleConfiguration
+                  - s3:PutBucketLogging
+                  - s3:PutBucketNotification
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource: '*'
+              # Lambda permissions for function product
+              - Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:GetFunction
+                  - lambda:ListTags
+                Resource: '*'
+              # IAM permissions for role management
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource: '*'
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:TagLogGroup
+                  - logs:UntagLogGroup
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              # CloudFormation permissions for stack operations
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:ListStackResources
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ServiceCatalogLaunchRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Service Catalog Launch Constraints'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ==================================================
+  # SERVICE CATALOG PORTFOLIO
+  # ==================================================
+  ServiceCatalogPortfolio:
+    Type: AWS::ServiceCatalog::Portfolio
+    Properties:
+      DisplayName: !Ref PortfolioDisplayName
+      Description: !Ref PortfolioDescription
+      ProviderName: !Ref PortfolioProviderName
+      Tags:
+        - Key: Name
+          Value: !Ref PortfolioDisplayName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Enterprise Infrastructure Governance'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ==================================================
+  # SERVICE CATALOG PRODUCTS
+  # ==================================================
+  S3BucketProduct:
+    Type: AWS::ServiceCatalog::CloudFormationProduct
+    DependsOn: S3BucketTemplate
+    Properties:
+      Name: !Ref S3ProductName
+      Description: 'Managed S3 bucket with security best practices and configurable features'
+      Owner: !Ref ProductOwner
+      ProvisioningArtifactParameters:
+        - Name: 'v1.0'
+          Description: 'Initial version with encryption, versioning, and lifecycle management'
+          Info:
+            LoadTemplateFromURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/s3-bucket-template.yaml'
+      Tags:
+        - Key: Name
+          Value: !Ref S3ProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ProductType
+          Value: 'Storage'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  LambdaFunctionProduct:
+    Type: AWS::ServiceCatalog::CloudFormationProduct
+    DependsOn: LambdaFunctionTemplate
+    Properties:
+      Name: !Ref LambdaProductName
+      Description: 'Managed Lambda function with IAM role, logging, and monitoring capabilities'
+      Owner: !Ref ProductOwner
+      ProvisioningArtifactParameters:
+        - Name: 'v1.0'
+          Description: 'Initial version with execution role, CloudWatch logging, and environment variables'
+          Info:
+            LoadTemplateFromURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/lambda-function-template.yaml'
+      Tags:
+        - Key: Name
+          Value: !Ref LambdaProductName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ProductType
+          Value: 'Compute'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ==================================================
+  # PRODUCT-PORTFOLIO ASSOCIATIONS
+  # ==================================================
+  S3ProductPortfolioAssociation:
+    Type: AWS::ServiceCatalog::PortfolioProductAssociation
+    Properties:
+      PortfolioId: !Ref ServiceCatalogPortfolio
+      ProductId: !Ref S3BucketProduct
+
+  LambdaProductPortfolioAssociation:
+    Type: AWS::ServiceCatalog::PortfolioProductAssociation
+    Properties:
+      PortfolioId: !Ref ServiceCatalogPortfolio
+      ProductId: !Ref LambdaFunctionProduct
+
+  # ==================================================
+  # LAUNCH CONSTRAINTS
+  # ==================================================
+  S3ProductLaunchConstraint:
+    Type: AWS::ServiceCatalog::LaunchRoleConstraint
+    Properties:
+      PortfolioId: !Ref ServiceCatalogPortfolio
+      ProductId: !Ref S3BucketProduct
+      RoleArn: !GetAtt ServiceCatalogLaunchRole.Arn
+      Description: 'Launch constraint for S3 bucket product with dedicated IAM role'
+
+  LambdaProductLaunchConstraint:
+    Type: AWS::ServiceCatalog::LaunchRoleConstraint
+    Properties:
+      PortfolioId: !Ref ServiceCatalogPortfolio
+      ProductId: !Ref LambdaFunctionProduct
+      RoleArn: !GetAtt ServiceCatalogLaunchRole.Arn
+      Description: 'Launch constraint for Lambda function product with dedicated IAM role'
+
+  # ==================================================
+  # PORTFOLIO ACCESS
+  # ==================================================
+  PortfolioPrincipalAssociation:
+    Type: AWS::ServiceCatalog::PortfolioPrincipalAssociation
+    Properties:
+      PortfolioId: !Ref ServiceCatalogPortfolio
+      PrincipalARN: !Ref PrincipalArn
+      PrincipalType: !Ref PrincipalType
+
+# ==================================================
+# OUTPUTS
+# ==================================================
+Outputs:
+  PortfolioId:
+    Description: 'ID of the created Service Catalog portfolio'
+    Value: !Ref ServiceCatalogPortfolio
+    Export:
+      Name: !Sub '${AWS::StackName}-PortfolioId'
+
+  PortfolioName:
+    Description: 'Display name of the Service Catalog portfolio'
+    Value: !Ref PortfolioDisplayName
+    Export:
+      Name: !Sub '${AWS::StackName}-PortfolioName'
+
+  S3ProductId:
+    Description: 'ID of the S3 bucket Service Catalog product'
+    Value: !Ref S3BucketProduct
+    Export:
+      Name: !Sub '${AWS::StackName}-S3ProductId'
+
+  LambdaProductId:
+    Description: 'ID of the Lambda function Service Catalog product'
+    Value: !Ref LambdaFunctionProduct
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaProductId'
+
+  LaunchRoleArn:
+    Description: 'ARN of the Service Catalog launch role'
+    Value: !GetAtt ServiceCatalogLaunchRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchRoleArn'
+
+  TemplateBucketName:
+    Description: 'Name of the S3 bucket storing CloudFormation templates'
+    Value: !Ref TemplateBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TemplateBucketName'
+
+  TemplateBucketArn:
+    Description: 'ARN of the S3 bucket storing CloudFormation templates'
+    Value: !GetAtt TemplateBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TemplateBucketArn'
+
+  S3TemplateUrl:
+    Description: 'URL of the S3 bucket CloudFormation template'
+    Value: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/s3-bucket-template.yaml'
+
+  LambdaTemplateUrl:
+    Description: 'URL of the Lambda function CloudFormation template'
+    Value: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/lambda-function-template.yaml'
+
+  ConsoleUrl:
+    Description: 'AWS Console URL to view the Service Catalog portfolio'
+    Value: !Sub 'https://console.aws.amazon.com/servicecatalog/home?region=${AWS::Region}#/portfolios/${ServiceCatalogPortfolio}'
+
+  DeploymentInstructions:
+    Description: 'Instructions for deploying this CloudFormation template'
+    Value: !Sub |
+      Deploy this template with the following AWS CLI command:
+      aws cloudformation create-stack --stack-name service-catalog-portfolio --template-body file://cloudformation.yaml --parameters ParameterKey=TemplateBucketName,ParameterValue=YOUR_UNIQUE_BUCKET_NAME ParameterKey=PrincipalArn,ParameterValue=YOUR_IAM_ARN --capabilities CAPABILITY_NAMED_IAM --region ${AWS::Region}
+
+  ValidationCommands:
+    Description: 'AWS CLI commands to validate the deployment'
+    Value: !Sub |
+      # List portfolios
+      aws servicecatalog list-portfolios --query "PortfolioDetails[?DisplayName=='${PortfolioDisplayName}']"
+      
+      # List products in portfolio
+      aws servicecatalog search-products-as-admin --portfolio-id ${ServiceCatalogPortfolio}
+      
+      # Test product search as end user
+      aws servicecatalog search-products --query 'ProductViewSummaries[].Name'

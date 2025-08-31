@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: EC2, Systems Manager, IAM
 estimated-time: 45 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: compute, systems-manager, security, session-manager, run-command
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Organizations need to manage their cloud servers securely while minimizing secur
 
 ## Solution
 
-Implement a secure server management solution using Amazon EC2 and AWS Systems Manager that eliminates the need for inbound ports, SSH keys, or bastion hosts. This approach uses Systems Manager's Session Manager for secure shell access to EC2 instances and Run Command for remote script execution. IAM policies control access permissions, providing granular user access based on roles and responsibilities. All session activity and commands are automatically logged for audit purposes through integration with CloudWatch Logs and S3. This solution greatly enhances security posture while simplifying administrative tasks and improving operational efficiency.
+Implement a secure server management solution using Amazon EC2 and AWS Systems Manager that eliminates the need for inbound ports, SSH keys, or bastion hosts. This approach uses Systems Manager's Session Manager for secure shell access to EC2 instances and Run Command for remote script execution. IAM policies control access permissions, providing granular user access based on roles and responsibilities. All session activity and commands are automatically logged for audit purposes through integration with CloudWatch Logs. This solution greatly enhances security posture while simplifying administrative tasks and improving operational efficiency.
 
 ## Architecture Diagram
 
@@ -78,8 +78,10 @@ graph TB
 1. AWS account with permissions to create/manage EC2 instances, IAM roles, and Systems Manager resources
 2. AWS CLI v2 installed and configured with appropriate credentials
 3. Basic familiarity with EC2, IAM, and Linux/Windows server administration concepts
-4. AWS Management Console access
+4. AWS Management Console access (for Session Manager plugin if not using CloudShell)
 5. Estimated cost: <$5.00 for a 1-day test (t2.micro EC2 instance + Systems Manager)
+
+> **Note**: This recipe follows AWS Well-Architected Framework security principles by eliminating inbound access ports and using IAM for access control. See [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) for additional security guidance.
 
 ## Preparation
 
@@ -192,7 +194,7 @@ echo "Region: ${AWS_REGION}"
        --query "Subnets[0].SubnetId" \
        --output text)
    
-   # Create security group that blocks all inbound traffic except HTTPS outbound
+   # Create security group that blocks all inbound traffic
    # This demonstrates the security improvement - no SSH ports needed
    SG_ID=$(aws ec2 create-security-group \
        --group-name "SSM-SecureServer-${RANDOM_SUFFIX}" \
@@ -201,12 +203,8 @@ echo "Region: ${AWS_REGION}"
        --query "GroupId" \
        --output text)
    
-   # Allow outbound traffic only (Systems Manager uses outbound HTTPS)
-   aws ec2 authorize-security-group-egress \
-       --group-id ${SG_ID} \
-       --protocol all \
-       --port -1 \
-       --cidr 0.0.0.0/0
+   # Note: Default security groups allow all outbound traffic
+   # Systems Manager uses outbound HTTPS (port 443) to communicate with AWS services
    
    # Launch instance with the IAM instance profile attached
    # The instance profile provides Systems Manager permissions
@@ -241,14 +239,19 @@ echo "Region: ${AWS_REGION}"
    
    # Check if instance is registered with Systems Manager
    # This verifies that the IAM permissions and network connectivity are working
-   aws ssm describe-instance-information \
+   PING_STATUS=$(aws ssm describe-instance-information \
        --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
-       --query "InstanceInformationList[].PingStatus" \
-       --output text
+       --query "InstanceInformationList[0].PingStatus" \
+       --output text)
+   
+   echo "Instance status in Systems Manager: ${PING_STATUS}"
    
    # If the output is "Online", the instance is successfully registered
-   
-   echo "✅ Verified EC2 instance is managed by Systems Manager"
+   if [ "$PING_STATUS" = "Online" ]; then
+       echo "✅ Verified EC2 instance is managed by Systems Manager"
+   else
+       echo "⚠️ Instance not yet online. Please wait and check connectivity."
+   fi
    ```
 
    The instance is now registered with Systems Manager and ready for secure management. This verification step ensures that the IAM permissions, network connectivity, and SSM Agent are all functioning correctly before proceeding to access the instance.
@@ -261,13 +264,13 @@ echo "Region: ${AWS_REGION}"
 
    ```bash
    # Start a session to the instance (this will open an interactive shell)
-   # Note: This command will only work if executed in an environment with the 
-   # AWS CLI Session Manager plugin installed. In CloudShell, this plugin is 
-   # pre-installed.
+   # Note: This command requires the Session Manager plugin to be installed
+   # In CloudShell, this plugin is pre-installed
    
    echo "To start a secure shell session to your instance, run this command:"
    echo "aws ssm start-session --target ${INSTANCE_ID}"
    
+   echo ""
    echo "Alternatively, you can connect through the AWS Console:"
    echo "1. Go to the EC2 console"
    echo "2. Select the instance with name ${EC2_INSTANCE_NAME}"
@@ -376,22 +379,41 @@ echo "Region: ${AWS_REGION}"
    aws logs create-log-group \
        --log-group-name "/aws/ssm/sessions/${RANDOM_SUFFIX}"
    
-   # Configure Session Manager to use CloudWatch Logs
+   # Create Session Manager preferences document for CloudWatch logging
+   # This configuration enables logging for all future sessions
+   cat > SessionManagerRunShell.json << EOF
+   {
+       "schemaVersion": "1.0",
+       "description": "Document to hold regional settings for Session Manager",
+       "sessionType": "Standard_Stream",
+       "inputs": {
+           "s3BucketName": "",
+           "s3KeyPrefix": "",
+           "s3EncryptionEnabled": true,
+           "cloudWatchLogGroupName": "/aws/ssm/sessions/${RANDOM_SUFFIX}",
+           "cloudWatchEncryptionEnabled": false,
+           "cloudWatchStreamingEnabled": false,
+           "kmsKeyId": "",
+           "runAsEnabled": false,
+           "runAsDefaultUser": "",
+           "idleSessionTimeout": "",
+           "maxSessionDuration": "",
+           "shellProfile": {
+               "windows": "",
+               "linux": ""
+           }
+       }
+   }
+   EOF
+   
+   # Update Session Manager preferences to use CloudWatch Logs
    aws ssm update-document \
        --name "SSM-SessionManagerRunShell" \
-       --document-version "\$DEFAULT" \
-       --content '{
-           "schemaVersion": "1.0",
-           "description": "Document to hold regional settings for Session Manager",
-           "sessionType": "Standard_Stream",
-           "inputs": {
-               "s3BucketName": "",
-               "s3KeyPrefix": "",
-               "s3EncryptionEnabled": true,
-               "cloudWatchLogGroupName": "/aws/ssm/sessions/'${RANDOM_SUFFIX}'",
-               "cloudWatchEncryptionEnabled": false
-           }
-       }'
+       --content "file://SessionManagerRunShell.json" \
+       --document-version "\$LATEST"
+   
+   # Clean up temporary file
+   rm SessionManagerRunShell.json
    
    echo "✅ Session logging configured to CloudWatch Logs"
    ```
@@ -431,21 +453,16 @@ echo "Region: ${AWS_REGION}"
        echo "Then run: curl http://localhost"
    else
        echo "Public IP: $PUBLIC_IP"
-       echo "To test the web server, open a browser and navigate to:"
-       echo "http://$PUBLIC_IP"
+       echo "To test the web server, you need to allow HTTP traffic."
+       echo "Add HTTP inbound rule to security group ${SG_ID} if needed."
        
-       # Test using curl (optional)
-       echo "Testing connection to web server..."
-       curl -s --connect-timeout 5 http://$PUBLIC_IP | grep -q "Hello from Systems Manager"
-       if [ $? -eq 0 ]; then
-           echo "✅ Web server is accessible and running correctly"
-       else
-           echo "⚠️ Could not reach web server. Security group may not allow inbound HTTP"
-       fi
+       # Note: The security group currently blocks all inbound traffic
+       echo "Current security group blocks all inbound traffic for security."
+       echo "This demonstrates Systems Manager's secure access without open ports."
    fi
    ```
 
-3. Verify session logging:
+3. Verify session logging configuration:
 
    ```bash
    # Check if log group was created successfully
@@ -538,36 +555,44 @@ echo "Region: ${AWS_REGION}"
    unset CMD_ID
    unset DEPLOY_CMD_ID
    unset PUBLIC_IP
+   unset PING_STATUS
    
    echo "✅ Cleanup complete! All resources have been removed."
    ```
 
 ## Discussion
 
-AWS Systems Manager transforms how you securely manage EC2 instances by eliminating the traditional security risks associated with direct SSH or RDP access. This approach addresses three key challenges: security, operational efficiency, and compliance.
+AWS Systems Manager transforms how you securely manage EC2 instances by eliminating the traditional security risks associated with direct SSH or RDP access. This approach addresses three key challenges: security, operational efficiency, and compliance, while following AWS Well-Architected Framework principles.
 
-From a security perspective, removing the need for inbound management ports significantly reduces your attack surface. According to the Verizon Data Breach Investigations Report, 70% of breaches are perpetrated by external actors, and many of these exploits target open management ports. Systems Manager's Session Manager provides secure shell access without opening any inbound ports, while IAM policies ensure fine-grained access control. The AWS-managed infrastructure handles authentication, authorization, and encryption in transit, eliminating many common security concerns.
+From a security perspective, removing the need for inbound management ports significantly reduces your attack surface. According to the Verizon Data Breach Investigations Report, 70% of breaches are perpetrated by external actors, and many of these exploits target open management ports. Systems Manager's Session Manager provides secure shell access without opening any inbound ports, while IAM policies ensure fine-grained access control. The AWS-managed infrastructure handles authentication, authorization, and encryption in transit, eliminating many common security concerns. This approach aligns with the AWS Well-Architected Framework's security pillar by implementing defense in depth and the principle of least privilege.
 
-Operationally, Systems Manager reduces the burden of credential management. Teams no longer need to generate, distribute, store, and rotate SSH keys or passwords. This streamlines the onboarding and offboarding of team members, as all access is controlled through IAM. The Run Command feature further enhances operational efficiency by allowing standardized operations across multiple instances simultaneously. This consistency reduces human error and allows for rapid response to operational needs.
+Operationally, Systems Manager reduces the burden of credential management and improves efficiency. Teams no longer need to generate, distribute, store, and rotate SSH keys or passwords. This streamlines the onboarding and offboarding of team members, as all access is controlled through IAM. The Run Command feature further enhances operational efficiency by allowing standardized operations across multiple instances simultaneously. This consistency reduces human error and allows for rapid response to operational needs, supporting the operational excellence pillar of the Well-Architected Framework.
 
-Compliance and auditability are automatically addressed through Systems Manager's integration with CloudWatch Logs. Every session and command is logged, providing a complete audit trail of who accessed which resources and what actions they performed. This detailed logging meets many compliance requirements out of the box, without requiring additional tools or configurations.
+Compliance and auditability are automatically addressed through Systems Manager's integration with CloudWatch Logs. Every session and command is logged, providing a complete audit trail of who accessed which resources and what actions they performed. This detailed logging meets many compliance requirements out of the box, without requiring additional tools or configurations. For organizations managing multiple environments or a large fleet of instances, Systems Manager's approach scales efficiently while maintaining centralized security controls.
 
-For organizations managing multiple environments or a large fleet of instances, Systems Manager's approach scales efficiently. The same tools and processes work identically across development, testing, and production environments. This consistency simplifies training, reduces mistakes, and increases overall security posture. Additionally, as your infrastructure grows, the centralized management model of Systems Manager becomes increasingly valuable, as it avoids the exponential complexity that can come with managing SSH keys or bastion hosts at scale.
+> **Note**: For additional security best practices and detailed implementation guidance, refer to the [AWS Systems Manager User Guide](https://docs.aws.amazon.com/systems-manager/latest/userguide/) and the [AWS Well-Architected Security Pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html).
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. Create custom IAM policies that restrict Systems Manager access to specific EC2 instances based on tags. This allows you to implement separation of duties between development, staging, and production environments.
+1. Create custom IAM policies that restrict Systems Manager access to specific EC2 instances based on tags, implementing separation of duties between development, staging, and production environments.
 
-2. Configure Systems Manager to store session logs in an S3 bucket with lifecycle policies for long-term retention to meet compliance requirements.
+2. Configure Systems Manager to store session logs in an S3 bucket with lifecycle policies for long-term retention and implement cross-region replication for compliance requirements.
 
-3. Use Systems Manager Parameter Store to securely store and retrieve configuration data for your applications instead of hardcoding sensitive values in scripts or environment variables.
+3. Use Systems Manager Parameter Store to securely store and retrieve configuration data for your applications, replacing hardcoded sensitive values in scripts with encrypted parameters.
 
-4. Create a Systems Manager maintenance window that automatically applies security patches to your EC2 instances on a regular schedule using the Patch Manager capability.
+4. Create a Systems Manager maintenance window that automatically applies security patches to your EC2 instances on a regular schedule using the Patch Manager capability, with approval workflows for critical systems.
 
-5. Build a custom automation document that sets up a complete application stack using Systems Manager Automation, allowing you to consistently deploy complex applications across multiple environments.
+5. Build a custom automation document that sets up a complete application stack using Systems Manager Automation, allowing you to consistently deploy complex applications across multiple environments with error handling and rollback capabilities.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

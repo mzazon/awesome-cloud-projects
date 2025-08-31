@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: s3, glacier
 estimated-time: 30 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-25
 passed-qa: null
 tags: s3, glacier, archiving, lifecycle-policies, compliance
 recipe-generator-version: 1.3
@@ -19,7 +19,7 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Your organization needs to retain data for extended periods (7+ years) to meet regulatory requirements while minimizing storage costs. You need a solution that safely archives historical data in a cost-effective manner while maintaining the ability to retrieve it when needed.
+Your organization needs to retain data for extended periods (7+ years) to meet regulatory requirements while minimizing storage costs. Traditional storage solutions are expensive for infrequently accessed data, and manual data management creates operational overhead and compliance risks.
 
 ## Solution
 
@@ -28,22 +28,40 @@ Create a comprehensive long-term archiving strategy using Amazon S3 and S3 Glaci
 ## Architecture Diagram
 
 ```mermaid
-graph TD
-    A[S3 Standard Bucket] -->|Lifecycle Policy| B[S3 Glacier Deep Archive]
-    B -->|Restore Request| C[Temporary S3 Standard Copy]
-    C -->|Access Data| D[Applications/Users]
-    E[S3 Inventory Reports] -->|Monitor| A
-    F[CloudWatch Events] -->|Notify on Archive/Restore| G[SNS Notifications]
-    G -->|Email/SMS| H[Admin]
+graph TB
+    subgraph "Data Sources"
+        A[Applications] --> B[S3 Standard Bucket]
+    end
+    
+    subgraph "Automated Lifecycle"
+        B -->|90 days| C[S3 Glacier Deep Archive]
+        B -->|180 days| C
+    end
+    
+    subgraph "Monitoring & Notifications"
+        E[S3 Inventory Reports] --> B
+        F[S3 Events] --> G[SNS Notifications]
+        G --> H[Admin Email]
+    end
+    
+    subgraph "Retrieval Process"
+        C -->|Restore Request| I[Temporary S3 Standard Copy]
+        I -->|Access Data| J[Applications/Users]
+    end
+    
+    style C fill:#FF9900
+    style B fill:#3F8624
 ```
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions to create and manage S3 buckets
+1. AWS account with permissions for S3, SNS, and IAM operations
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
-3. A dataset that requires long-term archiving
-4. Understanding of S3 storage classes and lifecycle policies
-5. Estimated cost: Less than $1 per TB stored (significantly less than standard S3)
+3. Understanding of S3 storage classes and lifecycle policies
+4. Email address for archive notifications
+5. Estimated cost: $0.00099 per GB/month for Deep Archive storage (75% less than S3 Standard)
+
+> **Note**: S3 Glacier Deep Archive provides 99.999999999% (11 9's) durability at the lowest cost storage class. Objects require 12+ hours minimum storage duration and retrieval times of 9-48 hours.
 
 ## Preparation
 
@@ -60,6 +78,8 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --output text --query RandomPassword)
 
 echo "✅ Environment prepared for archiving setup"
+echo "Region: $AWS_REGION"
+echo "Account: $AWS_ACCOUNT_ID"
 ```
 
 ## Steps
@@ -69,10 +89,15 @@ echo "✅ Environment prepared for archiving setup"
    Amazon S3 serves as the foundation for your archiving strategy, providing 99.999999999% (11 9's) durability and seamless integration with Glacier Deep Archive. Creating a dedicated archival bucket establishes the primary repository that will automatically transition data to the most cost-effective storage tier based on your lifecycle policies.
 
    ```bash
-   aws s3api create-bucket \
-     --bucket long-term-archive-${RANDOM_SUFFIX} \
-     --region ${AWS_REGION} \
-     --create-bucket-configuration LocationConstraint=${AWS_REGION}
+   # Create bucket with region-specific configuration
+   if [ "$AWS_REGION" = "us-east-1" ]; then
+     aws s3api create-bucket --bucket long-term-archive-${RANDOM_SUFFIX}
+   else
+     aws s3api create-bucket \
+       --bucket long-term-archive-${RANDOM_SUFFIX} \
+       --region ${AWS_REGION} \
+       --create-bucket-configuration LocationConstraint=${AWS_REGION}
+   fi
    
    BUCKET_NAME=long-term-archive-${RANDOM_SUFFIX}
    echo "✅ Created archival bucket: $BUCKET_NAME"
@@ -80,9 +105,28 @@ echo "✅ Environment prepared for archiving setup"
 
    The bucket is now ready to receive data and apply automated lifecycle transitions. This foundational step enables all subsequent archiving operations and provides the scalable storage foundation required for regulatory compliance and long-term data retention.
 
-   > **Note**: S3 bucket names must be globally unique across all AWS accounts. The random suffix ensures you can create a bucket with a unique name while following AWS naming conventions.
+2. **Enable Versioning and Default Encryption for Data Protection**:
 
-2. **Configure Lifecycle Policies for Automated Archiving**:
+   Versioning and encryption provide additional data protection layers essential for compliance and regulatory requirements. Versioning protects against accidental deletions while AES-256 encryption ensures data security at rest.
+
+   ```bash
+   # Enable versioning for data protection
+   aws s3api put-bucket-versioning \
+     --bucket ${BUCKET_NAME} \
+     --versioning-configuration Status=Enabled
+   
+   # Enable default encryption
+   aws s3api put-bucket-encryption \
+     --bucket ${BUCKET_NAME} \
+     --server-side-encryption-configuration \
+     'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+   
+   echo "✅ Enabled versioning and encryption for data protection"
+   ```
+
+   The bucket now provides enterprise-grade data protection with automatic versioning and encryption, ensuring compliance with security standards and protecting against both accidental and malicious data loss.
+
+3. **Configure Lifecycle Policies for Automated Archiving**:
 
    Lifecycle policies enable automated data management by transitioning objects between storage classes based on age, eliminating manual intervention and ensuring consistent cost optimization. This configuration implements a tiered approach where frequently accessed archive data transitions after 90 days, while general data transitions after 180 days.
 
@@ -91,7 +135,7 @@ echo "✅ Environment prepared for archiving setup"
    {
      "Rules": [
        {
-         "ID": "Move to Glacier Deep Archive after 90 days",
+         "ID": "Priority-Archive-90-Days",
          "Status": "Enabled",
          "Filter": {
            "Prefix": "archives/"
@@ -104,7 +148,7 @@ echo "✅ Environment prepared for archiving setup"
          ]
        },
        {
-         "ID": "Move all files to Glacier Deep Archive after 180 days",
+         "ID": "General-Archive-180-Days",
          "Status": "Enabled",
          "Filter": {
            "Prefix": ""
@@ -125,7 +169,7 @@ echo "✅ Environment prepared for archiving setup"
 
    This configuration establishes a "set-and-forget" archiving strategy that automatically manages data transitions based on business rules, reducing storage costs by up to 75% compared to S3 Standard while maintaining data durability and availability for compliance requirements.
 
-3. **Apply Lifecycle Configuration to Enable Automatic Transitions**:
+4. **Apply Lifecycle Configuration to Enable Automatic Transitions**:
 
    Applying the lifecycle configuration activates the automated data management policies that will continuously monitor object ages and transition them to the appropriate storage class. This automation ensures compliance with data retention policies while optimizing storage costs without manual intervention.
 
@@ -139,32 +183,73 @@ echo "✅ Environment prepared for archiving setup"
 
    The bucket now actively manages data transitions based on the configured rules, automatically moving objects to Glacier Deep Archive storage class when they reach the specified age thresholds.
 
-4. **Set Up Notification System for Archive Events**:
+5. **Create SNS Topic and Configure Permissions for S3 Events**:
 
-   S3 event notifications integrated with SNS provide real-time visibility into archiving operations, enabling operational monitoring and audit trail creation. This notification system alerts administrators when objects transition to Deep Archive, supporting compliance documentation and operational awareness.
+   SNS provides the notification infrastructure for archive event monitoring. Proper IAM permissions are essential to allow S3 to publish events to the SNS topic, enabling real-time visibility into archiving operations.
 
    ```bash
    # Create SNS topic for archive notifications
-   aws sns create-topic --name s3-archive-notifications
-   
-   # Store the topic ARN for configuration
-   TOPIC_ARN=$(aws sns create-topic --name s3-archive-notifications \
+   TOPIC_ARN=$(aws sns create-topic --name s3-archive-notifications-${RANDOM_SUFFIX} \
      --output text --query 'TopicArn')
    
-   # Subscribe email for notifications
+   # Create SNS topic policy to allow S3 to publish events
+   cat <<EOF > sns-policy.json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Principal": {
+           "Service": "s3.amazonaws.com"
+         },
+         "Action": "SNS:Publish",
+         "Resource": "${TOPIC_ARN}",
+         "Condition": {
+           "StringEquals": {
+             "aws:SourceAccount": "${AWS_ACCOUNT_ID}"
+           },
+           "ArnEquals": {
+             "aws:SourceArn": "arn:aws:s3:::${BUCKET_NAME}"
+           }
+         }
+       }
+     ]
+   }
+   EOF
+   
+   # Apply the policy to the SNS topic
+   aws sns set-topic-attributes \
+     --topic-arn ${TOPIC_ARN} \
+     --attribute-name Policy \
+     --attribute-value file://sns-policy.json
+   
+   echo "✅ SNS topic created with S3 permissions: $TOPIC_ARN"
+   ```
+
+   The SNS topic is now configured with proper permissions to receive events from S3, enabling secure and reliable notification delivery for archive operations.
+
+6. **Subscribe to Email Notifications for Archive Events**:
+
+   Email subscription provides operational visibility into archiving activities, enabling proactive monitoring and audit compliance for data lifecycle management. This notification system alerts administrators when objects transition to Deep Archive, supporting compliance documentation and operational awareness.
+
+   ```bash
+   # Subscribe email for notifications (replace with your email)
+   echo "Enter your email address for archive notifications:"
+   read EMAIL_ADDRESS
+   
    aws sns subscribe \
      --topic-arn ${TOPIC_ARN} \
      --protocol email \
-     --notification-endpoint your-email@example.com
+     --notification-endpoint ${EMAIL_ADDRESS}
    
-   echo "✅ Notification system configured - check email to confirm subscription"
+   echo "✅ Email subscription created - check ${EMAIL_ADDRESS} to confirm subscription"
    ```
 
    The notification infrastructure is now established to provide operational visibility into archiving activities, enabling proactive monitoring and audit compliance for data lifecycle management.
 
-5. **Configure Event Filtering for Targeted Notifications**:
+7. **Configure S3 Event Notifications for Lifecycle Transitions**:
 
-   Event filtering ensures you receive notifications only for relevant archiving activities, reducing notification noise while maintaining visibility into critical data movements. This configuration focuses on PDF documents as an example of document-centric archiving common in compliance scenarios.
+   Event filtering ensures you receive notifications only for relevant archiving activities, reducing notification noise while maintaining visibility into critical data movements. This configuration monitors all lifecycle transitions to Deep Archive storage.
 
    ```bash
    cat <<EOF > notification-config.json
@@ -175,12 +260,7 @@ echo "✅ Environment prepared for archiving setup"
          "Events": ["s3:LifecycleTransition"],
          "Filter": {
            "Key": {
-             "FilterRules": [
-               {
-                 "Name": "suffix",
-                 "Value": ".pdf"
-               }
-             ]
+             "FilterRules": []
            }
          }
        }
@@ -188,16 +268,7 @@ echo "✅ Environment prepared for archiving setup"
    }
    EOF
    
-   echo "✅ Event filtering configuration created"
-   ```
-
-   This filtering approach allows for granular monitoring of specific file types or data categories, enabling targeted operational responses and compliance tracking for different types of archived content.
-
-6. **Activate Event Notifications for Archive Monitoring**:
-
-   Applying the notification configuration establishes real-time monitoring of archiving events, providing operational visibility and audit capabilities essential for compliance and data governance. This integration enables proactive management of archived data and supports regulatory reporting requirements.
-
-   ```bash
+   # Apply notification configuration
    aws s3api put-bucket-notification-configuration \
      --bucket ${BUCKET_NAME} \
      --notification-configuration file://notification-config.json
@@ -205,28 +276,32 @@ echo "✅ Environment prepared for archiving setup"
    echo "✅ Event notifications activated for archive monitoring"
    ```
 
-   The notification system is now active and will alert administrators when PDF files transition to Deep Archive storage, enabling real-time tracking of compliance-critical data movements.
+   The notification system is now active and will alert administrators when objects transition to Deep Archive storage, enabling real-time tracking of compliance-critical data movements.
 
-7. **Test Archive System with Sample Data**:
+8. **Test Archive System with Sample Data**:
 
    Testing the archiving system with sample data validates the lifecycle policies and notification configurations while demonstrating the different transition timelines based on object location. This step verifies that the automated archiving workflow functions correctly before deploying with production data.
 
    ```bash
-   # Create sample document for testing
-   echo "This is a sample archived document" > sample-document.pdf
+   # Create sample documents for testing
+   echo "Sample archived document - Priority" > priority-doc.pdf
+   echo "Sample archived document - General" > general-doc.pdf
    
    # Upload to archives folder (90-day transition)
-   aws s3 cp sample-document.pdf s3://${BUCKET_NAME}/archives/
+   aws s3 cp priority-doc.pdf s3://${BUCKET_NAME}/archives/
    
    # Upload to root folder (180-day transition)
-   aws s3 cp sample-document.pdf s3://${BUCKET_NAME}/
+   aws s3 cp general-doc.pdf s3://${BUCKET_NAME}/
+   
+   # Verify uploads
+   aws s3 ls s3://${BUCKET_NAME}/ --recursive
    
    echo "✅ Sample data uploaded - lifecycle policies will govern automatic archiving"
    ```
 
    The sample files are now subject to the configured lifecycle policies and will automatically transition to Deep Archive storage based on their location, demonstrating the tiered archiving approach for different data types.
 
-8. **Enable S3 Inventory for Comprehensive Archive Tracking**:
+9. **Enable S3 Inventory for Comprehensive Archive Tracking**:
 
    S3 Inventory provides detailed reports about object storage classes, sizes, and metadata without incurring retrieval costs, essential for compliance auditing and cost optimization. Weekly inventory reports enable proactive management of archived data and support regulatory documentation requirements.
 
@@ -238,7 +313,7 @@ echo "✅ Environment prepared for archiving setup"
        "S3BucketDestination": {
          "Format": "CSV",
          "Bucket": "arn:aws:s3:::${BUCKET_NAME}",
-         "Prefix": "inventory-reports"
+         "Prefix": "inventory-reports/"
        }
      },
      "IsEnabled": true,
@@ -270,37 +345,57 @@ echo "✅ Environment prepared for archiving setup"
 
 1. Verify your lifecycle configuration was applied successfully:
 
-```bash
-aws s3api get-bucket-lifecycle-configuration --bucket ${BUCKET_NAME}
-```
+   ```bash
+   aws s3api get-bucket-lifecycle-configuration \
+     --bucket ${BUCKET_NAME}
+   ```
+
+   Expected output: JSON showing your configured lifecycle rules with transition settings.
 
 2. Check that your notification configuration is active:
 
-```bash
-aws s3api get-bucket-notification-configuration --bucket ${BUCKET_NAME}
-```
+   ```bash
+   aws s3api get-bucket-notification-configuration \
+     --bucket ${BUCKET_NAME}
+   ```
 
-3. Test the restoration process for an object (note that in a real scenario, objects would need to be in Glacier Deep Archive, which takes time to transition):
+   Expected output: JSON showing your SNS topic configuration for lifecycle events.
 
-```bash
-# Simulate with a direct upload to Glacier Deep Archive
-aws s3 cp sample-document.pdf \
-  s3://${BUCKET_NAME}/immediate-archive/ \
-  --storage-class DEEP_ARCHIVE
+3. Verify bucket versioning and encryption are enabled:
 
-# Initiate a restore request (48-hour retrieval)
-aws s3api restore-object \
-  --bucket ${BUCKET_NAME} \
-  --key immediate-archive/sample-document.pdf \
-  --restore-request '{"Days":5,"GlacierJobParameters":{"Tier":"Bulk"}}'
+   ```bash
+   # Check versioning status
+   aws s3api get-bucket-versioning --bucket ${BUCKET_NAME}
+   
+   # Check encryption configuration
+   aws s3api get-bucket-encryption --bucket ${BUCKET_NAME}
+   ```
 
-# Check the restore status
-aws s3api head-object \
-  --bucket ${BUCKET_NAME} \
-  --key immediate-archive/sample-document.pdf
-```
+   Expected output: Versioning status "Enabled" and AES256 encryption configuration.
 
-> **Tip**: When initiating restore requests for production data, consider your retrieval time needs carefully. Standard retrieval takes 9-12 hours, while bulk retrieval takes up to 48 hours but is more cost-effective for large datasets. For urgent needs, plan your restoration process in advance.
+4. Test the restoration process for an object in Deep Archive:
+
+   ```bash
+   # Upload a file directly to Deep Archive for testing
+   aws s3 cp general-doc.pdf \
+     s3://${BUCKET_NAME}/test-restore/ \
+     --storage-class DEEP_ARCHIVE
+   
+   # Initiate a restore request (bulk retrieval - up to 48 hours)
+   aws s3api restore-object \
+     --bucket ${BUCKET_NAME} \
+     --key test-restore/general-doc.pdf \
+     --restore-request '{"Days":5,"GlacierJobParameters":{"Tier":"Bulk"}}'
+   
+   # Check the restore status
+   aws s3api head-object \
+     --bucket ${BUCKET_NAME} \
+     --key test-restore/general-doc.pdf
+   
+   echo "✅ Restore request initiated - check restore status periodically"
+   ```
+
+> **Tip**: Standard retrieval takes 9-12 hours, while bulk retrieval takes up to 48 hours but costs significantly less. For production systems, plan restoration times according to your business recovery requirements.
 
 ## Cleanup
 
@@ -312,36 +407,79 @@ aws s3api put-bucket-notification-configuration \
   --bucket ${BUCKET_NAME} \
   --notification-configuration "{}"
 
-# Delete SNS topic
+# Delete SNS subscriptions and topic
+aws sns list-subscriptions-by-topic --topic-arn ${TOPIC_ARN} \
+  --query 'Subscriptions[].SubscriptionArn' --output text | \
+  xargs -I {} aws sns unsubscribe --subscription-arn {}
+
 aws sns delete-topic --topic-arn ${TOPIC_ARN}
 
-# Empty the bucket (required before deletion)
-aws s3 rm s3://${BUCKET_NAME} --recursive
+# Remove inventory configuration
+aws s3api delete-bucket-inventory-configuration \
+  --bucket ${BUCKET_NAME} \
+  --id "Weekly-Inventory"
+
+# Empty the bucket (including all versions)
+aws s3api list-object-versions --bucket ${BUCKET_NAME} \
+  --output json --query 'Versions[].{Key:Key,VersionId:VersionId}' | \
+  jq -r '.[] | "\(.Key) \(.VersionId)"' | \
+  while read key version; do
+    aws s3api delete-object --bucket ${BUCKET_NAME} --key "$key" --version-id "$version"
+  done
+
+# Delete any delete markers
+aws s3api list-object-versions --bucket ${BUCKET_NAME} \
+  --output json --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' | \
+  jq -r '.[] | "\(.Key) \(.VersionId)"' | \
+  while read key version; do
+    aws s3api delete-object --bucket ${BUCKET_NAME} --key "$key" --version-id "$version"
+  done
 
 # Delete the bucket
 aws s3api delete-bucket --bucket ${BUCKET_NAME}
+
+# Clean up temporary files
+rm -f lifecycle-config.json notification-config.json inventory-config.json sns-policy.json
+rm -f priority-doc.pdf general-doc.pdf
+
+echo "✅ All resources cleaned up successfully"
 ```
 
 ## Discussion
 
-Amazon S3 Glacier Deep Archive is the lowest-cost storage class offered by AWS, designed specifically for long-term data retention where access is infrequent (less than once per year). At approximately 1/4 the cost of S3 Standard storage, it provides an excellent solution for regulatory compliance requirements that mandate data retention for extended periods.
+Amazon S3 Glacier Deep Archive represents the most cost-effective storage solution in AWS, priced at approximately $0.00099 per GB per month—roughly 75% less than S3 Standard storage. This storage class is specifically designed for long-term data retention scenarios where access frequency is extremely low (less than once per year), making it ideal for regulatory compliance, backup archival, and disaster recovery use cases.
 
-When designing your archiving strategy, consider the trade-offs between accessibility and cost. S3 Glacier Deep Archive optimizes for cost at the expense of immediate access. Objects stored in this tier require a restore operation before they can be accessed, with retrieval times ranging from 9-48 hours depending on the chosen retrieval tier.
+The architecture follows the AWS Well-Architected Framework principles by implementing automated lifecycle management, comprehensive monitoring, and cost optimization strategies. The dual-tier lifecycle approach allows organizations to optimize costs further by applying different retention policies based on data criticality and access patterns.
 
-The lifecycle configuration approach allows you to automate the transition of objects between storage tiers based on age, creating a "set-and-forget" archiving solution. This is particularly valuable for organizations that generate regular reports, logs, or other time-series data that decreases in access frequency over time.
+S3 Inventory reporting provides crucial operational visibility without incurring retrieval costs, enabling organizations to maintain compliance documentation and cost tracking. This is particularly important for industries with strict regulatory requirements like healthcare (HIPAA), financial services (SOX), and government sectors that mandate long-term data retention.
 
-S3 Inventory provides a powerful mechanism to keep track of your archived objects without incurring retrieval costs. The weekly reports help you maintain an up-to-date catalog of archived data, which is important for both compliance and operational purposes.
+When designing your archiving strategy, consider the 180-day minimum storage duration for Deep Archive objects. Early deletion incurs prorated charges for the remaining days. Additionally, while storage costs are minimal, retrieval operations can become expensive at scale, particularly for expedited retrievals. Organizations should implement proper data classification and retention policies to ensure only necessary data is archived.
 
-> **Warning**: While S3 Glacier Deep Archive provides the lowest storage costs, be aware of potential retrieval costs. Retrieving large amounts of data can become expensive, especially using faster retrieval options. Plan your retrieval strategy carefully and consider batch operations for large restores.
+> **Warning**: S3 Glacier Deep Archive has a minimum 180-day storage commitment. Objects deleted before this period incur prorated charges. Plan your data lifecycle carefully and consider using S3 Intelligent-Tiering for data with unpredictable access patterns.
 
-Organizations should also consider implementing data classification policies to determine which data requires long-term archiving and which can be safely deleted. By only archiving truly necessary data, you can further optimize your storage costs while maintaining compliance.
+For comprehensive documentation on S3 lifecycle policies and best practices, see the [AWS S3 User Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html) and [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
 ## Challenge
 
-1. Extend this solution by creating different archive paths with varying retention schedules based on data sensitivity or regulatory requirements. For example, implement a tiered approach where financial records transition to Deep Archive after 7 years, while general business records transition after 3 years.
+Extend this solution by implementing these enhancements:
 
-2. Implement a Lambda function triggered by S3 events to automatically add metadata tags to objects when they're uploaded, such as "ArchiveDate" and "RetentionPeriod". Then modify your lifecycle rules to transition objects based on these tags rather than a fixed schedule.
+1. **Multi-Tier Archive Strategy**: Create a comprehensive lifecycle policy that transitions data through multiple storage classes (S3 Standard → S3 Standard-IA → S3 Glacier Flexible Retrieval → S3 Glacier Deep Archive) based on data classification tags and business requirements.
+
+2. **Automated Metadata Tagging**: Implement a Lambda function triggered by S3 PutObject events that automatically applies metadata tags based on object properties, then modify lifecycle rules to use tag-based filtering instead of prefix-based filtering.
+
+3. **Cross-Region Replication for DR**: Configure Cross-Region Replication to replicate archived data to a secondary region for disaster recovery, implementing different lifecycle policies for primary and replica buckets to optimize costs while maintaining compliance.
+
+4. **Restore Automation with Step Functions**: Build an AWS Step Functions workflow that automates the restoration process, including cost estimation, approval workflows, and automatic cleanup of restored objects after a specified access period.
+
+5. **Compliance Reporting Dashboard**: Create a CloudWatch dashboard that tracks archiving metrics, costs, and compliance status using S3 Inventory reports and CloudWatch Logs, providing executive visibility into data retention and costs.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

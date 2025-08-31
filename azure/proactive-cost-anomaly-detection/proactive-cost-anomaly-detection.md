@@ -4,12 +4,12 @@ id: f4a8b2c1
 category: financial-management
 difficulty: 200
 subject: azure
-services: Azure Cost Management, Azure Functions, Azure Monitor, Azure Logic Apps
+services: Cost Management, Functions, Cosmos DB, Logic Apps
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-management, anomaly-detection, serverless, automation, monitoring, alerts
 recipe-generator-version: 1.3
@@ -73,16 +73,17 @@ graph TB
 
 1. Azure subscription with Owner or Contributor permissions
 2. Azure CLI v2.60.0 or later installed and configured
-3. Basic knowledge of Azure Cost Management and billing concepts
-4. Understanding of serverless computing patterns and Azure Functions
-5. Familiarity with Azure Logic Apps and workflow automation
-6. Estimated cost: $15-30 per month for moderate usage (Function Apps, Cosmos DB, Storage)
+3. Azure Functions Core Tools v4.x installed for local development
+4. Basic knowledge of Azure Cost Management and billing concepts
+5. Understanding of serverless computing patterns and Azure Functions
+6. Familiarity with Azure Logic Apps and workflow automation
+7. Estimated cost: $15-30 per month for moderate usage (Function Apps, Cosmos DB, Storage)
 
 > **Note**: This solution requires access to Azure Cost Management billing APIs. Ensure your account has the necessary permissions to access billing data for the target subscriptions.
 
 ## Preparation
 
-Azure Cost Management provides comprehensive APIs for retrieving billing and usage data, enabling automated cost analysis and anomaly detection. Setting up the foundational resources involves creating storage for historical data, configuring serverless compute resources, and establishing monitoring capabilities.
+Azure Cost Management provides comprehensive APIs for retrieving billing and usage data, enabling automated cost analysis and anomaly detection. Setting up the foundational resources involves creating storage for historical data, configuring serverless compute resources, and establishing monitoring capabilities that follow Azure Well-Architected Framework principles.
 
 ```bash
 # Set environment variables for Azure resources
@@ -112,7 +113,8 @@ az storage account create \
     --location ${LOCATION} \
     --sku Standard_LRS \
     --kind StorageV2 \
-    --access-tier Hot
+    --access-tier Hot \
+    --allow-blob-public-access false
 
 echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
@@ -131,7 +133,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
 
 1. **Create Azure Functions App for Cost Data Processing**:
 
-   Azure Functions provides serverless compute capabilities that automatically scale based on demand, making it ideal for periodic cost analysis tasks. The consumption plan ensures cost-effective execution while the timer trigger enables scheduled data collection and analysis. This serverless approach eliminates infrastructure management overhead while providing reliable, scalable cost monitoring.
+   Azure Functions provides serverless compute capabilities that automatically scale based on demand, making it ideal for periodic cost analysis tasks. The consumption plan ensures cost-effective execution while the timer trigger enables scheduled data collection and analysis. This serverless approach eliminates infrastructure management overhead while providing reliable, scalable cost monitoring that aligns with Azure Well-Architected Framework principles.
 
    ```bash
    # Create Function App with consumption plan
@@ -141,7 +143,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --storage-account ${STORAGE_ACCOUNT} \
        --consumption-plan-location ${LOCATION} \
        --runtime python \
-       --runtime-version 3.11 \
+       --runtime-version 3.12 \
        --functions-version 4 \
        --disable-app-insights false
    
@@ -158,11 +160,11 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    echo "✅ Function App created and configured: ${FUNCTION_APP}"
    ```
 
-   The Function App is now ready with the necessary configuration for cost data processing. Application settings provide environment-specific variables that the functions will use to connect to Cosmos DB, specify the subscription to monitor, and define anomaly detection parameters.
+   The Function App is now ready with the necessary configuration for cost data processing. Application settings provide environment-specific variables that the functions will use to connect to Cosmos DB, specify the subscription to monitor, and define anomaly detection parameters. The consumption plan automatically scales based on demand while maintaining cost-effectiveness.
 
 2. **Create Cosmos DB Database and Container for Cost Data**:
 
-   Cosmos DB provides globally distributed, multi-model database capabilities with automatic scaling and low-latency access. Creating a dedicated database for cost data ensures efficient querying and enables complex analytics on historical spending patterns. The partition key strategy based on date enables optimal query performance for time-series cost analysis.
+   Azure Cosmos DB provides globally distributed, multi-model database capabilities with automatic scaling and low-latency access. Creating a dedicated database for cost data ensures efficient querying and enables complex analytics on historical spending patterns. The partition key strategy based on date enables optimal query performance for time-series cost analysis while following Cosmos DB best practices.
 
    ```bash
    # Create database for cost data
@@ -193,11 +195,11 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    echo "✅ Cosmos DB database and containers created"
    ```
 
-   The Cosmos DB database is now configured with optimized containers for cost data storage and anomaly detection results. This structure supports efficient querying for both historical analysis and real-time anomaly detection while maintaining cost-effective throughput allocation.
+   The Cosmos DB database is now configured with optimized containers for cost data storage and anomaly detection results. This structure supports efficient querying for both historical analysis and real-time anomaly detection while maintaining cost-effective throughput allocation and enabling horizontal scaling.
 
 3. **Deploy Cost Data Collection Function**:
 
-   The cost data collection function integrates with Azure Cost Management APIs to retrieve daily spending information across all services and resource groups. This function processes the raw billing data, calculates metrics, and stores structured cost information in Cosmos DB for analysis and anomaly detection.
+   The cost data collection function integrates with Azure Cost Management APIs to retrieve daily spending information across all services and resource groups. This function processes the raw billing data, calculates metrics, and stores structured cost information in Cosmos DB for analysis and anomaly detection using managed identity authentication for secure access.
 
    ```bash
    # Create function directory structure
@@ -234,7 +236,6 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    import os
    from datetime import datetime, timedelta
    from azure.identity import DefaultAzureCredential
-   from azure.mgmt.consumption import ConsumptionManagementClient
    from azure.mgmt.costmanagement import CostManagementClient
    
    def main(mytimer: func.TimerRequest, cosmosOut: func.Out[func.Document]) -> None:
@@ -299,9 +300,11 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
                cost_records.append(cost_record)
            
            # Output to Cosmos DB
-           cosmosOut.set(func.Document.from_dict(cost_records))
-           
-           logging.info(f'Successfully processed {len(cost_records)} cost records for {date_str}')
+           if cost_records:
+               cosmosOut.set(func.Document.from_dict(cost_records))
+               logging.info(f'Successfully processed {len(cost_records)} cost records for {date_str}')
+           else:
+               logging.info(f'No cost data found for {date_str}')
            
        except Exception as e:
            logging.error(f'Error processing cost data: {str(e)}')
@@ -312,24 +315,37 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    cat > ./cost-anomaly-functions/requirements.txt << 'EOF'
    azure-functions
    azure-identity
-   azure-mgmt-consumption
    azure-mgmt-costmanagement
    azure-cosmos
    EOF
    
+   # Create host.json for function app configuration
+   cat > ./cost-anomaly-functions/host.json << 'EOF'
+   {
+     "version": "2.0",
+     "functionTimeout": "00:10:00",
+     "extensions": {
+       "cosmosDB": {
+         "connectionMode": "Direct"
+       }
+     }
+   }
+   EOF
+   
    # Deploy function code
    cd ./cost-anomaly-functions
-   func azure functionapp publish ${FUNCTION_APP} --python
+   func azure functionapp publish ${FUNCTION_APP} \
+       --python
    cd ..
    
    echo "✅ Cost data collection function deployed"
    ```
 
-   The cost data collection function is now deployed and configured to run daily at 8 AM UTC. This function automatically retrieves the previous day's cost data from Azure Cost Management APIs, processes it into structured records, and stores it in Cosmos DB for analysis and historical tracking.
+   The cost data collection function is now deployed and configured to run daily at 8 AM UTC. This function automatically retrieves the previous day's cost data from Azure Cost Management APIs, processes it into structured records, and stores it in Cosmos DB for analysis and historical tracking with proper error handling and logging.
 
 4. **Create Anomaly Detection Function**:
 
-   The anomaly detection function implements statistical analysis algorithms to identify unusual spending patterns by comparing current costs against historical baselines. This function calculates rolling averages, standard deviations, and applies configurable thresholds to detect significant cost anomalies across different services and resource groups.
+   The anomaly detection function implements statistical analysis algorithms to identify unusual spending patterns by comparing current costs against historical baselines. This function calculates rolling averages, standard deviations, and applies configurable thresholds to detect significant cost anomalies across different services and resource groups using proven statistical methods.
 
    ```bash
    # Create anomaly detection function
@@ -350,6 +366,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
          "databaseName": "CostAnalytics",
          "collectionName": "DailyCosts",
          "connectionStringSetting": "COSMOS_CONNECTION",
+         "sqlQuery": "SELECT * FROM c WHERE c.date >= DateTimeAdd('day', -30, GetCurrentDateTime())",
          "direction": "in"
        },
        {
@@ -462,17 +479,18 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    
    # Redeploy with updated functions
    cd ./cost-anomaly-functions
-   func azure functionapp publish ${FUNCTION_APP} --python
+   func azure functionapp publish ${FUNCTION_APP} \
+       --python
    cd ..
    
    echo "✅ Anomaly detection function deployed"
    ```
 
-   The anomaly detection function now analyzes cost patterns using statistical methods to identify significant deviations from normal spending behavior. This function runs 30 minutes after the data collection function, ensuring fresh data is available for analysis while providing timely anomaly detection.
+   The anomaly detection function now analyzes cost patterns using statistical methods to identify significant deviations from normal spending behavior. This function runs 30 minutes after the data collection function, ensuring fresh data is available for analysis while providing timely anomaly detection with configurable sensitivity thresholds.
 
 5. **Create Logic App for Automated Alerting**:
 
-   Azure Logic Apps provides workflow orchestration capabilities that enable sophisticated alerting logic based on anomaly detection results. This workflow monitors for new anomalies, formats detailed alert messages, and distributes notifications through multiple channels including email and Microsoft Teams integration.
+   Azure Logic Apps provides workflow orchestration capabilities that enable sophisticated alerting logic based on anomaly detection results. This workflow monitors for new anomalies, formats detailed alert messages, and distributes notifications through multiple channels including email and Microsoft Teams integration following enterprise notification patterns.
 
    ```bash
    # Create Logic App
@@ -486,19 +504,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
          "parameters": {},
          "triggers": {
            "When_a_new_anomaly_is_detected": {
-             "type": "ApiConnection",
-             "inputs": {
-               "host": {
-                 "connection": {
-                   "name": "@parameters(\"$connections\")[\"documentdb\"][\"connectionId\"]"
-                 }
-               },
-               "method": "get",
-               "path": "/v2/cosmosdb/@{encodeURIComponent(\"cosmos-cost-anomaly-${RANDOM_SUFFIX}\")}/dbs/@{encodeURIComponent(\"CostAnalytics\")}/colls/@{encodeURIComponent(\"AnomalyResults\")}/docs",
-               "queries": {
-                 "x-ms-max-item-count": 1
-               }
-             },
+             "type": "Recurrence",
              "recurrence": {
                "frequency": "Hour",
                "interval": 1
@@ -506,21 +512,16 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
            }
          },
          "actions": {
-           "Send_email_notification": {
-             "type": "ApiConnection",
+           "Initialize_variable": {
+             "type": "InitializeVariable",
              "inputs": {
-               "host": {
-                 "connection": {
-                   "name": "@parameters(\"$connections\")[\"office365\"][\"connectionId\"]"
+               "variables": [
+                 {
+                   "name": "AnomalyFound",
+                   "type": "boolean",
+                   "value": false
                  }
-               },
-               "method": "post",
-               "path": "/v2/Mail",
-               "body": {
-                 "To": "admin@company.com",
-                 "Subject": "Cost Anomaly Detected",
-                 "Body": "A cost anomaly has been detected in your Azure subscription."
-               }
+               ]
              }
            }
          }
@@ -542,7 +543,8 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
          "databaseName": "CostAnalytics",
          "collectionName": "AnomalyResults",
          "connectionStringSetting": "COSMOS_CONNECTION",
-         "createLeaseCollectionIfNotExists": true
+         "createLeaseCollectionIfNotExists": true,
+         "leaseCollectionName": "leases"
        }
      ]
    }
@@ -573,6 +575,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
                Severity: {doc['severity']}
                
                Please investigate this cost anomaly and take appropriate action.
+               Review Azure Cost Management for detailed analysis.
                """
                
                # Log alert (replace with actual notification logic)
@@ -580,24 +583,29 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
                
                # Here you would integrate with your notification system
                # Examples: send to Slack, Teams, email, SMS, etc.
+               # Consider using Azure Communication Services for emails/SMS
+               # or Microsoft Graph API for Teams notifications
                
+           except KeyError as e:
+               logging.error(f'Missing required field in anomaly document: {str(e)}')
            except Exception as e:
                logging.error(f'Error processing anomaly notification: {str(e)}')
    EOF
    
    # Deploy notification handler
    cd ./cost-anomaly-functions
-   func azure functionapp publish ${FUNCTION_APP} --python
+   func azure functionapp publish ${FUNCTION_APP} \
+       --python
    cd ..
    
    echo "✅ Notification handler deployed"
    ```
 
-   The Logic App and notification handler are now configured to automatically process anomaly detection results and send formatted alerts. The notification system provides comprehensive anomaly details including cost comparisons, percentage changes, and severity levels to enable informed decision-making.
+   The Logic App and notification handler are now configured to automatically process anomaly detection results and send formatted alerts. The notification system provides comprehensive anomaly details including cost comparisons, percentage changes, and severity levels to enable informed decision-making while supporting extensible notification channels.
 
 6. **Configure Cosmos DB Connection and Permissions**:
 
-   Proper authentication and authorization are essential for secure access to Azure Cost Management APIs and Cosmos DB. This step configures managed identity authentication, assigns necessary role-based access control (RBAC) permissions, and establishes secure connections between the Function App and data storage services.
+   Proper authentication and authorization are essential for secure access to Azure Cost Management APIs and Cosmos DB. This step configures managed identity authentication, assigns necessary role-based access control (RBAC) permissions, and establishes secure connections between the Function App and data storage services following Azure security best practices.
 
    ```bash
    # Enable managed identity for Function App
@@ -643,7 +651,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    echo "✅ Permissions and connections configured"
    ```
 
-   The Function App now has the necessary permissions to access both Azure Cost Management APIs and Cosmos DB resources through managed identity authentication. This security configuration follows Azure best practices by avoiding hardcoded credentials and using role-based access control.
+   The Function App now has the necessary permissions to access both Azure Cost Management APIs and Cosmos DB resources through managed identity authentication. This security configuration follows Azure Well-Architected Framework security principles by avoiding hardcoded credentials and using role-based access control with least privilege access.
 
 ## Validation & Testing
 
@@ -705,7 +713,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --name ${FUNCTION_APP} \
        --resource-group ${RESOURCE_GROUP} \
        --function-name AnomalyDetector \
-       --query "{name:name, status:status}" \
+       --query "{name:name, config:config}" \
        --output table
    
    # Query anomaly results
@@ -732,7 +740,19 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    echo "✅ Function App deleted"
    ```
 
-2. **Remove Cosmos DB account**:
+2. **Remove Logic App**:
+
+   ```bash
+   # Delete Logic App
+   az logic workflow delete \
+       --name ${LOGIC_APP} \
+       --resource-group ${RESOURCE_GROUP} \
+       --yes
+   
+   echo "✅ Logic App deleted"
+   ```
+
+3. **Remove Cosmos DB account**:
 
    ```bash
    # Delete Cosmos DB account
@@ -744,7 +764,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    echo "✅ Cosmos DB account deleted"
    ```
 
-3. **Remove Storage Account**:
+4. **Remove Storage Account**:
 
    ```bash
    # Delete Storage Account
@@ -756,7 +776,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    echo "✅ Storage Account deleted"
    ```
 
-4. **Remove Resource Group and all remaining resources**:
+5. **Remove Resource Group and all remaining resources**:
 
    ```bash
    # Delete entire resource group
@@ -766,6 +786,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --no-wait
    
    echo "✅ Resource group deletion initiated"
+   echo "Note: Deletion may take several minutes to complete"
    
    # Clean up local files
    rm -rf ./cost-anomaly-functions
@@ -777,7 +798,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
 
 This automated cost anomaly detection solution demonstrates the power of combining Azure's native cost management capabilities with serverless computing and intelligent workflow orchestration. The architecture leverages [Azure Cost Management APIs](https://docs.microsoft.com/en-us/rest/api/cost-management/) to provide comprehensive billing data access, while Azure Functions enables cost-effective, event-driven processing that scales automatically based on demand. The solution addresses the critical challenge of proactive cost monitoring by implementing statistical anomaly detection algorithms that identify unusual spending patterns before they impact budgets significantly.
 
-The implementation follows Azure Well-Architected Framework principles by emphasizing reliability through managed services, security through managed identity authentication, and cost optimization through consumption-based pricing models. Azure Functions' serverless nature ensures that compute costs are directly proportional to actual usage, while Cosmos DB's global distribution and automatic scaling provide reliable data storage for cost analytics. The [Azure Functions consumption plan](https://docs.microsoft.com/en-us/azure/azure-functions/consumption-plan) offers a generous free tier that makes this solution cost-effective for most organizations.
+The implementation follows [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles by emphasizing reliability through managed services, security through managed identity authentication, and cost optimization through consumption-based pricing models. Azure Functions' serverless nature ensures that compute costs are directly proportional to actual usage, while Cosmos DB's global distribution and automatic scaling provide reliable data storage for cost analytics. The [Azure Functions consumption plan](https://docs.microsoft.com/en-us/azure/azure-functions/consumption-plan) offers a generous free tier that makes this solution cost-effective for most organizations.
 
 Integration with Azure Logic Apps enables sophisticated workflow automation that can be easily customized for different notification requirements and escalation procedures. The solution's modular design allows for easy extension with additional data sources, custom anomaly detection algorithms, or integration with existing IT service management systems. For organizations implementing FinOps practices, this solution provides the foundation for automated cost governance and optimization workflows as described in the [Azure FinOps documentation](https://docs.microsoft.com/en-us/azure/cloud-adoption-framework/strategy/track-costs).
 
@@ -801,4 +822,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

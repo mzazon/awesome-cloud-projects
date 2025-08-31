@@ -6,16 +6,16 @@ difficulty: 100
 subject: aws
 services: EventBridge Scheduler, SNS, IAM
 estimated-time: 60 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: notifications, automation, scheduling, serverless, business
 recipe-generator-version: 1.3
 ---
 
-# Scheduling Notifications with EventBridge and SNS
+# Scheduling Notifications with EventBridge Scheduler and SNS
 
 ## Problem
 
@@ -469,9 +469,9 @@ Security is implemented through IAM roles and policies that follow the principle
 
 - [Amazon EventBridge Scheduler User Guide](https://docs.aws.amazon.com/scheduler/latest/UserGuide/what-is-scheduler.html)
 - [Amazon SNS Developer Guide](https://docs.aws.amazon.com/sns/latest/dg/welcome.html)
-- [Using EventBridge Scheduler with SNS](https://docs.aws.amazon.com/sns/latest/dg/using-eventbridge-scheduler.html)
 - [EventBridge Scheduler IAM Permissions](https://docs.aws.amazon.com/scheduler/latest/UserGuide/security_iam_service-with-iam.html)
 - [SNS Message Filtering](https://docs.aws.amazon.com/sns/latest/dg/sns-message-filtering.html)
+- [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html)
 
 ## Challenge
 
@@ -489,4 +489,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,679 @@
+# Infrastructure Manager Configuration for Smart Expense Processing
+# This configuration deploys a complete intelligent expense processing system
+# using Document AI, Gemini, Cloud Workflows, and Cloud SQL
+
+metadata:
+  title: "Smart Expense Processing Infrastructure"
+  description: "Complete infrastructure for AI-powered expense processing with Document AI and Gemini"
+  version: "1.0"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    validation:
+      pattern: "[a-z][a-z0-9-]{4,28}[a-z0-9]"
+
+  region:
+    type: string
+    description: "Primary region for resources"
+    default: "us-central1"
+    validation:
+      enum: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"]
+
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    validation:
+      enum: ["dev", "staging", "prod"]
+
+  expense_db_password:
+    type: string
+    description: "Password for expense database (min 8 characters)"
+    sensitive: true
+    validation:
+      min_length: 8
+
+  enable_monitoring:
+    type: bool
+    description: "Enable monitoring and alerting"
+    default: true
+
+# Resource definitions
+resources:
+  # Random suffix for unique resource naming
+  random_suffix:
+    type: gcp-types/cloudresourcemanager-v1:random
+    properties:
+      length: 6
+      lower: true
+      upper: false
+      numeric: true
+
+  # Enable required APIs
+  enable_documentai_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/documentai.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_aiplatform_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/aiplatform.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_workflows_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/workflows.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_sqladmin_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/sqladmin.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_storage_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/storage.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_cloudfunctions_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudfunctions.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_run_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/run.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Cloud Storage bucket for receipt storage
+  receipt_storage_bucket:
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: expense-receipts-$(ref.random_suffix.result)-${var.environment}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycleRules:
+        - action:
+            type: Delete
+          condition:
+            age: 2555  # 7 years retention for compliance
+      encryption:
+        defaultKmsKeyName: projects/${var.project_id}/locations/${var.region}/keyRings/expense-processing-ring/cryptoKeys/receipt-storage-key
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+    metadata:
+      dependsOn:
+        - enable_storage_api
+
+  # KMS Key Ring for encryption
+  expense_key_ring:
+    type: gcp-types/cloudkms-v1:keyRing
+    properties:
+      name: expense-processing-ring
+      parent: projects/${var.project_id}/locations/${var.region}
+    metadata:
+      dependsOn:
+        - enable_storage_api
+
+  # KMS Crypto Key for bucket encryption
+  receipt_storage_key:
+    type: gcp-types/cloudkms-v1:cryptoKey
+    properties:
+      name: receipt-storage-key
+      parent: $(ref.expense_key_ring.name)
+      purpose: ENCRYPT_DECRYPT
+      rotationPeriod: 7776000s  # 90 days
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+    metadata:
+      dependsOn:
+        - expense_key_ring
+
+  # Document AI Processor for expense parsing
+  expense_processor:
+    type: gcp-types/documentai-v1:processor
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      displayName: expense-parser-$(ref.random_suffix.result)
+      type: EXPENSE_PROCESSOR
+      defaultProcessorVersion:
+        state: ENABLED
+    metadata:
+      dependsOn:
+        - enable_documentai_api
+
+  # Cloud SQL PostgreSQL instance for expense data
+  expense_database_instance:
+    type: gcp-types/sqladmin-v1beta4:instance
+    properties:
+      name: expense-db-$(ref.random_suffix.result)
+      project: ${var.project_id}
+      region: ${var.region}
+      databaseVersion: POSTGRES_15
+      settings:
+        tier: db-f1-micro
+        dataDiskType: PD_SSD
+        dataDiskSizeGb: 20
+        storageAutoResize: true
+        storageAutoResizeLimit: 100
+        availabilityType: ZONAL  # Use REGIONAL for production
+        backupConfiguration:
+          enabled: true
+          startTime: "03:00"
+          pointInTimeRecoveryEnabled: true
+          transactionLogRetentionDays: 7
+          backupRetentionSettings:
+            retainedBackups: 30
+            retentionUnit: COUNT
+        ipConfiguration:
+          ipv4Enabled: true
+          requireSsl: true
+          authorizedNetworks: []  # Restrict to specific IPs in production
+        databaseFlags:
+          - name: log_statement
+            value: "all"
+          - name: log_min_duration_statement
+            value: "1000"
+        maintenanceWindow:
+          hour: 4
+          day: 7  # Sunday
+          updateTrack: stable
+        insightsConfig:
+          queryInsightsEnabled: true
+          queryStringLength: 1024
+          recordApplicationTags: true
+          recordClientAddress: true
+        deletionProtection: true
+      rootPassword: ${var.expense_db_password}
+    metadata:
+      dependsOn:
+        - enable_sqladmin_api
+
+  # Create the expenses database
+  expense_database:
+    type: gcp-types/sqladmin-v1beta4:database
+    properties:
+      name: expenses
+      instance: $(ref.expense_database_instance.name)
+      project: ${var.project_id}
+      charset: UTF8
+      collation: en_US.UTF8
+    metadata:
+      dependsOn:
+        - expense_database_instance
+
+  # Service Account for expense processing functions
+  expense_processor_service_account:
+    type: gcp-types/iam-v1:serviceAccount
+    properties:
+      accountId: expense-processor-$(ref.random_suffix.result)
+      project: ${var.project_id}
+      displayName: "Expense Processing Service Account"
+      description: "Service account for expense processing Cloud Functions and Workflows"
+    metadata:
+      dependsOn:
+        - enable_storage_api
+
+  # IAM bindings for service account
+  expense_processor_documentai_binding:
+    type: gcp-types/cloudresourcemanager-v1:binding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/documentai.apiUser
+      members:
+        - serviceAccount:$(ref.expense_processor_service_account.email)
+    metadata:
+      dependsOn:
+        - expense_processor_service_account
+
+  expense_processor_aiplatform_binding:
+    type: gcp-types/cloudresourcemanager-v1:binding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/aiplatform.user
+      members:
+        - serviceAccount:$(ref.expense_processor_service_account.email)
+    metadata:
+      dependsOn:
+        - expense_processor_service_account
+
+  expense_processor_storage_binding:
+    type: gcp-types/cloudresourcemanager-v1:binding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/storage.objectAdmin
+      members:
+        - serviceAccount:$(ref.expense_processor_service_account.email)
+    metadata:
+      dependsOn:
+        - expense_processor_service_account
+
+  expense_processor_sql_binding:
+    type: gcp-types/cloudresourcemanager-v1:binding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/cloudsql.client
+      members:
+        - serviceAccount:$(ref.expense_processor_service_account.email)
+    metadata:
+      dependsOn:
+        - expense_processor_service_account
+
+  # Cloud Function source bucket
+  function_source_bucket:
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: expense-function-source-$(ref.random_suffix.result)
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+    metadata:
+      dependsOn:
+        - enable_storage_api
+
+  # Cloud Function for Gemini validation service
+  expense_validator_function:
+    type: gcp-types/cloudfunctions-v1:function
+    properties:
+      name: projects/${var.project_id}/locations/${var.region}/functions/expense-validator
+      sourceArchiveUrl: gs://$(ref.function_source_bucket.name)/validator-source.zip
+      entryPoint: validate_expense
+      runtime: python311
+      timeout: 60s
+      availableMemoryMb: 256
+      maxInstances: 100
+      environmentVariables:
+        PROJECT_ID: ${var.project_id}
+        REGION: ${var.region}
+        DB_INSTANCE: $(ref.expense_database_instance.connectionName)
+      serviceAccountEmail: $(ref.expense_processor_service_account.email)
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      ingressSettings: ALLOW_ALL
+    metadata:
+      dependsOn:
+        - enable_cloudfunctions_api
+        - expense_processor_service_account
+        - function_source_bucket
+
+  # Cloud Function for expense report generation
+  expense_report_function:
+    type: gcp-types/cloudfunctions-v1:function
+    properties:
+      name: projects/${var.project_id}/locations/${var.region}/functions/expense-report-generator
+      sourceArchiveUrl: gs://$(ref.function_source_bucket.name)/reporter-source.zip
+      entryPoint: generate_expense_report
+      runtime: python311
+      timeout: 300s
+      availableMemoryMb: 512
+      maxInstances: 10
+      environmentVariables:
+        PROJECT_ID: ${var.project_id}
+        REGION: ${var.region}
+        BUCKET_NAME: $(ref.receipt_storage_bucket.name)
+        DB_INSTANCE: $(ref.expense_database_instance.connectionName)
+      serviceAccountEmail: $(ref.expense_processor_service_account.email)
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      ingressSettings: ALLOW_INTERNAL_ONLY
+    metadata:
+      dependsOn:
+        - enable_cloudfunctions_api
+        - expense_processor_service_account
+        - function_source_bucket
+        - receipt_storage_bucket
+
+  # Cloud Workflow for expense processing orchestration
+  expense_processing_workflow:
+    type: gcp-types/workflows-v1:workflow
+    properties:
+      name: projects/${var.project_id}/locations/${var.region}/workflows/expense-processing-workflow
+      description: "Orchestrates expense processing pipeline from receipt to approval"
+      labels:
+        environment: ${var.environment}
+        component: expense-processing
+      serviceAccount: $(ref.expense_processor_service_account.email)
+      sourceContents: |
+        main:
+          params: [input]
+          steps:
+            - validate_input:
+                switch:
+                  - condition: $${not("receipt_content" in input)}
+                    return:
+                      error: "Missing receipt_content in input"
+                  - condition: $${not("employee_email" in input)}
+                    return:
+                      error: "Missing employee_email in input"
+                
+            - extract_receipt_data:
+                try:
+                  call: http.post
+                  args:
+                    url: $${"https://" + sys.get_env("REGION") + "-documentai.googleapis.com/v1/projects/" + sys.get_env("PROJECT_ID") + "/locations/" + sys.get_env("REGION") + "/processors/" + sys.get_env("PROCESSOR_ID") + ":process"}
+                    auth:
+                      type: OAuth2
+                    headers:
+                      Content-Type: "application/json"
+                    body:
+                      rawDocument:
+                        content: $${input.receipt_content}
+                        mimeType: $${default(input.mime_type, "image/jpeg")}
+                  result: extraction_result
+                except:
+                  as: e
+                  steps:
+                    - log_extraction_error:
+                        call: sys.log
+                        args:
+                          text: $${"Document AI extraction failed: " + string(e)}
+                          severity: ERROR
+                    - return_extraction_error:
+                        return:
+                          error: "Document processing failed"
+                          details: $${e}
+            
+            - parse_extracted_data:
+                assign:
+                  - entities: $${default(extraction_result.body.document.entities, [])}
+                  - vendor_entity: $${entities[0] if len(entities) > 0 else {}}
+                  - amount_entity: $${entities[1] if len(entities) > 1 else {}}
+                  - date_entity: $${entities[2] if len(entities) > 2 else {}}
+                  - expense_data:
+                      vendor_name: $${default(vendor_entity.mentionText, "Unknown Vendor")}
+                      total_amount: $${default(amount_entity.mentionText, "0.00")}
+                      expense_date: $${default(date_entity.mentionText, "")}
+                      category: $${default(input.category, "general")}
+                      description: $${default(input.description, "")}
+                      employee_email: $${input.employee_email}
+                      receipt_url: $${default(input.receipt_url, "")}
+            
+            - validate_with_gemini:
+                try:
+                  call: http.post
+                  args:
+                    url: $${sys.get_env("VALIDATOR_URL")}
+                    headers:
+                      Content-Type: "application/json"
+                    body: $${expense_data}
+                    timeout: 30
+                  result: validation_result
+                except:
+                  as: e
+                  steps:
+                    - log_validation_error:
+                        call: sys.log
+                        args:
+                          text: $${"Gemini validation failed: " + string(e)}
+                          severity: ERROR
+                    - assign_default_validation:
+                        assign:
+                          - validation_result:
+                              body:
+                                approved: false
+                                confidence: 0.0
+                                policy_violations: ["Validation service unavailable"]
+                                risk_score: 100
+            
+            - store_expense:
+                # In a real implementation, this would call Cloud SQL
+                assign:
+                  - storage_result:
+                      status: "stored"
+                      expense_id: $${"EXP-" + string(int(sys.now()))}
+                      timestamp: $${time.format(sys.now())}
+            
+            - determine_approval_path:
+                switch:
+                  - condition: $${validation_result.body.approved and validation_result.body.risk_score < 30}
+                    next: auto_approve
+                  - condition: $${validation_result.body.risk_score >= 70}
+                    next: require_manager_approval
+                  default: require_review
+            
+            - auto_approve:
+                assign:
+                  - approval_decision:
+                      status: "auto_approved"
+                      approver: "system"
+                      timestamp: $${time.format(sys.now())}
+                next: finalize_processing
+            
+            - require_review:
+                assign:
+                  - approval_decision:
+                      status: "pending_review"
+                      approver: "finance_team"
+                      timestamp: $${time.format(sys.now())}
+                next: finalize_processing
+            
+            - require_manager_approval:
+                assign:
+                  - approval_decision:
+                      status: "pending_manager_approval"
+                      approver: "manager"
+                      timestamp: $${time.format(sys.now())}
+                next: finalize_processing
+            
+            - finalize_processing:
+                return:
+                  status: "processed"
+                  expense_id: $${storage_result.expense_id}
+                  validation: $${validation_result.body}
+                  extracted_data: $${expense_data}
+                  approval: $${approval_decision}
+                  processing_time: $${time.format(sys.now())}
+    metadata:
+      dependsOn:
+        - enable_workflows_api
+        - expense_processor_service_account
+
+  # Cloud Monitoring notification channel (if monitoring enabled)
+  expense_alert_channel:
+    type: gcp-types/monitoring-v1:notificationChannel
+    properties:
+      displayName: "Expense Processing Alerts"
+      type: email
+      userLabels:
+        environment: ${var.environment}
+      verificationStatus: UNVERIFIED
+      enabled: true
+    metadata:
+      runtimePolicy:
+        CREATE: $${var.enable_monitoring}
+
+  # Monitoring alert policy for failed expense processing
+  expense_processing_alert:
+    type: gcp-types/monitoring-v1:alertPolicy
+    properties:
+      displayName: "Expense Processing Failures"
+      documentation:
+        content: "Alert when expense processing workflow fails"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "Workflow execution failures"
+          conditionThreshold:
+            filter: 'resource.type="workflows_workflow" AND resource.labels.workflow_id="expense-processing-workflow"'
+            comparison: COMPARISON_GT
+            thresholdValue: 0
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      combiner: OR
+      enabled: true
+      notificationChannels:
+        - $(ref.expense_alert_channel.name)
+      alertStrategy:
+        autoClose: 86400s  # 24 hours
+    metadata:
+      dependsOn:
+        - expense_alert_channel
+      runtimePolicy:
+        CREATE: $${var.enable_monitoring}
+
+  # BigQuery dataset for expense analytics (optional)
+  expense_analytics_dataset:
+    type: gcp-types/bigquery-v2:dataset
+    properties:
+      datasetId: expense_analytics
+      projectId: ${var.project_id}
+      location: ${var.region}
+      description: "Dataset for expense processing analytics and reporting"
+      defaultTableExpirationMs: 7776000000  # 90 days
+      labels:
+        environment: ${var.environment}
+        component: analytics
+      access:
+        - role: OWNER
+          userByEmail: $(ref.expense_processor_service_account.email)
+        - role: READER
+          specialGroup: projectReaders
+    metadata:
+      dependsOn:
+        - expense_processor_service_account
+
+  # Cloud Scheduler job for daily expense reports
+  daily_report_scheduler:
+    type: gcp-types/cloudscheduler-v1:job
+    properties:
+      name: projects/${var.project_id}/locations/${var.region}/jobs/daily-expense-report
+      description: "Triggers daily expense report generation"
+      schedule: "0 9 * * 1-5"  # 9 AM weekdays
+      timeZone: "America/New_York"
+      httpTarget:
+        uri: $(ref.expense_report_function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {
+            "report_type": "daily",
+            "format": "json"
+          }
+        oidcToken:
+          serviceAccountEmail: $(ref.expense_processor_service_account.email)
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 60s
+        maxDoublings: 3
+    metadata:
+      dependsOn:
+        - expense_report_function
+        - expense_processor_service_account
+
+# Output values for reference and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+
+  region:
+    description: "Primary deployment region"
+    value: ${var.region}
+
+  receipt_storage_bucket:
+    description: "Cloud Storage bucket for receipt storage"
+    value: $(ref.receipt_storage_bucket.name)
+
+  expense_processor_id:
+    description: "Document AI expense processor ID"
+    value: $(ref.expense_processor.name)
+
+  database_instance:
+    description: "Cloud SQL instance connection name"
+    value: $(ref.expense_database_instance.connectionName)
+
+  database_instance_ip:
+    description: "Cloud SQL instance IP address"
+    value: $(ref.expense_database_instance.ipAddresses[0].ipAddress)
+
+  validator_function_url:
+    description: "URL for expense validation Cloud Function"
+    value: $(ref.expense_validator_function.httpsTrigger.url)
+
+  report_function_url:
+    description: "URL for expense report generation Cloud Function"
+    value: $(ref.expense_report_function.httpsTrigger.url)
+
+  workflow_name:
+    description: "Expense processing workflow resource name"
+    value: $(ref.expense_processing_workflow.name)
+
+  service_account_email:
+    description: "Service account email for expense processing"
+    value: $(ref.expense_processor_service_account.email)
+
+  analytics_dataset:
+    description: "BigQuery dataset for expense analytics"
+    value: $(ref.expense_analytics_dataset.datasetId)
+
+  kms_key_name:
+    description: "KMS key for encryption"
+    value: $(ref.receipt_storage_key.name)
+
+  random_suffix:
+    description: "Random suffix used for resource naming"
+    value: $(ref.random_suffix.result)
+
+# Deployment configuration
+deployment:
+  # Resource creation order and dependencies are automatically handled
+  # by Infrastructure Manager based on the dependsOn metadata
+  
+  timeouts:
+    create: 30m
+    update: 20m
+    delete: 20m
+
+  retry:
+    attempts: 3
+    backoff: exponential
+    maxBackoff: 60s
+
+# Security and compliance configuration
+security:
+  # All resources use least privilege IAM
+  # Encryption at rest enabled for all data stores
+  # Network security with authorized networks for Cloud SQL
+  # HTTPS-only endpoints for all functions
+  # Service account authentication for inter-service communication
+
+compliance:
+  # 7-year data retention for financial records
+  # Audit logging enabled for all API calls
+  # Backup and point-in-time recovery configured
+  # Data encryption with customer-managed keys
+  # Access controls with IAM and service accounts

@@ -4,12 +4,12 @@ id: f3e8b6d2
 category: containers
 difficulty: 300
 subject: aws
-services: ecs,secrets,manager,parameter,store
-estimated-time: 60 minutes
-recipe-version: 1.2
+services: ECS, Systems Manager, S3, IAM
+estimated-time: 90 minutes
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers,ecs,environment-variables,secrets-management,configuration
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Modern containerized applications require robust configuration management to han
 
 ## Solution
 
-This recipe implements a comprehensive environment variable management strategy for Amazon ECS task definitions using AWS Systems Manager Parameter Store for configuration data and AWS Secrets Manager for sensitive information. The solution demonstrates multiple approaches including direct environment variables, Systems Manager Parameter Store integration, and environment files stored in S3, providing secure, scalable, and maintainable configuration management for containerized applications.
+This recipe implements a comprehensive environment variable management strategy for Amazon ECS task definitions using AWS Systems Manager Parameter Store for configuration data and environment files stored in S3. The solution demonstrates multiple approaches including direct environment variables, Systems Manager Parameter Store integration, and environment files from S3, providing secure, scalable, and maintainable configuration management for containerized applications.
 
 ## Architecture Diagram
 
@@ -73,7 +73,7 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of containerization and Docker
 4. Familiarity with AWS IAM policies and roles
-5. Estimated cost: $5-15 for ECS tasks, Parameter Store, and S3 storage during testing
+5. Estimated cost: $10-20 for ECS tasks, Parameter Store, and S3 storage during testing
 
 > **Note**: This recipe uses Fargate launch type which incurs compute costs. Clean up resources after testing to avoid ongoing charges.
 
@@ -106,7 +106,7 @@ aws ecs create-cluster \
     capacityProvider=FARGATE,weight=1
 
 # Create S3 bucket for environment files
-aws s3 mb s3://${S3_BUCKET}
+aws s3 mb s3://${S3_BUCKET} --region ${AWS_REGION}
 
 echo "✅ Created ECS cluster: ${CLUSTER_NAME}"
 echo "✅ Created S3 bucket: ${S3_BUCKET}"
@@ -240,6 +240,18 @@ echo "✅ Created S3 bucket: ${S3_BUCKET}"
            {
                "Effect": "Allow",
                "Action": [
+                   "kms:Decrypt"
+               ],
+               "Resource": "*",
+               "Condition": {
+                   "StringEquals": {
+                       "kms:ViaService": "ssm.${AWS_REGION}.amazonaws.com"
+                   }
+               }
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
                    "s3:GetObject"
                ],
                "Resource": [
@@ -262,7 +274,7 @@ echo "✅ Created S3 bucket: ${S3_BUCKET}"
    echo "✅ Created IAM roles with Systems Manager and S3 permissions"
    ```
 
-   The custom IAM policy restricts access to specific parameter hierarchies and S3 paths, ensuring containers can only access their designated configuration data. This granular permission model enables secure multi-tenant configurations within the same AWS account.
+   The custom IAM policy restricts access to specific parameter hierarchies and S3 paths, ensuring containers can only access their designated configuration data. The KMS decrypt permission is required for SecureString parameter access. This granular permission model enables secure multi-tenant configurations within the same AWS account.
 
 4. **Create ECS Task Definition with Multiple Environment Variable Sources**:
 
@@ -603,6 +615,8 @@ echo "✅ Created S3 bucket: ${S3_BUCKET}"
    cat /tmp/test-config.env
    ```
 
+   Expected output: List of environment files and their contents showing proper formatting.
+
 4. **Test Task Definition Retrieval**:
 
    ```bash
@@ -611,6 +625,8 @@ echo "✅ Created S3 bucket: ${S3_BUCKET}"
        --task-definition ${TASK_FAMILY} \
        --query 'taskDefinition.containerDefinitions[0].{Environment:environment,Secrets:secrets,EnvironmentFiles:environmentFiles}'
    ```
+
+   Expected output: JSON showing all three environment variable sources properly configured.
 
 5. **Monitor Task Logs for Environment Variable Loading**:
 
@@ -627,6 +643,8 @@ echo "✅ Created S3 bucket: ${S3_BUCKET}"
        --query 'logStreams[*].logStreamName'
    ```
 
+   Expected output: List of recent log streams showing successful task execution.
+
 ## Cleanup
 
 1. **Stop ECS Service and Tasks**:
@@ -637,6 +655,11 @@ echo "✅ Created S3 bucket: ${S3_BUCKET}"
        --cluster ${CLUSTER_NAME} \
        --service ${SERVICE_NAME} \
        --desired-count 0
+   
+   # Wait for service to scale down
+   aws ecs wait services-stable \
+       --cluster ${CLUSTER_NAME} \
+       --services ${SERVICE_NAME}
    
    # Delete the service
    aws ecs delete-service \
@@ -673,12 +696,15 @@ echo "✅ Created S3 bucket: ${S3_BUCKET}"
 
    ```bash
    # Delete all application parameters
-   aws ssm delete-parameters \
-       --names $(aws ssm get-parameters-by-path \
-           --path "/myapp" \
-           --recursive \
-           --query 'Parameters[*].Name' \
-           --output text)
+   PARAMETER_NAMES=$(aws ssm get-parameters-by-path \
+       --path "/myapp" \
+       --recursive \
+       --query 'Parameters[*].Name' \
+       --output text)
+   
+   if [ ! -z "$PARAMETER_NAMES" ]; then
+       aws ssm delete-parameters --names $PARAMETER_NAMES
+   fi
    
    echo "✅ Deleted Systems Manager parameters"
    ```
@@ -752,4 +778,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,1081 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'gRPC Microservices with VPC Lattice and CloudWatch - Production-ready infrastructure for high-performance microservices communication'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'grpc-microservices'
+    Description: 'Environment name for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for the VPC'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: 'Must be a valid CIDR block (e.g., 10.0.0.0/16)'
+
+  SubnetCidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: 'CIDR block for the subnet'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: 'Must be a valid CIDR block (e.g., 10.0.1.0/24)'
+
+  InstanceType:
+    Type: String
+    Default: 't3.micro'
+    Description: 'EC2 instance type for gRPC services'
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m5.large
+      - m5.xlarge
+    ConstraintDescription: 'Must be a valid EC2 instance type'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    Description: 'CloudWatch log retention period in days'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: 'Must be a valid CloudWatch log retention period'
+
+  HealthCheckIntervalSeconds:
+    Type: Number
+    Default: 30
+    Description: 'Health check interval in seconds'
+    MinValue: 5
+    MaxValue: 300
+    ConstraintDescription: 'Must be between 5 and 300 seconds'
+
+  HealthCheckTimeoutSeconds:
+    Type: Number
+    Default: 5
+    Description: 'Health check timeout in seconds'
+    MinValue: 2
+    MaxValue: 120
+    ConstraintDescription: 'Must be between 2 and 120 seconds'
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    Description: 'Enable detailed CloudWatch monitoring'
+    AllowedValues: ['true', 'false']
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+
+# ==============================================================================
+# MAPPINGS
+# ==============================================================================
+Mappings:
+  # Latest Amazon Linux 2 AMI IDs by region
+  RegionMap:
+    us-east-1:
+      AMI: ami-0c02fb55956c7d316
+    us-east-2:
+      AMI: ami-0f924dc71d44d23e2
+    us-west-1:
+      AMI: ami-0d382e80be7ffdae5
+    us-west-2:
+      AMI: ami-0c2d3e23b8c53d9a6
+    eu-west-1:
+      AMI: ami-0c9c942bd7bf113a2
+    eu-west-2:
+      AMI: ami-0015a39e4b7c0966f
+    eu-central-1:
+      AMI: ami-0a261c0e5f51090b1
+    ap-southeast-1:
+      AMI: ami-0dc5785603ad4ff54
+    ap-southeast-2:
+      AMI: ami-0a58e22c727337c51
+    ap-northeast-1:
+      AMI: ami-0218d08a1f9dac831
+
+  # Service configuration mapping
+  ServiceConfig:
+    UserService:
+      Port: 50051
+      Name: user-service
+    OrderService:
+      Port: 50052
+      Name: order-service
+    InventoryService:
+      Port: 50053
+      Name: inventory-service
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # --------------------------------------------------------------------------
+  # VPC AND NETWORKING RESOURCES
+  # --------------------------------------------------------------------------
+  
+  # VPC for gRPC microservices
+  GrpcVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: 'gRPC-Microservices'
+
+  # Internet Gateway for public access (if needed for management)
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-igw'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Attach Internet Gateway to VPC
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref GrpcVpc
+
+  # Subnet for EC2 instances
+  GrpcSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref GrpcVpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref SubnetCidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-subnet'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Route Table for subnet
+  GrpcRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref GrpcVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-rt'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Route to Internet Gateway
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref GrpcRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  # Associate subnet with route table
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref GrpcRouteTable
+      SubnetId: !Ref GrpcSubnet
+
+  # Security Group for gRPC services
+  GrpcSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-grpc-sg'
+      GroupDescription: 'Security group for gRPC microservices'
+      VpcId: !Ref GrpcVpc
+      SecurityGroupIngress:
+        # gRPC service ports
+        - IpProtocol: tcp
+          FromPort: 50051
+          ToPort: 50053
+          CidrIp: !Ref VpcCidr
+          Description: 'gRPC service communication'
+        # Health check port
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: !Ref VpcCidr
+          Description: 'Health check endpoint'
+        # SSH access for management (optional)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref VpcCidr
+          Description: 'SSH access for management'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-grpc-sg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # --------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # --------------------------------------------------------------------------
+
+  # IAM Role for EC2 instances
+  GrpcInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-grpc-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: GrpcServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Instance Profile for EC2 instances
+  GrpcInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${EnvironmentName}-grpc-instance-profile'
+      Roles:
+        - !Ref GrpcInstanceRole
+
+  # --------------------------------------------------------------------------
+  # VPC LATTICE RESOURCES
+  # --------------------------------------------------------------------------
+
+  # VPC Lattice Service Network
+  GrpcServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub '${EnvironmentName}-service-network'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: 'gRPC-Services'
+
+  # Associate VPC with Service Network
+  ServiceNetworkVpcAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref GrpcServiceNetwork
+      VpcIdentifier: !Ref GrpcVpc
+      Tags:
+        - Key: Service
+          Value: 'gRPC-Network'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # --------------------------------------------------------------------------
+  # TARGET GROUPS
+  # --------------------------------------------------------------------------
+
+  # User Service Target Group
+  UserServiceTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-user-service-tg'
+      Type: INSTANCE
+      Config:
+        Port: !FindInMap [ServiceConfig, UserService, Port]
+        Protocol: HTTP
+        ProtocolVersion: HTTP2
+        VpcIdentifier: !Ref GrpcVpc
+        HealthCheck:
+          Enabled: true
+          Protocol: HTTP
+          ProtocolVersion: HTTP1
+          Port: 8080
+          Path: '/health'
+          HealthCheckIntervalSeconds: !Ref HealthCheckIntervalSeconds
+          HealthCheckTimeoutSeconds: !Ref HealthCheckTimeoutSeconds
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 3
+          Matcher:
+            HttpCode: '200'
+      Tags:
+        - Key: Service
+          Value: UserService
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Order Service Target Group
+  OrderServiceTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-order-service-tg'
+      Type: INSTANCE
+      Config:
+        Port: !FindInMap [ServiceConfig, OrderService, Port]
+        Protocol: HTTP
+        ProtocolVersion: HTTP2
+        VpcIdentifier: !Ref GrpcVpc
+        HealthCheck:
+          Enabled: true
+          Protocol: HTTP
+          ProtocolVersion: HTTP1
+          Port: 8080
+          Path: '/health'
+          HealthCheckIntervalSeconds: !Ref HealthCheckIntervalSeconds
+          HealthCheckTimeoutSeconds: !Ref HealthCheckTimeoutSeconds
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 3
+          Matcher:
+            HttpCode: '200'
+      Tags:
+        - Key: Service
+          Value: OrderService
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Inventory Service Target Group
+  InventoryServiceTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-inventory-service-tg'
+      Type: INSTANCE
+      Config:
+        Port: !FindInMap [ServiceConfig, InventoryService, Port]
+        Protocol: HTTP
+        ProtocolVersion: HTTP2
+        VpcIdentifier: !Ref GrpcVpc
+        HealthCheck:
+          Enabled: true
+          Protocol: HTTP
+          ProtocolVersion: HTTP1
+          Port: 8080
+          Path: '/health'
+          HealthCheckIntervalSeconds: !Ref HealthCheckIntervalSeconds
+          HealthCheckTimeoutSeconds: !Ref HealthCheckTimeoutSeconds
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 3
+          Matcher:
+            HttpCode: '200'
+      Tags:
+        - Key: Service
+          Value: InventoryService
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # --------------------------------------------------------------------------
+  # EC2 INSTANCES
+  # --------------------------------------------------------------------------
+
+  # User Service Instance
+  UserServiceInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref GrpcSubnet
+      SecurityGroupIds:
+        - !Ref GrpcSecurityGroup
+      IamInstanceProfile: !Ref GrpcInstanceProfile
+      Monitoring: !If [EnableDetailedMonitoringCondition, true, false]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3 python3-pip amazon-cloudwatch-agent
+          pip3 install grpcio grpcio-tools flask
+
+          # Create health check server
+          cat > /home/ec2-user/health_server.py << 'EOF'
+          from flask import Flask
+          import json
+          app = Flask(__name__)
+
+          @app.route('/health')
+          def health():
+              return {'status': 'healthy', 'service': 'user-service', 'port': 50051}, 200
+
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=8080)
+          EOF
+
+          # Create simple gRPC server placeholder
+          cat > /home/ec2-user/user_service.py << 'EOF'
+          import grpc
+          from concurrent import futures
+          import time
+
+          class UserService:
+              def GetUser(self, request, context):
+                  # Placeholder for actual gRPC implementation
+                  pass
+
+          def serve():
+              server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+              server.add_insecure_port('[::]:50051')
+              print('User Service listening on port 50051')
+              server.start()
+              try:
+                  while True:
+                      time.sleep(86400)
+              except KeyboardInterrupt:
+                  server.stop(0)
+
+          if __name__ == '__main__':
+              serve()
+          EOF
+
+          # Start health check server
+          nohup python3 /home/ec2-user/health_server.py &
+
+          # Configure CloudWatch agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+          {
+              "metrics": {
+                  "namespace": "gRPC/UserService",
+                  "metrics_collected": {
+                      "cpu": {
+                          "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                          "metrics_collection_interval": 60
+                      },
+                      "mem": {
+                          "measurement": ["mem_used_percent"],
+                          "metrics_collection_interval": 60
+                      }
+                  }
+              },
+              "logs": {
+                  "logs_collected": {
+                      "files": {
+                          "collect_list": [
+                              {
+                                  "file_path": "/var/log/user-service.log",
+                                  "log_group_name": "/aws/ec2/grpc-services",
+                                  "log_stream_name": "user-service-{instance_id}"
+                              }
+                          ]
+                      }
+                  }
+              }
+          }
+          EOF
+
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-user-service'
+        - Key: Service
+          Value: UserService
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Order Service Instance
+  OrderServiceInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref GrpcSubnet
+      SecurityGroupIds:
+        - !Ref GrpcSecurityGroup
+      IamInstanceProfile: !Ref GrpcInstanceProfile
+      Monitoring: !If [EnableDetailedMonitoringCondition, true, false]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3 python3-pip amazon-cloudwatch-agent
+          pip3 install grpcio grpcio-tools flask
+
+          # Create health check server
+          cat > /home/ec2-user/health_server.py << 'EOF'
+          from flask import Flask
+          import json
+          app = Flask(__name__)
+
+          @app.route('/health')
+          def health():
+              return {'status': 'healthy', 'service': 'order-service', 'port': 50052}, 200
+
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=8080)
+          EOF
+
+          # Start health check server
+          nohup python3 /home/ec2-user/health_server.py &
+
+          # Configure CloudWatch agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+          {
+              "metrics": {
+                  "namespace": "gRPC/OrderService",
+                  "metrics_collected": {
+                      "cpu": {
+                          "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                          "metrics_collection_interval": 60
+                      },
+                      "mem": {
+                          "measurement": ["mem_used_percent"],
+                          "metrics_collection_interval": 60
+                      }
+                  }
+              }
+          }
+          EOF
+
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-order-service'
+        - Key: Service
+          Value: OrderService
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Inventory Service Instance
+  InventoryServiceInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref GrpcSubnet
+      SecurityGroupIds:
+        - !Ref GrpcSecurityGroup
+      IamInstanceProfile: !Ref GrpcInstanceProfile
+      Monitoring: !If [EnableDetailedMonitoringCondition, true, false]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3 python3-pip amazon-cloudwatch-agent
+          pip3 install grpcio grpcio-tools flask
+
+          # Create health check server
+          cat > /home/ec2-user/health_server.py << 'EOF'
+          from flask import Flask
+          import json
+          app = Flask(__name__)
+
+          @app.route('/health')
+          def health():
+              return {'status': 'healthy', 'service': 'inventory-service', 'port': 50053}, 200
+
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=8080)
+          EOF
+
+          # Start health check server
+          nohup python3 /home/ec2-user/health_server.py &
+
+          # Configure CloudWatch agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+          {
+              "metrics": {
+                  "namespace": "gRPC/InventoryService",
+                  "metrics_collected": {
+                      "cpu": {
+                          "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                          "metrics_collection_interval": 60
+                      },
+                      "mem": {
+                          "measurement": ["mem_used_percent"],
+                          "metrics_collection_interval": 60
+                      }
+                  }
+              }
+          }
+          EOF
+
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-inventory-service'
+        - Key: Service
+          Value: InventoryService
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # --------------------------------------------------------------------------
+  # VPC LATTICE SERVICES
+  # --------------------------------------------------------------------------
+
+  # User Service
+  UserService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub '${EnvironmentName}-user-service'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Service
+          Value: UserService
+        - Key: Protocol
+          Value: gRPC
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Order Service
+  OrderService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub '${EnvironmentName}-order-service'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Service
+          Value: OrderService
+        - Key: Protocol
+          Value: gRPC
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Inventory Service
+  InventoryService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub '${EnvironmentName}-inventory-service'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Service
+          Value: InventoryService
+        - Key: Protocol
+          Value: gRPC
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # --------------------------------------------------------------------------
+  # SERVICE NETWORK ASSOCIATIONS
+  # --------------------------------------------------------------------------
+
+  # User Service Association
+  UserServiceNetworkAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref GrpcServiceNetwork
+      ServiceIdentifier: !Ref UserService
+      Tags:
+        - Key: Service
+          Value: UserService
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Order Service Association
+  OrderServiceNetworkAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref GrpcServiceNetwork
+      ServiceIdentifier: !Ref OrderService
+      Tags:
+        - Key: Service
+          Value: OrderService
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Inventory Service Association
+  InventoryServiceNetworkAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref GrpcServiceNetwork
+      ServiceIdentifier: !Ref InventoryService
+      Tags:
+        - Key: Service
+          Value: InventoryService
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # --------------------------------------------------------------------------
+  # VPC LATTICE LISTENERS
+  # --------------------------------------------------------------------------
+
+  # User Service Listener
+  UserServiceListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref UserService
+      Name: grpc-listener
+      Protocol: HTTPS
+      Port: 443
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref UserServiceTargetGroup
+              Weight: 100
+      Tags:
+        - Key: Protocol
+          Value: gRPC
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Order Service Listener
+  OrderServiceListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref OrderService
+      Name: grpc-listener
+      Protocol: HTTPS
+      Port: 443
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref OrderServiceTargetGroup
+              Weight: 100
+      Tags:
+        - Key: Protocol
+          Value: gRPC
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Inventory Service Listener
+  InventoryServiceListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref InventoryService
+      Name: grpc-listener
+      Protocol: HTTPS
+      Port: 443
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref InventoryServiceTargetGroup
+              Weight: 100
+      Tags:
+        - Key: Protocol
+          Value: gRPC
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # --------------------------------------------------------------------------
+  # CLOUDWATCH RESOURCES
+  # --------------------------------------------------------------------------
+
+  # CloudWatch Log Group for VPC Lattice Access Logs
+  VpcLatticeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpc-lattice/${EnvironmentName}-grpc-services'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: 'VPC-Lattice-Access-Logs'
+
+  # CloudWatch Log Group for EC2 Application Logs
+  EC2LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/ec2/grpc-services'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: 'EC2-Application-Logs'
+
+  # CloudWatch Dashboard for gRPC Metrics
+  GrpcDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${EnvironmentName}-gRPC-Microservices'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VpcLattice", "TotalRequestCount", "Service", "${EnvironmentName}-user-service" ],
+                  [ ".", ".", ".", "${EnvironmentName}-order-service" ],
+                  [ ".", ".", ".", "${EnvironmentName}-inventory-service" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "gRPC Request Count",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VpcLattice", "RequestTime", "Service", "${EnvironmentName}-user-service" ],
+                  [ ".", ".", ".", "${EnvironmentName}-order-service" ],
+                  [ ".", ".", ".", "${EnvironmentName}-inventory-service" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "gRPC Request Latency (ms)",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VpcLattice", "HTTPCode_2XX_Count", "Service", "${EnvironmentName}-user-service" ],
+                  [ ".", "HTTPCode_4XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_5XX_Count", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "HTTP Response Codes - User Service",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "gRPC/UserService", "cpu_usage_active", "InstanceId", "${UserServiceInstance}" ],
+                  [ "gRPC/OrderService", ".", ".", "${OrderServiceInstance}" ],
+                  [ "gRPC/InventoryService", ".", ".", "${InventoryServiceInstance}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "CPU Utilization by Service",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+  # --------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS
+  # --------------------------------------------------------------------------
+
+  # High Error Rate Alarm for User Service
+  UserServiceHighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-UserService-HighErrorRate'
+      AlarmDescription: 'High error rate in User Service'
+      MetricName: HTTPCode_5XX_Count
+      Namespace: AWS/VpcLattice
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Service
+          Value: !Sub '${EnvironmentName}-user-service'
+      AlarmActions: []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Service
+          Value: UserService
+
+  # High Latency Alarm for Order Service
+  OrderServiceHighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-OrderService-HighLatency'
+      AlarmDescription: 'High latency in Order Service'
+      MetricName: RequestTime
+      Namespace: AWS/VpcLattice
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Service
+          Value: !Sub '${EnvironmentName}-order-service'
+      AlarmActions: []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Service
+          Value: OrderService
+
+  # Connection Failures Alarm
+  ServicesConnectionFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-Services-ConnectionFailures'
+      AlarmDescription: 'High connection failure rate across services'
+      MetricName: ConnectionErrorCount
+      Namespace: AWS/VpcLattice
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !Sub '${EnvironmentName}-user-service-tg'
+      AlarmActions: []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  VpcId:
+    Description: 'VPC ID for the gRPC microservices'
+    Value: !Ref GrpcVpc
+    Export:
+      Name: !Sub '${EnvironmentName}-VpcId'
+
+  SubnetId:
+    Description: 'Subnet ID for EC2 instances'
+    Value: !Ref GrpcSubnet
+    Export:
+      Name: !Sub '${EnvironmentName}-SubnetId'
+
+  SecurityGroupId:
+    Description: 'Security Group ID for gRPC services'
+    Value: !Ref GrpcSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-SecurityGroupId'
+
+  ServiceNetworkId:
+    Description: 'VPC Lattice Service Network ID'
+    Value: !Ref GrpcServiceNetwork
+    Export:
+      Name: !Sub '${EnvironmentName}-ServiceNetworkId'
+
+  ServiceNetworkArn:
+    Description: 'VPC Lattice Service Network ARN'
+    Value: !GetAtt GrpcServiceNetwork.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-ServiceNetworkArn'
+
+  UserServiceEndpoint:
+    Description: 'User Service VPC Lattice endpoint'
+    Value: !GetAtt UserService.DnsEntry.DomainName
+    Export:
+      Name: !Sub '${EnvironmentName}-UserServiceEndpoint'
+
+  OrderServiceEndpoint:
+    Description: 'Order Service VPC Lattice endpoint'
+    Value: !GetAtt OrderService.DnsEntry.DomainName
+    Export:
+      Name: !Sub '${EnvironmentName}-OrderServiceEndpoint'
+
+  InventoryServiceEndpoint:
+    Description: 'Inventory Service VPC Lattice endpoint'
+    Value: !GetAtt InventoryService.DnsEntry.DomainName
+    Export:
+      Name: !Sub '${EnvironmentName}-InventoryServiceEndpoint'
+
+  UserServiceTargetGroupId:
+    Description: 'User Service Target Group ID'
+    Value: !Ref UserServiceTargetGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-UserServiceTargetGroupId'
+
+  OrderServiceTargetGroupId:
+    Description: 'Order Service Target Group ID'
+    Value: !Ref OrderServiceTargetGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-OrderServiceTargetGroupId'
+
+  InventoryServiceTargetGroupId:
+    Description: 'Inventory Service Target Group ID'
+    Value: !Ref InventoryServiceTargetGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-InventoryServiceTargetGroupId'
+
+  UserServiceInstanceId:
+    Description: 'User Service EC2 Instance ID'
+    Value: !Ref UserServiceInstance
+    Export:
+      Name: !Sub '${EnvironmentName}-UserServiceInstanceId'
+
+  OrderServiceInstanceId:
+    Description: 'Order Service EC2 Instance ID'
+    Value: !Ref OrderServiceInstance
+    Export:
+      Name: !Sub '${EnvironmentName}-OrderServiceInstanceId'
+
+  InventoryServiceInstanceId:
+    Description: 'Inventory Service EC2 Instance ID'
+    Value: !Ref InventoryServiceInstance
+    Export:
+      Name: !Sub '${EnvironmentName}-InventoryServiceInstanceId'
+
+  CloudWatchDashboardURL:
+    Description: 'CloudWatch Dashboard URL for monitoring gRPC services'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${EnvironmentName}-gRPC-Microservices'
+
+  VpcLatticeLogGroup:
+    Description: 'CloudWatch Log Group for VPC Lattice access logs'
+    Value: !Ref VpcLatticeLogGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-VpcLatticeLogGroup'
+
+  EC2LogGroup:
+    Description: 'CloudWatch Log Group for EC2 application logs'
+    Value: !Ref EC2LogGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-EC2LogGroup'
+
+  StackInfo:
+    Description: 'Stack deployment information'
+    Value: !Sub |
+      Stack: ${AWS::StackName}
+      Region: ${AWS::Region}
+      Environment: ${EnvironmentName}
+      Services: User Service, Order Service, Inventory Service
+      Monitoring: CloudWatch Dashboard and Alarms configured
+      Protocol: gRPC over HTTP/2 via VPC Lattice

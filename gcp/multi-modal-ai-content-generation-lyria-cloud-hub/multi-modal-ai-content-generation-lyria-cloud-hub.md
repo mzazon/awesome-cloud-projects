@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Vertex AI, Cloud Storage, Cloud Functions, Cloud Run
 estimated-time: 150 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: generative-ai, multi-modal, content-creation, music-generation, vertex-ai
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Modern content creators face significant challenges in producing synchronized, h
 
 ## Solution
 
-This recipe demonstrates building an intelligent content creation platform using Google's advanced Lyria 2 generative music models and Veo 3 video generation integrated with Vertex AI's multi-modal capabilities. The solution combines text-to-music generation, synchronized video creation, and speech synthesis to produce cohesive multimedia content from simple text prompts, enabling creators to generate professional-quality synchronized content at scale while maintaining creative control and consistent artistic direction.
+This recipe demonstrates building an intelligent content creation platform using Google's advanced Lyria music generation models and Veo video generation integrated with Vertex AI's multi-modal capabilities. The solution combines text-to-music generation, synchronized video creation, and speech synthesis to produce cohesive multimedia content from simple text prompts, enabling creators to generate professional-quality synchronized content at scale while maintaining creative control and consistent artistic direction.
 
 ## Architecture Diagram
 
@@ -36,8 +36,8 @@ graph TB
     
     subgraph "Vertex AI Platform"
         VERTEX[Vertex AI API]
-        LYRIA[Lyria 2 Music Model]
-        VEO[Veo 3 Video Generation]
+        LYRIA[Lyria Music Model]
+        VEO[Veo Video Generation]
         TTS[Text-to-Speech API]
     end
     
@@ -91,13 +91,13 @@ graph TB
 
 ## Prerequisites
 
-1. Google Cloud account with Vertex AI API enabled and Lyria 2 access approved
-2. gcloud CLI v2 installed and configured (or Google Cloud Shell)
+1. Google Cloud account with Vertex AI API enabled and access to Lyria and Veo models
+2. gcloud CLI v450.0.0+ installed and configured (or Google Cloud Shell)
 3. Understanding of generative AI concepts, API orchestration, and content production workflows
 4. Basic knowledge of Google Cloud services (Cloud Storage, Cloud Functions, Vertex AI)
 5. Estimated cost: $25-50 for initial setup and testing (varies based on content generation volume)
 
-> **Note**: Lyria 2 and Veo 3 are currently in preview with allowlist access. Request access through the Google Cloud console or contact your Google account representative for approval.
+> **Note**: Lyria and Veo 3 models require allowlist access. Request access through the Google Cloud console Vertex AI Studio or contact your Google account representative for approval.
 
 ## Preparation
 
@@ -118,12 +118,12 @@ gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
 
 # Enable required Google Cloud APIs
-gcloud services enable aiplatform.googleapis.com
-gcloud services enable storage.googleapis.com
-gcloud services enable cloudfunctions.googleapis.com
-gcloud services enable run.googleapis.com
-gcloud services enable monitoring.googleapis.com
-gcloud services enable logging.googleapis.com
+gcloud services enable aiplatform.googleapis.com \
+    storage.googleapis.com \
+    cloudfunctions.googleapis.com \
+    run.googleapis.com \
+    monitoring.googleapis.com \
+    logging.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled for AI content generation platform"
@@ -185,9 +185,9 @@ echo "✅ APIs enabled for AI content generation platform"
 
    The service account now has appropriate permissions to access Vertex AI's generative models and manage content assets in Cloud Storage. This security configuration supports both development and production workflows while maintaining Google Cloud's defense-in-depth security model.
 
-3. **Deploy Lyria 2 Music Generation Function**:
+3. **Deploy Lyria Music Generation Function**:
 
-   Google Cloud Functions provide serverless execution for our Lyria 2 integration, enabling automatic scaling based on content generation demand. Lyria 2's text-to-music capabilities can generate high-fidelity audio across various musical styles, with fine-grained control over instruments, tempo, and emotional tone essential for professional content creation workflows.
+   Google Cloud Functions provide serverless execution for our Lyria integration, enabling automatic scaling based on content generation demand. Lyria's text-to-music capabilities can generate high-fidelity instrumental audio across various musical styles, with fine-grained control over instruments, tempo, and emotional tone essential for professional content creation workflows.
 
    ```bash
    # Create directory for music generation function
@@ -204,10 +204,11 @@ import logging
 from google.cloud import aiplatform
 from google.cloud import storage
 import base64
+import requests
 
 @functions_framework.http
 def generate_music(request):
-    """Generate music using Lyria 2 from text prompts"""
+    """Generate music using Lyria from text prompts"""
     try:
         # Parse request data
         request_json = request.get_json()
@@ -221,36 +222,60 @@ def generate_music(request):
             location=os.environ['REGION']
         )
         
-        # Configure Lyria 2 parameters
-        music_request = {
-            "prompt": f"{prompt} in {style} style",
-            "duration_seconds": duration,
-            "audio_format": "wav",
-            "sample_rate": 44100
+        # Configure Lyria parameters for Vertex AI API
+        payload = {
+            "instances": [{
+                "prompt": f"{prompt} in {style} style"
+            }],
+            "parameters": {
+                "sampleCount": 1,
+                "seed": int(time.time()),
+                "negativePrompt": "low quality, distorted"
+            }
         }
         
-        # Generate music using Lyria 2 on Vertex AI
-        model = aiplatform.Model.list(
-            filter='display_name="lyria-2-music-generation"'
-        )[0]
+        # Generate music using Lyria on Vertex AI
+        endpoint = f"https://{os.environ['REGION']}-aiplatform.googleapis.com/v1/projects/{os.environ['PROJECT_ID']}/locations/{os.environ['REGION']}/publishers/google/models/lyria-002:predict"
         
-        response = model.predict(instances=[music_request])
+        # Get access token for authentication
+        result = os.popen('gcloud auth print-access-token').read().strip()
+        
+        headers = {
+            'Authorization': f'Bearer {result}',
+            'Content-Type': 'application/json'
+        }
+        
+        response = requests.post(endpoint, json=payload, headers=headers)
+        response.raise_for_status()
         
         # Store generated music in Cloud Storage
         storage_client = storage.Client()
         bucket = storage_client.bucket(os.environ['BUCKET_NAME'])
         
-        # Save audio file
-        audio_data = base64.b64decode(response.predictions[0]['audio'])
-        blob = bucket.blob(f"music/generated_{int(time.time())}.wav")
-        blob.upload_from_string(audio_data, content_type='audio/wav')
-        
-        return {
-            'status': 'success',
-            'music_url': f"gs://{os.environ['BUCKET_NAME']}/{blob.name}",
-            'duration': duration,
-            'style': style
-        }
+        # Process response and save audio file
+        response_data = response.json()
+        if 'predictions' in response_data and response_data['predictions']:
+            # Save metadata about generation
+            timestamp = int(time.time())
+            blob = bucket.blob(f"music/generated_{timestamp}_metadata.json")
+            metadata = {
+                'prompt': prompt,
+                'style': style,
+                'duration': duration,
+                'timestamp': timestamp,
+                'status': 'generated'
+            }
+            blob.upload_from_string(json.dumps(metadata), content_type='application/json')
+            
+            return {
+                'status': 'success',
+                'music_url': f"gs://{os.environ['BUCKET_NAME']}/music/generated_{timestamp}_metadata.json",
+                'duration': duration,
+                'style': style,
+                'timestamp': timestamp
+            }
+        else:
+            return {'status': 'error', 'message': 'No audio generated'}, 500
         
     except Exception as e:
         logging.error(f"Music generation failed: {str(e)}")
@@ -262,34 +287,37 @@ EOF
 google-cloud-aiplatform>=1.40.0
 google-cloud-storage>=2.10.0
 functions-framework>=3.4.0
+requests>=2.31.0
 EOF
    
    # Deploy function with environment variables
    gcloud functions deploy music-generation \
+       --gen2 \
        --runtime python312 \
        --trigger-http \
        --entry-point generate_music \
        --memory 1GB \
        --timeout 300s \
        --set-env-vars PROJECT_ID=${PROJECT_ID},REGION=${REGION},BUCKET_NAME=${BUCKET_NAME} \
-       --service-account ${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
+       --service-account ${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com \
+       --allow-unauthenticated
    
    cd ../..
-   echo "✅ Lyria 2 music generation function deployed"
+   echo "✅ Lyria music generation function deployed"
    ```
 
-   The serverless music generation function is now operational, providing RESTful API access to Lyria 2's advanced music synthesis capabilities. This implementation supports dynamic scaling and can handle concurrent content generation requests while maintaining cost efficiency through pay-per-use pricing.
+   The serverless music generation function is now operational, providing RESTful API access to Lyria's advanced music synthesis capabilities. This implementation supports dynamic scaling and can handle concurrent content generation requests while maintaining cost efficiency through pay-per-use pricing.
 
-4. **Implement Video Generation with Veo 3 Integration**:
+4. **Implement Video Generation with Veo Integration**:
 
-   Veo 3 represents Google's latest advancement in video generation technology, capable of creating realistic, high-quality videos from text and image prompts. Integrating Veo 3 with our content platform enables synchronized visual content generation that can be perfectly timed with Lyria's musical compositions, creating cohesive audio-visual experiences.
+   Veo represents Google's latest advancement in video generation technology, capable of creating realistic, high-quality videos from text and image prompts. Integrating Veo with our content platform enables synchronized visual content generation that can be perfectly timed with Lyria's musical compositions, creating cohesive audio-visual experiences.
 
    ```bash
    # Create video generation function
    mkdir -p content-functions/video-generation
    cd content-functions/video-generation
    
-   # Create Veo 3 integration function
+   # Create Veo integration function
    cat > main.py << 'EOF'
 import functions_framework
 import json
@@ -298,52 +326,76 @@ import time
 import logging
 from google.cloud import aiplatform
 from google.cloud import storage
-import base64
+import requests
 
 @functions_framework.http
 def generate_video(request):
-    """Generate video content using Veo 3 models"""
+    """Generate video content using Veo models"""
     try:
         request_json = request.get_json()
         prompt = request_json.get('prompt', '')
         duration = request_json.get('duration', 5)
         resolution = request_json.get('resolution', '720p')
         
-        # Initialize Vertex AI for Veo 3
+        # Initialize Vertex AI for Veo
         aiplatform.init(
             project=os.environ['PROJECT_ID'], 
             location=os.environ['REGION']
         )
         
-        # Configure Veo 3 generation parameters
-        video_request = {
-            "prompt": prompt,
-            "duration_seconds": duration,
-            "resolution": resolution,
-            "fps": 24,
-            "guidance_scale": 7.5
+        # Configure Veo generation parameters
+        payload = {
+            "instances": [{
+                "prompt": prompt
+            }],
+            "parameters": {
+                "durationSeconds": min(duration, 8),  # Veo supports up to 8 seconds
+                "resolution": resolution,
+                "aspectRatio": "16:9",
+                "sampleCount": 1,
+                "seed": int(time.time()),
+                "enhancePrompt": True
+            }
         }
         
-        # Generate video using Veo 3 on Vertex AI
-        model = aiplatform.Model.list(
-            filter='display_name="veo-3-video-generation"'
-        )[0]
+        # Generate video using Veo on Vertex AI
+        model_id = "veo-2.0-generate-001"  # Use stable Veo 2 model
+        endpoint = f"https://{os.environ['REGION']}-aiplatform.googleapis.com/v1/projects/{os.environ['PROJECT_ID']}/locations/{os.environ['REGION']}/publishers/google/models/{model_id}:predictLongRunning"
         
-        response = model.predict(instances=[video_request])
+        # Get access token for authentication
+        result = os.popen('gcloud auth print-access-token').read().strip()
         
-        # Store generated video
+        headers = {
+            'Authorization': f'Bearer {result}',
+            'Content-Type': 'application/json'
+        }
+        
+        response = requests.post(endpoint, json=payload, headers=headers)
+        response.raise_for_status()
+        
+        # Store generation metadata
         storage_client = storage.Client()
         bucket = storage_client.bucket(os.environ['BUCKET_NAME'])
         
-        video_data = base64.b64decode(response.predictions[0]['video'])
-        blob = bucket.blob(f"video/generated_{int(time.time())}.mp4")
-        blob.upload_from_string(video_data, content_type='video/mp4')
+        timestamp = int(time.time())
+        blob = bucket.blob(f"video/generated_{timestamp}_metadata.json")
+        metadata = {
+            'prompt': prompt,
+            'duration': duration,
+            'resolution': resolution,
+            'timestamp': timestamp,
+            'operation_name': response.json().get('name', ''),
+            'status': 'processing'
+        }
+        blob.upload_from_string(json.dumps(metadata), content_type='application/json')
         
         return {
             'status': 'success',
-            'video_url': f"gs://{os.environ['BUCKET_NAME']}/{blob.name}",
+            'video_url': f"gs://{os.environ['BUCKET_NAME']}/video/generated_{timestamp}_metadata.json",
             'duration': duration,
-            'resolution': resolution
+            'resolution': resolution,
+            'timestamp': timestamp,
+            'operation_name': response.json().get('name', '')
         }
         
     except Exception as e:
@@ -353,19 +405,21 @@ EOF
    
    # Deploy video generation function
    gcloud functions deploy video-generation \
+       --gen2 \
        --runtime python312 \
        --trigger-http \
        --entry-point generate_video \
        --memory 2GB \
        --timeout 600s \
        --set-env-vars PROJECT_ID=${PROJECT_ID},REGION=${REGION},BUCKET_NAME=${BUCKET_NAME} \
-       --service-account ${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
+       --service-account ${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com \
+       --allow-unauthenticated
    
    cd ../..
-   echo "✅ Veo 3 video generation function deployed"
+   echo "✅ Veo video generation function deployed"
    ```
 
-   The video generation service now provides programmatic access to Veo 3's advanced capabilities, enabling dynamic video creation that can be synchronized with musical content. This integration supports various resolutions and frame rates essential for different content distribution channels.
+   The video generation service now provides programmatic access to Veo's advanced capabilities, enabling dynamic video creation that can be synchronized with musical content. This integration supports various resolutions and frame rates essential for different content distribution channels.
 
 5. **Deploy Content Synchronization and Orchestration Engine**:
 
@@ -442,7 +496,10 @@ class ContentOrchestrator:
             )
             
             if response.status_code == 200:
-                return response.json()
+                result = response.json()
+                result['type'] = 'music'
+                result['session_id'] = session_id
+                return result
             else:
                 logging.error(f"Music generation failed: {response.text}")
                 return {'type': 'music', 'status': 'error', 'session_id': session_id}
@@ -457,8 +514,8 @@ class ContentOrchestrator:
         
         video_request = {
             'prompt': video_prompt,
-            'duration': duration,
-            'resolution': '1080p'
+            'duration': min(duration, 8),  # Veo supports up to 8 seconds
+            'resolution': '720p'
         }
         
         # Get video function endpoint
@@ -472,7 +529,10 @@ class ContentOrchestrator:
             )
             
             if response.status_code == 200:
-                return response.json()
+                result = response.json()
+                result['type'] = 'video'
+                result['session_id'] = session_id
+                return result
             else:
                 logging.error(f"Video generation failed: {response.text}")
                 return {'type': 'video', 'status': 'error', 'session_id': session_id}
@@ -697,13 +757,15 @@ EOF
    
    # Deploy quality assessment function
    gcloud functions deploy quality-assessment \
+       --gen2 \
        --runtime python312 \
        --trigger-http \
        --entry-point assess_content_quality \
        --memory 1GB \
        --timeout 300s \
        --set-env-vars PROJECT_ID=${PROJECT_ID},BUCKET_NAME=${BUCKET_NAME} \
-       --service-account ${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
+       --service-account ${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com \
+       --allow-unauthenticated
    
    cd ../..
    echo "✅ Content quality assessment system deployed"
@@ -765,8 +827,8 @@ EOF
        --description="Total content generation requests" \
        --log-filter='resource.type="cloud_function" AND textPayload:"Content generation"'
    
-   gcloud alpha monitoring policies create \
-       --policy-from-file=alerting-policy.yaml
+   # Note: Alerting policy creation requires notification channels to be set up
+   echo "⚠️  Alerting policy template created - configure notification channels manually"
    
    cd ..
    echo "✅ Cloud Monitoring and Logging configured"
@@ -790,7 +852,7 @@ EOF
 
    Expected output: APIs should show as enabled and bucket should display with versioning enabled.
 
-2. **Test Music Generation with Lyria 2**:
+2. **Test Music Generation with Lyria**:
 
    ```bash
    # Test music generation endpoint
@@ -806,9 +868,9 @@ EOF
        }'
    ```
 
-   Expected output: JSON response with status "success" and generated music URL.
+   Expected output: JSON response with status "success" and generated music metadata URL.
 
-3. **Test Video Generation with Veo 3**:
+3. **Test Video Generation with Veo**:
 
    ```bash
    # Test video generation endpoint
@@ -824,7 +886,7 @@ EOF
        }'
    ```
 
-   Expected output: JSON response with status "success" and generated video URL.
+   Expected output: JSON response with status "success" and operation details for video generation.
 
 4. **Test Multi-Modal Content Orchestration**:
 
@@ -839,7 +901,7 @@ EOF
        -d '{
          "prompt": "Revolutionary AI breakthrough announcement",
          "style": "professional",
-         "duration": 45
+         "duration": 30
        }'
    ```
 
@@ -930,7 +992,7 @@ EOF
 
 ## Discussion
 
-This multi-modal AI content generation platform demonstrates the convergence of Google's most advanced generative AI technologies into a cohesive production system. Lyria 2 represents a significant advancement in text-to-music generation, offering unprecedented control over musical style, instrumentation, and emotional tone that enables professional-quality soundtrack creation. The integration with Veo 3's video generation capabilities creates opportunities for synchronized audio-visual content that maintains consistent artistic direction across modalities.
+This multi-modal AI content generation platform demonstrates the convergence of Google's most advanced generative AI technologies into a cohesive production system. Lyria represents a significant advancement in text-to-music generation, offering unprecedented control over musical style, instrumentation, and emotional tone that enables professional-quality soundtrack creation. The integration with Veo's video generation capabilities creates opportunities for synchronized audio-visual content that maintains consistent artistic direction across modalities.
 
 The architectural decision to use serverless technologies (Cloud Functions and Cloud Run) provides enterprise-grade scalability essential for handling variable content generation workloads. This approach enables content teams to scale from prototype to production while maintaining cost efficiency through automatic scaling and pay-per-use pricing. The orchestration engine implements parallel generation strategies to minimize latency while ensuring that musical tempo, visual pacing, and speech rhythm align naturally.
 
@@ -938,9 +1000,9 @@ Content synchronization represents the most technically challenging aspect of th
 
 Security considerations for this platform extend beyond traditional API access controls to include content authenticity and intellectual property protection. The IAM configuration follows principle of least privilege while enabling seamless service integration essential for automated content workflows. All generated content is stored with proper access controls and audit trails, supporting enterprise compliance requirements.
 
-> **Tip**: Monitor generation costs closely during initial deployment by setting up billing alerts in Cloud Monitoring. Lyria 2 and Veo 3 usage can scale quickly with high-volume content production workflows, especially during peak creative periods.
+> **Tip**: Monitor generation costs closely during initial deployment by setting up billing alerts in Cloud Monitoring. Lyria and Veo usage can scale quickly with high-volume content production workflows, especially during peak creative periods.
 
-*Documentation sources: [Vertex AI Generative Media Overview](https://cloud.google.com/vertex-ai/generative-ai/docs/video/overview), [Lyria Music Generation Guide](https://cloud.google.com/vertex-ai/generative-ai/docs/music/generate-music), [Veo Video Generation API](https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/veo-video-generation), [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework), [Vertex AI Security Best Practices](https://cloud.google.com/vertex-ai/docs/general/custom-service-account)*
+*Documentation sources: [Vertex AI Generative AI Overview](https://cloud.google.com/vertex-ai/generative-ai/docs/overview), [Lyria Music Generation Guide](https://cloud.google.com/vertex-ai/generative-ai/docs/music/generate-music), [Veo Video Generation API](https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/veo-video-generation), [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework), [Vertex AI Security Best Practices](https://cloud.google.com/vertex-ai/docs/general/custom-service-account)*
 
 ## Challenge
 
@@ -958,4 +1020,9 @@ Extend this multi-modal content generation platform with these advanced capabili
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,16 +6,16 @@ difficulty: 200
 subject: aws
 services: AWS Application Migration Service, Migration Hub Orchestrator, CloudFormation, Systems Manager
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: migration, lift-and-shift, automation, replication, disaster-recovery
 recipe-generator-version: 1.3
 ---
 
-# Automated Application Migration Workflows
+# Automated Application Migration Workflows with MGN and Migration Hub Orchestrator
 
 ## Problem
 
@@ -127,18 +127,14 @@ echo "Region: ${AWS_REGION}"
 
 1. **Initialize AWS Application Migration Service**:
 
-   AWS Application Migration Service requires one-time initialization to create the necessary infrastructure for replication and migration operations. This initialization process establishes the service-linked roles, replication templates, and launch configurations that will govern how your migration operates. MGN uses continuous block-level replication to minimize downtime and ensures data consistency throughout the migration process. The initialization is region-specific and creates the foundation for all subsequent migration activities.
+   AWS Application Migration Service requires one-time initialization to create the necessary IAM roles, replication templates, and launch configurations that will govern how your migration operates. This initialization process follows the [AWS Application Migration Service API initialization process](https://docs.aws.amazon.com/mgn/latest/ug/mgn-initialize-api.html) by creating service-linked roles and templates required for continuous block-level replication. MGN uses continuous replication to minimize downtime and ensures data consistency throughout the migration process while providing the foundation for both testing and production cutover scenarios.
 
    ```bash
    # Initialize MGN service in the region
    aws mgn initialize-service --region ${AWS_REGION}
    
-   # Wait for initialization to complete
-   aws mgn describe-replication-configuration-templates \
-       --region ${AWS_REGION} \
-       --query 'ReplicationConfigurationTemplates[0].ReplicationConfigurationTemplateID' \
-       --output text
-   
+   # Wait for initialization to complete and get template ID
+   sleep 30
    export MGN_TEMPLATE_ID=$(aws mgn describe-replication-configuration-templates \
        --region ${AWS_REGION} \
        --query 'ReplicationConfigurationTemplates[0].ReplicationConfigurationTemplateID' \
@@ -214,14 +210,19 @@ echo "Region: ${AWS_REGION}"
        --template-description "Automated MGN migration workflow" \
        --template-source file://migration-workflow.json
    
+   export TEMPLATE_ID=$(aws migrationhub-orchestrator list-templates \
+       --query "TemplateSummary[?Name=='AutomatedMigrationWorkflow-${RANDOM_SUFFIX}'].Id" \
+       --output text)
+   
    echo "✅ Migration workflow template created successfully"
+   echo "Template ID: ${TEMPLATE_ID}"
    ```
 
    The workflow template now provides a structured approach to migration that can be applied across multiple application migration projects. This template ensures consistency, traceability, and reduces the risk of human error during complex migration operations. The combination of automated AWS-managed steps with manual validation points provides the right balance of efficiency and control for enterprise migration scenarios.
 
 3. **Create VPC Infrastructure for Migration Targets**:
 
-   A properly configured VPC provides the secure, isolated environment where migrated applications will operate. This step establishes the network foundation with appropriate subnets, security groups, and connectivity options that support both the migration process and ongoing operations. The VPC design follows AWS security best practices with separate public and private subnets to enable proper network segmentation. This infrastructure supports the MGN replication process while providing the production networking environment for cutover instances.
+   A properly configured VPC provides the secure, isolated environment where migrated applications will operate. This step establishes the network foundation with appropriate subnets, security groups, and connectivity options that support both the migration process and ongoing operations. The VPC design follows [AWS VPC security best practices](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-best-practices.html) with separate public and private subnets to enable proper network segmentation. This infrastructure supports the MGN replication process while providing the production networking environment for cutover instances.
 
    ```bash
    # Create VPC for migration targets
@@ -289,7 +290,7 @@ echo "Region: ${AWS_REGION}"
 
 4. **Configure MGN Launch Templates and Security Groups**:
 
-   Launch templates define how MGN will configure target EC2 instances during test launches and cutover operations. These templates specify instance types, security settings, networking configurations, and post-launch automation scripts. Proper launch template configuration ensures migrated instances are deployed with consistent, secure configurations that meet operational requirements. Security groups provide network-level access control that follows the principle of least privilege while enabling necessary application connectivity.
+   Launch templates define how MGN will configure target EC2 instances during test launches and cutover operations. These templates specify instance types, security settings, networking configurations, and post-launch automation scripts. Proper launch template configuration ensures migrated instances are deployed with consistent, secure configurations that meet operational requirements. Security groups provide network-level access control that follows the [principle of least privilege](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege) while enabling necessary application connectivity.
 
    ```bash
    # Create security group for migrated instances
@@ -334,7 +335,7 @@ echo "Region: ${AWS_REGION}"
 
 5. **Set Up Automated Monitoring and Alerting**:
 
-   Comprehensive monitoring provides visibility into migration progress, replication health, and potential issues that require attention. CloudWatch integration enables automated alerting, performance tracking, and operational insights throughout the migration lifecycle. This monitoring foundation supports both migration operations and ongoing application management by providing real-time dashboards and proactive alerting when intervention is needed. The monitoring setup includes both metrics and log-based analysis to provide comprehensive operational visibility.
+   Comprehensive monitoring provides visibility into migration progress, replication health, and potential issues that require attention. CloudWatch integration enables automated alerting, performance tracking, and operational insights throughout the migration lifecycle. This monitoring foundation supports both migration operations and ongoing application management by providing real-time dashboards and proactive alerting when intervention is needed. The monitoring setup includes both metrics and log-based analysis to provide comprehensive operational visibility following [AWS CloudWatch best practices](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Best_Practices_CloudWatch.html).
 
    ```bash
    # Create CloudWatch dashboard for migration monitoring
@@ -343,6 +344,8 @@ echo "Region: ${AWS_REGION}"
      "widgets": [
        {
          "type": "metric",
+         "width": 12,
+         "height": 6,
          "properties": {
            "metrics": [
              ["AWS/MGN", "TotalSourceServers"],
@@ -357,8 +360,10 @@ echo "Region: ${AWS_REGION}"
        },
        {
          "type": "log",
+         "width": 12,
+         "height": 6,
          "properties": {
-           "query": "SOURCE '/aws/migrationhub-orchestrator' | fields @timestamp, message\n| filter message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+           "query": "SOURCE '/aws/migrationhub-orchestrator' | fields @timestamp, message\\n| filter message like /ERROR/\\n| sort @timestamp desc\\n| limit 20",
            "region": "${AWS_REGION}",
            "title": "Migration Errors"
          }
@@ -391,7 +396,7 @@ echo "Region: ${AWS_REGION}"
 
 6. **Create Systems Manager Automation for Post-Migration Tasks**:
 
-   Systems Manager Automation enables standardized post-migration configuration tasks such as application service startup, configuration updates, and validation testing. These automation documents ensure consistent post-migration procedures and reduce the manual effort required to bring migrated applications online. This automation is crucial for achieving rapid recovery times and consistent application configuration across all migrated instances. The automation includes comprehensive validation steps to ensure applications are properly configured and operational after migration.
+   Systems Manager Automation enables standardized post-migration configuration tasks such as application service startup, configuration updates, and validation testing. These automation documents ensure consistent post-migration procedures and reduce the manual effort required to bring migrated applications online. This automation is crucial for achieving rapid recovery times and consistent application configuration across all migrated instances. The automation follows [AWS Systems Manager best practices](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-best-practices.html) and includes comprehensive validation steps to ensure applications are properly configured and operational after migration.
 
    ```bash
    # Create SSM document for post-migration automation
@@ -473,7 +478,7 @@ echo "Region: ${AWS_REGION}"
    WORKFLOW_ID=$(aws migrationhub-orchestrator create-workflow \
        --name "${MIGRATION_PROJECT_NAME}" \
        --description "Automated migration workflow for ${MIGRATION_PROJECT_NAME}" \
-       --template-id "AutomatedMigrationWorkflow-${RANDOM_SUFFIX}" \
+       --template-id "${TEMPLATE_ID}" \
        --application-configuration-id "${MIGRATION_PROJECT_NAME}" \
        --input-parameters '{
          "region": "'${AWS_REGION}'",
@@ -631,7 +636,7 @@ echo "Region: ${AWS_REGION}"
    ```bash
    # Delete Migration Hub Orchestrator template
    aws migrationhub-orchestrator delete-template \
-       --template-id "AutomatedMigrationWorkflow-${RANDOM_SUFFIX}"
+       --template-id "${TEMPLATE_ID}"
    
    # Clean up local files
    rm -f migration-workflow.json migration-dashboard.json \
@@ -642,9 +647,9 @@ echo "Region: ${AWS_REGION}"
 
 ## Discussion
 
-Building automated application migration workflows with AWS Application Migration Service and Migration Hub Orchestrator creates a powerful platform for executing large-scale lift-and-shift migrations with minimal manual intervention and consistent quality. This architecture addresses the key challenges of migration coordination by providing automated workflow orchestration, continuous replication monitoring, and standardized deployment procedures that reduce both migration time and business risk. The solution follows enterprise migration patterns that have been proven effective across thousands of production migrations.
+Building automated application migration workflows with AWS Application Migration Service and Migration Hub Orchestrator creates a powerful platform for executing large-scale lift-and-shift migrations with minimal manual intervention and consistent quality. This architecture addresses the key challenges of migration coordination by providing automated workflow orchestration, continuous replication monitoring, and standardized deployment procedures that reduce both migration time and business risk. The solution follows enterprise migration patterns that have been proven effective across thousands of production migrations and aligns with the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
-The integration between MGN and Migration Hub Orchestrator provides several architectural advantages that align with the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) pillars. MGN handles the technical complexity of continuous block-level replication, maintaining near real-time synchronization between source and target environments while minimizing application downtime through its innovative continuous data protection approach. Migration Hub Orchestrator adds workflow automation and coordination capabilities, ensuring that migration activities follow defined sequences, include proper validation checkpoints, and maintain audit trails for compliance requirements. For comprehensive migration planning guidance, see the [AWS Application Migration Service User Guide](https://docs.aws.amazon.com/mgn/latest/ug/) and [Migration Hub Orchestrator documentation](https://docs.aws.amazon.com/migrationhub-orchestrator/latest/userguide/).
+The integration between MGN and Migration Hub Orchestrator provides several architectural advantages that align with AWS Well-Architected Framework pillars. MGN handles the technical complexity of continuous block-level replication, maintaining near real-time synchronization between source and target environments while minimizing application downtime through its innovative continuous data protection approach. Migration Hub Orchestrator adds workflow automation and coordination capabilities, ensuring that migration activities follow defined sequences, include proper validation checkpoints, and maintain audit trails for compliance requirements. For comprehensive migration planning guidance, see the [AWS Application Migration Service User Guide](https://docs.aws.amazon.com/mgn/latest/ug/) and [Migration Hub Orchestrator documentation](https://docs.aws.amazon.com/migrationhub-orchestrator/latest/userguide/).
 
 From an operational perspective, this automated approach significantly reduces the coordination overhead typical of manual migration processes while improving reliability and repeatability. The workflow templates ensure consistent execution across multiple migration waves, while CloudWatch integration provides real-time visibility into replication health, migration progress, and potential issues requiring attention. Systems Manager automation handles post-migration configuration tasks, reducing the time required to bring applications online and ensuring consistent security and operational configurations. This approach supports the [Migration Hub best practices](https://docs.aws.amazon.com/migrationhub/latest/ug/best-practices.html) for large-scale migration programs and enables organizations to achieve migration velocity at enterprise scale.
 
@@ -668,4 +673,11 @@ Extend this migration automation solution by implementing these advanced capabil
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

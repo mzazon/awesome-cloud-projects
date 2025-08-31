@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Storage, Cloud Monitoring, Cloud Functions, Cloud Scheduler
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: storage, monitoring, automation, optimization, serverless
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Global enterprises face significant challenges with data locality optimization a
 
 ## Solution
 
-This solution implements an intelligent data locality optimization system that automatically monitors Cloud Storage access patterns using Cloud Monitoring metrics and triggers bucket relocation operations through Cloud Functions when performance thresholds are exceeded. The system uses Cloud Scheduler to orchestrate periodic analysis and leverages Google Cloud's serverless bucket relocation service to seamlessly move data closer to primary access locations without downtime, reducing latency by up to 80% and minimizing egress costs.
+This solution implements an intelligent data locality optimization system that automatically monitors Cloud Storage access patterns using Cloud Monitoring metrics and triggers bucket relocation operations through Cloud Functions when performance thresholds are exceeded. The system uses Cloud Scheduler to orchestrate periodic analysis and leverages Google Cloud's bucket relocation service to seamlessly move data closer to primary access locations without downtime, reducing latency by up to 80% and minimizing egress costs.
 
 ## Architecture Diagram
 
@@ -82,12 +82,12 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and appropriate permissions for Cloud Storage, Cloud Monitoring, Cloud Functions, and Cloud Scheduler
-2. gcloud CLI installed and configured (version 400.0.0 or later)
+2. gcloud CLI installed and configured (version 450.0.0 or later)
 3. Understanding of Cloud Storage access patterns and network latency concepts
 4. Familiarity with Google Cloud serverless services and monitoring concepts
 5. Estimated cost: $15-25 per month for monitoring, functions, and storage (excluding data transfer costs)
 
-> **Note**: This solution requires the Cloud Storage bucket relocation service which is available in most regions. Review the [Cloud Storage locations documentation](https://cloud.google.com/storage/docs/locations) for supported relocation paths.
+> **Note**: This solution requires the Cloud Storage bucket relocation service which is available for relocations between most regions. Review the [Cloud Storage locations documentation](https://cloud.google.com/storage/docs/locations) for supported relocation paths.
 
 ## Preparation
 
@@ -192,8 +192,8 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
    }
    EOF
    
-   # Create the custom metric
-   gcloud monitoring metrics create \
+   # Create the custom metric using the Monitoring API
+   gcloud alpha monitoring metrics create \
        --descriptor-from-file=metric_descriptor.json
    
    echo "✅ Custom monitoring metrics configured"
@@ -215,9 +215,9 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
    from google.cloud import storage
    from google.cloud import monitoring_v3
    from google.cloud import pubsub_v1
-   from google.cloud import functions_v1
    import os
    from datetime import datetime, timedelta
+   import functions_framework
    
    # Initialize clients
    storage_client = storage.Client()
@@ -276,8 +276,9 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
            if bucket.location.lower() == target_location.lower():
                return {"status": "no_action", "message": "Bucket already in optimal location"}
            
-           # Note: Bucket relocation API calls would go here
-           # For demo purposes, we'll simulate the relocation process
+           # For production use, implement actual bucket relocation
+           # using gcloud storage buckets relocate command or REST API
+           # This is a simulation for demo purposes
            
            relocation_info = {
                "source_location": bucket.location,
@@ -298,6 +299,7 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
            logging.error(f"Relocation failed: {str(e)}")
            return {"status": "error", "message": str(e)}
    
+   @functions_framework.http
    def bucket_relocator(request):
        """Main Cloud Function entry point"""
        
@@ -323,12 +325,12 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
            return json.dumps({"status": "error", "message": str(e)})
    EOF
    
-   # Create requirements.txt
+   # Create requirements.txt with updated versions
    cat > requirements.txt << 'EOF'
-   google-cloud-storage==2.10.0
-   google-cloud-monitoring==2.16.0
-   google-cloud-pubsub==2.18.4
-   google-cloud-functions==1.13.3
+   google-cloud-storage==2.18.0
+   google-cloud-monitoring==2.22.0
+   google-cloud-pubsub==2.23.1
+   functions-framework==3.8.1
    EOF
    
    echo "✅ Cloud Function source code created"
@@ -340,20 +342,24 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
    Deploying the Cloud Function creates a serverless endpoint that can be triggered by monitoring alerts or scheduled events. The function operates with minimal cold-start latency and scales automatically based on demand, ensuring consistent performance for data locality optimization tasks regardless of organizational scale.
 
    ```bash
-   # Deploy the Cloud Function
+   # Deploy the Cloud Function using Cloud Run functions (2nd gen)
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --gen2 \
+       --runtime python312 \
        --trigger-http \
        --entry-point bucket_relocator \
        --source ./bucket-relocator-function \
        --set-env-vars GCP_PROJECT=${PROJECT_ID},BUCKET_NAME=${BUCKET_NAME},PUBSUB_TOPIC=${PUBSUB_TOPIC} \
        --memory 512MB \
        --timeout 300s \
-       --allow-unauthenticated
+       --allow-unauthenticated \
+       --region ${REGION}
    
    # Get the function URL
    export FUNCTION_URL=$(gcloud functions describe ${FUNCTION_NAME} \
-       --format="value(httpsTrigger.url)")
+       --gen2 \
+       --region ${REGION} \
+       --format="value(serviceConfig.uri)")
    
    echo "✅ Cloud Function deployed successfully"
    echo "Function URL: ${FUNCTION_URL}"
@@ -413,7 +419,8 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
        --uri=${FUNCTION_URL} \
        --http-method=GET \
        --time-zone="America/New_York" \
-       --description="Daily data locality analysis and optimization"
+       --description="Daily data locality analysis and optimization" \
+       --location=${REGION}
    
    echo "✅ Cloud Scheduler job created for daily analysis"
    ```
@@ -461,7 +468,10 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
    curl -X GET ${FUNCTION_URL} -w "\n%{http_code}\n"
    
    # Check function logs for execution details
-   gcloud functions logs read ${FUNCTION_NAME} --limit=10
+   gcloud functions logs read ${FUNCTION_NAME} \
+       --gen2 \
+       --region ${REGION} \
+       --limit=10
    ```
 
    Expected output: JSON response with analysis results and HTTP 200 status code.
@@ -470,10 +480,12 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
 
    ```bash
    # Check custom metrics creation
-   gcloud monitoring metrics list --filter="type:custom.googleapis.com/storage/regional_access_latency"
+   gcloud alpha monitoring metrics list \
+       --filter="type:custom.googleapis.com/storage/regional_access_latency"
    
    # List alert policies
-   gcloud alpha monitoring policies list --filter="displayName:Storage Access Latency Alert"
+   gcloud alpha monitoring policies list \
+       --filter="displayName:Storage Access Latency Alert"
    ```
 
    Expected output: Custom metrics and alert policies properly configured.
@@ -482,7 +494,8 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
 
    ```bash
    # Pull messages from the subscription
-   gcloud pubsub subscriptions pull ${PUBSUB_TOPIC}-monitor --limit=5
+   gcloud pubsub subscriptions pull ${PUBSUB_TOPIC}-monitor \
+       --limit=5
    
    # Check subscription details
    gcloud pubsub subscriptions describe ${PUBSUB_TOPIC}-monitor
@@ -496,7 +509,9 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
 
    ```bash
    # Delete the scheduler job
-   gcloud scheduler jobs delete ${SCHEDULER_JOB} --quiet
+   gcloud scheduler jobs delete ${SCHEDULER_JOB} \
+       --location=${REGION} \
+       --quiet
    
    echo "✅ Cloud Scheduler job deleted"
    ```
@@ -505,7 +520,10 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
 
    ```bash
    # Delete the Cloud Function
-   gcloud functions delete ${FUNCTION_NAME} --quiet
+   gcloud functions delete ${FUNCTION_NAME} \
+       --gen2 \
+       --region ${REGION} \
+       --quiet
    
    echo "✅ Cloud Function deleted"
    ```
@@ -514,11 +532,15 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
 
    ```bash
    # Delete alert policies
-   gcloud alpha monitoring policies list --filter="displayName:Storage Access Latency Alert" \
-       --format="value(name)" | xargs -I {} gcloud alpha monitoring policies delete {} --quiet
+   gcloud alpha monitoring policies list \
+       --filter="displayName:Storage Access Latency Alert" \
+       --format="value(name)" | \
+       xargs -I {} gcloud alpha monitoring policies delete {} --quiet
    
    # Delete custom metrics
-   gcloud monitoring metrics delete custom.googleapis.com/storage/regional_access_latency --quiet
+   gcloud alpha monitoring metrics delete \
+       custom.googleapis.com/storage/regional_access_latency \
+       --quiet
    
    echo "✅ Monitoring resources deleted"
    ```
@@ -572,7 +594,7 @@ Cost optimization is achieved through intelligent data placement that minimizes 
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Cloud Data Locality**: Integrate with [Cloud Storage Transfer Service](https://cloud.google.com/storage-transfer/docs) to implement cross-cloud data locality optimization, automatically moving data between Google Cloud and other cloud providers based on access patterns and cost analysis.
+1. **Multi-Cloud Data Locality**: Integrate with [Storage Transfer Service](https://cloud.google.com/storage-transfer/docs) to implement cross-cloud data locality optimization, automatically moving data between Google Cloud and other cloud providers based on access patterns and cost analysis.
 
 2. **Predictive Analytics Integration**: Enhance the decision-making logic with [Vertex AI](https://cloud.google.com/vertex-ai) machine learning models that predict future access patterns based on historical data, seasonal trends, and business events to proactively optimize data placement.
 
@@ -580,8 +602,13 @@ Extend this solution by implementing these enhancements:
 
 4. **Application-Aware Optimization**: Integrate with [Cloud Asset Inventory](https://cloud.google.com/asset-inventory) to understand application dependencies and optimize data placement based on compute resource locations and application deployment patterns.
 
-5. **Compliance and Governance Integration**: Add [Cloud Data Loss Prevention](https://cloud.google.com/dlp) scanning and [Cloud Security Command Center](https://cloud.google.com/security-command-center) integration to ensure data locality optimization decisions comply with regional data residency requirements and security policies.
+5. **Compliance and Governance Integration**: Add [Cloud Data Loss Prevention](https://cloud.google.com/dlp) scanning and [Security Command Center](https://cloud.google.com/security-command-center) integration to ensure data locality optimization decisions comply with regional data residency requirements and security policies.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: batch,ec2,ecr,efs
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: aws-batch,multi-node,hpc,scientific-computing,mpi,distributed-computing,ec2,efs
 recipe-generator-version: 1.3
@@ -634,6 +634,8 @@ echo "✅ Basic infrastructure created"
 
 9. **Create Advanced Job Definition with Parameter Support**:
 
+   Parameterized job definitions enable flexible job submission by allowing users to override default values at job submission time. This approach supports different computational workloads with varying resource requirements while maintaining a single job definition template. Parameters enable researchers to customize input paths, output directories, and computational intensity settings without needing to create multiple job definitions for similar workloads.
+
    ```bash
    # Create advanced job definition with parameterization
    cat > /tmp/advanced-job-definition.json << EOF
@@ -713,6 +715,8 @@ echo "✅ Basic infrastructure created"
    echo "✅ Advanced parameterized job definition created"
    echo "Advanced Job Definition ARN: ${ADVANCED_JOB_DEF_ARN}"
    ```
+
+   The parameterized job definition provides flexibility for various scientific computing workloads while maintaining consistency in resource allocation and container configuration. This approach enables researchers to submit jobs with different parameters without requiring separate job definitions, simplifying job management and improving resource utilization across different computational scenarios.
 
 10. **Set Up Job Monitoring and Logging**:
 
@@ -1087,15 +1091,15 @@ echo "✅ Basic infrastructure created"
 
 ## Discussion
 
-AWS Batch multi-node parallel jobs revolutionize scientific computing by providing elastic, managed infrastructure for tightly-coupled workloads that traditionally required dedicated HPC clusters. The gang scheduling capability ensures all nodes for a job start simultaneously, which is critical for MPI applications where nodes must coordinate from the beginning. This eliminates the complexity of manually managing cluster provisioning, job scheduling, and inter-node communication setup.
+AWS Batch multi-node parallel jobs revolutionize scientific computing by providing elastic, managed infrastructure for tightly-coupled workloads that traditionally required dedicated HPC clusters. The gang scheduling capability ensures all nodes for a job start simultaneously, which is critical for MPI applications where nodes must coordinate from the beginning. This eliminates the complexity of manually managing cluster provisioning, job scheduling, and inter-node communication setup while following AWS Well-Architected Framework principles for operational excellence and reliability.
 
 The architecture leverages several sophisticated AWS services working in concert. Enhanced networking capabilities ensure low-latency communication essential for MPI workloads, while EFS provides shared storage that all nodes can access simultaneously. The container-based approach using ECR enables reproducible environments and simplifies dependency management, allowing researchers to package their entire software stack including MPI libraries, scientific applications, and custom algorithms.
 
-Cost optimization is achieved through automatic scaling and the ability to use Spot instances for fault-tolerant workloads. Unlike traditional HPC clusters that require constant resource provisioning for peak workloads, Batch scales from zero to hundreds of nodes based on job queue demand. The service automatically handles instance lifecycle, job placement, and failure recovery, reducing operational overhead significantly.
+Cost optimization is achieved through automatic scaling and the ability to use Spot instances for fault-tolerant workloads. Unlike traditional HPC clusters that require constant resource provisioning for peak workloads, Batch scales from zero to hundreds of nodes based on job queue demand. The service automatically handles instance lifecycle, job placement, and failure recovery, reducing operational overhead significantly while maintaining security best practices with IAM roles and encryption.
 
-The EFS integration deserves special attention as it provides POSIX-compliant shared storage that scales automatically and delivers consistent performance across all compute nodes. This enables complex workflows where intermediate results must be shared between nodes or where large datasets need to be accessible from any node in the cluster. The provisioned throughput mode ensures predictable I/O performance for data-intensive scientific applications.
+The EFS integration deserves special attention as it provides POSIX-compliant shared storage that scales automatically and delivers consistent performance across all compute nodes. This enables complex workflows where intermediate results must be shared between nodes or where large datasets need to be accessible from any node in the cluster. The provisioned throughput mode ensures predictable I/O performance for data-intensive scientific applications, supporting the performance pillar of the AWS Well-Architected Framework.
 
-> **Tip**: Use EFS Intelligent Tiering to automatically move infrequently accessed data to lower-cost storage classes, and consider FSx for Lustre for workloads requiring extreme I/O performance with S3 integration.
+> **Tip**: Use EFS Intelligent Tiering to automatically move infrequently accessed data to lower-cost storage classes, and consider FSx for Lustre for workloads requiring extreme I/O performance with S3 integration. Review the [AWS Batch User Guide](https://docs.aws.amazon.com/batch/latest/userguide/) for additional optimization strategies.
 
 ## Challenge
 
@@ -1113,4 +1117,11 @@ Extend this solution by implementing these advanced scientific computing capabil
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

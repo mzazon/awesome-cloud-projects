@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: CloudWatch, SNS, Lambda
 estimated-time: 60 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: monitoring, logs, alerts, automation, error-detection
 recipe-generator-version: 1.3
@@ -101,7 +101,7 @@ export ALARM_NAME="application-errors-alarm"
 export SNS_TOPIC_NAME="log-monitoring-alerts-${RANDOM_SUFFIX}"
 export LAMBDA_FUNCTION_NAME="log-processor-${RANDOM_SUFFIX}"
 
-# Set your email for notifications
+# Set your email for notifications (replace with your actual email)
 export NOTIFICATION_EMAIL="your-email@example.com"
 
 echo "✅ AWS environment configured with unique identifiers"
@@ -166,7 +166,7 @@ echo "Lambda Function: ${LAMBDA_FUNCTION_NAME}"
    aws logs put-metric-filter \
        --log-group-name ${LOG_GROUP_NAME} \
        --filter-name ${METRIC_FILTER_NAME} \
-       --filter-pattern '{ ($.level = "ERROR") || ($.message = "*ERROR*") || ($.message = "*FAILED*") || ($.message = "*EXCEPTION*") || ($.message = "*TIMEOUT*") }' \
+       --filter-pattern '[timestamp, request_id, level="ERROR", message] || [timestamp, request_id, level, message="*ERROR*"] || [timestamp, request_id, level, message="*FAILED*"] || [timestamp, request_id, level, message="*EXCEPTION*"] || [timestamp, request_id, level, message="*TIMEOUT*"]' \
        --metric-transformations \
            metricName=ApplicationErrors,\
            metricNamespace=CustomApp/Monitoring,\
@@ -265,10 +265,10 @@ EOF
    # Wait for role to be available
    sleep 10
    
-   # Create Lambda function
+   # Create Lambda function with latest Python runtime
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-log-processor-role \
        --handler log-processor.lambda_handler \
        --zip-file fileb://log-processor.zip \
@@ -356,7 +356,7 @@ EOF
            --log-group-name ${LOG_GROUP_NAME} \
            --log-stream-name ${LOG_STREAM_NAME} \
            --log-events \
-               timestamp=$(date +%s000),message="ERROR: Database connection failed - attempt $i"
+               timestamp=$(date +%s000),message="$(date +%Y-%m-%dT%H:%M:%S) req-$i ERROR: Database connection failed - attempt $i"
        
        echo "Sent test error event $i"
        sleep 2
@@ -501,39 +501,46 @@ EOF
 
 ## Discussion
 
-This log monitoring solution demonstrates a fundamental DevOps practice of proactive monitoring and alerting. By using CloudWatch Logs metric filters, we transform unstructured log data into actionable metrics that can trigger automated responses. The architecture follows AWS Well-Architected Framework principles, particularly in the areas of operational excellence and reliability.
+This log monitoring solution demonstrates a fundamental DevOps practice of proactive monitoring and alerting. By using CloudWatch Logs metric filters, we transform unstructured log data into actionable metrics that can trigger automated responses. The architecture follows AWS Well-Architected Framework principles, particularly in the areas of operational excellence and reliability, providing cost-effective monitoring that scales automatically with log volume.
 
-The metric filter pattern `{ ($.level = "ERROR") || ($.message = "*ERROR*") || ($.message = "*FAILED*") || ($.message = "*EXCEPTION*") || ($.message = "*TIMEOUT*") }` uses CloudWatch Logs' JSON-based filtering syntax to detect various error conditions. This pattern works well for structured JSON logs but can be adapted for text-based logs using different syntax. The filter creates a custom metric that provides better visibility into application health than manual log review.
+The metric filter pattern uses a simpler text-based approach that works with both structured and unstructured logs, scanning for common error keywords like "ERROR", "FAILED", "EXCEPTION", and "TIMEOUT". This pattern is more flexible than JSON-based filtering and works across different log formats. The filter creates a custom metric that provides better visibility into application health than manual log review while enabling threshold-based alerting for rapid incident response.
 
-The integration between CloudWatch Alarms, SNS, and Lambda creates a flexible notification and processing pipeline. SNS provides reliable message delivery to multiple endpoints, while Lambda enables custom processing logic without managing servers. This serverless approach ensures cost-effective scaling and reduces operational overhead. The alarm threshold of 2 errors in 5 minutes balances sensitivity with false positive prevention - this can be adjusted based on your application's error patterns and business requirements.
+The integration between CloudWatch Alarms, SNS, and Lambda creates a flexible notification and processing pipeline. SNS provides reliable message delivery to multiple endpoints with built-in retry mechanisms, while Lambda enables custom processing logic without managing servers. This serverless approach ensures cost-effective scaling and reduces operational overhead. The alarm threshold of 2 errors in 5 minutes balances sensitivity with false positive prevention - this can be adjusted based on your application's error patterns and business requirements.
 
-Consider implementing log sampling for high-volume applications to manage costs while maintaining monitoring effectiveness. CloudWatch Logs pricing is based on data ingested, stored, and analyzed, so efficient log management is important for cost optimization. Additionally, using structured logging (JSON format) improves filtering accuracy and enables more sophisticated log analysis.
+Consider implementing log sampling for high-volume applications to manage costs while maintaining monitoring effectiveness. CloudWatch Logs pricing is based on data ingested, stored, and analyzed, so efficient log management is important for cost optimization. Using structured logging (JSON format) improves filtering accuracy and enables more sophisticated log analysis with CloudWatch Logs Insights for advanced troubleshooting and pattern recognition.
 
 > **Tip**: Use CloudWatch Logs Insights for advanced log analysis and troubleshooting. The query language enables complex log searches across multiple log groups, helping identify patterns and root causes during incident response.
 
-For production environments, consider implementing additional monitoring layers such as application performance monitoring (APM) tools, distributed tracing with AWS X-Ray, and custom business metrics. The monitoring strategy should align with your application's criticality and service level objectives (SLOs).
+For production environments, consider implementing additional monitoring layers such as application performance monitoring (APM) tools, distributed tracing with AWS X-Ray, and custom business metrics. The monitoring strategy should align with your application's criticality and service level objectives (SLOs). Regular testing of the monitoring system ensures reliable alerting when actual incidents occur.
 
 **Documentation References:**
 - [Creating metrics from log events using filters](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/MonitoringLogData.html)
 - [Log group-level subscription filters](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/SubscriptionFilters.html)
 - [Using Amazon CloudWatch alarms](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html)
-- [Sending Lambda function logs to CloudWatch Logs](https://docs.aws.amazon.com/lambda/latest/dg/monitoring-cloudwatchlogs.html)
+- [Building Lambda functions with Python](https://docs.aws.amazon.com/lambda/latest/dg/lambda-python.html)
 - [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html)
 
 ## Challenge
 
 Extend this log monitoring solution by implementing these enhancements:
 
-1. **Multi-Pattern Detection**: Create additional metric filters for different error severities (WARNING, CRITICAL, FATAL) with separate thresholds and notification channels.
+1. **Multi-Pattern Detection**: Create additional metric filters for different error severities (WARNING, CRITICAL, FATAL) with separate thresholds and notification channels for escalated incident management.
 
-2. **Geographic Distribution**: Implement cross-region log monitoring for applications deployed in multiple AWS regions, using CloudWatch cross-region functionality.
+2. **Geographic Distribution**: Implement cross-region log monitoring for applications deployed in multiple AWS regions, using CloudWatch cross-region functionality to aggregate metrics and provide global visibility.
 
-3. **Automated Remediation**: Extend the Lambda function to perform automated remediation actions like restarting services, scaling resources, or creating support tickets based on error patterns.
+3. **Automated Remediation**: Extend the Lambda function to perform automated remediation actions like restarting services, scaling resources, or creating support tickets based on error patterns and severity levels.
 
-4. **Integration with External Systems**: Add SNS subscriptions for Slack, PagerDuty, or other incident management tools to create a comprehensive alerting ecosystem.
+4. **Integration with External Systems**: Add SNS subscriptions for Slack, PagerDuty, or other incident management tools to create a comprehensive alerting ecosystem with escalation policies.
 
-5. **Advanced Analytics**: Implement CloudWatch Logs Insights queries within the Lambda function to provide detailed error context and trending information in alert notifications.
+5. **Advanced Analytics**: Implement CloudWatch Logs Insights queries within the Lambda function to provide detailed error context, trending information, and root cause analysis in alert notifications.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

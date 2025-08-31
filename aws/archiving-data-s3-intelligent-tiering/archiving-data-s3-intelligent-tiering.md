@@ -82,8 +82,9 @@ graph TB
 3. Basic understanding of S3 storage classes and pricing
 4. Sample data for testing (at least 1 GB recommended)
 5. Understanding of organizational sustainability goals and metrics
+6. Estimated cost: S3 Intelligent-Tiering monitoring at $0.0025/1,000 objects/month, Lambda costs ~$0.20/million invocations, CloudWatch metrics ~$0.30/metric/month
 
-> **Note**: S3 Intelligent-Tiering has monitoring and automation charges of $0.0025 per 1,000 objects. Evaluate this cost against potential savings for your specific use case.
+> **Note**: S3 Intelligent-Tiering has monitoring charges of $0.0025 per 1,000 objects monthly. For objects larger than 128KB that are accessed infrequently, the automatic cost optimization typically provides significant savings that exceed monitoring costs.
 
 ## Preparation
 
@@ -448,7 +449,7 @@ def calculate_storage_efficiency(s3, bucket_name):
 
 def calculate_carbon_impact(storage_metrics):
     """Estimate carbon footprint reduction through intelligent tiering"""
-    # AWS estimates for carbon impact (simplified model)
+    # AWS carbon impact estimates (simplified model based on AWS sustainability data)
     # Standard storage: ~0.000385 kg CO2/GB/month
     # IA storage: ~0.000308 kg CO2/GB/month (20% reduction)
     # Archive tiers: ~0.000077 kg CO2/GB/month (80% reduction)
@@ -796,4 +797,11 @@ Extend this solution by implementing multi-region sustainability reporting that 
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

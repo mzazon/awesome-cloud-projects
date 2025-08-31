@@ -1,0 +1,385 @@
+# Infrastructure Manager Configuration for Static Website Hosting
+# This configuration deploys a complete static website hosting solution using
+# Google Cloud Storage for web serving and Cloud DNS for domain management.
+#
+# Architecture Components:
+# - Cloud Storage bucket configured for static website hosting
+# - Cloud DNS managed zone for domain resolution
+# - CNAME record pointing domain to Cloud Storage
+# - IAM bindings for public read access to website content
+#
+# Prerequisites:
+# - Google Cloud project with billing enabled
+# - Domain name registered with external registrar
+# - Cloud Storage and Cloud DNS APIs enabled
+
+apiVersion: config.cloud.google.com/v1beta1
+kind: Config
+metadata:
+  name: static-website-hosting
+  labels:
+    recipe: static-website-hosting-storage-dns
+    category: networking
+    difficulty: "100"
+
+# Input variables for customizing the deployment
+# These can be overridden during deployment using --input-values
+spec:
+  inputs:
+    # Domain name for the website (must be owned by deployer)
+    - name: domain_name
+      description: "The domain name for the static website (e.g., example.com)"
+      type: string
+      required: true
+      validation:
+        pattern: "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"
+    
+    # Google Cloud project ID
+    - name: project_id
+      description: "Google Cloud project ID for resource deployment"
+      type: string
+      required: true
+    
+    # Region for Cloud Storage bucket
+    - name: region
+      description: "Google Cloud region for storage bucket"
+      type: string
+      default: "us-central1"
+      validation:
+        enum: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"]
+    
+    # Storage class for the bucket
+    - name: storage_class
+      description: "Storage class for the Cloud Storage bucket"
+      type: string
+      default: "STANDARD"
+      validation:
+        enum: ["STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"]
+    
+    # DNS zone description
+    - name: dns_zone_description
+      description: "Description for the Cloud DNS managed zone"
+      type: string
+      default: "DNS zone for static website hosting"
+
+  # Resource definitions for the static website hosting infrastructure
+  resources:
+    # Cloud Storage bucket for website hosting
+    # The bucket name must match the domain name for CNAME compatibility
+    - name: website-storage-bucket
+      type: storage.cnrm.cloud.google.com/v1beta1/StorageBucket
+      metadata:
+        annotations:
+          # Deletion policy to prevent accidental data loss
+          cnrm.cloud.google.com/deletion-policy: "abandon"
+        labels:
+          component: storage
+          purpose: website-hosting
+      spec:
+        # Bucket name must match domain for CNAME record mapping
+        bucketName: $(ref.inputs.domain_name)
+        location: $(ref.inputs.region)
+        storageClass: $(ref.inputs.storage_class)
+        
+        # Website configuration for static hosting
+        website:
+          mainPageSuffix: "index.html"
+          notFoundPage: "404.html"
+        
+        # Bucket-level IAM to allow public access
+        # This enables website serving without requiring signed URLs
+        uniformBucketLevelAccess: true
+        
+        # Public access prevention - disabled to allow public website access
+        publicAccessPrevention: "inherited"
+        
+        # Lifecycle rules for cost optimization (optional)
+        lifecycle:
+          rule:
+            - action:
+                type: "Delete"
+              condition:
+                age: 365
+                matchesStorageClass: ["STANDARD"]
+            # Move old versions to cheaper storage after 30 days
+            - action:
+                type: "SetStorageClass"
+                storageClass: "NEARLINE"
+              condition:
+                age: 30
+                matchesStorageClass: ["STANDARD"]
+        
+        # Versioning for website content management
+        versioning:
+          enabled: true
+        
+        # Logging configuration for access monitoring
+        logging:
+          logBucket: $(ref.website-logging-bucket.bucketName)
+          logObjectPrefix: "access-logs/"
+        
+        # CORS configuration for web applications
+        cors:
+          - origin: ["*"]
+            method: ["GET", "HEAD"]
+            responseHeader: ["Content-Type", "Content-Length", "Date", "Etag"]
+            maxAgeSeconds: 3600
+
+    # Separate bucket for access logs (recommended security practice)
+    - name: website-logging-bucket
+      type: storage.cnrm.cloud.google.com/v1beta1/StorageBucket
+      metadata:
+        labels:
+          component: logging
+          purpose: access-logs
+      spec:
+        bucketName: $(ref.inputs.domain_name)-logs
+        location: $(ref.inputs.region)
+        storageClass: "STANDARD"
+        uniformBucketLevelAccess: true
+        
+        # Lifecycle rule to manage log retention costs
+        lifecycle:
+          rule:
+            - action:
+                type: "Delete"
+              condition:
+                age: 90
+
+    # IAM binding to make website bucket publicly readable
+    # This is required for static website hosting functionality
+    - name: website-bucket-public-access
+      type: iam.cnrm.cloud.google.com/v1beta1/IAMPolicy
+      metadata:
+        labels:
+          component: security
+          purpose: public-access
+      spec:
+        resourceRef:
+          kind: StorageBucket
+          name: website-storage-bucket
+        bindings:
+          # Grant public read access to all users
+          - role: "roles/storage.objectViewer"
+            members:
+              - "allUsers"
+          # Grant the service account used by Infrastructure Manager
+          # administrative access for deployment operations
+          - role: "roles/storage.admin"
+            members:
+              - "serviceAccount:infra-manager@$(ref.inputs.project_id).iam.gserviceaccount.com"
+      # Ensure bucket exists before applying IAM policy
+      dependsOn:
+        - website-storage-bucket
+
+    # Cloud DNS managed zone for domain management
+    # This provides authoritative DNS hosting for the domain
+    - name: website-dns-zone
+      type: dns.cnrm.cloud.google.com/v1beta1/DNSManagedZone
+      metadata:
+        labels:
+          component: dns
+          purpose: domain-management
+      spec:
+        dnsName: $(ref.inputs.domain_name).
+        description: $(ref.inputs.dns_zone_description)
+        # Public zone visible to internet DNS resolvers
+        visibility: "public"
+        
+        # DNSSEC configuration for enhanced security
+        dnssecConfig:
+          state: "on"
+          nonExistence: "nsec3"
+          
+        # DNS forwarding configuration (if needed for hybrid setups)
+        # Commented out for standard public hosting
+        # forwardingConfig:
+        #   targetNameServers:
+        #     - ipv4Address: "8.8.8.8"
+        #     - ipv4Address: "8.8.4.4"
+
+    # CNAME record pointing domain to Cloud Storage
+    # This enables custom domain access to the website
+    - name: website-cname-record
+      type: dns.cnrm.cloud.google.com/v1beta1/DNSRecordSet
+      metadata:
+        labels:
+          component: dns
+          purpose: domain-routing
+      spec:
+        name: $(ref.inputs.domain_name).
+        managedZoneRef:
+          name: website-dns-zone
+        type: "CNAME"
+        ttl: 300  # 5 minutes for faster DNS propagation during testing
+        rrdatas:
+          # Google Cloud Storage canonical name for web serving
+          - "c.storage.googleapis.com."
+      # Ensure DNS zone exists before creating records
+      dependsOn:
+        - website-dns-zone
+
+    # A record for root domain (alternative to CNAME for apex domains)
+    # Some domain registrars require A records for root domains
+    # This is an alternative configuration - use either CNAME or A record
+    - name: website-a-record
+      type: dns.cnrm.cloud.google.com/v1beta1/DNSRecordSet
+      metadata:
+        labels:
+          component: dns
+          purpose: root-domain-routing
+        annotations:
+          # This resource is optional and can be disabled if CNAME is sufficient
+          cnrm.cloud.google.com/disable: "true"
+      spec:
+        name: $(ref.inputs.domain_name).
+        managedZoneRef:
+          name: website-dns-zone
+        type: "A"
+        ttl: 300
+        rrdatas:
+          # Google Cloud Storage IP addresses for direct routing
+          # Note: These IPs may change; CNAME is preferred when possible
+          - "216.58.193.128"
+      dependsOn:
+        - website-dns-zone
+
+    # Optional: CAA record for certificate authority authorization
+    # This enhances security by specifying which CAs can issue certificates
+    - name: website-caa-record
+      type: dns.cnrm.cloud.google.com/v1beta1/DNSRecordSet
+      metadata:
+        labels:
+          component: dns
+          purpose: certificate-security
+        annotations:
+          # Optional security enhancement
+          cnrm.cloud.google.com/disable: "true"
+      spec:
+        name: $(ref.inputs.domain_name).
+        managedZoneRef:
+          name: website-dns-zone
+        type: "CAA"
+        ttl: 3600
+        rrdatas:
+          # Allow Google Trust Services to issue certificates
+          - "0 issue \"pki.goog\""
+          # Allow Let's Encrypt for additional flexibility
+          - "0 issue \"letsencrypt.org\""
+          # Incident reporting contact
+          - "0 iodef \"mailto:security@$(ref.inputs.domain_name)\""
+      dependsOn:
+        - website-dns-zone
+
+  # Output values for verification and integration
+  outputs:
+    # Storage bucket information
+    - name: website_bucket_name
+      description: "Name of the Cloud Storage bucket hosting the website"
+      value: $(ref.website-storage-bucket.bucketName)
+    
+    - name: website_bucket_url
+      description: "Direct URL to access the website via Cloud Storage"
+      value: "https://storage.googleapis.com/$(ref.website-storage-bucket.bucketName)/index.html"
+    
+    # DNS configuration information
+    - name: dns_zone_name
+      description: "Name of the Cloud DNS managed zone"
+      value: $(ref.website-dns-zone.name)
+    
+    - name: dns_name_servers
+      description: "Name servers for domain configuration with registrar"
+      value: $(ref.website-dns-zone.nameServers)
+    
+    - name: domain_url
+      description: "Primary domain URL for the website"
+      value: "http://$(ref.inputs.domain_name)"
+    
+    # Security and access information
+    - name: bucket_public_access_configured
+      description: "Confirmation that public access is properly configured"
+      value: "Public read access enabled for website content"
+    
+    # Logging information
+    - name: access_logs_bucket
+      description: "Bucket name for website access logs"
+      value: $(ref.website-logging-bucket.bucketName)
+    
+    # DNS security status
+    - name: dnssec_status
+      description: "DNSSEC security status for the domain"
+      value: "DNSSEC enabled for enhanced security"
+
+    # Instructions for completing setup
+    - name: setup_instructions
+      description: "Next steps to complete website deployment"
+      value: |
+        1. Upload website content (index.html, 404.html) to bucket: $(ref.website-storage-bucket.bucketName)
+        2. Configure name servers with domain registrar: $(ref.website-dns-zone.nameServers)
+        3. Wait for DNS propagation (24-48 hours)
+        4. Verify website access at: http://$(ref.inputs.domain_name)
+        5. Consider adding HTTPS support with Cloud Load Balancer for production use
+
+# Deployment validation rules
+# These ensure the infrastructure is properly configured
+spec:
+  # Health checks to verify deployment success
+  healthChecks:
+    - name: bucket-accessibility
+      description: "Verify storage bucket is accessible for web serving"
+      type: "http"
+      httpCheck:
+        requestUrl: "https://storage.googleapis.com/$(ref.website-storage-bucket.bucketName)/"
+        expectedResponseCode: 200
+    
+    - name: dns-zone-creation
+      description: "Verify DNS zone was created successfully"
+      type: "gcp-resource"
+      gcpResourceCheck:
+        resourceType: "dns.cnrm.cloud.google.com/v1beta1/DNSManagedZone"
+        resourceName: "website-dns-zone"
+        expectedStatus: "Ready"
+
+  # Resource dependencies and ordering
+  # Infrastructure Manager will respect these dependencies during deployment
+  dependencyGraph:
+    - source: website-storage-bucket
+      targets: [website-bucket-public-access]
+    - source: website-dns-zone
+      targets: [website-cname-record, website-a-record, website-caa-record]
+    - source: website-logging-bucket
+      targets: [website-storage-bucket]
+
+# Security and compliance configuration
+security:
+  # IAM security requirements
+  requiredRoles:
+    - "roles/storage.admin"      # For bucket creation and management
+    - "roles/dns.admin"          # For DNS zone and record management
+    - "roles/iam.securityAdmin"  # For IAM policy management
+  
+  # Network security settings
+  networkSecurity:
+    allowPublicAccess: true  # Required for static website hosting
+    httpsRedirect: false     # Will be handled by load balancer if added later
+  
+  # Data protection settings
+  dataProtection:
+    encryptionAtRest: true   # Cloud Storage default encryption
+    accessLogging: true      # Enable access logging to separate bucket
+    versioning: true         # Enable object versioning for content management
+
+# Cost optimization settings
+costOptimization:
+  # Storage lifecycle management
+  lifecycleRules: true       # Enabled via bucket lifecycle configuration
+  
+  # DNS query optimization
+  dnsConfiguration:
+    ttl: 300                 # 5 minutes for testing, increase for production
+    cachingPolicy: "standard"
+  
+  # Monitoring and alerting for cost control
+  budgetAlerts:
+    enabled: false           # Can be enabled for production deployments
+    monthlyBudget: 10        # USD - very low for static websites

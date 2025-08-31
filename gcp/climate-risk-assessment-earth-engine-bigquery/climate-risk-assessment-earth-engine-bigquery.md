@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Earth Engine, BigQuery, Cloud Functions, Cloud Monitoring
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: climate, earth-engine, bigquery, geospatial, risk-assessment, satellite-imagery, environmental
 recipe-generator-version: 1.3
@@ -69,7 +69,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and appropriate permissions for Earth Engine, BigQuery, Cloud Functions, and Cloud Storage
-2. Google Cloud CLI (gcloud) v400.0.0 or later installed and configured
+2. Google Cloud CLI (gcloud) v450.0.0 or later installed and configured
 3. Basic understanding of geospatial concepts, SQL, and Python programming
 4. Familiarity with climate science terminology and remote sensing concepts
 5. Earth Engine account registration (free at https://earthengine.google.com)
@@ -133,7 +133,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    
    # Create requirements.txt for Python dependencies
    cat > requirements.txt << 'EOF'
-   earthengine-api>=0.1.360
+   earthengine-api>=0.1.382
    google-cloud-bigquery>=3.11.0
    google-cloud-storage>=2.10.0
    pandas>=2.0.0
@@ -161,8 +161,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    import pandas as pd
    from datetime import datetime, timedelta
    
-   # Initialize Earth Engine
-   ee.Initialize()
+   # Initialize Earth Engine with service account authentication
+   ee.Initialize(ee.ServiceAccountCredentials(None, key_file='ee-service-account.json'))
    
    @functions_framework.http
    def process_climate_data(request):
@@ -179,8 +179,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        region = ee.Geometry.Rectangle(region_bounds)
        
        # Load climate datasets
-       # MODIS Land Surface Temperature
-       lst_collection = ee.ImageCollection('MODIS/006/MOD11A1') \
+       # MODIS Land Surface Temperature (Collection 6.1)
+       lst_collection = ee.ImageCollection('MODIS/061/MOD11A1') \
            .filterDate(start_date, end_date) \
            .filterBounds(region) \
            .select(['LST_Day_1km', 'LST_Night_1km'])
@@ -191,23 +191,23 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
            .filterBounds(region) \
            .select('precipitation')
        
-       # MODIS Vegetation Indices
-       ndvi_collection = ee.ImageCollection('MODIS/006/MOD13Q1') \
+       # MODIS Vegetation Indices (Collection 6.1)
+       ndvi_collection = ee.ImageCollection('MODIS/061/MOD13Q1') \
            .filterDate(start_date, end_date) \
            .filterBounds(region) \
            .select(['NDVI', 'EVI'])
        
-       # Calculate climate statistics
+       # Calculate climate statistics with proper scaling
        lst_mean = lst_collection.mean().multiply(0.02).subtract(273.15)
        precip_total = precip_collection.sum()
-       ndvi_mean = ndvi_collection.mean()
+       ndvi_mean = ndvi_collection.mean().multiply(0.0001)
        
        # Create composite image with all climate indicators
        climate_composite = lst_mean.addBands(precip_total) \
                                   .addBands(ndvi_mean)
        
        # Sample climate data at regular intervals
-       sample_points = region.coveringGrid(0.1)  # ~10km grid
+       sample_points = region.coveringGrid(ee.Number(0.1))  # ~10km grid
        
        # Extract values at sample points
        climate_samples = climate_composite.sampleRegions(
@@ -275,7 +275,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    echo "✅ Earth Engine processing function created"
    ```
 
-   The climate data extraction function is now configured to access multiple Earth Engine datasets including MODIS temperature and vegetation data, plus CHIRPS precipitation records. This multi-dataset approach provides comprehensive climate indicators essential for robust risk assessment modeling.
+   The climate data extraction function is now configured to access multiple Earth Engine datasets including MODIS Collection 6.1 temperature and vegetation data, plus CHIRPS precipitation records. This multi-dataset approach provides comprehensive climate indicators essential for robust risk assessment modeling.
 
 3. **Deploy Cloud Function for Climate Data Processing**:
 
@@ -284,18 +284,20 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    ```bash
    # Deploy the Cloud Function
    gcloud functions deploy ${FUNCTION_NAME} \
+       --gen2 \
        --runtime python311 \
-       --trigger http \
+       --trigger-http \
        --entry-point process_climate_data \
-       --memory 2048MB \
+       --memory 2Gi \
        --timeout 540s \
        --region ${REGION} \
        --allow-unauthenticated
    
    # Get function URL for later use
    FUNCTION_URL=$(gcloud functions describe ${FUNCTION_NAME} \
+       --gen2 \
        --region=${REGION} \
-       --format="value(httpsTrigger.url)")
+       --format="value(serviceConfig.uri)")
    
    echo "✅ Climate processing function deployed"
    echo "Function URL: ${FUNCTION_URL}"
@@ -309,8 +311,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 
    ```bash
    # Create climate extremes detection table
-   bq query --use_legacy_sql=false << 'EOF'
-   CREATE OR REPLACE TABLE `${PROJECT_ID}.${DATASET_ID}.climate_extremes` (
+   bq query --use_legacy_sql=false << EOF
+   CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET_ID}.climate_extremes\` (
        location GEOGRAPHY,
        region_name STRING,
        extreme_heat_days INT64,
@@ -330,8 +332,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    EOF
    
    # Create climate risk scoring table
-   bq query --use_legacy_sql=false << 'EOF'
-   CREATE OR REPLACE TABLE `${PROJECT_ID}.${DATASET_ID}.risk_assessments` (
+   bq query --use_legacy_sql=false << EOF
+   CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET_ID}.risk_assessments\` (
        assessment_id STRING,
        location GEOGRAPHY,
        assessment_date TIMESTAMP,
@@ -369,7 +371,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        }"
    
    # Wait for processing to complete
-   sleep 30
+   sleep 60
    
    # Verify data was loaded to BigQuery
    bq query --use_legacy_sql=false \
@@ -387,8 +389,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 
    ```bash
    # Create view for climate risk analysis
-   bq query --use_legacy_sql=false << 'EOF'
-   CREATE OR REPLACE VIEW `${PROJECT_ID}.${DATASET_ID}.climate_risk_analysis` AS
+   bq query --use_legacy_sql=false << EOF
+   CREATE OR REPLACE VIEW \`${PROJECT_ID}.${DATASET_ID}.climate_risk_analysis\` AS
    WITH climate_stats AS (
      SELECT 
        location,
@@ -404,7 +406,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        COUNTIF(total_precipitation_mm < 10 AND avg_ndvi < 0.3) as drought_indicators,
        -- Calculate geographic centroid for regional analysis
        ST_CENTROID(ST_UNION_AGG(location)) as region_center
-     FROM `${PROJECT_ID}.${DATASET_ID}.climate_indicators`
+     FROM \`${PROJECT_ID}.${DATASET_ID}.climate_indicators\`
      WHERE avg_day_temp_c IS NOT NULL 
        AND total_precipitation_mm IS NOT NULL
        AND avg_ndvi IS NOT NULL
@@ -545,10 +547,11 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    
    # Deploy monitoring function
    gcloud functions deploy climate-monitor-${RANDOM_SUFFIX} \
+       --gen2 \
        --runtime python311 \
-       --trigger http \
+       --trigger-http \
        --entry-point monitor_climate_risks \
-       --memory 1024MB \
+       --memory 1Gi \
        --timeout 300s \
        --region ${REGION} \
        --allow-unauthenticated
@@ -564,8 +567,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 
    ```bash
    # Create dashboard support queries
-   bq query --use_legacy_sql=false << 'EOF'
-   CREATE OR REPLACE VIEW `${PROJECT_ID}.${DATASET_ID}.risk_dashboard_summary` AS
+   bq query --use_legacy_sql=false << EOF
+   CREATE OR REPLACE VIEW \`${PROJECT_ID}.${DATASET_ID}.risk_dashboard_summary\` AS
    WITH temporal_trends AS (
      SELECT 
        DATE_TRUNC(DATE(analysis_date), MONTH) as analysis_month,
@@ -573,7 +576,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        SUM(total_precipitation_mm) as monthly_total_precip,
        AVG(avg_ndvi) as monthly_avg_vegetation,
        COUNT(*) as monthly_observations
-     FROM `${PROJECT_ID}.${DATASET_ID}.climate_indicators`
+     FROM \`${PROJECT_ID}.${DATASET_ID}.climate_indicators\`
      WHERE analysis_date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 YEAR)
      GROUP BY analysis_month
    ),
@@ -586,7 +589,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        MAX(composite_risk_score) as max_risk_score,
        -- Create geographic bounds for each risk category
        ST_ENVELOPE(ST_UNION_AGG(location)) as risk_region_bounds
-     FROM `${PROJECT_ID}.${DATASET_ID}.climate_risk_analysis`
+     FROM \`${PROJECT_ID}.${DATASET_ID}.climate_risk_analysis\`
      GROUP BY risk_category
    )
    SELECT 
@@ -627,8 +630,9 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    ```bash
    # Test the climate processing function
    MONITOR_URL=$(gcloud functions describe climate-monitor-${RANDOM_SUFFIX} \
+       --gen2 \
        --region=${REGION} \
-       --format="value(httpsTrigger.url)")
+       --format="value(serviceConfig.uri)")
    
    # Test monitoring function
    curl -X POST ${MONITOR_URL} \
@@ -673,11 +677,13 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    ```bash
    # Delete climate processing function
    gcloud functions delete ${FUNCTION_NAME} \
+       --gen2 \
        --region=${REGION} \
        --quiet
    
    # Delete monitoring function
    gcloud functions delete climate-monitor-${RANDOM_SUFFIX} \
+       --gen2 \
        --region=${REGION} \
        --quiet
    
@@ -735,4 +741,9 @@ Extend this climate risk assessment solution by implementing these advanced capa
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

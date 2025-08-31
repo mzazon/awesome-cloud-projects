@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Data Factory, Azure Database for MySQL, Azure Key Vault, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: etl, orchestration, data-pipeline, mysql, enterprise, monitoring, security
 recipe-generator-version: 1.3
@@ -87,7 +87,7 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-etl-orchestration"
+export RESOURCE_GROUP="rg-etl-orchestration-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -177,15 +177,8 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
        --version 8.0 \
        --high-availability Enabled \
        --zone 1 \
-       --standby-zone 2
-   
-   # Configure firewall rules for Azure services
-   az mysql flexible-server firewall-rule create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${MYSQL_SERVER_NAME} \
-       --rule-name "AllowAzureServices" \
-       --start-ip-address 0.0.0.0 \
-       --end-ip-address 0.0.0.0
+       --standby-zone 2 \
+       --public-access 0.0.0.0
    
    # Create target database for ETL operations
    az mysql flexible-server db create \
@@ -209,11 +202,10 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
        --name ${ADF_NAME} \
        --location ${LOCATION}
    
-   # Configure managed identity for secure service-to-service authentication
-   az datafactory update \
+   # Enable managed identity for secure service-to-service authentication
+   az datafactory identity assign \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${ADF_NAME} \
-       --set identity.type=SystemAssigned
+       --factory-name ${ADF_NAME}
    
    # Get Data Factory managed identity object ID
    ADF_IDENTITY_ID=$(az datafactory show \
@@ -255,18 +247,17 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
 
    ```bash
    # Create self-hosted integration runtime
-   az datafactory integration-runtime create \
+   az datafactory integration-runtime self-hosted create \
        --resource-group ${RESOURCE_GROUP} \
        --factory-name ${ADF_NAME} \
        --name "SelfHostedIR" \
-       --type SelfHosted \
        --description "Integration Runtime for on-premises MySQL connectivity"
    
    # Get integration runtime authentication key
-   IR_AUTH_KEY=$(az datafactory integration-runtime get-connection-info \
+   IR_AUTH_KEY=$(az datafactory integration-runtime list-auth-key \
        --resource-group ${RESOURCE_GROUP} \
        --factory-name ${ADF_NAME} \
-       --name "SelfHostedIR" \
+       --integration-runtime-name "SelfHostedIR" \
        --query authKey1 -o tsv)
    
    echo "✅ Self-hosted Integration Runtime created"
@@ -281,11 +272,30 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    Linked services define connection information for external data sources and destinations. These configurations enable Data Factory to securely connect to both on-premises MySQL databases and the Azure MySQL Flexible Server target.
 
    ```bash
+   # Create linked service for Azure Key Vault
+   cat > keyvault-linkedservice.json << 'EOF'
+   {
+       "name": "AzureKeyVaultLinkedService",
+       "properties": {
+           "type": "AzureKeyVault",
+           "typeProperties": {
+               "baseUrl": "https://${KEY_VAULT_NAME}.vault.azure.net/"
+           }
+       }
+   }
+   EOF
+   
+   # Deploy Key Vault linked service
+   az datafactory linked-service create \
+       --resource-group ${RESOURCE_GROUP} \
+       --factory-name ${ADF_NAME} \
+       --linked-service-name "AzureKeyVaultLinkedService" \
+       --properties @keyvault-linkedservice.json
+   
    # Create linked service for on-premises MySQL (source)
    cat > mysql-source-linkedservice.json << 'EOF'
    {
        "name": "MySQLSourceLinkedService",
-       "type": "Microsoft.DataFactory/factories/linkedservices",
        "properties": {
            "type": "MySql",
            "connectVia": {
@@ -306,31 +316,78 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    }
    EOF
    
-   # Create linked service for Azure MySQL (target)
-   cat > mysql-target-linkedservice.json << 'EOF'
+   # Deploy source MySQL linked service
+   az datafactory linked-service create \
+       --resource-group ${RESOURCE_GROUP} \
+       --factory-name ${ADF_NAME} \
+       --linked-service-name "MySQLSourceLinkedService" \
+       --properties @mysql-source-linkedservice.json
+   
+   echo "✅ Linked service configurations created and deployed"
+   ```
+
+   These linked service configurations establish secure connections using Azure Key Vault secrets and support both on-premises and cloud-based MySQL databases. The configuration ensures encrypted data transfer and proper authentication for all data movement operations.
+
+7. **Create Data Factory Datasets**:
+
+   Datasets represent the data structures within linked services and define the schema and location of data for pipeline activities. This step creates datasets for both source and target MySQL databases.
+
+   ```bash
+   # Create source dataset for on-premises MySQL
+   cat > mysql-source-dataset.json << 'EOF'
    {
-       "name": "MySQLTargetLinkedService",
-       "type": "Microsoft.DataFactory/factories/linkedservices",
+       "name": "MySQLSourceDataset",
        "properties": {
-           "type": "AzureMySql",
+           "linkedServiceName": {
+               "referenceName": "MySQLSourceLinkedService",
+               "type": "LinkedServiceReference"
+           },
+           "type": "MySqlTable",
            "typeProperties": {
-               "connectionString": {
-                   "type": "SecureString",
-                   "value": "$(concat('server=',parameters('targetServer'),';port=3306;database=consolidated_data;uid=',parameters('targetUsername'),';pwd=',parameters('targetPassword'),';sslmode=required'))"
-               }
+               "tableName": "customers"
            }
        }
    }
    EOF
    
-   echo "✅ Linked service configurations created"
+   # Create target dataset for Azure MySQL
+   cat > mysql-target-dataset.json << 'EOF'
+   {
+       "name": "MySQLTargetDataset",
+       "properties": {
+           "linkedServiceName": {
+               "referenceName": "MySQLTargetLinkedService",
+               "type": "LinkedServiceReference"
+           },
+           "type": "AzureMySqlTable",
+           "typeProperties": {
+               "tableName": "customers_consolidated"
+           }
+       }
+   }
+   EOF
+   
+   # Deploy datasets
+   az datafactory dataset create \
+       --resource-group ${RESOURCE_GROUP} \
+       --factory-name ${ADF_NAME} \
+       --dataset-name "MySQLSourceDataset" \
+       --properties @mysql-source-dataset.json
+   
+   az datafactory dataset create \
+       --resource-group ${RESOURCE_GROUP} \
+       --factory-name ${ADF_NAME} \
+       --dataset-name "MySQLTargetDataset" \
+       --properties @mysql-target-dataset.json
+   
+   echo "✅ Source and target datasets created"
    ```
 
-   These linked service configurations establish secure connections using Azure Key Vault secrets and support both on-premises and cloud-based MySQL databases. The configuration ensures encrypted data transfer and proper authentication for all data movement operations.
+   The datasets now define the structure and location of data for ETL operations. This configuration supports schema evolution and data validation during pipeline execution.
 
-7. **Create ETL Pipeline with Data Flow Activities**:
+8. **Create ETL Pipeline with Copy Activities**:
 
-   The ETL pipeline orchestrates data movement, transformation, and loading operations across multiple source databases. Data flows provide visual transformation capabilities with code-free data processing logic and built-in optimization features.
+   The ETL pipeline orchestrates data movement, transformation, and loading operations across multiple source databases. Copy activities provide optimized data transfer with built-in error handling and performance monitoring.
 
    ```bash
    # Create comprehensive ETL pipeline definition
@@ -352,7 +409,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
                    "typeProperties": {
                        "source": {
                            "type": "MySqlSource",
-                           "query": "SELECT customer_id, customer_name, email, registration_date, last_login FROM customers WHERE last_modified >= '${formatDateTime(addDays(utcNow(), -1), 'yyyy-MM-dd HH:mm:ss')}'"
+                           "query": "SELECT customer_id, customer_name, email, registration_date, last_login FROM customers WHERE last_modified >= DATE_SUB(NOW(), INTERVAL 1 DAY)"
                        },
                        "sink": {
                            "type": "AzureMySqlSink",
@@ -378,30 +435,6 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
                            "type": "DatasetReference"
                        }
                    ]
-               },
-               {
-                   "name": "TransformAndAggregateData",
-                   "type": "ExecuteDataFlow",
-                   "dependsOn": [
-                       {
-                           "activity": "CopyCustomerData",
-                           "dependencyConditions": ["Succeeded"]
-                       }
-                   ],
-                   "policy": {
-                       "timeout": "1.00:00:00",
-                       "retry": 2
-                   },
-                   "typeProperties": {
-                       "dataflow": {
-                           "referenceName": "CustomerDataTransformation",
-                           "type": "DataFlowReference"
-                       },
-                       "compute": {
-                           "coreCount": 8,
-                           "computeType": "General"
-                       }
-                   }
                }
            ],
            "parameters": {
@@ -421,12 +454,19 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    }
    EOF
    
-   echo "✅ ETL pipeline configuration created with retry policies and optimization"
+   # Deploy ETL pipeline
+   az datafactory pipeline create \
+       --resource-group ${RESOURCE_GROUP} \
+       --factory-name ${ADF_NAME} \
+       --pipeline-name "MultiDatabaseETLPipeline" \
+       --pipeline @etl-pipeline.json
+   
+   echo "✅ ETL pipeline created with retry policies and optimization"
    ```
 
    The pipeline configuration includes enterprise-grade features such as incremental data loading, error handling, parallel execution, and performance optimization. This approach ensures efficient data processing while maintaining data integrity and system reliability.
 
-8. **Configure Pipeline Triggers and Scheduling**:
+9. **Configure Pipeline Triggers and Scheduling**:
 
    Automated scheduling ensures consistent data synchronization without manual intervention. Trigger configuration supports various scheduling patterns including time-based, event-driven, and dependency-based execution models.
 
@@ -462,98 +502,80 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    }
    EOF
    
-   # Create event-based trigger for real-time processing
-   cat > event-etl-trigger.json << 'EOF'
-   {
-       "name": "EventBasedETLTrigger",
-       "properties": {
-           "description": "Event-driven ETL for real-time data processing",
-           "type": "BlobEventsTrigger",
-           "typeProperties": {
-               "blobPathBeginsWith": "/etl-staging/",
-               "blobPathEndsWith": ".csv",
-               "ignoreEmptyBlobs": true,
-               "events": ["Microsoft.Storage.BlobCreated"]
-           },
-           "pipelines": [
-               {
-                   "pipelineReference": {
-                       "referenceName": "MultiDatabaseETLPipeline",
-                       "type": "PipelineReference"
-                   }
-               }
-           ]
-       }
-   }
-   EOF
-   
-   echo "✅ ETL triggers configured for scheduled and event-driven execution"
-   ```
-
-   The trigger configuration enables both scheduled batch processing and real-time event-driven execution. This hybrid approach ensures data freshness while optimizing resource utilization and operational costs.
-
-9. **Implement Comprehensive Monitoring and Alerting**:
-
-   Azure Monitor integration provides real-time visibility into pipeline performance, data quality, and system health. Custom metrics and alerts enable proactive issue detection and automated response to operational events.
-
-   ```bash
-   # Create diagnostic settings for Data Factory
-   az monitor diagnostic-settings create \
-       --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DataFactory/factories/${ADF_NAME}" \
-       --name "DataFactoryDiagnostics" \
-       --workspace "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${LOG_ANALYTICS_NAME}" \
-       --logs '[
-           {
-               "category": "PipelineRuns",
-               "enabled": true,
-               "retentionPolicy": {
-                   "enabled": true,
-                   "days": 90
-               }
-           },
-           {
-               "category": "ActivityRuns",
-               "enabled": true,
-               "retentionPolicy": {
-                   "enabled": true,
-                   "days": 90
-               }
-           },
-           {
-               "category": "TriggerRuns",
-               "enabled": true,
-               "retentionPolicy": {
-                   "enabled": true,
-                   "days": 90
-               }
-           }
-       ]' \
-       --metrics '[
-           {
-               "category": "AllMetrics",
-               "enabled": true,
-               "retentionPolicy": {
-                   "enabled": true,
-                   "days": 90
-               }
-           }
-       ]'
-   
-   # Create alert rule for pipeline failures
-   az monitor metrics alert create \
-       --name "ETL-Pipeline-Failure-Alert" \
+   # Deploy trigger
+   az datafactory trigger create \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DataFactory/factories/${ADF_NAME}" \
-       --condition "count 'Pipeline failed runs' > 0" \
-       --description "Alert when ETL pipeline fails" \
-       --evaluation-frequency 5m \
-       --window-size 5m \
-       --severity 2
+       --factory-name ${ADF_NAME} \
+       --trigger-name "DailyETLTrigger" \
+       --properties @daily-etl-trigger.json
    
-   echo "✅ Comprehensive monitoring and alerting configured"
+   echo "✅ ETL trigger configured for scheduled execution"
    ```
 
-   The monitoring configuration provides detailed telemetry for all pipeline operations, enabling performance optimization and rapid issue resolution. Custom alerts ensure immediate notification of critical events and support proactive system management.
+   The trigger configuration enables scheduled batch processing with configurable retry policies and dependency management. This approach ensures data freshness while optimizing resource utilization and operational costs.
+
+10. **Implement Comprehensive Monitoring and Alerting**:
+
+    Azure Monitor integration provides real-time visibility into pipeline performance, data quality, and system health. Custom metrics and alerts enable proactive issue detection and automated response to operational events.
+
+    ```bash
+    # Create diagnostic settings for Data Factory
+    az monitor diagnostic-settings create \
+        --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DataFactory/factories/${ADF_NAME}" \
+        --name "DataFactoryDiagnostics" \
+        --workspace "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${LOG_ANALYTICS_NAME}" \
+        --logs '[
+            {
+                "category": "PipelineRuns",
+                "enabled": true,
+                "retentionPolicy": {
+                    "enabled": true,
+                    "days": 90
+                }
+            },
+            {
+                "category": "ActivityRuns",
+                "enabled": true,
+                "retentionPolicy": {
+                    "enabled": true,
+                    "days": 90
+                }
+            },
+            {
+                "category": "TriggerRuns",
+                "enabled": true,
+                "retentionPolicy": {
+                    "enabled": true,
+                    "days": 90
+                }
+            }
+        ]' \
+        --metrics '[
+            {
+                "category": "AllMetrics",
+                "enabled": true,
+                "retentionPolicy": {
+                    "enabled": true,
+                    "days": 90
+                }
+            }
+        ]'
+    
+    # Create alert rule for pipeline failures
+    az monitor metrics alert create \
+        --name "ETL-Pipeline-Failure-Alert" \
+        --resource-group ${RESOURCE_GROUP} \
+        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DataFactory/factories/${ADF_NAME}" \
+        --condition "count 'Pipeline failed runs' > 0" \
+        --description "Alert when ETL pipeline fails" \
+        --evaluation-frequency 5m \
+        --window-size 5m \
+        --severity 2
+    
+    echo "✅ Comprehensive monitoring and alerting configured"
+    ```
+
+    The monitoring configuration provides detailed telemetry for all pipeline operations, enabling performance optimization and rapid issue resolution. Custom alerts ensure immediate notification of critical events and support proactive system management.
 
 ## Validation & Testing
 
@@ -570,7 +592,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    az datafactory integration-runtime show \
        --resource-group ${RESOURCE_GROUP} \
        --factory-name ${ADF_NAME} \
-       --name "SelfHostedIR" \
+       --integration-runtime-name "SelfHostedIR" \
        --query "{Name:name,State:state,Type:type}"
    ```
 
@@ -598,20 +620,19 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
 
    ```bash
    # Trigger a manual pipeline run for testing
-   az datafactory pipeline create-run \
+   PIPELINE_RUN_ID=$(az datafactory pipeline create-run \
        --resource-group ${RESOURCE_GROUP} \
        --factory-name ${ADF_NAME} \
-       --name "MultiDatabaseETLPipeline"
+       --pipeline-name "MultiDatabaseETLPipeline" \
+       --query runId -o tsv)
+   
+   echo "Pipeline run started with ID: ${PIPELINE_RUN_ID}"
    
    # Monitor pipeline execution status
    az datafactory pipeline-run show \
        --resource-group ${RESOURCE_GROUP} \
        --factory-name ${ADF_NAME} \
-       --run-id $(az datafactory pipeline create-run \
-           --resource-group ${RESOURCE_GROUP} \
-           --factory-name ${ADF_NAME} \
-           --name "MultiDatabaseETLPipeline" \
-           --query runId -o tsv)
+       --run-id ${PIPELINE_RUN_ID}
    ```
 
    Expected output: Pipeline should execute successfully with "Succeeded" status.
@@ -640,13 +661,13 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    az datafactory trigger stop \
        --resource-group ${RESOURCE_GROUP} \
        --factory-name ${ADF_NAME} \
-       --name "DailyETLTrigger"
+       --trigger-name "DailyETLTrigger"
    
    # Delete triggers
    az datafactory trigger delete \
        --resource-group ${RESOURCE_GROUP} \
        --factory-name ${ADF_NAME} \
-       --name "DailyETLTrigger" \
+       --trigger-name "DailyETLTrigger" \
        --yes
    
    echo "✅ Data Factory triggers stopped and deleted"
@@ -659,7 +680,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    az datafactory integration-runtime delete \
        --resource-group ${RESOURCE_GROUP} \
        --factory-name ${ADF_NAME} \
-       --name "SelfHostedIR" \
+       --integration-runtime-name "SelfHostedIR" \
        --yes
    
    echo "✅ Integration Runtime deleted"
@@ -744,4 +765,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

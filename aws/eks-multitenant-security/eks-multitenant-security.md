@@ -4,14 +4,14 @@ id: 3d7f1b9e
 category: security
 difficulty: 300
 subject: aws
-services: eks,iam,kubernetes,rbac
+services: EKS, IAM, Kubernetes, VPC
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: security,eks,kubernetes,multi-tenancy,rbac,namespace-isolation
+tags: security, eks, kubernetes, multi-tenancy, rbac, namespace-isolation
 recipe-generator-version: 1.3
 ---
 
@@ -121,10 +121,10 @@ graph TB
 3. kubectl command-line tool installed and configured
 4. Basic understanding of Kubernetes concepts (pods, namespaces, services)
 5. Familiarity with RBAC and IAM principles
-6. An existing EKS cluster (or ability to create one)
+6. An existing EKS cluster with authentication mode set to API or API_AND_CONFIG_MAP
 7. Estimated cost: $0.10/hour for EKS cluster + $0.05/hour per worker node + minimal charges for IAM operations
 
-> **Note**: This recipe assumes you have an existing EKS cluster. If you need to create one, refer to the [AWS EKS User Guide](https://docs.aws.amazon.com/eks/latest/userguide/getting-started.html) for cluster creation steps.
+> **Note**: This recipe assumes you have an existing EKS cluster with access entries enabled. If you need to create one or change the authentication mode, refer to the [AWS EKS User Guide](https://docs.aws.amazon.com/eks/latest/userguide/getting-started.html) for cluster creation steps.
 
 ## Preparation
 
@@ -177,6 +177,9 @@ echo "✅ Environment prepared successfully"
        isolation=enabled \
        environment=production
    
+   # Label kube-system namespace for network policy compatibility
+   kubectl label namespace kube-system name=kube-system
+   
    echo "✅ Tenant namespaces created with identification labels"
    ```
 
@@ -213,6 +216,9 @@ echo "✅ Environment prepared successfully"
        --role-name ${TENANT_B_NAME}-eks-role \
        --assume-role-policy-document file://tenant-trust-policy.json
    
+   # Wait for role propagation
+   sleep 10
+   
    # Clean up temporary file
    rm tenant-trust-policy.json
    
@@ -237,6 +243,9 @@ echo "✅ Environment prepared successfully"
    - apiGroups: [""]
      resources: ["pods", "services", "configmaps", "secrets", "persistentvolumeclaims"]
      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+   - apiGroups: [""]
+     resources: ["pods/log", "pods/status", "pods/exec"]
+     verbs: ["get", "list", "create"]
    - apiGroups: ["apps"]
      resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -270,6 +279,9 @@ echo "✅ Environment prepared successfully"
    - apiGroups: [""]
      resources: ["pods", "services", "configmaps", "secrets", "persistentvolumeclaims"]
      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+   - apiGroups: [""]
+     resources: ["pods/log", "pods/status", "pods/exec"]
+     verbs: ["get", "list", "create"]
    - apiGroups: ["apps"]
      resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -320,6 +332,9 @@ echo "✅ Environment prepared successfully"
        --type STANDARD \
        --username ${TENANT_B_NAME}-user
    
+   # Wait for access entries to propagate
+   sleep 15
+   
    echo "✅ Access entries configured for IAM-to-RBAC mapping"
    ```
 
@@ -366,6 +381,12 @@ echo "✅ Environment prepared successfully"
          port: 53
        - protocol: UDP
          port: 53
+     - to: []
+       ports:
+       - protocol: TCP
+         port: 443
+       - protocol: TCP
+         port: 80
    EOF
    
    # Create network policy for Tenant B namespace
@@ -404,6 +425,12 @@ echo "✅ Environment prepared successfully"
          port: 53
        - protocol: UDP
          port: 53
+     - to: []
+       ports:
+       - protocol: TCP
+         port: 443
+       - protocol: TCP
+         port: 80
    EOF
    
    # Apply network policies
@@ -413,7 +440,7 @@ echo "✅ Environment prepared successfully"
    echo "✅ Network policies implemented for tenant isolation"
    ```
 
-   Network isolation is now enforced at the pod level, preventing cross-tenant communication while maintaining essential cluster connectivity. The policies allow DNS resolution and system namespace access while blocking unauthorized inter-tenant traffic.
+   Network isolation is now enforced at the pod level, preventing cross-tenant communication while maintaining essential cluster connectivity. The policies allow DNS resolution, system namespace access, and external HTTP/HTTPS traffic while blocking unauthorized inter-tenant traffic.
 
 > **Warning**: Network policies require a compatible CNI plugin such as Calico, Cilium, or the AWS VPC CNI with network policy support. Ensure your EKS cluster has [network policy enforcement enabled](https://aws.amazon.com/blogs/containers/amazon-vpc-cni-now-supports-kubernetes-network-policies/) before implementing these policies.
 
@@ -455,6 +482,13 @@ echo "✅ Environment prepared successfully"
          cpu: 100m
          memory: 128Mi
        type: Container
+     - max:
+         cpu: 500m
+         memory: 512Mi
+       min:
+         cpu: 50m
+         memory: 64Mi
+       type: Container
    EOF
    
    # Create resource quota for Tenant B
@@ -489,6 +523,13 @@ echo "✅ Environment prepared successfully"
        defaultRequest:
          cpu: 100m
          memory: 128Mi
+       type: Container
+     - max:
+         cpu: 500m
+         memory: 512Mi
+       min:
+         cpu: 50m
+         memory: 64Mi
        type: Container
    EOF
    
@@ -525,7 +566,7 @@ echo "✅ Environment prepared successfully"
        spec:
          containers:
          - name: app
-           image: nginx:1.20
+           image: nginx:1.24
            ports:
            - containerPort: 80
            resources:
@@ -535,6 +576,18 @@ echo "✅ Environment prepared successfully"
              limits:
                cpu: 200m
                memory: 256Mi
+           livenessProbe:
+             httpGet:
+               path: /
+               port: 80
+             initialDelaySeconds: 30
+             periodSeconds: 10
+           readinessProbe:
+             httpGet:
+               path: /
+               port: 80
+             initialDelaySeconds: 5
+             periodSeconds: 5
    ---
    apiVersion: v1
    kind: Service
@@ -578,6 +631,18 @@ echo "✅ Environment prepared successfully"
              limits:
                cpu: 200m
                memory: 256Mi
+           livenessProbe:
+             httpGet:
+               path: /
+               port: 80
+             initialDelaySeconds: 30
+             periodSeconds: 10
+           readinessProbe:
+             httpGet:
+               path: /
+               port: 80
+             initialDelaySeconds: 5
+             periodSeconds: 5
    ---
    apiVersion: v1
    kind: Service
@@ -596,6 +661,12 @@ echo "✅ Environment prepared successfully"
    kubectl apply -f tenant-a-app.yaml
    kubectl apply -f tenant-b-app.yaml
    
+   # Wait for deployments to be ready
+   kubectl wait --for=condition=available --timeout=300s \
+       deployment/${TENANT_A_NAME}-app -n ${TENANT_A_NAME}
+   kubectl wait --for=condition=available --timeout=300s \
+       deployment/${TENANT_B_NAME}-app -n ${TENANT_B_NAME}
+   
    echo "✅ Sample applications deployed for isolation testing"
    ```
 
@@ -607,7 +678,8 @@ echo "✅ Environment prepared successfully"
 
    ```bash
    # Check namespace creation and labels
-   kubectl get namespaces --show-labels | grep -E "(tenant-alpha|tenant-beta)"
+   kubectl get namespaces --show-labels | \
+       grep -E "(tenant-alpha|tenant-beta)"
    
    # Verify pods are running in correct namespaces
    kubectl get pods -n ${TENANT_A_NAME}
@@ -620,14 +692,19 @@ echo "✅ Environment prepared successfully"
 
    ```bash
    # Test cross-namespace access restrictions
-   kubectl auth can-i get pods --as=${TENANT_A_NAME}-user -n ${TENANT_B_NAME}
-   kubectl auth can-i get pods --as=${TENANT_B_NAME}-user -n ${TENANT_A_NAME}
+   kubectl auth can-i get pods --as=${TENANT_A_NAME}-user \
+       -n ${TENANT_B_NAME}
+   kubectl auth can-i get pods --as=${TENANT_B_NAME}-user \
+       -n ${TENANT_A_NAME}
    
    # Test allowed namespace access
-   kubectl auth can-i get pods --as=${TENANT_A_NAME}-user -n ${TENANT_A_NAME}
+   kubectl auth can-i get pods --as=${TENANT_A_NAME}-user \
+       -n ${TENANT_A_NAME}
+   kubectl auth can-i create deployments --as=${TENANT_A_NAME}-user \
+       -n ${TENANT_A_NAME}
    ```
 
-   Expected output: Cross-namespace access should be denied, while same-namespace access should be allowed.
+   Expected output: Cross-namespace access should be denied (no), while same-namespace access should be allowed (yes).
 
 3. **Validate Network Policy Enforcement**:
 
@@ -635,15 +712,20 @@ echo "✅ Environment prepared successfully"
    # Test network connectivity between tenants (should fail)
    kubectl exec -n ${TENANT_A_NAME} \
        $(kubectl get pods -n ${TENANT_A_NAME} -o jsonpath='{.items[0].metadata.name}') \
-       -- curl -m 5 ${TENANT_B_NAME}-service.${TENANT_B_NAME}.svc.cluster.local
+       -- timeout 5 curl -s ${TENANT_B_NAME}-service.${TENANT_B_NAME}.svc.cluster.local
    
    # Test internal connectivity (should succeed)
    kubectl exec -n ${TENANT_A_NAME} \
        $(kubectl get pods -n ${TENANT_A_NAME} -o jsonpath='{.items[0].metadata.name}') \
-       -- curl -m 5 ${TENANT_A_NAME}-service.${TENANT_A_NAME}.svc.cluster.local
+       -- timeout 5 curl -s ${TENANT_A_NAME}-service.${TENANT_A_NAME}.svc.cluster.local
+   
+   # Test external connectivity (should succeed)
+   kubectl exec -n ${TENANT_A_NAME} \
+       $(kubectl get pods -n ${TENANT_A_NAME} -o jsonpath='{.items[0].metadata.name}') \
+       -- timeout 5 curl -s https://httpbin.org/get
    ```
 
-   Expected output: Cross-tenant network access should timeout or fail, while intra-tenant access should succeed.
+   Expected output: Cross-tenant network access should timeout or fail, while intra-tenant and external access should succeed.
 
 4. **Verify Resource Quotas**:
 
@@ -654,6 +736,10 @@ echo "✅ Environment prepared successfully"
    
    # Check limit ranges
    kubectl describe limitrange ${TENANT_A_NAME}-limits -n ${TENANT_A_NAME}
+   
+   # Verify pod resource constraints
+   kubectl get pods -n ${TENANT_A_NAME} -o yaml | \
+       grep -A 4 -B 2 resources:
    ```
 
    Expected output: Resource quotas should show current usage and limits, with containers having appropriate resource constraints.
@@ -716,7 +802,7 @@ echo "✅ Environment prepared successfully"
    aws iam delete-role --role-name ${TENANT_A_NAME}-eks-role
    aws iam delete-role --role-name ${TENANT_B_NAME}-eks-role
    
-   # Delete namespaces
+   # Delete namespaces (this will cascade delete all resources)
    kubectl delete namespace ${TENANT_A_NAME}
    kubectl delete namespace ${TENANT_B_NAME}
    
@@ -730,11 +816,11 @@ echo "✅ Environment prepared successfully"
 
 Multi-tenant security in Kubernetes requires a layered approach that combines multiple isolation mechanisms to achieve comprehensive security. The implementation presented here demonstrates "soft multi-tenancy" using native Kubernetes constructs, which provides logical isolation while maintaining cost efficiency through shared infrastructure. This approach is particularly suitable for enterprise environments with semi-trusted tenants or SaaS applications requiring moderate isolation levels.
 
-The integration of AWS IAM with Kubernetes RBAC creates a robust authentication and authorization framework. AWS IAM handles identity management and cluster-level authentication, while Kubernetes RBAC provides fine-grained authorization within the cluster. This dual-layer security model ensures that access control is enforced at both the AWS API level and the Kubernetes API level, reducing the risk of privilege escalation and unauthorized access.
+The integration of AWS IAM with Kubernetes RBAC creates a robust authentication and authorization framework. AWS IAM handles identity management and cluster-level authentication, while Kubernetes RBAC provides fine-grained authorization within the cluster. This dual-layer security model ensures that access control is enforced at both the AWS API level and the Kubernetes API level, reducing the risk of privilege escalation and unauthorized access. The modern EKS access entries feature provides better auditability and eliminates the complexity of managing the aws-auth ConfigMap.
 
-Network policies provide crucial network-level isolation by implementing microsegmentation within the cluster. Unlike traditional network security that relies on perimeter defenses, network policies create pod-level firewall rules that prevent lateral movement between tenant workloads. This is essential for compliance requirements and defense-in-depth strategies, particularly in environments handling sensitive data or regulated workloads.
+Network policies provide crucial network-level isolation by implementing microsegmentation within the cluster. Unlike traditional network security that relies on perimeter defenses, network policies create pod-level firewall rules that prevent lateral movement between tenant workloads. This is essential for compliance requirements and defense-in-depth strategies, particularly in environments handling sensitive data or regulated workloads. The policies implemented here follow a default-deny approach with explicit allow rules for necessary communication.
 
-Resource quotas and limit ranges ensure fair resource distribution and prevent resource starvation scenarios. By implementing both namespace-level quotas and pod-level limits, administrators can guarantee minimum resource availability for each tenant while preventing any single tenant from consuming excessive cluster resources. This resource governance is critical for maintaining SLA commitments and ensuring predictable performance across all tenants.
+Resource quotas and limit ranges ensure fair resource distribution and prevent resource starvation scenarios. By implementing both namespace-level quotas and pod-level limits, administrators can guarantee minimum resource availability for each tenant while preventing any single tenant from consuming excessive cluster resources. This resource governance is critical for maintaining SLA commitments and ensuring predictable performance across all tenants. The limit ranges also provide default resource requests and limits for containers that don't specify them.
 
 > **Tip**: For enhanced security in highly regulated environments, consider implementing additional controls such as Pod Security Standards, OPA Gatekeeper policies, or container image scanning. Review the [AWS EKS Security Best Practices Guide](https://docs.aws.amazon.com/eks/latest/best-practices/security.html) for comprehensive security recommendations.
 
@@ -748,10 +834,17 @@ Extend this multi-tenant security implementation with these advanced enhancement
 
 3. **Configure node-level tenant isolation** using node affinity, taints, and tolerations to ensure tenant workloads run on dedicated nodes for stronger isolation boundaries.
 
-4. **Implement secret management** with AWS Secrets Manager integration and namespace-scoped service accounts to provide secure credential management for tenant applications.
+4. **Implement secret management** with AWS Secrets Manager integration using the Secret Store CSI Driver to provide secure credential management for tenant applications without storing secrets in etcd.
 
-5. **Add monitoring and alerting** using CloudWatch and Prometheus to detect policy violations, resource limit breaches, and potential security incidents across tenant namespaces.
+5. **Add monitoring and alerting** using CloudWatch Container Insights and Prometheus to detect policy violations, resource limit breaches, and potential security incidents across tenant namespaces.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

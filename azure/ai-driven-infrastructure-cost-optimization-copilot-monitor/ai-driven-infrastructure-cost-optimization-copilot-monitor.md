@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Copilot, Azure Monitor, Azure Cost Management, Azure Automation
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-optimization, ai-driven, automation, finops, infrastructure
 recipe-generator-version: 1.3
@@ -80,12 +80,12 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Owner or Contributor role
-2. Azure CLI v2.50.0 or later installed (or use Azure Cloud Shell)
+2. Azure CLI v2.55.0 or later installed (or use Azure Cloud Shell)
 3. PowerShell 7.0 or later for runbook development
 4. Basic understanding of Azure Cost Management and FinOps principles
 5. Estimated cost: $50-100/month (depending on monitored resources)
 
-> **Note**: Azure Copilot capabilities are included at no additional cost for current features. Future capabilities may be subject to pricing.
+> **Note**: Azure Copilot capabilities are included at no additional cost for current features. Future AI-powered capabilities may be subject to pricing.
 
 ## Preparation
 
@@ -137,20 +137,19 @@ echo "✅ Resource group and workspace created successfully"
                 {"category": "ResourceHealth", "enabled": true}]' \
        --workspace ${WORKSPACE_ID}
    
-   # Enable Azure Monitor metrics for cost analysis
-   az monitor metrics alert create \
-       --name "HighCostAlert" \
+   # Create resource group for metric alert (alerts don't support cost metrics directly)
+   # Instead, create an activity log alert for high spending events
+   az monitor activity-log alert create \
+       --name "HighCostActivityAlert" \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes ${SUBSCRIPTION_ID} \
-       --condition "total cost > 1000" \
-       --description "Alert when daily costs exceed $1000" \
-       --evaluation-frequency 1h \
-       --window-size 1h
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}" \
+       --condition category=Administrative operationName="Microsoft.Compute/virtualMachines/write" \
+       --description "Alert when new expensive VMs are created"
    
    echo "✅ Azure Monitor configured for cost tracking"
    ```
 
-   The diagnostic settings now capture all administrative and health events that could impact costs, while the metric alert provides proactive notification when spending thresholds are exceeded. This data forms the basis for Azure Copilot's cost analysis capabilities.
+   The diagnostic settings now capture all administrative and health events that could impact costs, while the activity log alert provides proactive notification when expensive resources are created. This data forms the basis for Azure Copilot's cost analysis capabilities.
 
 2. **Create Azure Automation Account and Runbooks**:
 
@@ -160,19 +159,19 @@ echo "✅ Resource group and workspace created successfully"
    # Create Automation Account
    export AUTOMATION_ACCOUNT="aa-costopt-${RANDOM_SUFFIX}"
    az automation account create \
-       --name ${AUTOMATION_ACCOUNT} \
+       --automation-account-name ${AUTOMATION_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --sku "Basic"
    
-   # Create system-assigned managed identity for authentication
+   # Enable system-assigned managed identity for authentication
    az automation account identity assign \
-       --name ${AUTOMATION_ACCOUNT} \
+       --automation-account-name ${AUTOMATION_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP}
    
    # Get the principal ID for role assignment
    export PRINCIPAL_ID=$(az automation account show \
-       --name ${AUTOMATION_ACCOUNT} \
+       --automation-account-name ${AUTOMATION_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --query identity.principalId --output tsv)
    
@@ -203,16 +202,22 @@ echo "✅ Resource group and workspace created successfully"
    # Log the optimization action
    Write-Output "Starting VM optimization for $VMName"
    
-   # Stop the VM
-   Stop-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Force
+   # Get current VM state
+   $vm = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName
+   if ($vm.PowerState -eq "VM running") {
+       # Stop the VM
+       Stop-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Force
+   }
    
    # Resize the VM
    $vm = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName
    $vm.HardwareProfile.VmSize = $NewSize
    Update-AzVM -VM $vm -ResourceGroupName $ResourceGroupName
    
-   # Start the VM
-   Start-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName
+   # Start the VM if it was running
+   if ($vm.PowerState -eq "VM running") {
+       Start-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName
+   }
    
    Write-Output "VM $VMName resized to $NewSize successfully"
    EOF
@@ -244,28 +249,19 @@ echo "✅ Resource group and workspace created successfully"
    # Create a budget with alert
    az consumption budget create \
        --budget-name "MonthlyOptimizationBudget" \
-       --resource-group ${RESOURCE_GROUP} \
        --amount 5000 \
        --time-grain Monthly \
        --start-date $(date +%Y-%m-01) \
        --end-date $(date -d "+1 year" +%Y-%m-%d) \
-       --category Cost \
-       --notifications '[{
-           "enabled": true,
-           "operator": "GreaterThan",
-           "threshold": 80,
-           "contactEmails": ["admin@example.com"],
-           "contactRoles": ["Owner", "Contributor"]
-       }]'
+       --category cost
    
-   # Create cost anomaly alert
-   az monitor metrics alert create \
+   # Create cost anomaly detection using activity log alert
+   az monitor activity-log alert create \
        --name "CostAnomalyDetection" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}" \
-       --condition "total dailyCost > dynamic(avg,3d,2x)" \
-       --description "Detect unusual cost spikes" \
-       --evaluation-frequency 1h
+       --condition category=Administrative operationName="Microsoft.Compute/virtualMachines/write" \
+       --description "Detect unusual resource creation patterns"
    
    echo "✅ Cost management budgets and alerts configured"
    ```
@@ -275,11 +271,11 @@ echo "✅ Resource group and workspace created successfully"
    Azure Advisor provides personalized best practices and recommendations that Azure Copilot can analyze and act upon. By enabling Advisor's cost recommendations and configuring automated responses, we create a closed-loop optimization system that continuously improves resource efficiency based on actual usage patterns and Azure's machine learning models.
 
    ```bash
-   # Configure Advisor recommendations
-   az advisor configuration create \
-       --resource-group ${RESOURCE_GROUP} \
-       --low-cpu-threshold 5 \
-       --exclude-preview true
+   # Configure Advisor to generate cost recommendations
+   # Note: az advisor configuration create is not available in current CLI
+   # Use PowerShell equivalent or configure through portal
+   echo "Configure Azure Advisor through portal at:"
+   echo "https://portal.azure.com/#view/Microsoft_Azure_Expert/AdvisorMenuBlade"
    
    # Create automation webhook for Advisor integration
    WEBHOOK_URI=$(az automation webhook create \
@@ -291,11 +287,12 @@ echo "✅ Resource group and workspace created successfully"
        --query uri --output tsv)
    
    echo "✅ Azure Advisor integration configured"
+   echo "Webhook URI stored for automation: ${WEBHOOK_URI}"
    ```
 
 6. **Implement Automated Response Workflows**:
 
-   The final step connects all components into an intelligent, automated cost optimization system. By creating Logic Apps or Azure Functions that respond to Azure Monitor alerts and Copilot recommendations, we enable autonomous execution of optimization strategies while maintaining governance through approval workflows for high-impact changes.
+   The final step connects all components into an intelligent, automated cost optimization system. By creating Logic Apps that respond to Azure Monitor alerts and Copilot recommendations, we enable autonomous execution of optimization strategies while maintaining governance through approval workflows for high-impact changes.
 
    ```bash
    # Create Logic App for automated responses
@@ -307,13 +304,8 @@ echo "✅ Resource group and workspace created successfully"
                "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
                "triggers": {
                    "When_a_cost_alert_is_triggered": {
-                       "type": "HttpWebhook",
-                       "inputs": {
-                           "subscribe": {
-                               "method": "POST",
-                               "uri": "@listCallbackUrl()"
-                           }
-                       }
+                       "type": "HttpRequest",
+                       "kind": "Http"
                    }
                },
                "actions": {
@@ -365,7 +357,7 @@ echo "✅ Resource group and workspace created successfully"
        --admin-username azureuser \
        --generate-ssh-keys
    
-   # Test the runbook
+   # Test the runbook execution
    az automation runbook start \
        --automation-account-name ${AUTOMATION_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
@@ -398,7 +390,7 @@ echo "✅ Resource group and workspace created successfully"
    ```bash
    # Delete automation account
    az automation account delete \
-       --name ${AUTOMATION_ACCOUNT} \
+       --automation-account-name ${AUTOMATION_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --yes
    
@@ -452,4 +444,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

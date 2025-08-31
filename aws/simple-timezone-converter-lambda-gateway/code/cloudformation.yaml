@@ -1,0 +1,792 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple Time Zone Converter with Lambda and API Gateway - A serverless REST API that converts timestamps between different time zones using AWS Lambda and API Gateway'
+
+# Parameters section - allows customization of the deployment
+Parameters:
+  # Function configuration parameters
+  FunctionName:
+    Type: String
+    Default: timezone-converter
+    Description: Name for the Lambda function (will have random suffix appended for uniqueness)
+    MinLength: 1
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with letter and contain only alphanumeric characters and hyphens
+
+  FunctionMemorySize:
+    Type: Number
+    Default: 128
+    MinValue: 128
+    MaxValue: 10240
+    Description: Memory allocation for Lambda function in MB (128MB is sufficient for timezone conversion)
+    ConstraintDescription: Must be between 128 and 10240 MB
+
+  FunctionTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Timeout for Lambda function in seconds
+    ConstraintDescription: Must be between 3 and 900 seconds
+
+  # API Gateway configuration parameters  
+  ApiName:
+    Type: String
+    Default: timezone-converter-api
+    Description: Name for the API Gateway REST API (will have random suffix appended for uniqueness)
+    MinLength: 1
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with letter and contain only alphanumeric characters and hyphens
+
+  ApiStageName:
+    Type: String
+    Default: prod
+    Description: Stage name for API Gateway deployment
+    AllowedValues: [prod, staging, dev, test]
+    ConstraintDescription: Must be one of prod, staging, dev, or test
+
+  # Monitoring and logging parameters
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable detailed CloudWatch monitoring for Lambda function
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: Number of days to retain CloudWatch logs
+
+  # Environment and deployment parameters
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, staging, prod]
+    Description: Environment tag for resource organization
+
+# Conditions for conditional resource creation
+Conditions:
+  # Condition to enable detailed monitoring
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  
+  # Condition for production environment (enables additional features)
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+# Mappings for region-specific configurations
+Mappings:
+  # Python runtime versions by region (ensuring consistency)
+  PythonRuntimeMap:
+    us-east-1:
+      Runtime: python3.12
+    us-east-2:
+      Runtime: python3.12
+    us-west-1:
+      Runtime: python3.12
+    us-west-2:
+      Runtime: python3.12
+    eu-west-1:
+      Runtime: python3.12
+    eu-central-1:
+      Runtime: python3.12
+    ap-southeast-1:
+      Runtime: python3.12
+    ap-southeast-2:
+      Runtime: python3.12
+    ap-northeast-1:
+      Runtime: python3.12
+
+Resources:
+  # Random suffix generator for unique resource naming
+  RandomSuffixGenerator:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+      Length: 6
+
+  # Lambda function to generate random suffix for resource uniqueness
+  RandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-random-suffix-generator'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt RandomSuffixExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import string
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  length = int(event['ResourceProperties'].get('Length', 6))
+                  suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+                  
+                  response_data = {'Suffix': suffix}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM role for the random suffix generator Lambda
+  RandomSuffixExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-random-suffix-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # CloudWatch Log Group for the main Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FunctionName}-${RandomSuffixGenerator.Suffix}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimezoneConverter
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM role for the main Lambda function with least privilege permissions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${FunctionName}-role-${RandomSuffixGenerator.Suffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LambdaLogGroup.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimezoneConverter
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Main Lambda function for timezone conversion
+  TimezoneConverterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${FunctionName}-${RandomSuffixGenerator.Suffix}'
+      Runtime: !FindInMap [PythonRuntimeMap, !Ref 'AWS::Region', Runtime]
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref FunctionMemorySize
+      Timeout: !Ref FunctionTimeout
+      ReservedConcurrencyLimit: !If [IsProductionEnvironment, 100, 10]
+      Environment:
+        Variables:
+          LOG_LEVEL: !If [EnableMonitoring, INFO, ERROR]
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          
+          # Configure logging based on environment variable
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          def lambda_handler(event, context):
+              """
+              Convert timestamp between timezones
+              
+              Expected event format:
+              {
+                "timestamp": "2025-07-12T15:30:00",
+                "from_timezone": "UTC",
+                "to_timezone": "America/New_York"
+              }
+              """
+              try:
+                  # Log request for monitoring (in production, consider structured logging)
+                  logger.info(f"Processing timezone conversion request: {json.dumps(event, default=str)}")
+                  
+                  # Parse the request body from API Gateway proxy integration
+                  if 'body' in event:
+                      if event['body']:
+                          body = json.loads(event['body'])
+                      else:
+                          body = {}
+                  else:
+                      body = event
+                  
+                  # Extract required parameters with validation
+                  timestamp_str = body.get('timestamp')
+                  from_tz = body.get('from_timezone', 'UTC')  # Default to UTC if not specified
+                  to_tz = body.get('to_timezone')
+                  
+                  # Validate required parameters
+                  if not timestamp_str or not to_tz:
+                      error_msg = 'Missing required parameters: timestamp and to_timezone'
+                      logger.warning(f"Validation error: {error_msg}")
+                      return create_response(400, {'error': error_msg})
+                  
+                  # Parse the timestamp with multiple format support
+                  try:
+                      # Try parsing with timezone info first (ISO format with timezone)
+                      if 'T' in timestamp_str and ('+' in timestamp_str or 'Z' in timestamp_str):
+                          dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                      else:
+                          # Parse as naive datetime and assign source timezone
+                          dt_naive = datetime.fromisoformat(timestamp_str)
+                          dt = dt_naive.replace(tzinfo=ZoneInfo(from_tz))
+                  except ValueError as e:
+                      error_msg = f'Invalid timestamp format: {str(e)}'
+                      logger.warning(f"Timestamp parsing error: {error_msg}")
+                      return create_response(400, {'error': error_msg})
+                  
+                  # Convert to target timezone with error handling
+                  try:
+                      target_tz = ZoneInfo(to_tz)
+                      converted_dt = dt.astimezone(target_tz)
+                  except Exception as e:
+                      error_msg = f'Invalid timezone: {str(e)}'
+                      logger.warning(f"Timezone conversion error: {error_msg}")
+                      return create_response(400, {'error': error_msg})
+                  
+                  # Format comprehensive response with metadata
+                  response_data = {
+                      'original_timestamp': timestamp_str,
+                      'original_timezone': from_tz,
+                      'converted_timestamp': converted_dt.isoformat(),
+                      'target_timezone': to_tz,
+                      'timezone_offset': converted_dt.strftime('%z'),
+                      'timezone_name': converted_dt.tzname(),
+                      'is_dst': bool(converted_dt.dst()),  # Daylight saving time indicator
+                      'conversion_metadata': {
+                          'processed_at': datetime.utcnow().isoformat() + 'Z',
+                          'function_version': context.function_version if context else '1.0'
+                      }
+                  }
+                  
+                  logger.info(f"Successfully converted {timestamp_str} from {from_tz} to {to_tz}")
+                  return create_response(200, response_data)
+                  
+              except Exception as e:
+                  error_msg = 'Internal server error occurred during timezone conversion'
+                  logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+                  return create_response(500, {'error': error_msg})
+          
+          def create_response(status_code, body):
+              """Create standardized HTTP response with CORS headers"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token',
+                      'X-Content-Type-Options': 'nosniff',
+                      'X-Frame-Options': 'DENY',
+                      'Cache-Control': 'no-cache'
+                  },
+                  'body': json.dumps(body, ensure_ascii=False)
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimezoneConverter
+        - Key: ManagedBy
+          Value: CloudFormation
+    DependsOn: 
+      - LambdaLogGroup
+      - RandomSuffixGenerator
+
+  # Lambda function version for alias management (production best practice)
+  TimezoneConverterFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref TimezoneConverterFunction
+      Description: !Sub 'Version deployed at ${AWS::StackName} creation'
+
+  # Lambda alias for production traffic management
+  TimezoneConverterFunctionAlias:
+    Type: AWS::Lambda::Alias
+    Condition: IsProductionEnvironment
+    Properties:
+      FunctionName: !Ref TimezoneConverterFunction
+      FunctionVersion: !GetAtt TimezoneConverterFunctionVersion.Version
+      Name: LIVE
+      Description: Live alias for production traffic
+
+  # API Gateway REST API
+  TimezoneConverterApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ApiName}-${RandomSuffixGenerator.Suffix}'
+      Description: 'REST API for timezone conversion service with comprehensive error handling and CORS support'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimezoneConverter
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # API Gateway resource for /convert endpoint
+  ConvertResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimezoneConverterApi
+      ParentId: !GetAtt TimezoneConverterApi.RootResourceId
+      PathPart: convert
+
+  # POST method for timezone conversion
+  ConvertPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimezoneConverterApi
+      ResourceId: !Ref ConvertResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref ApiRequestValidator
+      RequestModels:
+        application/json: !Ref ConvertRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
+          - FunctionArn: !If 
+            - IsProductionEnvironment
+            - !Ref TimezoneConverterFunctionAlias
+            - !GetAtt TimezoneConverterFunction.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseHeaders:
+              Access-Control-Allow-Origin: "'*'"
+          - StatusCode: 400
+            ResponseHeaders:
+              Access-Control-Allow-Origin: "'*'"
+          - StatusCode: 500
+            ResponseHeaders:
+              Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: !Ref ConvertResponseModel
+        - StatusCode: 400
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+        - StatusCode: 500
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+
+  # OPTIONS method for CORS preflight requests
+  ConvertOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimezoneConverterApi
+      ResourceId: !Ref ConvertResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Headers: true
+            Access-Control-Allow-Methods: true
+            Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+
+  # Request validator for input validation
+  ApiRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref TimezoneConverterApi
+      Name: RequestValidator
+      ValidateRequestBody: true
+      ValidateRequestParameters: false
+
+  # Request model for input validation
+  ConvertRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref TimezoneConverterApi
+      ContentType: application/json
+      Name: ConvertRequest
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Timezone Conversion Request
+        type: object
+        properties:
+          timestamp:
+            type: string
+            description: Timestamp to convert (ISO format)
+            pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?$'
+          from_timezone:
+            type: string
+            description: Source timezone (IANA timezone identifier)
+            default: UTC
+          to_timezone:
+            type: string
+            description: Target timezone (IANA timezone identifier)
+        required:
+          - timestamp
+          - to_timezone
+        additionalProperties: false
+
+  # Response model for successful conversions
+  ConvertResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref TimezoneConverterApi
+      ContentType: application/json
+      Name: ConvertResponse
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Timezone Conversion Response
+        type: object
+        properties:
+          original_timestamp:
+            type: string
+            description: Original timestamp as provided
+          original_timezone:
+            type: string
+            description: Source timezone used for conversion
+          converted_timestamp:
+            type: string
+            description: Converted timestamp in ISO format
+          target_timezone:
+            type: string
+            description: Target timezone identifier
+          timezone_offset:
+            type: string
+            description: UTC offset for target timezone
+          timezone_name:
+            type: string
+            description: Timezone abbreviation
+          is_dst:
+            type: boolean
+            description: Whether daylight saving time is active
+          conversion_metadata:
+            type: object
+            properties:
+              processed_at:
+                type: string
+                description: UTC timestamp when conversion was processed
+              function_version:
+                type: string
+                description: Lambda function version used
+        required:
+          - original_timestamp
+          - converted_timestamp
+          - target_timezone
+
+  # Error response model
+  ErrorResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref TimezoneConverterApi
+      ContentType: application/json
+      Name: ErrorResponse
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Error Response
+        type: object
+        properties:
+          error:
+            type: string
+            description: Error message describing what went wrong
+        required:
+          - error
+
+  # Lambda permission for API Gateway to invoke the function
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !If 
+        - IsProductionEnvironment
+        - !Ref TimezoneConverterFunctionAlias
+        - !Ref TimezoneConverterFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${TimezoneConverterApi}/*/POST/convert'
+
+  # Additional permission for OPTIONS method (CORS)
+  ApiGatewayLambdaPermissionOptions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !If 
+        - IsProductionEnvironment
+        - !Ref TimezoneConverterFunctionAlias
+        - !Ref TimezoneConverterFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${TimezoneConverterApi}/*/*'
+
+  # API Gateway deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref TimezoneConverterApi
+      StageName: !Ref ApiStageName
+      StageDescription:
+        LoggingLevel: !If [EnableMonitoring, INFO, ERROR]
+        MetricsEnabled: !If [EnableMonitoring, true, false]
+        DataTraceEnabled: !If [EnableMonitoring, true, false]
+        ThrottlingBurstLimit: !If [IsProductionEnvironment, 2000, 100]
+        ThrottlingRateLimit: !If [IsProductionEnvironment, 1000, 50]
+        CachingEnabled: !If [IsProductionEnvironment, true, false]
+        CacheTtlInSeconds: !If [IsProductionEnvironment, 300, 0]
+        Variables:
+          environment: !Ref Environment
+          lambdaAlias: !If [IsProductionEnvironment, LIVE, $LATEST]
+      Description: !Sub 'Deployment of timezone converter API for ${Environment} environment'
+    DependsOn:
+      - ConvertPostMethod
+      - ConvertOptionsMethod
+
+  # CloudWatch dashboard for monitoring (production only)
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: IsProductionEnvironment
+    Properties:
+      DashboardName: !Sub 'TimezoneConverter-${RandomSuffixGenerator.Suffix}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${TimezoneConverterFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ],
+                  [ ".", "Throttles", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${TimezoneConverterApi}", "Stage", "${ApiStageName}" ],
+                  [ ".", "4XXError", ".", ".", ".", "." ],
+                  [ ".", "5XXError", ".", ".", ".", "." ],
+                  [ ".", "Latency", ".", ".", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch alarms for production monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProductionEnvironment
+    Properties:
+      AlarmName: !Sub '${TimezoneConverterFunction}-errors'
+      AlarmDescription: 'Lambda function error rate alarm'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TimezoneConverterFunction
+      TreatMissingData: notBreaching
+
+  ApiGateway5XXAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProductionEnvironment
+    Properties:
+      AlarmName: !Sub '${TimezoneConverterApi}-5xx-errors'
+      AlarmDescription: 'API Gateway 5XX error rate alarm'
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref TimezoneConverterApi
+        - Name: Stage
+          Value: !Ref ApiStageName
+      TreatMissingData: notBreaching
+
+# Outputs section - provides important information about deployed resources
+Outputs:
+  # API Gateway outputs
+  ApiGatewayEndpoint:
+    Description: 'API Gateway endpoint URL for timezone conversion'
+    Value: !Sub 'https://${TimezoneConverterApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  ApiGatewayId:
+    Description: 'API Gateway REST API ID'
+    Value: !Ref TimezoneConverterApi
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiId'
+
+  ConvertEndpoint:
+    Description: 'Full URL for the timezone conversion endpoint'
+    Value: !Sub 'https://${TimezoneConverterApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/convert'
+    Export:
+      Name: !Sub '${AWS::StackName}-ConvertEndpoint'
+
+  # Lambda function outputs
+  LambdaFunctionName:
+    Description: 'Name of the timezone converter Lambda function'
+    Value: !Ref TimezoneConverterFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the timezone converter Lambda function'
+    Value: !GetAtt TimezoneConverterFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaFunctionVersion:
+    Description: 'Version of the deployed Lambda function'
+    Value: !GetAtt TimezoneConverterFunctionVersion.Version
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaVersion'
+
+  # IAM role outputs
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecutionRoleArn'
+
+  # Monitoring outputs
+  CloudWatchLogGroup:
+    Description: 'CloudWatch Log Group for Lambda function logs'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  CloudWatchDashboard:
+    Condition: IsProductionEnvironment
+    Description: 'CloudWatch Dashboard for monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MonitoringDashboard}'
+
+  # Resource identification outputs
+  ResourceSuffix:
+    Description: 'Random suffix used for resource naming'
+    Value: !GetAtt RandomSuffixGenerator.Suffix
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceSuffix'
+
+  StackEnvironment:
+    Description: 'Environment tag value for this stack'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # Usage examples
+  CurlTestCommand:
+    Description: 'Sample curl command to test the API'
+    Value: !Sub |
+      curl -X POST https://${TimezoneConverterApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/convert \
+      -H "Content-Type: application/json" \
+      -d '{"timestamp":"2025-07-12T15:30:00","from_timezone":"UTC","to_timezone":"America/New_York"}'
+
+  PythonTestCode:
+    Description: 'Sample Python code to test the API'
+    Value: !Sub |
+      import requests
+      import json
+      
+      url = "https://${TimezoneConverterApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/convert"
+      payload = {
+          "timestamp": "2025-07-12T15:30:00",
+          "from_timezone": "UTC",
+          "to_timezone": "America/Los_Angeles"
+      }
+      
+      response = requests.post(url, json=payload)
+      print(json.dumps(response.json(), indent=2))

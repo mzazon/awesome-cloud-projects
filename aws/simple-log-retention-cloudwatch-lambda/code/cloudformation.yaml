@@ -1,0 +1,527 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple Log Retention Management with CloudWatch and Lambda - Automated log retention policy management for cost optimization and compliance'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  FunctionName:
+    Type: String
+    Default: 'log-retention-manager'
+    Description: 'Name for the Lambda function that manages log retention policies'
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: 'Function name must contain only alphanumeric characters, hyphens, and underscores'
+    MaxLength: 64
+    
+  DefaultRetentionDays:
+    Type: Number
+    Default: 30
+    Description: 'Default retention period in days for log groups that do not match any specific pattern'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: 'Must be a valid CloudWatch Logs retention period'
+    
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(7 days)'
+    Description: 'Schedule expression for automated execution (EventBridge rate or cron expression)'
+    AllowedPattern: '^(rate\(.*\)|cron\(.*\))$'
+    ConstraintDescription: 'Must be a valid EventBridge schedule expression (rate or cron)'
+    
+  LambdaRetentionDays:
+    Type: Number
+    Default: 30
+    Description: 'Retention period in days for Lambda function logs'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    
+  ApiGatewayRetentionDays:
+    Type: Number
+    Default: 90
+    Description: 'Retention period in days for API Gateway logs'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    
+  ApplicationRetentionDays:
+    Type: Number
+    Default: 180
+    Description: 'Retention period in days for application logs'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    
+  SystemRetentionDays:
+    Type: Number
+    Default: 365
+    Description: 'Retention period in days for system logs'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    
+  CreateTestLogGroups:
+    Type: String
+    Default: 'false'
+    Description: 'Whether to create test log groups for demonstration purposes'
+    AllowedValues: ['true', 'false']
+    
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    Description: 'Enable detailed CloudWatch monitoring for the Lambda function'
+    AllowedValues: ['true', 'false']
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  CreateTestLogGroupsCondition: !Equals [!Ref CreateTestLogGroups, 'true']
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # -----------------------------------------------------------------------------
+  # IAM ROLE FOR LAMBDA FUNCTION
+  # -----------------------------------------------------------------------------
+  LogRetentionManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${FunctionName}-ExecutionRole-${AWS::Region}'
+      Description: 'IAM role for Lambda function to manage CloudWatch Logs retention policies'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LogRetentionManagementPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DescribeLogGroups
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref 'AWS::Region'
+              - Sid: ManageRetentionPolicies
+                Effect: Allow
+                Action:
+                  - logs:PutRetentionPolicy
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+              - Sid: ManageFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}*'
+      Tags:
+        - Key: Application
+          Value: LogRetentionManager
+        - Key: Environment
+          Value: Production
+        - Key: Purpose
+          Value: CostOptimization
+
+  # -----------------------------------------------------------------------------
+  # LAMBDA FUNCTION
+  # -----------------------------------------------------------------------------
+  LogRetentionManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Description: 'Automated CloudWatch Logs retention policy management for cost optimization and compliance'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LogRetentionManagerRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrencyLimit: 5
+      Environment:
+        Variables:
+          DEFAULT_RETENTION_DAYS: !Ref DefaultRetentionDays
+          LAMBDA_RETENTION_DAYS: !Ref LambdaRetentionDays
+          APIGATEWAY_RETENTION_DAYS: !Ref ApiGatewayRetentionDays
+          APPLICATION_RETENTION_DAYS: !Ref ApplicationRetentionDays
+          SYSTEM_RETENTION_DAYS: !Ref SystemRetentionDays
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from botocore.exceptions import ClientError
+          
+          # Initialize CloudWatch Logs client
+          logs_client = boto3.client('logs')
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+          
+          def apply_retention_policy(log_group_name, retention_days):
+              """Apply retention policy to a specific log group"""
+              try:
+                  logs_client.put_retention_policy(
+                      logGroupName=log_group_name,
+                      retentionInDays=retention_days
+                  )
+                  logger.info(f"Applied {retention_days} day retention to {log_group_name}")
+                  return True
+              except ClientError as e:
+                  logger.error(f"Failed to set retention for {log_group_name}: {e}")
+                  return False
+          
+          def get_retention_days(log_group_name):
+              """Determine appropriate retention period based on log group name patterns"""
+              # Define retention rules based on log group naming patterns
+              retention_rules = {
+                  '/aws/lambda/': int(os.environ.get('LAMBDA_RETENTION_DAYS', '30')),
+                  '/aws/apigateway/': int(os.environ.get('APIGATEWAY_RETENTION_DAYS', '90')),
+                  '/aws/codebuild/': 14,  # CodeBuild logs: 14 days
+                  '/aws/ecs/': 60,        # ECS logs: 60 days
+                  '/aws/stepfunctions/': 90,  # Step Functions: 90 days
+                  '/aws/rds/': 7,         # RDS logs: 7 days
+                  '/aws/vpc/': 30,        # VPC Flow logs: 30 days
+                  '/application/': int(os.environ.get('APPLICATION_RETENTION_DAYS', '180')),
+                  '/system/': int(os.environ.get('SYSTEM_RETENTION_DAYS', '365')),
+              }
+              
+              # Check log group name against patterns
+              for pattern, days in retention_rules.items():
+                  if pattern in log_group_name:
+                      return days
+              
+              # Default retention for unmatched patterns
+              return int(os.environ.get('DEFAULT_RETENTION_DAYS', '30'))
+          
+          def lambda_handler(event, context):
+              """Main Lambda handler for log retention management"""
+              try:
+                  processed_groups = 0
+                  updated_groups = 0
+                  skipped_groups = 0
+                  errors = []
+                  
+                  logger.info("Starting log retention policy management")
+                  
+                  # Get all log groups (paginated)
+                  paginator = logs_client.get_paginator('describe_log_groups')
+                  
+                  for page in paginator.paginate():
+                      for log_group in page['logGroups']:
+                          log_group_name = log_group['logGroupName']
+                          current_retention = log_group.get('retentionInDays')
+                          
+                          # Determine appropriate retention period
+                          target_retention = get_retention_days(log_group_name)
+                          
+                          processed_groups += 1
+                          
+                          # Apply retention policy if needed
+                          if current_retention != target_retention:
+                              if apply_retention_policy(log_group_name, target_retention):
+                                  updated_groups += 1
+                                  logger.info(f"Updated retention for {log_group_name}: {current_retention} -> {target_retention} days")
+                              else:
+                                  errors.append({
+                                      'logGroup': log_group_name,
+                                      'error': 'Failed to apply retention policy'
+                                  })
+                          else:
+                              skipped_groups += 1
+                              logger.debug(f"Log group {log_group_name} already has correct retention: {current_retention} days")
+                  
+                  # Return summary
+                  result = {
+                      'statusCode': 200,
+                      'message': f'Processed {processed_groups} log groups, updated {updated_groups}, skipped {skipped_groups}',
+                      'summary': {
+                          'processedGroups': processed_groups,
+                          'updatedGroups': updated_groups,
+                          'skippedGroups': skipped_groups,
+                          'errorCount': len(errors)
+                      },
+                      'errors': errors[:10]  # Limit error details to first 10
+                  }
+                  
+                  logger.info(f"Log retention management completed: {result['message']}")
+                  return result
+                  
+              except Exception as e:
+                  error_msg = f"Error in log retention management: {str(e)}"
+                  logger.error(error_msg)
+                  return {
+                      'statusCode': 500,
+                      'error': error_msg
+                  }
+      Tags:
+        - Key: Application
+          Value: LogRetentionManager
+        - Key: Environment
+          Value: Production
+        - Key: Purpose
+          Value: CostOptimization
+
+  # -----------------------------------------------------------------------------
+  # LAMBDA FUNCTION LOG GROUP
+  # -----------------------------------------------------------------------------
+  LogRetentionManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FunctionName}'
+      RetentionInDays: !Ref LambdaRetentionDays
+      Tags:
+        - Key: Application
+          Value: LogRetentionManager
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -----------------------------------------------------------------------------
+  # EVENTBRIDGE RULE FOR SCHEDULED EXECUTION
+  # -----------------------------------------------------------------------------
+  LogRetentionScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${FunctionName}-schedule'
+      Description: 'Scheduled execution of log retention management function'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LogRetentionManagerFunction.Arn
+          Id: LogRetentionManagerTarget
+          Input: !Sub |
+            {
+              "source": "aws.events",
+              "scheduledExecution": true,
+              "timestamp": "{{ aws.events.event.ingestion-time }}"
+            }
+
+  # -----------------------------------------------------------------------------
+  # LAMBDA PERMISSION FOR EVENTBRIDGE
+  # -----------------------------------------------------------------------------
+  EventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LogRetentionManagerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LogRetentionScheduleRule.Arn
+
+  # -----------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS FOR MONITORING
+  # -----------------------------------------------------------------------------
+  FunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${FunctionName}-Errors'
+      AlarmDescription: 'Alarm for Lambda function errors in log retention management'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LogRetentionManagerFunction
+      TreatMissingData: notBreaching
+
+  FunctionDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${FunctionName}-Duration'
+      AlarmDescription: 'Alarm for Lambda function execution duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 240000  # 4 minutes (timeout is 5 minutes)
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LogRetentionManagerFunction
+      TreatMissingData: notBreaching
+
+  # -----------------------------------------------------------------------------
+  # TEST LOG GROUPS (CONDITIONAL)
+  # -----------------------------------------------------------------------------
+  TestLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateTestLogGroupsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/test-function-${AWS::StackId}'
+      Tags:
+        - Key: Purpose
+          Value: Testing
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: DeleteAfterTesting
+          Value: 'true'
+
+  TestApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateTestLogGroupsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/test-api-${AWS::StackId}'
+      Tags:
+        - Key: Purpose
+          Value: Testing
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: DeleteAfterTesting
+          Value: 'true'
+
+  TestApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateTestLogGroupsCondition
+    Properties:
+      LogGroupName: !Sub '/application/web-app-${AWS::StackId}'
+      Tags:
+        - Key: Purpose
+          Value: Testing
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: DeleteAfterTesting
+          Value: 'true'
+
+  TestSystemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateTestLogGroupsCondition
+    Properties:
+      LogGroupName: !Sub '/system/server-logs-${AWS::StackId}'
+      Tags:
+        - Key: Purpose
+          Value: Testing
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: DeleteAfterTesting
+          Value: 'true'
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function that manages log retention policies'
+    Value: !Ref LogRetentionManagerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt LogRetentionManagerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  IAMRoleArn:
+    Description: 'ARN of the IAM role used by the Lambda function'
+    Value: !GetAtt LogRetentionManagerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  EventBridgeRuleArn:
+    Description: 'ARN of the EventBridge rule for scheduled execution'
+    Value: !GetAtt LogRetentionScheduleRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleArn'
+
+  ScheduleExpression:
+    Description: 'Schedule expression for automated execution'
+    Value: !Ref ScheduleExpression
+
+  RetentionPolicies:
+    Description: 'Summary of retention policies applied by the function'
+    Value: !Sub |
+      Lambda: ${LambdaRetentionDays} days
+      API Gateway: ${ApiGatewayRetentionDays} days
+      Application: ${ApplicationRetentionDays} days
+      System: ${SystemRetentionDays} days
+      Default: ${DefaultRetentionDays} days
+
+  ManualInvokeCommand:
+    Description: 'AWS CLI command to manually invoke the function'
+    Value: !Sub 'aws lambda invoke --function-name ${LogRetentionManagerFunction} --payload "{}" response.json'
+
+  TestLogGroups:
+    Condition: CreateTestLogGroupsCondition
+    Description: 'Test log groups created for demonstration'
+    Value: !Sub |
+      ${TestLambdaLogGroup}
+      ${TestApiGatewayLogGroup}
+      ${TestApplicationLogGroup}
+      ${TestSystemLogGroup}
+
+  MonitoringDashboard:
+    Condition: EnableDetailedMonitoringCondition
+    Description: 'CloudWatch console URL for monitoring the Lambda function'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#metricsV2:graph=~();query=AWS%2FLambda%20FunctionName%20${LogRetentionManagerFunction}'
+
+  NextExecutionTime:
+    Description: 'Information about when the function will next execute'
+    Value: !Sub 'Function will execute based on schedule: ${ScheduleExpression}. Check EventBridge console for next execution time.'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Function Configuration"
+        Parameters:
+          - FunctionName
+          - DefaultRetentionDays
+          - ScheduleExpression
+      - Label:
+          default: "Retention Policies"
+        Parameters:
+          - LambdaRetentionDays
+          - ApiGatewayRetentionDays
+          - ApplicationRetentionDays
+          - SystemRetentionDays
+      - Label:
+          default: "Testing and Monitoring"
+        Parameters:
+          - CreateTestLogGroups
+          - EnableDetailedMonitoring
+    ParameterLabels:
+      FunctionName:
+        default: "Lambda Function Name"
+      DefaultRetentionDays:
+        default: "Default Retention (Days)"
+      ScheduleExpression:
+        default: "Execution Schedule"
+      LambdaRetentionDays:
+        default: "Lambda Logs Retention (Days)"
+      ApiGatewayRetentionDays:
+        default: "API Gateway Logs Retention (Days)"
+      ApplicationRetentionDays:
+        default: "Application Logs Retention (Days)"
+      SystemRetentionDays:
+        default: "System Logs Retention (Days)"
+      CreateTestLogGroups:
+        default: "Create Test Log Groups"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed Monitoring"
+
+  # Template information for recipe integration
+  RecipeInfo:
+    Title: "Simple Log Retention Management with CloudWatch and Lambda"
+    RecipeId: "a7f3e8d2"
+    Category: "monitoring"
+    Difficulty: 100
+    EstimatedTime: "25 minutes"
+    Services: "CloudWatch Logs, Lambda"
+    Tags: "log-management, cost-optimization, compliance, automation, governance"
+    Purpose: "Automated log retention policy management for cost optimization and compliance"

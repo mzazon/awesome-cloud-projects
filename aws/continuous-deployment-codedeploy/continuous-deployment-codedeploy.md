@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: codedeploy,codecommit,codebuild,iam
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: codedeploy,codecommit,codebuild,continuous-deployment,blue-green,cicd,automation
 recipe-generator-version: 1.3
 ---
 
 # Continuous Deployment with CodeDeploy
-
 
 ## Problem
 
@@ -145,6 +144,8 @@ echo "VPC ID: $DEFAULT_VPC_ID"
 
 1. **Create IAM Roles and Policies**:
 
+   AWS Identity and Access Management (IAM) roles provide secure access to AWS services without hardcoded credentials. The CodeDeploy service role enables CodeDeploy to orchestrate deployments across EC2 instances and Auto Scaling Groups, while the EC2 instance profile allows instances to communicate with AWS services during deployment. These roles follow the principle of least privilege, granting only the minimum permissions required for successful operations.
+
    ```bash
    # Create CodeDeploy service role
    aws iam create-role \
@@ -200,17 +201,16 @@ echo "VPC ID: $DEFAULT_VPC_ID"
        --instance-profile-name CodeDeployEC2InstanceProfile \
        --role-name CodeDeployEC2Role
    
-   
    echo "✅ IAM roles and instance profile created"
    ```
 
-   The CodeDeploy service role allows CodeDeploy to perform deployments on EC2 instances and Auto Scaling groups. The EC2 instance profile enables instances to download deployment artifacts from S3 and communicate with CodeDeploy.
+   The CodeDeploy service role allows CodeDeploy to perform deployments on EC2 instances and Auto Scaling groups with appropriate permissions for blue-green deployments. The EC2 instance profile enables instances to download deployment artifacts from S3 and communicate with CodeDeploy during the deployment process.
 
    > **Note**: Follow the [principle of least privilege](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege) when configuring IAM permissions for production environments.
 
 2. **Create Application Load Balancer and Target Groups**:
 
-   Application Load Balancers enable blue-green deployments by routing traffic between different target groups. Two target groups represent the blue and green environments, allowing seamless traffic switching during deployments.
+   Application Load Balancers enable blue-green deployments by routing traffic between different target groups representing the blue and green environments. The ALB provides Layer-7 load balancing with health checks, ensuring traffic only reaches healthy instances during deployments. Two target groups allow seamless traffic switching without downtime, forming the foundation of the blue-green deployment strategy.
 
    ```bash
    # Create security group for ALB
@@ -270,11 +270,11 @@ echo "VPC ID: $DEFAULT_VPC_ID"
    echo "✅ Application Load Balancer and target groups created"
    ```
 
-   The blue target group initially receives all traffic, while the green target group remains idle until deployment. Health checks ensure only healthy instances receive traffic during deployments.
+   The blue target group initially receives all traffic, while the green target group remains idle until deployment. Health checks ensure only healthy instances receive traffic during deployments, providing automatic failure detection and traffic isolation.
 
 3. **Create Auto Scaling Group and Launch Template**:
 
-   Auto Scaling Groups provide the compute infrastructure for deployments. The launch template includes the CodeDeploy agent installation and initial application setup, ensuring new instances are deployment-ready.
+   Auto Scaling Groups provide the compute infrastructure for deployments, automatically managing instance lifecycle and maintaining desired capacity. The launch template includes CodeDeploy agent installation and application setup, ensuring new instances are deployment-ready from launch. This infrastructure foundation enables CodeDeploy to perform blue-green deployments by creating parallel environments and managing instance replacement.
 
    ```bash
    # Create security group for EC2 instances
@@ -305,7 +305,7 @@ echo "VPC ID: $DEFAULT_VPC_ID"
        --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
        --output text)
    
-   # Create launch template
+   # Create launch template with region-agnostic CodeDeploy agent installation
    aws ec2 create-launch-template \
        --launch-template-name "${APP_NAME}-launch-template" \
        --launch-template-data '{
@@ -324,7 +324,7 @@ systemctl start httpd
 systemctl enable httpd
 echo "<h1>Blue Environment - Version 1.0</h1>" > /var/www/html/index.html
 cd /home/ec2-user
-wget https://aws-codedeploy-us-east-1.s3.us-east-1.amazonaws.com/latest/install
+wget https://aws-codedeploy-${AWS_REGION}.s3.${AWS_REGION}.amazonaws.com/latest/install
 chmod +x ./install
 ./install auto
 systemctl start codedeploy-agent
@@ -348,11 +348,11 @@ EOF
    echo "✅ Auto Scaling Group and launch template created"
    ```
 
-   The user data script installs the CodeDeploy agent and sets up a basic web server. The Auto Scaling Group maintains desired capacity and automatically replaces unhealthy instances during deployments.
+   The user data script installs the CodeDeploy agent using a region-agnostic URL and sets up a basic web server. The Auto Scaling Group maintains desired capacity and automatically replaces unhealthy instances during deployments, providing resilient compute infrastructure for the blue-green deployment process.
 
 4. **Create CodeCommit Repository and Sample Application**:
 
-   CodeCommit provides secure, scalable Git repository hosting for your application source code. The repository stores the application code along with deployment configuration files needed for CodeDeploy.
+   CodeCommit provides secure, scalable Git repository hosting with integrated AWS service authentication. The repository stores application source code along with deployment configuration files, including the appspec.yml file that defines deployment hooks and file mappings. This centralized source control enables automated CI/CD workflows where code changes trigger builds and deployments through the pipeline.
 
    ```bash
    # Create CodeCommit repository
@@ -367,7 +367,7 @@ EOF
    # Create sample application files
    mkdir -p scripts
    
-   # Create application specification file
+   # Create application specification file for CodeDeploy
    cat > appspec.yml << 'EOF'
 version: 0.0
 os: linux
@@ -394,7 +394,7 @@ hooks:
       runas: root
 EOF
    
-   # Create application HTML file
+   # Create sample web application
    cat > index.html << 'EOF'
 <!DOCTYPE html>
 <html>
@@ -427,7 +427,7 @@ EOF
 </html>
 EOF
    
-   # Create deployment scripts
+   # Create deployment lifecycle scripts
    cat > scripts/install_dependencies.sh << 'EOF'
 #!/bin/bash
 yum update -y
@@ -453,17 +453,17 @@ EOF
    
    chmod +x scripts/*.sh
    
-   # Create buildspec for CodeBuild
+   # Create buildspec for CodeBuild with updated runtime
    cat > buildspec.yml << 'EOF'
 version: 0.2
 phases:
   install:
     runtime-versions:
-      nodejs: 14
+      nodejs: 20
   pre_build:
     commands:
-      - echo Logging in to Amazon ECR...
       - echo Build started on `date`
+      - echo Logging in to Amazon ECR...
   build:
     commands:
       - echo Build completed on `date`
@@ -482,9 +482,11 @@ EOF
    echo "✅ CodeCommit repository created with sample application"
    ```
 
+   The appspec.yml file defines the deployment lifecycle with hooks for dependency installation, service management, and validation. The deployment scripts ensure proper application lifecycle management during blue-green deployments, enabling automated service startup, validation, and cleanup processes.
+
 5. **Create CodeBuild Project**:
 
-   CodeBuild provides fully managed build services that compile source code, run tests, and produce deployable artifacts. In our CI/CD pipeline, CodeBuild serves as the crucial bridge between source code commits and deployment artifacts, automatically triggering builds when code changes are detected in CodeCommit. This serverless build service scales automatically based on demand and only charges for build time usage, making it cost-effective for teams of any size.
+   CodeBuild provides fully managed build services that compile source code, run tests, and produce deployable artifacts. The build service uses the latest Amazon Linux container image and Node.js runtime, ensuring builds execute in a consistent, secure environment. CodeBuild integrates seamlessly with CodeCommit for source retrieval and S3 for artifact storage, creating the crucial bridge between source code and deployment artifacts in the CI/CD pipeline.
 
    ```bash
    # Create CodeBuild service role
@@ -535,22 +537,22 @@ EOF
    export ARTIFACTS_BUCKET_NAME="codedeploy-artifacts-${RANDOM_SUFFIX}"
    aws s3 mb s3://$ARTIFACTS_BUCKET_NAME
    
-   # Create CodeBuild project
+   # Create CodeBuild project with current image
    aws codebuild create-project \
        --name $BUILD_PROJECT_NAME \
        --source type=CODECOMMIT,location=https://codecommit.${AWS_REGION}.amazonaws.com/v1/repos/${REPO_NAME} \
        --artifacts type=S3,location=${ARTIFACTS_BUCKET_NAME}/artifacts \
-       --environment type=LINUX_CONTAINER,image=aws/codebuild/amazonlinux2-x86_64-standard:3.0,computeType=BUILD_GENERAL1_SMALL \
+       --environment type=LINUX_CONTAINER,image=aws/codebuild/amazonlinux-x86_64-standard:5.0,computeType=BUILD_GENERAL1_SMALL \
        --service-role arn:aws:iam::${AWS_ACCOUNT_ID}:role/CodeBuildServiceRole
    
    echo "✅ CodeBuild project created"
    ```
 
-   The CodeBuild project is now configured with the necessary IAM permissions to access CodeCommit repositories and store build artifacts in S3. The build specification (buildspec.yml) defines the build phases and artifact outputs, enabling automated compilation and packaging of your application code. This foundation enables consistent, repeatable builds that feed directly into the deployment pipeline. See the [CodeBuild User Guide](https://docs.aws.amazon.com/codebuild/latest/userguide/build-spec-ref.html) for advanced build configuration options.
+   The CodeBuild project uses the latest Amazon Linux 2023 image with Node.js 20 runtime, ensuring builds execute with current tools and security patches. The build specification defines build phases and artifact outputs, enabling automated compilation and packaging of application code with consistent, repeatable results. Learn more about [CodeBuild build specifications](https://docs.aws.amazon.com/codebuild/latest/userguide/build-spec-ref.html) for advanced build configuration options.
 
 6. **Create CodeDeploy Application and Deployment Group**:
 
-   CodeDeploy applications define the deployment target and configuration settings for your application deployments. The deployment group specifies which instances receive the deployment and defines the deployment strategy (blue-green, in-place, etc.). This configuration is critical for ensuring zero-downtime deployments and automatic rollback capabilities. The blue-green deployment configuration creates a parallel environment, validates the new deployment, and switches traffic only after successful validation.
+   CodeDeploy applications define the deployment target and configuration settings for application deployments. The deployment group specifies which instances receive deployments and defines the blue-green deployment strategy with automatic instance provisioning and traffic switching. This configuration enables zero-downtime deployments by creating parallel environments, validating new deployments, and switching traffic only after successful validation.
 
    ```bash
    # Create CodeDeploy application
@@ -588,11 +590,11 @@ EOF
    echo "✅ CodeDeploy application and deployment group created"
    ```
 
-   The CodeDeploy application and deployment group are now configured for blue-green deployments with automatic instance provisioning and traffic switching. The deployment configuration specifies that new instances are created (green environment) while maintaining the existing instances (blue environment) until the deployment is validated. This setup ensures zero-downtime deployments and provides immediate rollback capabilities if issues arise. Learn more about [deployment configurations](https://docs.aws.amazon.com/codedeploy/latest/userguide/deployment-groups.html) in the CodeDeploy documentation.
+   The CodeDeploy application and deployment group are configured for blue-green deployments with the "AllAtOnceBlueGreen" strategy, which provisions new instances (green environment) while maintaining existing instances (blue environment) until deployment validation completes. This setup ensures zero-downtime deployments and provides immediate rollback capabilities. Learn more about [CodeDeploy deployment configurations](https://docs.aws.amazon.com/codedeploy/latest/userguide/deployment-configurations.html) for different deployment strategies.
 
 7. **Trigger Initial Build and Deployment**:
 
-   With all infrastructure components in place, we can now trigger the complete CI/CD pipeline workflow. This step demonstrates the end-to-end automation from source code to production deployment. The build process creates deployment artifacts from your source code, while the deployment process uses these artifacts to perform a blue-green deployment. This initial deployment validates that your entire pipeline is working correctly and establishes the baseline production environment.
+   With all infrastructure components configured, we can now execute the complete CI/CD pipeline workflow. This demonstrates end-to-end automation from source code to production deployment, validating that CodeBuild successfully creates deployment artifacts and CodeDeploy orchestrates the blue-green deployment process. The initial deployment establishes the baseline production environment and validates pipeline functionality.
 
    ```bash
    # Start CodeBuild build
@@ -606,7 +608,7 @@ EOF
    echo "Waiting for build to complete..."
    aws codebuild wait build-succeeded --ids $BUILD_ID
    
-   # Create deployment
+   # Create deployment using build artifacts
    aws deploy create-deployment \
        --application-name $APP_NAME \
        --deployment-group-name $DEPLOYMENT_GROUP_NAME \
@@ -617,11 +619,11 @@ EOF
    echo "✅ Initial deployment triggered"
    ```
 
-   The initial deployment has been successfully triggered and your application is now running in the blue-green deployment configuration. This process demonstrated the seamless coordination between CodeBuild creating deployment artifacts and CodeDeploy orchestrating the deployment. The blue-green deployment strategy ensures that your application remains available throughout the deployment process, with automatic validation and rollback capabilities built-in.
+   The initial deployment demonstrates seamless coordination between CodeBuild artifact creation and CodeDeploy orchestration. The blue-green deployment strategy ensures application availability throughout the deployment process, with automatic validation and rollback capabilities providing production-grade reliability and safety.
 
 8. **Configure CloudWatch Monitoring and Alarms**:
 
-   CloudWatch monitoring and alarms provide the observability layer essential for production deployments. These alarms monitor key metrics such as deployment success rates, application health, and target group health to automatically trigger rollbacks when issues are detected. Proactive monitoring reduces mean time to recovery (MTTR) and ensures that deployment failures are caught and resolved quickly. The integration with CodeDeploy's automatic rollback feature creates a self-healing deployment system that maintains application availability.
+   CloudWatch monitoring and alarms provide essential observability for production deployments, automatically detecting deployment failures and application health issues. These alarms integrate with CodeDeploy's rollback mechanisms to create self-healing deployment systems that maintain application availability. Proactive monitoring reduces mean time to recovery (MTTR) by catching and resolving deployment issues before they impact end users.
 
    ```bash
    # Create CloudWatch alarm for deployment failures
@@ -635,7 +637,6 @@ EOF
        --threshold 1 \
        --comparison-operator GreaterThanOrEqualToThreshold \
        --evaluation-periods 1 \
-       --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:codedeploy-alerts \
        --dimensions Name=ApplicationName,Value=$APP_NAME Name=DeploymentGroupName,Value=$DEPLOYMENT_GROUP_NAME
    
    # Create CloudWatch alarm for application health
@@ -651,18 +652,19 @@ EOF
        --evaluation-periods 2 \
        --dimensions Name=TargetGroup,Value=$(basename $TG_BLUE_ARN) Name=LoadBalancer,Value=$(basename $ALB_ARN)
    
-   
-   > **Tip**: Configure CloudWatch alarms with appropriate thresholds to balance between early warning and false positive alerts.
+   echo "✅ CloudWatch monitoring and alarms configured"
    ```
 
-   The CloudWatch alarms are now monitoring critical deployment and application metrics, providing automated health checks that integrate with CodeDeploy's rollback mechanisms. These alarms serve as the early warning system for deployment issues, enabling automatic rollback before problems impact end users. The combination of deployment failure monitoring and target group health monitoring creates comprehensive coverage for both the deployment process and application performance.
+   The CloudWatch alarms monitor critical deployment and application metrics, providing automated health checks that integrate with CodeDeploy's rollback mechanisms. These alarms create comprehensive coverage for deployment process monitoring and application performance validation.
+
+   > **Tip**: Configure CloudWatch alarms with appropriate thresholds to balance between early warning and false positive alerts. Consider adding custom application metrics for business-specific monitoring.
 
 9. **Create Automated Rollback Configuration**:
 
-   Automated rollback configuration is a critical safety mechanism that automatically reverts deployments when failures or performance degradations are detected. This configuration links CloudWatch alarms with CodeDeploy's rollback capabilities, creating an automated safety net that responds to deployment failures, instance failures, or alarm threshold breaches. The rollback process restores the previous stable version of your application, ensuring minimal downtime and user impact. This automation is essential for maintaining high availability in production environments.
+   Automated rollback configuration creates a critical safety mechanism that automatically reverts deployments when failures or performance degradations are detected. This configuration links CloudWatch alarms with CodeDeploy's rollback capabilities, creating an automated safety net that responds to deployment failures, instance failures, or alarm threshold breaches, ensuring minimal downtime and maintaining application availability in production environments.
 
    ```bash
-   # Update deployment group with rollback configuration
+   # Update deployment group with automated rollback configuration
    aws deploy update-deployment-group \
        --application-name $APP_NAME \
        --current-deployment-group-name $DEPLOYMENT_GROUP_NAME \
@@ -685,17 +687,17 @@ EOF
    echo "✅ Automated rollback configuration enabled"
    ```
 
-   The automated rollback configuration is now active and will automatically trigger rollbacks based on the CloudWatch alarms we configured. This creates a robust deployment safety net that monitors for deployment failures, instance failures, and alarm threshold breaches. The rollback process maintains application availability by quickly reverting to the last known stable version when issues are detected. This configuration is essential for production environments where deployment reliability is paramount.
+   The automated rollback configuration creates a robust deployment safety net that monitors for deployment failures, instance failures, and alarm threshold breaches. The system automatically triggers rollbacks based on CloudWatch alarms, maintaining application availability by quickly reverting to the last known stable version when issues are detected.
 
 10. **Test Deployment Pipeline with Code Changes**:
 
-    Testing the complete deployment pipeline with real code changes validates that your CI/CD system works end-to-end. This step simulates the typical developer workflow where code changes trigger automatic builds and deployments. The pipeline should demonstrate seamless integration between CodeCommit, CodeBuild, and CodeDeploy, showing how source code changes automatically flow through the build process and deploy to production using the blue-green deployment strategy. This testing validates that your automation is working correctly and ready for production use.
+    Testing the complete deployment pipeline with real code changes validates end-to-end CI/CD system functionality. This simulates the typical developer workflow where code changes trigger automatic builds and deployments, demonstrating seamless integration between CodeCommit, CodeBuild, and CodeDeploy. The pipeline validation ensures the automation works correctly and is ready for production use with built-in reliability features.
 
     ```bash
     # Navigate to repository
     cd $REPO_NAME
     
-    # Create a new version of the application
+    # Create updated application version
     cat > index.html << 'EOF'
 <!DOCTYPE html>
 <html>
@@ -758,7 +760,7 @@ EOF
     echo "✅ Deployment pipeline tested with v3.0"
     ```
 
-    The deployment pipeline has been successfully tested with a new application version, demonstrating the complete automation from code commit to production deployment. This workflow shows how developers can confidently deploy changes knowing that the blue-green deployment strategy and automated rollback mechanisms provide safety nets for production deployments. The successful completion of this test validates that your CI/CD pipeline is ready for production use with built-in reliability and safety features.
+    The deployment pipeline successfully processed the new application version, demonstrating complete automation from code commit to production deployment. The blue-green deployment strategy and automated rollback mechanisms provide safety nets that enable confident deployments with built-in reliability and recovery capabilities.
 
 ## Validation & Testing
 
@@ -843,7 +845,7 @@ EOF
    # Create a failing deployment by introducing errors
    cd $REPO_NAME
    
-   # Create a broken version
+   # Create a broken version for rollback testing
    cat > scripts/validate_service.sh << 'EOF'
 #!/bin/bash
 exit 1  # This will cause validation to fail
@@ -853,7 +855,7 @@ EOF
    git commit -m "Broken version for rollback testing"
    git push origin main
    
-   # Trigger deployment
+   # Trigger deployment that will fail
    export BROKEN_BUILD_ID=$(aws codebuild start-build \
        --project-name $BUILD_PROJECT_NAME \
        --query 'build.id' --output text)
@@ -938,7 +940,7 @@ EOF
    echo "✅ EC2 and Load Balancer resources removed"
    ```
 
-4. **Remove Security Groups and IAM Roles**:
+4. **Remove Security Groups and Key Pair**:
 
    ```bash
    # Delete security groups
@@ -1011,11 +1013,11 @@ EOF
 
 AWS CodeDeploy provides a robust foundation for implementing continuous deployment strategies that minimize risk and maximize application availability. The blue-green deployment pattern implemented in this recipe ensures zero-downtime releases by maintaining two identical environments and gradually shifting traffic from the current version to the new version. This approach allows for immediate rollback capabilities if issues are detected during deployment, significantly reducing the impact of failed deployments on end users.
 
-The integration between CodeCommit, CodeBuild, and CodeDeploy creates a complete continuous integration and deployment pipeline that automates the entire software delivery process. CodeCommit provides secure, scalable source control that integrates seamlessly with other AWS services. CodeBuild handles the build automation, creating deployment artifacts that CodeDeploy can consume. The combination of these services enables teams to implement GitOps workflows where code changes automatically trigger builds and deployments.
+The integration between CodeCommit, CodeBuild, and CodeDeploy creates a complete continuous integration and deployment pipeline that automates the entire software delivery process. CodeCommit provides secure, scalable source control that integrates seamlessly with other AWS services. CodeBuild handles the build automation using current container images and runtime versions, creating deployment artifacts that CodeDeploy can consume. The combination of these services enables teams to implement GitOps workflows where code changes automatically trigger builds and deployments.
 
-Blue-green deployments offer several advantages over traditional in-place deployments, including the ability to test the new version in a production-like environment before switching traffic, instant rollback capabilities, and zero-downtime deployments. However, this approach requires twice the infrastructure resources during deployment, which increases costs temporarily. The automated rollback configuration with CloudWatch alarms provides additional safety nets by monitoring deployment health and automatically reversing failed deployments.
+Blue-green deployments offer several advantages over traditional in-place deployments, including the ability to test the new version in a production-like environment before switching traffic, instant rollback capabilities, and zero-downtime deployments. However, this approach requires twice the infrastructure resources during deployment, which increases costs temporarily. The automated rollback configuration with CloudWatch alarms provides additional safety nets by monitoring deployment health and automatically reversing failed deployments. See the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) for guidance on operational excellence and reliability best practices.
 
-Auto Scaling Groups play a crucial role in blue-green deployments by automatically managing the lifecycle of EC2 instances. When CodeDeploy performs a blue-green deployment, it creates a new Auto Scaling Group with the updated launch template, deploys the application to the new instances, and then gradually shifts traffic using the Application Load Balancer. This approach ensures that the new environment is fully validated before receiving production traffic.
+Auto Scaling Groups play a crucial role in blue-green deployments by automatically managing the lifecycle of EC2 instances. When CodeDeploy performs a blue-green deployment, it creates a new Auto Scaling Group with the updated launch template, deploys the application to the new instances, and then gradually shifts traffic using the Application Load Balancer. This approach ensures that the new environment is fully validated before receiving production traffic. For detailed information about CodeDeploy integration with Auto Scaling, see the [CodeDeploy Auto Scaling integration guide](https://docs.aws.amazon.com/codedeploy/latest/userguide/integrations-aws-auto-scaling.html).
 
 > **Warning**: Blue-green deployments temporarily double your infrastructure costs during deployment. Monitor your AWS billing and ensure you have sufficient capacity limits for running parallel environments.
 
@@ -1035,4 +1037,11 @@ Extend this continuous deployment solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

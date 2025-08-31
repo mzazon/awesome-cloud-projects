@@ -1,0 +1,574 @@
+# Google Cloud Infrastructure Manager Configuration
+# Dynamic Delivery Route Optimization with Maps Platform and BigQuery
+# Recipe ID: a7b9c2d5
+
+terraform:
+  required_providers:
+    google:
+      source: hashicorp/google
+      version: "~> 5.0"
+
+  # Backend configuration for state management
+  backend:
+    gcs:
+      bucket: "${var.project_id}-terraform-state"
+      prefix: "route-optimization"
+
+variables:
+  # Project Configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for the route optimization solution"
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must not be empty"
+
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    validation:
+      condition: contains(["us-central1", "us-east1", "us-west1", "europe-west1", "asia-southeast1"], var.region)
+      error_message: "Region must be a valid Google Cloud region"
+
+  zone:
+    type: string
+    description: "Google Cloud zone for zonal resources"
+    default: "us-central1-a"
+
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be dev, staging, or prod"
+
+  # Resource Configuration
+  dataset_name:
+    type: string
+    description: "BigQuery dataset name for delivery analytics"
+    default: "delivery_analytics"
+
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function"
+    default: "1Gi"
+
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function in seconds"
+    default: "300s"
+
+  # Operational Configuration
+  enable_apis:
+    type: bool
+    description: "Enable required Google Cloud APIs"
+    default: true
+
+  enable_monitoring:
+    type: bool
+    description: "Enable Cloud Monitoring and logging"
+    default: true
+
+  enable_scheduler:
+    type: bool
+    description: "Enable automated route optimization scheduling"
+    default: true
+
+  optimization_schedule:
+    type: string
+    description: "Cron schedule for automated optimization (every 2 hours by default)"
+    default: "0 */2 * * *"
+
+resources:
+  # Enable Required Google Cloud APIs
+  enable_apis:
+    count: var.enable_apis ? 1 : 0
+    for_each:
+      - cloudfunctions.googleapis.com
+      - bigquery.googleapis.com
+      - routeoptimization.googleapis.com
+      - storage.googleapis.com
+      - cloudbuild.googleapis.com
+      - cloudscheduler.googleapis.com
+      - logging.googleapis.com
+      - monitoring.googleapis.com
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: ${each.value}
+      disable_on_destroy: false
+
+  # Cloud Storage Bucket for Route Data and Logs
+  delivery_data_bucket:
+    type: google_storage_bucket
+    properties:
+      name: "${var.project_id}-delivery-data"
+      location: ${var.region}
+      project: ${var.project_id}
+      
+      # Storage configuration
+      storage_class: "STANDARD"
+      uniform_bucket_level_access: true
+      
+      # Versioning for data protection
+      versioning:
+        enabled: true
+      
+      # Lifecycle management for cost optimization
+      lifecycle_rule:
+        - action:
+            type: "SetStorageClass"
+            storage_class: "NEARLINE"
+          condition:
+            age: 30
+        - action:
+            type: "SetStorageClass"
+            storage_class: "COLDLINE"
+          condition:
+            age: 90
+        - action:
+            type: "Delete"
+          condition:
+            age: 365
+      
+      # Labels for resource management
+      labels:
+        environment: ${var.environment}
+        purpose: "route-optimization"
+        component: "data-storage"
+    depends_on:
+      - enable_apis
+
+  # Create bucket folders for organized data storage
+  bucket_folders:
+    for_each:
+      - "route-requests"
+      - "route-responses"
+      - "logs"
+      - "historical-data"
+    type: google_storage_bucket_object
+    properties:
+      name: "${each.value}/README.txt"
+      bucket: ${delivery_data_bucket.name}
+      content: "${each.value} data folder for route optimization system"
+      content_type: "text/plain"
+
+  # BigQuery Dataset for Delivery Analytics
+  delivery_analytics_dataset:
+    type: google_bigquery_dataset
+    properties:
+      dataset_id: ${var.dataset_name}
+      project: ${var.project_id}
+      location: ${var.region}
+      
+      description: "Delivery and route optimization analytics dataset"
+      
+      # Access control
+      access:
+        - role: "OWNER"
+          user_by_email: "serviceAccount:${route_optimizer_function_sa.email}"
+        - role: "WRITER"
+          user_by_email: "serviceAccount:${route_optimizer_function_sa.email}"
+      
+      # Data retention and deletion
+      default_table_expiration_ms: 31536000000  # 1 year
+      
+      # Labels for resource management
+      labels:
+        environment: ${var.environment}
+        purpose: "route-optimization"
+        component: "analytics"
+    depends_on:
+      - enable_apis
+
+  # BigQuery Table: Delivery History
+  delivery_history_table:
+    type: google_bigquery_table
+    properties:
+      dataset_id: ${delivery_analytics_dataset.dataset_id}
+      table_id: "delivery_history"
+      project: ${var.project_id}
+      
+      description: "Historical delivery performance data with partitioning and clustering"
+      
+      # Time partitioning for performance
+      time_partitioning:
+        type: "DAY"
+        field: "delivery_date"
+        require_partition_filter: true
+      
+      # Clustering for query optimization
+      clustering: ["delivery_zone", "vehicle_type"]
+      
+      # Schema definition
+      schema: |
+        [
+          {"name": "delivery_id", "type": "STRING", "mode": "REQUIRED", "description": "Unique delivery identifier"},
+          {"name": "delivery_date", "type": "DATE", "mode": "REQUIRED", "description": "Date of delivery"},
+          {"name": "pickup_lat", "type": "FLOAT", "mode": "REQUIRED", "description": "Pickup location latitude"},
+          {"name": "pickup_lng", "type": "FLOAT", "mode": "REQUIRED", "description": "Pickup location longitude"},
+          {"name": "delivery_lat", "type": "FLOAT", "mode": "REQUIRED", "description": "Delivery location latitude"},
+          {"name": "delivery_lng", "type": "FLOAT", "mode": "REQUIRED", "description": "Delivery location longitude"},
+          {"name": "delivery_zone", "type": "STRING", "mode": "REQUIRED", "description": "Delivery zone identifier"},
+          {"name": "vehicle_type", "type": "STRING", "mode": "REQUIRED", "description": "Type of delivery vehicle"},
+          {"name": "delivery_time_minutes", "type": "INTEGER", "mode": "REQUIRED", "description": "Actual delivery time in minutes"},
+          {"name": "distance_km", "type": "FLOAT", "mode": "REQUIRED", "description": "Total delivery distance in kilometers"},
+          {"name": "fuel_cost", "type": "FLOAT", "mode": "REQUIRED", "description": "Fuel cost for delivery"},
+          {"name": "driver_id", "type": "STRING", "mode": "REQUIRED", "description": "Driver identifier"},
+          {"name": "customer_priority", "type": "STRING", "mode": "REQUIRED", "description": "Customer priority level"}
+        ]
+      
+      # Labels for resource management
+      labels:
+        environment: ${var.environment}
+        purpose: "route-optimization"
+        component: "delivery-data"
+
+  # BigQuery Table: Optimized Routes
+  optimized_routes_table:
+    type: google_bigquery_table
+    properties:
+      dataset_id: ${delivery_analytics_dataset.dataset_id}
+      table_id: "optimized_routes"
+      project: ${var.project_id}
+      
+      description: "AI-generated optimized delivery routes with performance metrics"
+      
+      # Time partitioning for performance
+      time_partitioning:
+        type: "DAY"
+        field: "route_date"
+        require_partition_filter: true
+      
+      # Schema definition
+      schema: |
+        [
+          {"name": "route_id", "type": "STRING", "mode": "REQUIRED", "description": "Unique route identifier"},
+          {"name": "route_date", "type": "DATE", "mode": "REQUIRED", "description": "Date of route optimization"},
+          {"name": "vehicle_id", "type": "STRING", "mode": "REQUIRED", "description": "Vehicle identifier"},
+          {"name": "driver_id", "type": "STRING", "mode": "REQUIRED", "description": "Assigned driver identifier"},
+          {"name": "total_stops", "type": "INTEGER", "mode": "REQUIRED", "description": "Total number of delivery stops"},
+          {"name": "estimated_duration_minutes", "type": "INTEGER", "mode": "REQUIRED", "description": "Estimated route duration in minutes"},
+          {"name": "estimated_distance_km", "type": "FLOAT", "mode": "REQUIRED", "description": "Estimated total distance in kilometers"},
+          {"name": "optimization_score", "type": "FLOAT", "mode": "REQUIRED", "description": "Route optimization efficiency score"},
+          {"name": "route_waypoints", "type": "STRING", "mode": "REQUIRED", "description": "JSON string of route waypoints and metadata"}
+        ]
+      
+      # Labels for resource management
+      labels:
+        environment: ${var.environment}
+        purpose: "route-optimization"
+        component: "route-data"
+
+  # BigQuery Views for Analytics
+  delivery_performance_view:
+    type: google_bigquery_table
+    properties:
+      dataset_id: ${delivery_analytics_dataset.dataset_id}
+      table_id: "delivery_performance_view"
+      project: ${var.project_id}
+      
+      description: "Real-time delivery performance metrics and analytics"
+      
+      view:
+        query: |
+          SELECT 
+            delivery_zone,
+            vehicle_type,
+            DATE(delivery_date) as delivery_date,
+            COUNT(*) as total_deliveries,
+            AVG(delivery_time_minutes) as avg_delivery_time,
+            AVG(distance_km) as avg_distance,
+            AVG(fuel_cost) as avg_fuel_cost,
+            SUM(fuel_cost) as total_fuel_cost
+          FROM `${var.project_id}.${var.dataset_name}.delivery_history`
+          WHERE delivery_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          GROUP BY delivery_zone, vehicle_type, DATE(delivery_date)
+          ORDER BY delivery_date DESC, delivery_zone
+        use_legacy_sql: false
+      
+      # Labels for resource management
+      labels:
+        environment: ${var.environment}
+        purpose: "route-optimization"
+        component: "analytics-view"
+
+  route_efficiency_view:
+    type: google_bigquery_table
+    properties:
+      dataset_id: ${delivery_analytics_dataset.dataset_id}
+      table_id: "route_efficiency_view"
+      project: ${var.project_id}
+      
+      description: "Route optimization performance analysis and efficiency metrics"
+      
+      view:
+        query: |
+          SELECT 
+            DATE(route_date) as route_date,
+            COUNT(*) as total_routes,
+            AVG(optimization_score) as avg_optimization_score,
+            AVG(estimated_duration_minutes) as avg_duration,
+            AVG(estimated_distance_km) as avg_distance,
+            AVG(total_stops) as avg_stops_per_route
+          FROM `${var.project_id}.${var.dataset_name}.optimized_routes`
+          WHERE route_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+          GROUP BY DATE(route_date)
+          ORDER BY route_date DESC
+        use_legacy_sql: false
+      
+      # Labels for resource management
+      labels:
+        environment: ${var.environment}
+        purpose: "route-optimization"
+        component: "analytics-view"
+
+  # Service Account for Cloud Function
+  route_optimizer_function_sa:
+    type: google_service_account
+    properties:
+      account_id: "route-optimizer-function"
+      project: ${var.project_id}
+      display_name: "Route Optimizer Cloud Function Service Account"
+      description: "Service account for route optimization Cloud Function with required permissions"
+
+  # IAM Bindings for Service Account
+  bigquery_data_editor_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/bigquery.dataEditor"
+      member: "serviceAccount:${route_optimizer_function_sa.email}"
+
+  bigquery_job_user_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/bigquery.jobUser"
+      member: "serviceAccount:${route_optimizer_function_sa.email}"
+
+  storage_object_admin_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/storage.objectAdmin"
+      member: "serviceAccount:${route_optimizer_function_sa.email}"
+
+  route_optimization_user_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/routeoptimization.user"
+      member: "serviceAccount:${route_optimizer_function_sa.email}"
+
+  # Cloud Function for Route Optimization
+  route_optimizer_function:
+    type: google_cloudfunctions2_function
+    properties:
+      name: "route-optimizer"
+      location: ${var.region}
+      project: ${var.project_id}
+      
+      description: "Serverless function for intelligent delivery route optimization using Maps Platform"
+      
+      build_config:
+        runtime: "python311"
+        entry_point: "optimize_routes"
+        source:
+          storage_source:
+            bucket: ${delivery_data_bucket.name}
+            object: "functions/route-optimizer.zip"
+      
+      service_config:
+        max_instance_count: 100
+        min_instance_count: 0
+        available_memory: ${var.function_memory}
+        timeout_seconds: 300
+        max_instance_request_concurrency: 80
+        available_cpu: "1"
+        
+        # Environment variables
+        environment_variables:
+          PROJECT_ID: ${var.project_id}
+          BUCKET_NAME: ${delivery_data_bucket.name}
+          DATASET_NAME: ${var.dataset_name}
+          REGION: ${var.region}
+        
+        # Service account configuration
+        service_account_email: ${route_optimizer_function_sa.email}
+        
+        # Ingress and security settings
+        ingress_settings: "ALLOW_ALL"
+        all_traffic_on_latest_revision: true
+      
+      # Labels for resource management
+      labels:
+        environment: ${var.environment}
+        purpose: "route-optimization"
+        component: "compute"
+    depends_on:
+      - route_optimizer_function_sa
+      - bigquery_data_editor_binding
+      - bigquery_job_user_binding
+      - storage_object_admin_binding
+      - route_optimization_user_binding
+
+  # Cloud Function IAM for HTTP Access
+  function_invoker_binding:
+    type: google_cloudfunctions2_function_iam_member
+    properties:
+      project: ${var.project_id}
+      location: ${var.region}
+      cloud_function: ${route_optimizer_function.name}
+      role: "roles/cloudfunctions.invoker"
+      member: "allUsers"
+
+  # Cloud Scheduler Job for Automated Optimization
+  automated_optimization_job:
+    count: var.enable_scheduler ? 1 : 0
+    type: google_cloud_scheduler_job
+    properties:
+      name: "optimize-routes-automated"
+      project: ${var.project_id}
+      region: ${var.region}
+      
+      description: "Automated route optimization triggered every 2 hours"
+      schedule: ${var.optimization_schedule}
+      time_zone: "UTC"
+      
+      # HTTP target configuration
+      http_target:
+        uri: ${route_optimizer_function.service_config[0].uri}
+        http_method: "POST"
+        headers:
+          Content-Type: "application/json"
+        body: |
+          {
+            "deliveries": [
+              {"delivery_id": "AUTO001", "lat": 37.7749, "lng": -122.4194, "estimated_minutes": 25, "estimated_km": 3.2},
+              {"delivery_id": "AUTO002", "lat": 37.7849, "lng": -122.4094, "estimated_minutes": 30, "estimated_km": 4.1},
+              {"delivery_id": "AUTO003", "lat": 37.7949, "lng": -122.4294, "estimated_minutes": 35, "estimated_km": 5.8}
+            ],
+            "vehicle_id": "AUTO_VEH001",
+            "driver_id": "AUTO_DRV001",
+            "vehicle_capacity": 10
+          }
+      
+      # Retry configuration
+      retry_config:
+        retry_count: 3
+        max_retry_duration: "600s"
+        min_backoff_duration: "60s"
+        max_backoff_duration: "300s"
+    depends_on:
+      - route_optimizer_function
+      - function_invoker_binding
+
+  # Cloud Monitoring Dashboard (Optional)
+  route_optimization_dashboard:
+    count: var.enable_monitoring ? 1 : 0
+    type: google_monitoring_dashboard
+    properties:
+      project: ${var.project_id}
+      dashboard_json: |
+        {
+          "displayName": "Route Optimization Analytics",
+          "mosaicLayout": {
+            "tiles": [
+              {
+                "width": 6,
+                "height": 4,
+                "widget": {
+                  "title": "Function Invocations",
+                  "xyChart": {
+                    "dataSets": [
+                      {
+                        "timeSeriesQuery": {
+                          "timeSeriesFilter": {
+                            "filter": "resource.type=\"cloud_function\" AND resource.labels.function_name=\"route-optimizer\"",
+                            "aggregation": {
+                              "alignmentPeriod": "60s",
+                              "perSeriesAligner": "ALIGN_RATE",
+                              "crossSeriesReducer": "REDUCE_SUM"
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "width": 6,
+                "height": 4,
+                "xPos": 6,
+                "widget": {
+                  "title": "BigQuery Slot Usage",
+                  "xyChart": {
+                    "dataSets": [
+                      {
+                        "timeSeriesQuery": {
+                          "timeSeriesFilter": {
+                            "filter": "resource.type=\"bigquery_project\"",
+                            "aggregation": {
+                              "alignmentPeriod": "60s",
+                              "perSeriesAligner": "ALIGN_MEAN"
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+
+# Outputs for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+
+  storage_bucket_name:
+    description: "Cloud Storage bucket for route data"
+    value: ${delivery_data_bucket.name}
+
+  bigquery_dataset_id:
+    description: "BigQuery dataset for delivery analytics"
+    value: ${delivery_analytics_dataset.dataset_id}
+
+  function_name:
+    description: "Cloud Function name for route optimization"
+    value: ${route_optimizer_function.name}
+
+  function_url:
+    description: "Cloud Function HTTP trigger URL"
+    value: ${route_optimizer_function.service_config[0].uri}
+
+  service_account_email:
+    description: "Service account email for the route optimizer function"
+    value: ${route_optimizer_function_sa.email}
+
+  scheduler_job_name:
+    description: "Cloud Scheduler job name for automated optimization"
+    value: var.enable_scheduler ? ${automated_optimization_job[0].name} : "disabled"
+
+  delivery_performance_view:
+    description: "BigQuery view for delivery performance analytics"
+    value: "${var.project_id}.${var.dataset_name}.delivery_performance_view"
+
+  route_efficiency_view:
+    description: "BigQuery view for route efficiency analytics"
+    value: "${var.project_id}.${var.dataset_name}.route_efficiency_view"
+
+  estimated_monthly_cost:
+    description: "Estimated monthly cost for the solution (USD)"
+    value: "$15-25 for testing, $100-500 for production depending on usage"

@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: CodeArtifact, IAM, KMS
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, codeartifact, artifact-management, packages, security
 recipe-generator-version: 1.3
@@ -81,9 +81,9 @@ graph TB
 3. Node.js and npm installed (for testing npm packages)
 4. Python and pip installed (for testing Python packages)
 5. Basic understanding of package management concepts
-6. Estimated cost: $0.50-$2.00 per GB stored + $0.05 per request (first 100GB free tier)
+6. Estimated cost: $0.024 per GB stored + $0.06 per 1,000 requests (includes Free Tier: 2GB storage + 100,000 requests monthly)
 
-> **Note**: CodeArtifact charges for storage and requests. Most testing scenarios remain within free tier limits.
+> **Note**: CodeArtifact charges for storage and requests. Most testing scenarios remain within free tier limits of 2GB storage and 100,000 requests per month.
 
 > **Warning**: Always configure proper IAM policies before production use. Overly permissive policies can expose sensitive packages or allow unauthorized publishing. See [CodeArtifact IAM documentation](https://docs.aws.amazon.com/codeartifact/latest/ug/security-iam.html) for security best practices.
 
@@ -117,7 +117,7 @@ echo "Region: ${AWS_REGION}"
 
 1. **Create CodeArtifact Domain**:
 
-   A CodeArtifact domain serves as the top-level container for your artifact repositories and provides a namespace for organizing packages across your organization. Domains enable centralized management of authentication, authorization, and encryption policies while supporting cross-repository package sharing. Understanding domain concepts is fundamental to implementing enterprise-grade artifact management strategies.
+   A CodeArtifact domain serves as the top-level container for your artifact repositories and provides a namespace for organizing packages across your organization. Domains enable centralized management of authentication, authorization, and encryption policies while supporting cross-repository package sharing. Understanding domain concepts is fundamental to implementing enterprise-grade artifact management strategies following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
    ```bash
    # Create the domain for artifact management
@@ -131,7 +131,7 @@ echo "Region: ${AWS_REGION}"
    echo "✅ Created CodeArtifact domain: ${DOMAIN_NAME}"
    ```
 
-   The domain is now established and ready to host multiple repositories with shared governance policies. This foundational step enables all subsequent repository creation and establishes the security boundary for your artifact management infrastructure.
+   The domain is now established and ready to host multiple repositories with shared governance policies. This foundational step enables all subsequent repository creation and establishes the security boundary for your artifact management infrastructure with automatic KMS encryption for data at rest.
 
 2. **Create Repository Hierarchy**:
 
@@ -300,7 +300,7 @@ echo "Region: ${AWS_REGION}"
 
 6. **Configure Package Manager Authentication**:
 
-   Authentication tokens provide temporary, secure access to CodeArtifact repositories and automatically configure package managers to use your private repositories instead of public ones. The login command generates time-limited tokens and updates package manager configurations, eliminating the need for long-lived credentials. This approach supports automated CI/CD workflows while maintaining security through token rotation. Learn more about [CodeArtifact authentication](https://docs.aws.amazon.com/codeartifact/latest/ug/tokens-authentication.html) and token management.
+   Authentication tokens provide temporary, secure access to CodeArtifact repositories and automatically configure package managers to use your private repositories instead of public ones. The login command generates time-limited tokens (12 hours by default) and updates package manager configurations, eliminating the need for long-lived credentials. This approach supports automated CI/CD workflows while maintaining security through token rotation. Learn more about [CodeArtifact authentication](https://docs.aws.amazon.com/codeartifact/latest/ug/tokens-authentication.html) and token management.
 
    ```bash
    # Configure npm to use CodeArtifact
@@ -320,7 +320,7 @@ echo "Region: ${AWS_REGION}"
    echo "✅ Configured npm and pip authentication"
    ```
 
-   Package managers are now authenticated and configured to use your private repositories. The generated tokens provide secure, temporary access that will automatically expire, requiring periodic re-authentication for enhanced security.
+   Package managers are now authenticated and configured to use your private repositories. The generated tokens provide secure, temporary access that will automatically expire after 12 hours, requiring periodic re-authentication for enhanced security.
 
 7. **Test Package Installation from Public Repositories**:
 
@@ -328,20 +328,10 @@ echo "Region: ${AWS_REGION}"
 
    ```bash
    # Test npm package installation (lodash from npmjs)
-   npm install lodash --registry \
-       $(aws codeartifact get-repository-endpoint \
-           --domain ${DOMAIN_NAME} \
-           --domain-owner ${DOMAIN_OWNER} \
-           --repository ${TEAM_REPO} \
-           --format npm --query repositoryEndpoint --output text)
+   npm install lodash
    
    # Test pip package installation (requests from PyPI)
-   pip install requests \
-       --index-url $(aws codeartifact get-repository-endpoint \
-           --domain ${DOMAIN_NAME} \
-           --domain-owner ${DOMAIN_OWNER} \
-           --repository ${TEAM_REPO} \
-           --format pypi --query repositoryEndpoint --output text)simple/
+   pip install requests
    
    echo "✅ Successfully installed packages from public repositories"
    ```
@@ -383,12 +373,7 @@ echo "Region: ${AWS_REGION}"
    EOF
    
    # Publish the package to CodeArtifact
-   npm publish --registry \
-       $(aws codeartifact get-repository-endpoint \
-           --domain ${DOMAIN_NAME} \
-           --domain-owner ${DOMAIN_OWNER} \
-           --repository ${TEAM_REPO} \
-           --format npm --query repositoryEndpoint --output text)
+   npm publish
    
    cd ..
    
@@ -534,9 +519,9 @@ echo "Region: ${AWS_REGION}"
    npm config delete registry
    npm config delete @mycompany:registry
    
-   # Reset pip configuration
-   pip config unset global.index-url
-   pip config unset global.trusted-host
+   # Reset pip configuration (if pip config command exists)
+   pip config unset global.index-url 2>/dev/null || true
+   pip config unset global.trusted-host 2>/dev/null || true
    
    echo "✅ Reset package manager configurations"
    ```
@@ -618,30 +603,37 @@ echo "Region: ${AWS_REGION}"
 
 ## Discussion
 
-AWS CodeArtifact addresses critical challenges in enterprise artifact management by providing a centralized, secure repository service that integrates seamlessly with existing development workflows. The hierarchical repository structure enables sophisticated package promotion workflows, where packages can be tested in development repositories before being promoted to production environments.
+AWS CodeArtifact addresses critical challenges in enterprise artifact management by providing a centralized, secure repository service that integrates seamlessly with existing development workflows. The hierarchical repository structure enables sophisticated package promotion workflows, where packages can be tested in development repositories before being promoted to production environments following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
-The upstream repository feature creates a powerful caching and governance layer. When developers request packages, CodeArtifact checks local repositories first, then upstream repositories, and finally external connections. This approach reduces dependency on external services while maintaining access to the full ecosystem of open-source packages. The external connections feature ensures that commonly used packages are cached locally, improving build performance and reliability.
+The upstream repository feature creates a powerful caching and governance layer. When developers request packages, CodeArtifact checks local repositories first, then upstream repositories, and finally external connections. This approach reduces dependency on external services while maintaining access to the full ecosystem of open-source packages. The external connections feature ensures that commonly used packages are cached locally, improving build performance and reliability while supporting the Reliability pillar of the Well-Architected Framework.
 
-Security is enhanced through fine-grained IAM integration and repository policies. Organizations can control who can publish packages, consume packages, and manage repository configurations. The integration with AWS KMS provides encryption at rest, while authorization tokens ensure secure access during package operations. Repository policies enable cross-account sharing scenarios, allowing organizations to maintain separate AWS accounts for different environments while sharing approved packages.
+Security is enhanced through fine-grained IAM integration and repository policies that implement the Security pillar principles. Organizations can control who can publish packages, consume packages, and manage repository configurations. The integration with AWS KMS provides encryption at rest, while authorization tokens ensure secure access during package operations. Repository policies enable cross-account sharing scenarios, allowing organizations to maintain separate AWS accounts for different environments while sharing approved packages.
 
-The cost model is particularly attractive for organizations with variable artifact usage patterns. Unlike traditional artifact repositories that require dedicated infrastructure, CodeArtifact scales automatically and charges only for storage and requests. The service's integration with other AWS services, such as CodeBuild and CodePipeline, creates comprehensive DevOps workflows that can automate package publishing and deployment processes.
+The cost model is particularly attractive for organizations with variable artifact usage patterns. Unlike traditional artifact repositories that require dedicated infrastructure, CodeArtifact scales automatically and charges only for storage ($0.024/GB) and requests ($0.06/1,000 requests). The service's integration with other AWS services, such as [CodeBuild](https://docs.aws.amazon.com/codebuild/latest/userguide/welcome.html) and [CodePipeline](https://docs.aws.amazon.com/codepipeline/latest/userguide/welcome.html), creates comprehensive DevOps workflows that can automate package publishing and deployment processes.
 
-> **Tip**: Use repository naming conventions that reflect your promotion workflow, such as "team-dev", "integration-test", and "production" to clearly indicate the intended usage and access patterns. Consider implementing automated promotion policies using AWS CodePipeline to enforce quality gates and approval processes.
+> **Tip**: Use repository naming conventions that reflect your promotion workflow, such as "team-dev", "integration-test", and "production" to clearly indicate the intended usage and access patterns. Consider implementing automated promotion policies using AWS CodePipeline to enforce quality gates and approval processes following [DevOps best practices](https://docs.aws.amazon.com/wellarchitected/latest/operational-excellence-pillar/welcome.html).
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Region Artifact Distribution**: Configure CodeArtifact repositories in multiple AWS regions with cross-region replication strategies for global development teams.
+1. **Multi-Region Artifact Distribution**: Configure CodeArtifact repositories in multiple AWS regions with cross-region replication strategies for global development teams and improved disaster recovery.
 
 2. **Automated Package Scanning**: Integrate with Amazon Inspector or third-party security scanning tools to automatically scan packages for vulnerabilities before allowing them in production repositories.
 
 3. **CI/CD Integration**: Create CodePipeline workflows that automatically publish packages to CodeArtifact after successful builds and tests, implementing automated promotion between repository tiers.
 
-4. **Package Lifecycle Management**: Implement automated policies to archive old package versions, manage retention periods, and cleanup unused packages to optimize storage costs.
+4. **Package Lifecycle Management**: Implement automated policies using Lambda functions to archive old package versions, manage retention periods, and cleanup unused packages to optimize storage costs.
 
-5. **Advanced Analytics and Monitoring**: Create CloudWatch dashboards to track package usage, download patterns, and repository health metrics for better visibility into artifact consumption patterns.
+5. **Advanced Analytics and Monitoring**: Create CloudWatch dashboards to track package usage, download patterns, and repository health metrics for better visibility into artifact consumption patterns and cost optimization opportunities.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

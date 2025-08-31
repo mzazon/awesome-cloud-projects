@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Document AI, Cloud Workflows, Cloud Storage, Eventarc
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: document-processing, ai-ml, workflow-orchestration, event-driven, automation
 recipe-generator-version: 1.3
@@ -342,7 +342,7 @@ EOF
    gcloud workflows deploy document-validation-workflow \
        --source=document-validation-workflow.yaml \
        --location=${REGION} \
-       --env-vars="FORM_PROCESSOR_ID=${FORM_PROCESSOR_ID},INVOICE_PROCESSOR_ID=${INVOICE_PROCESSOR_ID},VALID_BUCKET=${VALID_BUCKET},INVALID_BUCKET=${INVALID_BUCKET},REVIEW_BUCKET=${REVIEW_BUCKET},DATASET_NAME=${DATASET_NAME}"
+       --set-env-vars="FORM_PROCESSOR_ID=${FORM_PROCESSOR_ID},INVOICE_PROCESSOR_ID=${INVOICE_PROCESSOR_ID},VALID_BUCKET=${VALID_BUCKET},INVALID_BUCKET=${INVALID_BUCKET},REVIEW_BUCKET=${REVIEW_BUCKET},DATASET_NAME=${DATASET_NAME}"
    
    # Get workflow details
    export WORKFLOW_NAME="document-validation-workflow"
@@ -622,4 +622,9 @@ Extend this document validation solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

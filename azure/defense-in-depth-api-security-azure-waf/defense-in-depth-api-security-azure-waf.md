@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure API Management, Azure Web Application Firewall, Azure Application Gateway, Azure Private Link
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: zero-trust, api-security, waf, application-gateway, private-link, threat-protection
 recipe-generator-version: 1.3
@@ -196,70 +196,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
    The monitoring foundation is established with centralized logging and application performance monitoring. This creates the observability layer required for zero-trust security monitoring, enabling detection of anomalous behavior, security incidents, and performance issues across the entire API security stack.
 
-3. **Create API Management Service with Virtual Network Integration**:
-
-   Azure API Management serves as the central policy enforcement point in zero-trust architecture, applying authentication, authorization, rate limiting, and transformation policies to all API requests. Deploying API Management in internal mode within the virtual network ensures that APIs are not directly accessible from the internet, requiring all traffic to flow through the Application Gateway security controls.
-
-   ```bash
-   # Create API Management service (this takes 20-30 minutes)
-   az apim create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${APIM_NAME} \
-       --publisher-email "admin@contoso.com" \
-       --publisher-name "Contoso API Security" \
-       --sku-name Standard \
-       --location ${LOCATION} \
-       --enable-managed-identity \
-       --virtual-network Internal \
-       --subnet-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/${VNET_NAME}/subnets/apim-subnet"
-   
-   # Wait for API Management provisioning
-   az apim wait \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${APIM_NAME} \
-       --created \
-       --timeout 2400
-   
-   # Get API Management gateway URL
-   APIM_GATEWAY_URL=$(az apim show \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${APIM_NAME} \
-       --query gatewayUrl --output tsv)
-   
-   echo "✅ API Management created with internal virtual network integration"
-   ```
-
-   API Management is now deployed in internal mode, accessible only through the private network. This configuration enforces zero-trust principles by eliminating direct internet access to APIs and requiring all traffic to pass through the Application Gateway's security controls, creating a secure API gateway architecture.
-
-4. **Configure Application Insights Integration**:
-
-   Integrating Application Insights with API Management enables comprehensive monitoring of API performance, security events, and user behavior patterns. This integration provides the telemetry data necessary for zero-trust security monitoring, allowing security teams to identify threats, monitor compliance, and optimize API performance based on real-world usage patterns.
-
-   ```bash
-   # Create Application Insights logger in API Management
-   az apim logger create \
-       --resource-group ${RESOURCE_GROUP} \
-       --service-name ${APIM_NAME} \
-       --logger-id appInsights \
-       --logger-type applicationInsights \
-       --description "Application Insights Logger" \
-       --credentials "instrumentationKey=${APPINSIGHTS_KEY}"
-   
-   # Enable diagnostic logging for API Management
-   az apim diagnostic create \
-       --resource-group ${RESOURCE_GROUP} \
-       --service-name ${APIM_NAME} \
-       --diagnostic-id applicationinsights \
-       --logger-id appInsights \
-       --always-log allErrors \
-       --sampling-percentage 100
-   
-   echo "✅ Application Insights integration configured for comprehensive monitoring"
-   ```
-
-   API Management now streams security and performance telemetry to Application Insights, providing real-time visibility into API operations. This monitoring foundation enables security teams to detect anomalies, track security events, and maintain compliance with zero-trust security principles through continuous monitoring and analysis.
-
-5. **Create Web Application Firewall Policy**:
+3. **Create Web Application Firewall Policy**:
 
    Azure Web Application Firewall provides the first line of defense against web-based attacks, implementing OWASP Core Rule Set protections and custom security rules. The WAF policy enforces zero-trust security by inspecting all incoming requests before they reach API Management, blocking malicious traffic patterns and protecting against common web vulnerabilities.
 
@@ -298,6 +235,70 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
    The WAF policy is configured with comprehensive threat protection including OWASP Core Rule Set for common web vulnerabilities, rate limiting to prevent abuse, and prevention mode to actively block malicious requests. This creates a robust security perimeter that aligns with zero-trust principles of never trusting, always verifying.
 
+4. **Create API Management Service with Virtual Network Integration**:
+
+   Azure API Management serves as the central policy enforcement point in zero-trust architecture, applying authentication, authorization, rate limiting, and transformation policies to all API requests. Deploying API Management in internal mode within the virtual network ensures that APIs are not directly accessible from the internet, requiring all traffic to flow through the Application Gateway security controls.
+
+   ```bash
+   # Create API Management service (this takes 20-30 minutes)
+   az apim create \
+       --resource-group ${RESOURCE_GROUP} \
+       --name ${APIM_NAME} \
+       --publisher-email "admin@contoso.com" \
+       --publisher-name "Contoso API Security" \
+       --sku-name Standard \
+       --location ${LOCATION} \
+       --enable-managed-identity \
+       --virtual-network Internal \
+       --vnet-name ${VNET_NAME} \
+       --vnet-subnet apim-subnet
+   
+   # Wait for API Management provisioning
+   az apim wait \
+       --resource-group ${RESOURCE_GROUP} \
+       --name ${APIM_NAME} \
+       --created \
+       --timeout 2400
+   
+   # Get API Management gateway URL
+   APIM_GATEWAY_URL=$(az apim show \
+       --resource-group ${RESOURCE_GROUP} \
+       --name ${APIM_NAME} \
+       --query gatewayUrl --output tsv)
+   
+   echo "✅ API Management created with internal virtual network integration"
+   ```
+
+   API Management is now deployed in internal mode, accessible only through the private network. This configuration enforces zero-trust principles by eliminating direct internet access to APIs and requiring all traffic to pass through the Application Gateway's security controls, creating a secure API gateway architecture.
+
+5. **Configure Application Insights Integration**:
+
+   Integrating Application Insights with API Management enables comprehensive monitoring of API performance, security events, and user behavior patterns. This integration provides the telemetry data necessary for zero-trust security monitoring, allowing security teams to identify threats, monitor compliance, and optimize API performance based on real-world usage patterns.
+
+   ```bash
+   # Create Application Insights logger in API Management
+   az apim logger create \
+       --resource-group ${RESOURCE_GROUP} \
+       --service-name ${APIM_NAME} \
+       --logger-id appInsights \
+       --logger-type applicationInsights \
+       --description "Application Insights Logger" \
+       --credentials "instrumentationKey=${APPINSIGHTS_KEY}"
+   
+   # Enable diagnostic logging for API Management
+   az apim diagnostic create \
+       --resource-group ${RESOURCE_GROUP} \
+       --service-name ${APIM_NAME} \
+       --diagnostic-id applicationinsights \
+       --logger-id appInsights \
+       --always-log allErrors \
+       --sampling-percentage 100
+   
+   echo "✅ Application Insights integration configured for comprehensive monitoring"
+   ```
+
+   API Management now streams security and performance telemetry to Application Insights, providing real-time visibility into API operations. This monitoring foundation enables security teams to detect anomalies, track security events, and maintain compliance with zero-trust security principles through continuous monitoring and analysis.
+
 6. **Create Application Gateway with WAF Integration**:
 
    Azure Application Gateway serves as the secure entry point for all API traffic, providing SSL termination, load balancing, and WAF protection. This configuration creates a secure reverse proxy that terminates public internet connections and forwards verified traffic to API Management through private network connectivity, implementing zero-trust network access principles.
@@ -317,6 +318,9 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --name ${AGW_NAME}-pip \
        --query ipAddress --output tsv)
    
+   # Extract hostname from APIM gateway URL for backend pool
+   APIM_HOSTNAME=$(echo ${APIM_GATEWAY_URL} | sed 's|https://||' | sed 's|http://||')
+   
    # Create Application Gateway with WAF
    az network application-gateway create \
        --resource-group ${RESOURCE_GROUP} \
@@ -330,7 +334,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --waf-policy ${WAF_POLICY_NAME} \
        --frontend-port 80 \
        --routing-rule-type Basic \
-       --servers "${APIM_GATEWAY_URL#https://}" \
+       --servers ${APIM_HOSTNAME} \
        --priority 100
    
    echo "✅ Application Gateway created with WAF protection at IP: ${PUBLIC_IP}"
@@ -424,15 +428,15 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Azure Private Link enables secure, private connectivity between API Management and backend services, eliminating exposure to the public internet. This configuration completes the zero-trust architecture by ensuring that all communication between API Management and backend services occurs over private network connections, preventing data exfiltration and unauthorized access.
 
    ```bash
-   # Create private endpoint for potential backend services
+   # Create private endpoint for API Management gateway
    az network private-endpoint create \
        --resource-group ${RESOURCE_GROUP} \
-       --name pe-backend \
+       --name pe-apim-gateway \
        --vnet-name ${VNET_NAME} \
        --subnet pe-subnet \
        --private-connection-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_NAME}" \
        --group-ids gateway \
-       --connection-name backend-connection
+       --connection-name apim-gateway-connection
    
    # Create private DNS zone for name resolution
    az network private-dns zone create \
@@ -549,7 +553,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    # Delete private endpoints and DNS zones
    az network private-endpoint delete \
        --resource-group ${RESOURCE_GROUP} \
-       --name pe-backend
+       --name pe-apim-gateway
    
    az network private-dns zone delete \
        --resource-group ${RESOURCE_GROUP} \
@@ -606,4 +610,9 @@ Extend this zero-trust API security solution by implementing these advanced secu
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

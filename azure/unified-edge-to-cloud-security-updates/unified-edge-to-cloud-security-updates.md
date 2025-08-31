@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure IoT Device Update, Azure Update Manager, Azure IoT Hub, Azure Monitor
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, edge-computing, security-updates, firmware-updates, patch-management, hybrid-cloud
 recipe-generator-version: 1.3
@@ -181,12 +181,18 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_WORKSPACE}"
        --location ${LOCATION} \
        --tags purpose=firmware-updates
 
+   # Get IoT Hub resource ID for Device Update instance
+   IOT_HUB_RESOURCE_ID=$(az iot hub show \
+       --name ${IOT_HUB_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query id --output tsv)
+
    # Create Device Update instance linked to IoT Hub
    az iot du instance create \
        --account ${DEVICE_UPDATE_ACCOUNT} \
        --instance ${DEVICE_UPDATE_INSTANCE} \
        --resource-group ${RESOURCE_GROUP} \
-       --iothub-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Devices/IotHubs/${IOT_HUB_NAME}"
+       --iothub-ids ${IOT_HUB_RESOURCE_ID}
 
    echo "✅ Device Update account and instance created"
    ```
@@ -208,7 +214,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_WORKSPACE}"
        --generate-ssh-keys \
        --location ${LOCATION}
 
-   # Enable Update Manager for the VM
+   # Enable Update Manager for the VM by setting patch mode
    az vm update \
        --name ${VM_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -322,11 +328,11 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_WORKSPACE}"
 
    ```bash
    # Create monitoring dashboard for update operations
-   az monitor dashboard create \
+   az portal dashboard create \
        --resource-group ${RESOURCE_GROUP} \
        --name "IoT-Updates-Dashboard" \
        --location ${LOCATION} \
-       --dashboard-metadata '{
+       --metadata '{
          "title": "IoT Edge to Cloud Updates",
          "description": "Monitoring dashboard for Device Update and Update Manager operations"
        }'
@@ -548,4 +554,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

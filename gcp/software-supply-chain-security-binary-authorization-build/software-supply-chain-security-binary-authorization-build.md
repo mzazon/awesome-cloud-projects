@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Binary Authorization, Cloud Build, Artifact Registry, Cloud KMS
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, supply-chain, attestations, container-security, ci-cd
 recipe-generator-version: 1.3
@@ -128,7 +128,7 @@ echo "✅ Required APIs enabled for Binary Authorization pipeline"
    # Configure Docker authentication for Artifact Registry
    gcloud auth configure-docker ${REGION}-docker.pkg.dev
    
-   # Enable vulnerability scanning for automatic security analysis
+   # Verify repository creation and configuration
    gcloud artifacts repositories describe ${REPO_NAME} \
        --location=${REGION} \
        --format="value(name)"
@@ -232,6 +232,7 @@ echo "✅ Required APIs enabled for Binary Authorization pipeline"
    - namePattern: gcr.io/google_containers/*
    - namePattern: k8s.gcr.io/*
    - namePattern: gcr.io/gke-release/*
+   - namePattern: registry.k8s.io/*
    defaultAdmissionRule:
      requireAttestationsBy:
      - projects/${PROJECT_ID}/attestors/${ATTESTOR_NAME}
@@ -307,9 +308,10 @@ echo "✅ Required APIs enabled for Binary Authorization pipeline"
      - '-c'
      - |
        echo "Waiting for vulnerability scan to complete..."
-       sleep 30
+       sleep 60
+       # Check scan results
        gcloud artifacts docker images scan ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/secure-app:\$SHORT_SHA \
-         --location=${REGION} --async
+         --location=${REGION} --format="value(scan.name)" || echo "Scan in progress"
    
    # Create attestation for the built image
    - name: 'gcr.io/google.com/cloudsdktool/google-cloud-cli:latest'
@@ -368,7 +370,8 @@ echo "✅ Required APIs enabled for Binary Authorization pipeline"
    gcloud builds submit . --config=cloudbuild.yaml
    
    # Get the built image SHA for verification
-   export IMAGE_SHA=$(gcloud builds list --limit=1 --format="value(substitutions.SHORT_SHA)")
+   export IMAGE_SHA=$(gcloud builds list --limit=1 \
+       --format="value(substitutions.SHORT_SHA)")
    export FULL_IMAGE_URL="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/secure-app:${IMAGE_SHA}"
    
    echo "✅ Secure build pipeline completed with attestation generation"
@@ -593,4 +596,9 @@ Extend this software supply chain security implementation with these advanced en
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

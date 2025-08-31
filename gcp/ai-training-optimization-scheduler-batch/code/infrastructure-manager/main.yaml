@@ -1,0 +1,555 @@
+# AI Training Optimization with Dynamic Workload Scheduler and Batch
+# Infrastructure Manager Configuration
+# This configuration deploys a complete AI training optimization solution using
+# Google Cloud's Dynamic Workload Scheduler with Cloud Batch for intelligent GPU scheduling
+# and cost-efficient resource allocation.
+
+metadata:
+  name: ai-training-optimization-dws-batch
+  description: "Infrastructure for AI training optimization using Dynamic Workload Scheduler and Cloud Batch"
+  labels:
+    recipe-id: "7c4a8b2f"
+    category: "compute"
+    difficulty: "300"
+    services: "dynamic-workload-scheduler,cloud-batch,cloud-monitoring"
+
+# Import statements for required modules
+imports:
+  - path: ./modules/service_account.yaml
+    name: service_account
+  - path: ./modules/storage.yaml
+    name: storage
+  - path: ./modules/instance_template.yaml
+    name: instance_template
+  - path: ./modules/monitoring.yaml
+    name: monitoring
+  - path: ./modules/batch_job.yaml
+    name: batch_job
+
+# Configuration resources in dependency order
+resources:
+  # Enable required Google Cloud APIs
+  - name: compute-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/compute.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  - name: batch-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/batch.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/monitoring.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/storage-api.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Service Account for Batch Training Jobs
+  # This service account will be used by Cloud Batch jobs for secure access to GCP resources
+  - name: batch-training-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: batch-training-sa-{{ env.unique_suffix }}
+      displayName: "Batch Training Service Account"
+      description: "Service account for AI training batch jobs with necessary permissions"
+    metadata:
+      dependsOn:
+        - compute-api
+
+  # IAM Policy Bindings for Service Account
+  # Grant minimum required permissions for batch training operations
+  - name: storage-object-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: {{ env.project }}
+      policy:
+        bindings:
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:batch-training-sa-{{ env.unique_suffix }}@{{ env.project }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - batch-training-service-account
+
+  - name: monitoring-metric-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: {{ env.project }}
+      policy:
+        bindings:
+          - role: roles/monitoring.metricWriter
+            members:
+              - serviceAccount:batch-training-sa-{{ env.unique_suffix }}@{{ env.project }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - batch-training-service-account
+
+  # Cloud Storage Bucket for Training Data and Models
+  # Optimized for machine learning workloads with versioning enabled
+  - name: ai-training-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ai-training-data-{{ env.unique_suffix }}
+      location: {{ properties.region }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      labels:
+        workload-type: ai-training
+        purpose: training-data
+        cost-center: ml-research
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          - action:
+              type: Delete
+            condition:
+              age: 365
+    metadata:
+      dependsOn:
+        - storage-api
+
+  # Compute Instance Template for GPU Training
+  # Configured with NVIDIA L4 GPUs and optimized deep learning image
+  - name: ai-training-instance-template
+    type: gcp-types/compute-v1:instanceTemplates
+    properties:
+      name: ai-training-template-{{ env.unique_suffix }}
+      description: "Instance template for AI training workloads with GPU support"
+      properties:
+        machineType: g2-standard-4
+        disks:
+          - boot: true
+            initializeParams:
+              sourceImage: projects/deeplearning-platform-release/global/images/family/pytorch-latest-gpu
+              diskType: pd-standard
+              diskSizeGb: 50
+        networkInterfaces:
+          - network: projects/{{ env.project }}/global/networks/default
+            accessConfigs:
+              - name: External NAT
+                type: ONE_TO_ONE_NAT
+        serviceAccounts:
+          - email: batch-training-sa-{{ env.unique_suffix }}@{{ env.project }}.iam.gserviceaccount.com
+            scopes:
+              - https://www.googleapis.com/auth/cloud-platform
+        guestAccelerators:
+          - acceleratorType: nvidia-l4
+            acceleratorCount: 1
+        metadata:
+          items:
+            - key: install-nvidia-driver
+              value: "True"
+            - key: enable-osconfig
+              value: "TRUE"
+        tags:
+          items:
+            - ai-training
+            - batch-job
+            - gpu-workload
+        labels:
+          workload-type: ai-training
+          scheduler: dynamic-workload-scheduler
+          cost-center: ml-research
+        scheduling:
+          automaticRestart: false
+          onHostMaintenance: TERMINATE
+          preemptible: false
+    metadata:
+      dependsOn:
+        - compute-api
+        - batch-training-service-account
+
+  # Cloud Monitoring Dashboard for AI Training Visibility
+  # Provides comprehensive observability for training workloads and GPU utilization
+  - name: ai-training-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: "AI Training Optimization Dashboard"
+      mosaicLayout:
+        tiles:
+          # GPU Utilization Chart
+          - width: 6
+            height: 4
+            widget:
+              title: "GPU Utilization"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: >-
+                          resource.type="compute_instance" AND 
+                          metric.type="compute.googleapis.com/instance/accelerator/utilization" AND
+                          resource.labels.instance_name=~"ai-training.*"
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_MEAN
+                          groupByFields:
+                            - resource.labels.instance_name
+                    plotType: LINE
+                yAxis:
+                  label: "Utilization %"
+                  scale: LINEAR
+          # Batch Job Status Chart
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: "Batch Job Status"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: >-
+                          resource.type="batch_job" AND 
+                          metric.type="batch.googleapis.com/job/task/count"
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - metric.labels.task_state
+                    plotType: STACKED_AREA
+                yAxis:
+                  label: "Task Count"
+                  scale: LINEAR
+          # Memory Utilization Chart
+          - width: 6
+            height: 4
+            yPos: 4
+            widget:
+              title: "Memory Utilization"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: >-
+                          resource.type="compute_instance" AND 
+                          metric.type="compute.googleapis.com/instance/memory/utilization" AND
+                          resource.labels.instance_name=~"ai-training.*"
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_MEAN
+                          groupByFields:
+                            - resource.labels.instance_name
+                    plotType: LINE
+                yAxis:
+                  label: "Utilization %"
+                  scale: LINEAR
+          # CPU Utilization Chart
+          - width: 6
+            height: 4
+            xPos: 6
+            yPos: 4
+            widget:
+              title: "CPU Utilization"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: >-
+                          resource.type="compute_instance" AND 
+                          metric.type="compute.googleapis.com/instance/cpu/utilization" AND
+                          resource.labels.instance_name=~"ai-training.*"
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_MEAN
+                          groupByFields:
+                            - resource.labels.instance_name
+                    plotType: LINE
+                yAxis:
+                  label: "Utilization %"
+                  scale: LINEAR
+    metadata:
+      dependsOn:
+        - monitoring-api
+
+  # Alert Policy for GPU Underutilization
+  # Proactive monitoring to optimize resource usage and cost efficiency
+  - name: gpu-underutilization-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "AI Training GPU Underutilization Alert"
+      documentation:
+        content: |
+          This alert triggers when GPU utilization falls below 70% for more than 5 minutes,
+          indicating potential resource inefficiency in AI training workloads.
+          
+          Recommended actions:
+          1. Check training job configuration and resource allocation
+          2. Verify training data loading efficiency
+          3. Consider adjusting batch size or parallelism settings
+          4. Review Dynamic Workload Scheduler allocation policies
+        mimeType: text/markdown
+      conditions:
+        - displayName: "GPU Utilization Below 70%"
+          conditionThreshold:
+            filter: >-
+              resource.type="compute_instance" AND 
+              metric.type="compute.googleapis.com/instance/accelerator/utilization" AND
+              resource.labels.instance_name=~"ai-training.*"
+            comparison: COMPARISON_LESS_THAN
+            thresholdValue: 0.7
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.labels.instance_name
+      alertStrategy:
+        autoClose: 1800s
+      enabled: true
+      notificationChannels: []
+    metadata:
+      dependsOn:
+        - monitoring-api
+
+  # Alert Policy for High Cost Tracking
+  # Monitor spending to prevent budget overruns
+  - name: cost-tracking-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "AI Training Cost Monitoring Alert"
+      documentation:
+        content: |
+          This alert monitors compute costs for AI training workloads to prevent budget overruns.
+          
+          Recommended actions:
+          1. Review current training job resource allocation
+          2. Consider using Dynamic Workload Scheduler Flex Start mode for cost savings
+          3. Implement automatic job termination for long-running tasks
+          4. Analyze cost trends and optimize instance selection
+        mimeType: text/markdown
+      conditions:
+        - displayName: "High Compute Costs"
+          conditionThreshold:
+            filter: >-
+              resource.type="compute_instance" AND 
+              metric.type="compute.googleapis.com/instance/up" AND
+              resource.labels.instance_name=~"ai-training.*"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 10
+            duration: 3600s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_SUM
+      alertStrategy:
+        autoClose: 3600s
+      enabled: true
+      notificationChannels: []
+    metadata:
+      dependsOn:
+        - monitoring-api
+
+# Training Script Storage Object
+# Upload the training script to Cloud Storage for batch job execution
+  - name: training-script-object
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: ai-training-data-{{ env.unique_suffix }}
+      name: scripts/training_script.py
+      contentType: text/x-python
+      metadata:
+        purpose: ai-training-simulation
+        version: "1.0"
+      # Base64 encoded Python training script
+      data: |
+        IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwppbXBvcnQgdGltZQppbXBvcnQgb3MKaW1wb3J0IGxvZ2dpbmcKZnJvbSBnb29nbGUuY2xvdWQgaW1wb3J0IG1vbml0b3JpbmdfdjMKZnJvbSBnb29nbGUuY2xvdWQgaW1wb3J0IHN0b3JhZ2UKCmRlZiBzZXR1cF9sb2dnaW5nKCk6CiAgICBsb2dnaW5nLmJhc2ljQ29uZmlnKGxldmVsPWxvZ2dpbmcuSU5GTykKICAgIHJldHVybiBsb2dnaW5nLmdldExvZ2dlcihfX25hbWVfXykKCmRlZiBzaW11bGF0ZV90cmFpbmluZyhkdXJhdGlvbl9taW51dGVzPTE1KToKICAgIGxvZ2dlciA9IHNldHVwX2xvZ2dpbmcoKQogICAgbG9nZ2VyLmluZm8oIlN0YXJ0aW5nIEFJIG1vZGVsIHRyYWluaW5nIHNpbXVsYXRpb24uLi4iKQogICAgCiAgICAjIFNpbXVsYXRlIHRyYWluaW5nIGVwb2NocwogICAgZXBvY2hzID0gMTAKICAgIGZvciBlcG9jaCBpbiByYW5nZShlcG9jaHMpOgogICAgICAgIGxvZ2dlci5pbmZvKGYiVHJhaW5pbmcgZXBvY2gge2Vwb2NoICsgMX0ve2Vwb2Noc30iKQogICAgICAgIAogICAgICAgICMgU2ltdWxhdGUgdHJhaW5pbmcgY29tcHV0YXRpb24KICAgICAgICB0aW1lLnNsZWVwKGR1cmF0aW9uX21pbnV0ZXMgKiA2MCAqIDEwKQogICAgICAgIAogICAgICAgICMgTG9nIHRyYWluaW5nIG1ldHJpY3MKICAgICAgICBhY2N1cmFjeSA9IDAuNyArIChlcG9jaCAqIDAuMDMpCiAgICAgICAgbG9zcyA9IDIuNSAtIChlcG9jaCAqIDAuMikKICAgICAgICBsb2dnZXIuaW5mbyhmIkVwb2NoIHtlcG9jaCArIDF9IC0gQWNjdXJhY3k6IHthY2N1cmFjeTouM2Z9LCBMb3NzOiB7bG9zczouM2Z9IikKICAgIAogICAgbG9nZ2VyLmluZm8oIlRyYWluaW5nIGNvbXBsZXRlZCBzdWNjZXNzZnVsbHkhIikKICAgIHJldHVybiBUcnVlCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgc3VjY2VzcyA9IHNpbXVsYXRlX3RyYWluaW5nKCkKICAgIGV4aXQoMCBpZiBzdWNjZXNzIGVsc2UgMSk=
+    metadata:
+      dependsOn:
+        - ai-training-storage-bucket
+
+# Output values for use in deployment and monitoring
+outputs:
+  # Service Account Information
+  - name: service_account_email
+    value: $(ref.batch-training-service-account.email)
+    description: "Email of the service account created for batch training jobs"
+
+  # Storage Information
+  - name: storage_bucket_name
+    value: $(ref.ai-training-storage-bucket.name)
+    description: "Name of the Cloud Storage bucket for training data and models"
+
+  - name: storage_bucket_url
+    value: gs://$(ref.ai-training-storage-bucket.name)
+    description: "GCS URL of the training data bucket"
+
+  # Instance Template Information
+  - name: instance_template_name
+    value: $(ref.ai-training-instance-template.name)
+    description: "Name of the instance template for GPU training"
+
+  - name: instance_template_selflink
+    value: $(ref.ai-training-instance-template.selfLink)
+    description: "Self-link of the instance template for batch job configuration"
+
+  # Monitoring Information
+  - name: monitoring_dashboard_name
+    value: $(ref.ai-training-monitoring-dashboard.name)
+    description: "Name of the Cloud Monitoring dashboard for training visibility"
+
+  - name: gpu_alert_policy_name
+    value: $(ref.gpu-underutilization-alert.name)
+    description: "Name of the GPU underutilization alert policy"
+
+  - name: cost_alert_policy_name
+    value: $(ref.cost-tracking-alert.name)
+    description: "Name of the cost tracking alert policy"
+
+  # Training Script Information
+  - name: training_script_path
+    value: gs://$(ref.ai-training-storage-bucket.name)/scripts/training_script.py
+    description: "GCS path to the uploaded training script"
+
+  # Sample Batch Job Configuration
+  - name: sample_batch_job_config
+    value: |
+      {
+        "taskGroups": [
+          {
+            "name": "training-task-group",
+            "taskSpec": {
+              "runnables": [
+                {
+                  "container": {
+                    "imageUri": "gcr.io/deeplearning-platform-release/pytorch-gpu.1-13:latest",
+                    "commands": [
+                      "/bin/bash",
+                      "-c",
+                      "gsutil cp gs://$(ref.ai-training-storage-bucket.name)/scripts/training_script.py . && python training_script.py"
+                    ]
+                  }
+                }
+              ],
+              "computeResource": {
+                "cpuMilli": 4000,
+                "memoryMib": 16384
+              },
+              "maxRetryCount": 2,
+              "maxRunDuration": "3600s"
+            },
+            "taskCount": 1,
+            "parallelism": 1
+          }
+        ],
+        "allocationPolicy": {
+          "instances": [
+            {
+              "instanceTemplate": "$(ref.ai-training-instance-template.selfLink)",
+              "policy": {
+                "machineType": "g2-standard-4",
+                "accelerators": [
+                  {
+                    "type": "nvidia-l4",
+                    "count": 1
+                  }
+                ],
+                "provisioningModel": "STANDARD"
+              }
+            }
+          ]
+        },
+        "labels": {
+          "workload-type": "ai-training",
+          "scheduler": "dynamic-workload-scheduler",
+          "cost-center": "ml-research"
+        },
+        "logsPolicy": {
+          "destination": "CLOUD_LOGGING"
+        }
+      }
+    description: "Sample batch job configuration JSON for AI training with DWS integration"
+
+# Deployment parameters that can be customized
+properties:
+  region:
+    type: string
+    default: us-central1
+    description: "Google Cloud region for resource deployment"
+  
+  zone:
+    type: string
+    default: us-central1-a
+    description: "Google Cloud zone for compute resources"
+  
+  machine_type:
+    type: string
+    default: g2-standard-4
+    description: "Machine type for GPU training instances"
+  
+  gpu_type:
+    type: string
+    default: nvidia-l4
+    description: "GPU accelerator type for training workloads"
+  
+  gpu_count:
+    type: integer
+    default: 1
+    description: "Number of GPUs per training instance"
+  
+  boot_disk_size:
+    type: integer
+    default: 50
+    description: "Boot disk size in GB for training instances"
+  
+  storage_class:
+    type: string
+    default: STANDARD
+    description: "Storage class for the training data bucket"
+  
+  enable_versioning:
+    type: boolean
+    default: true
+    description: "Enable versioning on the training data bucket"
+  
+  alert_threshold_gpu:
+    type: number
+    default: 0.7
+    description: "GPU utilization threshold for underutilization alerts"
+  
+  alert_duration:
+    type: string
+    default: 300s
+    description: "Duration before alerts are triggered"
+
+# Environment variables for resource naming
+environment:
+  project:
+    type: string
+    description: "Google Cloud Project ID"
+  
+  unique_suffix:
+    type: string
+    description: "Unique suffix for resource names (e.g., generated hash)"

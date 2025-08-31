@@ -1,0 +1,651 @@
+# Google Cloud Infrastructure Manager Configuration
+# Automated Regulatory Compliance Reporting with Document AI and Scheduler
+# 
+# This configuration deploys a complete serverless compliance automation system
+# that processes regulatory documents using Document AI, orchestrates workflows
+# with Cloud Scheduler, and generates automated compliance reports.
+
+imports:
+- path: https://raw.githubusercontent.com/GoogleCloudPlatform/cloud-foundation-toolkit/master/dm/templates/storage/storage.py
+  name: storage.py
+
+# Template metadata and configuration
+metadata:
+  version: "1.0"
+  displayName: "Automated Regulatory Compliance System"
+  description: "Serverless compliance automation with Document AI processing and scheduled reporting"
+
+# Input parameters for customization
+parameters:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    default: "compliance-automation-project"
+  
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+    allowedValues:
+    - "us-central1"
+    - "us-east1"
+    - "us-west1"
+    - "europe-west1"
+    - "asia-southeast1"
+  
+  # Resource naming configuration
+  resource_suffix:
+    type: string
+    description: "Unique suffix for resource names"
+    default: "$(ref.random_suffix.hex)"
+    minLength: 3
+    maxLength: 8
+  
+  # Compliance configuration
+  compliance_frameworks:
+    type: array
+    description: "Supported regulatory frameworks"
+    default:
+    - "SOX"
+    - "HIPAA"
+    - "GDPR"
+    - "PCI_DSS"
+  
+  # Notification configuration
+  notification_email:
+    type: string
+    description: "Email address for compliance alerts"
+    default: "compliance@example.com"
+    pattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+  
+  # Processing configuration
+  document_retention_days:
+    type: integer
+    description: "Document retention period in days"
+    default: 2555  # 7 years for regulatory compliance
+    minimum: 365
+    maximum: 3650
+  
+  max_processing_timeout:
+    type: integer
+    description: "Maximum document processing timeout in seconds"
+    default: 540
+    minimum: 60
+    maximum: 540
+
+# Resource definitions
+resources:
+
+  # Generate random suffix for unique resource naming
+  random_suffix:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      runtimePolicy:
+      - CREATE
+    properties:
+      resource: $(ref.project_id)
+      role: roles/editor
+      member: serviceAccount:$(ref.project_id)@appspot.gserviceaccount.com
+    outputs:
+    - name: hex
+      value: $(ref.random_suffix.uniqueId)
+
+  # Enable required APIs for the compliance system
+  enable_apis:
+    type: deploymentmanager.v2.virtual.enabledServices
+    properties:
+      consumerId: "project:$(ref.project_id)"
+      servicesToEnable:
+      - documentai.googleapis.com
+      - cloudfunctions.googleapis.com
+      - cloudscheduler.googleapis.com
+      - storage-component.googleapis.com
+      - storage-api.googleapis.com
+      - logging.googleapis.com
+      - monitoring.googleapis.com
+      - cloudbuild.googleapis.com
+      - artifactregistry.googleapis.com
+
+  # Cloud Storage Buckets for Document Workflow
+  
+  # Input bucket for incoming compliance documents
+  input_bucket:
+    type: storage.py
+    properties:
+      name: "compliance-input-$(ref.resource_suffix)"
+      project: $(ref.project_id)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess:
+        enabled: true
+      lifecycleRules:
+      - action:
+          type: Delete
+        condition:
+          age: $(ref.document_retention_days)
+          withState: ARCHIVED
+      - action:
+          type: SetStorageClass
+          storageClass: COLDLINE
+        condition:
+          age: 90
+      iamConfiguration:
+        bucketPolicyOnly:
+          enabled: true
+      labels:
+        purpose: "compliance-input"
+        environment: "production"
+        compliance: "required"
+    metadata:
+      dependsOn:
+      - enable_apis
+
+  # Processed documents bucket
+  processed_bucket:
+    type: storage.py
+    properties:
+      name: "compliance-processed-$(ref.resource_suffix)"
+      project: $(ref.project_id)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess:
+        enabled: true
+      lifecycleRules:
+      - action:
+          type: Delete
+        condition:
+          age: $(ref.document_retention_days)
+      - action:
+          type: SetStorageClass
+          storageClass: NEARLINE
+        condition:
+          age: 30
+      - action:
+          type: SetStorageClass
+          storageClass: COLDLINE
+        condition:
+          age: 365
+      labels:
+        purpose: "compliance-processed"
+        environment: "production"
+        compliance: "required"
+    metadata:
+      dependsOn:
+      - enable_apis
+
+  # Compliance reports bucket
+  reports_bucket:
+    type: storage.py
+    properties:
+      name: "compliance-reports-$(ref.resource_suffix)"
+      project: $(ref.project_id)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess:
+        enabled: true
+      lifecycleRules:
+      - action:
+          type: Delete
+        condition:
+          age: $(ref.document_retention_days)
+      - action:
+          type: SetStorageClass
+          storageClass: NEARLINE
+        condition:
+          age: 90
+      labels:
+        purpose: "compliance-reports"
+        environment: "production"
+        compliance: "required"
+    metadata:
+      dependsOn:
+      - enable_apis
+
+  # Document AI Processor for Compliance Documents
+  document_ai_processor:
+    type: gcp-types/documentai-v1:projects.locations.processors
+    properties:
+      parent: "projects/$(ref.project_id)/locations/$(ref.region)"
+      displayName: "Compliance Form Parser"
+      type: "FORM_PARSER_PROCESSOR"
+      description: "Document AI processor for extracting structured data from regulatory compliance documents"
+    metadata:
+      dependsOn:
+      - enable_apis
+
+  # Service Account for Cloud Functions
+  function_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: "compliance-functions-sa"
+      displayName: "Compliance Functions Service Account"
+      description: "Service account for compliance automation Cloud Functions"
+      project: $(ref.project_id)
+    metadata:
+      dependsOn:
+      - enable_apis
+
+  # IAM Policy Bindings for Service Account
+
+  # Document AI User role
+  documentai_user_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/documentai.apiUser
+      member: "serviceAccount:$(ref.function_service_account.email)"
+    metadata:
+      dependsOn:
+      - function_service_account
+
+  # Storage Object Admin role
+  storage_admin_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/storage.objectAdmin
+      member: "serviceAccount:$(ref.function_service_account.email)"
+    metadata:
+      dependsOn:
+      - function_service_account
+
+  # Cloud Logging Writer role
+  logging_writer_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/logging.logWriter
+      member: "serviceAccount:$(ref.function_service_account.email)"
+    metadata:
+      dependsOn:
+      - function_service_account
+
+  # Cloud Monitoring Metric Writer role
+  monitoring_writer_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/monitoring.metricWriter
+      member: "serviceAccount:$(ref.function_service_account.email)"
+    metadata:
+      dependsOn:
+      - function_service_account
+
+  # Cloud Functions for Document Processing and Report Generation
+
+  # Document Processing Cloud Function
+  document_processor_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: "projects/$(ref.project_id)/locations/$(ref.region)"
+      function: "document-processor-$(ref.resource_suffix)"
+      description: "Processes compliance documents with Document AI and applies validation rules"
+      runtime: "python312"
+      availableMemoryMb: 1024
+      timeout: "$(ref.max_processing_timeout)s"
+      entryPoint: "process_compliance_document"
+      serviceAccountEmail: $(ref.function_service_account.email)
+      environmentVariables:
+        PROJECT_ID: $(ref.project_id)
+        REGION: $(ref.region)
+        PROCESSOR_ID: $(ref.document_ai_processor.name)
+        PROCESSED_BUCKET: $(ref.processed_bucket.name)
+        COMPLIANCE_FRAMEWORKS: $(ref.compliance_frameworks)
+      eventTrigger:
+        eventType: "google.storage.object.finalize"
+        resource: $(ref.input_bucket.name)
+        failurePolicy:
+          retry: {}
+      sourceArchiveUrl: "gs://$(ref.input_bucket.name)/function-source.zip"
+      labels:
+        purpose: "document-processing"
+        compliance: "required"
+        environment: "production"
+    metadata:
+      dependsOn:
+      - input_bucket
+      - processed_bucket
+      - document_ai_processor
+      - function_service_account
+      - documentai_user_binding
+      - storage_admin_binding
+      - logging_writer_binding
+
+  # Report Generation Cloud Function
+  report_generator_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: "projects/$(ref.project_id)/locations/$(ref.region)"
+      function: "report-generator-$(ref.resource_suffix)"
+      description: "Generates compliance reports from processed documents with automated analysis"
+      runtime: "python312"
+      availableMemoryMb: 512
+      timeout: "300s"
+      entryPoint: "generate_compliance_report"
+      serviceAccountEmail: $(ref.function_service_account.email)
+      environmentVariables:
+        PROJECT_ID: $(ref.project_id)
+        PROCESSED_BUCKET: $(ref.processed_bucket.name)
+        REPORTS_BUCKET: $(ref.reports_bucket.name)
+        COMPLIANCE_FRAMEWORKS: $(ref.compliance_frameworks)
+        NOTIFICATION_EMAIL: $(ref.notification_email)
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      sourceArchiveUrl: "gs://$(ref.input_bucket.name)/report-function-source.zip"
+      labels:
+        purpose: "report-generation"
+        compliance: "required"
+        environment: "production"
+    metadata:
+      dependsOn:
+      - processed_bucket
+      - reports_bucket
+      - function_service_account
+      - storage_admin_binding
+      - logging_writer_binding
+
+  # Cloud Scheduler Jobs for Automated Compliance Workflows
+
+  # Daily compliance report generation job
+  daily_scheduler_job:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: "projects/$(ref.project_id)/locations/$(ref.region)"
+      name: "compliance-scheduler-daily-$(ref.resource_suffix)"
+      description: "Daily compliance report generation job"
+      schedule: "0 8 * * *"  # Daily at 8 AM UTC
+      timeZone: "UTC"
+      httpTarget:
+        uri: $(ref.report_generator_function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: "application/json"
+        body: '{"report_type": "daily"}'
+        oidcToken:
+          serviceAccountEmail: $(ref.function_service_account.email)
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: "300s"
+        minBackoffDuration: "10s"
+        maxBackoffDuration: "60s"
+    metadata:
+      dependsOn:
+      - report_generator_function
+      - function_service_account
+
+  # Weekly compliance summary job
+  weekly_scheduler_job:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: "projects/$(ref.project_id)/locations/$(ref.region)"
+      name: "compliance-scheduler-weekly-$(ref.resource_suffix)"
+      description: "Weekly compliance summary report generation job"
+      schedule: "0 9 * * 1"  # Weekly on Monday at 9 AM UTC
+      timeZone: "UTC"
+      httpTarget:
+        uri: $(ref.report_generator_function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: "application/json"
+        body: '{"report_type": "weekly"}'
+        oidcToken:
+          serviceAccountEmail: $(ref.function_service_account.email)
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: "300s"
+        minBackoffDuration: "10s"
+        maxBackoffDuration: "60s"
+    metadata:
+      dependsOn:
+      - report_generator_function
+      - function_service_account
+
+  # Monthly compliance audit job
+  monthly_scheduler_job:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: "projects/$(ref.project_id)/locations/$(ref.region)"
+      name: "compliance-scheduler-monthly-$(ref.resource_suffix)"
+      description: "Monthly compliance audit report generation job"
+      schedule: "0 10 1 * *"  # Monthly on 1st day at 10 AM UTC
+      timeZone: "UTC"
+      httpTarget:
+        uri: $(ref.report_generator_function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: "application/json"
+        body: '{"report_type": "monthly"}'
+        oidcToken:
+          serviceAccountEmail: $(ref.function_service_account.email)
+      retryConfig:
+        retryCount: 5
+        maxRetryDuration: "600s"
+        minBackoffDuration: "30s"
+        maxBackoffDuration: "120s"
+    metadata:
+      dependsOn:
+      - report_generator_function
+      - function_service_account
+
+  # Monitoring and Alerting Configuration
+
+  # Log-based metric for compliance violations
+  compliance_violations_metric:
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: "projects/$(ref.project_id)"
+      metricId: "compliance_violations"
+      description: "Count of compliance violations detected in processed documents"
+      filter: 'resource.type="cloud_function" AND textPayload:"NON_COMPLIANT"'
+      metricDescriptor:
+        metricKind: GAUGE
+        valueType: INT64
+        displayName: "Compliance Violations"
+        description: "Number of compliance violations detected"
+      labelExtractors:
+        document_type: 'EXTRACT(textPayload)'
+        severity: 'EXTRACT(severity)'
+    metadata:
+      dependsOn:
+      - enable_apis
+
+  # Log-based metric for processing errors
+  processing_errors_metric:
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: "projects/$(ref.project_id)"
+      metricId: "processing_errors"
+      description: "Count of document processing errors"
+      filter: 'resource.type="cloud_function" AND severity="ERROR"'
+      metricDescriptor:
+        metricKind: GAUGE
+        valueType: INT64
+        displayName: "Processing Errors"
+        description: "Number of document processing errors"
+      labelExtractors:
+        function_name: 'EXTRACT(resource.labels.function_name)'
+        error_type: 'EXTRACT(textPayload)'
+    metadata:
+      dependsOn:
+      - enable_apis
+
+  # Log-based metric for successful processing
+  successful_processing_metric:
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: "projects/$(ref.project_id)"
+      metricId: "successful_processing"
+      description: "Count of successful document processing operations"
+      filter: 'resource.type="cloud_function" AND textPayload:"Document processed successfully"'
+      metricDescriptor:
+        metricKind: GAUGE
+        valueType: INT64
+        displayName: "Successful Processing"
+        description: "Number of successful document processing operations"
+      labelExtractors:
+        function_name: 'EXTRACT(resource.labels.function_name)'
+        document_type: 'EXTRACT(textPayload)'
+    metadata:
+      dependsOn:
+      - enable_apis
+
+  # Notification channel for compliance alerts
+  notification_channel:
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: "projects/$(ref.project_id)"
+      displayName: "Compliance Alerts Email"
+      description: "Email notifications for compliance violations and system errors"
+      type: "email"
+      labels:
+        email_address: $(ref.notification_email)
+      enabled: true
+    metadata:
+      dependsOn:
+      - enable_apis
+
+  # Alert policy for compliance violations
+  compliance_violations_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: "projects/$(ref.project_id)"
+      displayName: "Compliance Violations Alert"
+      documentation:
+        content: "This policy monitors for compliance violations in processed documents and sends alerts when violations exceed acceptable thresholds."
+        mimeType: "text/markdown"
+      conditions:
+      - displayName: "High Compliance Violations"
+        conditionThreshold:
+          filter: 'metric.type="logging.googleapis.com/user/compliance_violations"'
+          comparison: COMPARISON_GREATER_THAN
+          thresholdValue: 5
+          duration: "300s"
+          aggregations:
+          - alignmentPeriod: "300s"
+            perSeriesAligner: ALIGN_RATE
+            crossSeriesReducer: REDUCE_SUM
+      notificationChannels:
+      - $(ref.notification_channel.name)
+      alertStrategy:
+        autoClose: "604800s"  # 1 week
+      enabled: true
+      severity: CRITICAL
+    metadata:
+      dependsOn:
+      - compliance_violations_metric
+      - notification_channel
+
+  # Alert policy for processing errors
+  processing_errors_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: "projects/$(ref.project_id)"
+      displayName: "Processing Errors Alert"
+      documentation:
+        content: "This policy monitors for document processing errors and sends alerts when error rates exceed acceptable thresholds."
+        mimeType: "text/markdown"
+      conditions:
+      - displayName: "High Processing Error Rate"
+        conditionThreshold:
+          filter: 'metric.type="logging.googleapis.com/user/processing_errors"'
+          comparison: COMPARISON_GREATER_THAN
+          thresholdValue: 10
+          duration: "600s"
+          aggregations:
+          - alignmentPeriod: "300s"
+            perSeriesAligner: ALIGN_RATE
+            crossSeriesReducer: REDUCE_SUM
+      notificationChannels:
+      - $(ref.notification_channel.name)
+      alertStrategy:
+        autoClose: "604800s"  # 1 week
+      enabled: true
+      severity: WARNING
+    metadata:
+      dependsOn:
+      - processing_errors_metric
+      - notification_channel
+
+# Outputs for verification and integration
+outputs:
+  # Storage bucket information
+  input_bucket_name:
+    description: "Name of the input bucket for compliance documents"
+    value: $(ref.input_bucket.name)
+  
+  processed_bucket_name:
+    description: "Name of the processed documents bucket"
+    value: $(ref.processed_bucket.name)
+  
+  reports_bucket_name:
+    description: "Name of the compliance reports bucket"
+    value: $(ref.reports_bucket.name)
+  
+  # Document AI processor information
+  document_ai_processor_id:
+    description: "Document AI processor ID for compliance processing"
+    value: $(ref.document_ai_processor.name)
+  
+  # Cloud Functions information
+  document_processor_function_name:
+    description: "Name of the document processing Cloud Function"
+    value: $(ref.document_processor_function.name)
+  
+  report_generator_function_name:
+    description: "Name of the report generation Cloud Function"
+    value: $(ref.report_generator_function.name)
+  
+  report_generator_function_url:
+    description: "HTTP trigger URL for the report generation function"
+    value: $(ref.report_generator_function.httpsTrigger.url)
+  
+  # Scheduler job information
+  daily_job_name:
+    description: "Name of the daily compliance scheduler job"
+    value: $(ref.daily_scheduler_job.name)
+  
+  weekly_job_name:
+    description: "Name of the weekly compliance scheduler job"
+    value: $(ref.weekly_scheduler_job.name)
+  
+  monthly_job_name:
+    description: "Name of the monthly compliance scheduler job"
+    value: $(ref.monthly_scheduler_job.name)
+  
+  # Service account information
+  function_service_account_email:
+    description: "Email of the service account used by Cloud Functions"
+    value: $(ref.function_service_account.email)
+  
+  # Monitoring information
+  notification_channel_name:
+    description: "Name of the notification channel for alerts"
+    value: $(ref.notification_channel.name)
+  
+  compliance_violations_metric_name:
+    description: "Name of the compliance violations log metric"
+    value: $(ref.compliance_violations_metric.name)
+  
+  processing_errors_metric_name:
+    description: "Name of the processing errors log metric"
+    value: $(ref.processing_errors_metric.name)
+  
+  # Configuration information
+  deployment_region:
+    description: "Region where resources are deployed"
+    value: $(ref.region)
+  
+  resource_suffix:
+    description: "Unique suffix used for resource naming"
+    value: $(ref.resource_suffix)
+  
+  supported_compliance_frameworks:
+    description: "List of supported regulatory compliance frameworks"
+    value: $(ref.compliance_frameworks)

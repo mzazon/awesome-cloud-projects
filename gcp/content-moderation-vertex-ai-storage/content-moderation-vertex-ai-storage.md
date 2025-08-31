@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Vertex AI, Cloud Storage, Cloud Functions, Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: content-moderation, ai-ml, serverless, event-driven, security
 recipe-generator-version: 1.3
@@ -231,23 +231,24 @@ echo "✅ Project ${PROJECT_ID} configured with required APIs"
    
    # Create requirements.txt for Python dependencies
    cat > requirements.txt << 'EOF'
-   google-cloud-storage==2.10.0
-   google-cloud-aiplatform==1.38.1
-   google-cloud-pubsub==2.18.4
-   functions-framework==3.4.0
-   Pillow==10.0.1
+   google-cloud-storage==2.14.0
+   google-cloud-aiplatform==1.43.0
+   google-cloud-pubsub==2.20.1
+   functions-framework==3.5.0
+   cloudevents>=1.6.0
    EOF
    
    # Create the main function code
    cat > main.py << 'EOF'
    import json
-   import base64
+   import time
    from google.cloud import storage
    from google.cloud import aiplatform
    from google.cloud import pubsub_v1
    import vertexai
    from vertexai.generative_models import GenerativeModel, Part, SafetySetting
    import functions_framework
+   from cloudevents.http.event import CloudEvent
    import os
    import logging
    
@@ -269,7 +270,7 @@ echo "✅ Project ${PROJECT_ID} configured with required APIs"
    model = GenerativeModel('gemini-1.5-pro')
    
    @functions_framework.cloud_event
-   def moderate_content(cloud_event):
+   def moderate_content(cloud_event: CloudEvent) -> None:
        """Cloud Function triggered by Cloud Storage uploads."""
        try:
            # Parse the Cloud Storage event
@@ -330,23 +331,23 @@ echo "✅ Project ${PROJECT_ID} configured with required APIs"
            - "reasoning": brief explanation
            """
            
-           # Configure safety settings
+           # Configure safety settings to allow content analysis
            safety_settings = [
                SafetySetting(
                    category=SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                   threshold=SafetySetting.HarmBlockThreshold.BLOCK_LOW_AND_ABOVE
+                   threshold=SafetySetting.HarmBlockThreshold.BLOCK_NONE
                ),
                SafetySetting(
                    category=SafetySetting.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                   threshold=SafetySetting.HarmBlockThreshold.BLOCK_LOW_AND_ABOVE
+                   threshold=SafetySetting.HarmBlockThreshold.BLOCK_NONE
                ),
                SafetySetting(
                    category=SafetySetting.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                   threshold=SafetySetting.HarmBlockThreshold.BLOCK_LOW_AND_ABOVE
+                   threshold=SafetySetting.HarmBlockThreshold.BLOCK_NONE
                ),
                SafetySetting(
                    category=SafetySetting.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                   threshold=SafetySetting.HarmBlockThreshold.BLOCK_LOW_AND_ABOVE
+                   threshold=SafetySetting.HarmBlockThreshold.BLOCK_NONE
                )
            ]
            
@@ -364,6 +365,8 @@ echo "✅ Project ${PROJECT_ID} configured with required APIs"
            result_text = response.text.strip()
            if result_text.startswith('```json'):
                result_text = result_text[7:-3]
+           elif result_text.startswith('```'):
+               result_text = result_text[3:-3]
            
            return json.loads(result_text)
            
@@ -396,7 +399,7 @@ echo "✅ Project ${PROJECT_ID} configured with required APIs"
            - "reasoning": brief explanation
            """
            
-           # Generate response
+           # Generate response with disabled safety filters
            response = model.generate_content(
                prompt,
                generation_config={
@@ -409,6 +412,8 @@ echo "✅ Project ${PROJECT_ID} configured with required APIs"
            result_text = response.text.strip()
            if result_text.startswith('```json'):
                result_text = result_text[7:-3]
+           elif result_text.startswith('```'):
+               result_text = result_text[3:-3]
            
            return json.loads(result_text)
            
@@ -472,7 +477,7 @@ echo "✅ Project ${PROJECT_ID} configured with required APIs"
        --trigger-event-filters="bucket=${BUCKET_INCOMING}" \
        --service-account=content-moderator-sa@${PROJECT_ID}.iam.gserviceaccount.com \
        --set-env-vars="GCP_PROJECT=${PROJECT_ID},QUARANTINE_BUCKET=${BUCKET_QUARANTINE},APPROVED_BUCKET=${BUCKET_APPROVED}" \
-       --memory=1024MB \
+       --memory=1Gi \
        --timeout=540s \
        --max-instances=10
    
@@ -494,18 +499,16 @@ echo "✅ Project ${PROJECT_ID} configured with required APIs"
    
    cat > main.py << 'EOF'
    import json
-   import smtplib
-   from email.mime.text import MimeText
-   from email.mime.multipart import MimeMultipart
    from google.cloud import storage
    import functions_framework
+   from cloudevents.http.event import CloudEvent
    import os
    import logging
    
    logger = logging.getLogger(__name__)
    
    @functions_framework.cloud_event
-   def notify_quarantine(cloud_event):
+   def notify_quarantine(cloud_event: CloudEvent) -> None:
        """Notify moderators of quarantined content."""
        try:
            data = cloud_event.data
@@ -543,8 +546,9 @@ echo "✅ Project ${PROJECT_ID} configured with required APIs"
    EOF
    
    cat > requirements.txt << 'EOF'
-   google-cloud-storage==2.10.0
-   functions-framework==3.4.0
+   google-cloud-storage==2.14.0
+   functions-framework==3.5.0
+   cloudevents>=1.6.0
    EOF
    
    # Deploy notification function
@@ -558,7 +562,7 @@ echo "✅ Project ${PROJECT_ID} configured with required APIs"
        --trigger-event-filters="bucket=${BUCKET_QUARANTINE}" \
        --service-account=content-moderator-sa@${PROJECT_ID}.iam.gserviceaccount.com \
        --set-env-vars="QUARANTINE_BUCKET=${BUCKET_QUARANTINE}" \
-       --memory=256MB \
+       --memory=512Mi \
        --timeout=60s
    
    cd ..
@@ -578,7 +582,7 @@ echo "✅ Project ${PROJECT_ID} configured with required APIs"
    
    # Verify function deployment
    gcloud functions describe ${FUNCTION_NAME} --region=${REGION} \
-       --format="value(status.state)"
+       --format="value(state)"
    
    # Check service account permissions
    gcloud projects get-iam-policy ${PROJECT_ID} \
@@ -737,4 +741,9 @@ Extend this content moderation system by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

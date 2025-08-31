@@ -4,12 +4,12 @@ id: d4f2a8c7
 category: networking
 difficulty: 400
 subject: azure
-services: Azure ExpressRoute, Azure Application Gateway, Azure Database for PostgreSQL Flexible Server
+services: ExpressRoute, Application Gateway, PostgreSQL Flexible Server
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: expressroute, application-gateway, postgresql, hybrid-connectivity, ssl-termination, private-connectivity
 recipe-generator-version: 1.3
@@ -92,7 +92,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for consistent resource naming
+# Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-hybrid-db-connectivity"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
@@ -190,7 +190,7 @@ echo "✅ Resource group and virtual network infrastructure created successfully
        --admin-password 'ComplexPassword123!' \
        --sku-name Standard_D2s_v3 \
        --tier GeneralPurpose \
-       --version 14 \
+       --version 17 \
        --storage-size 128 \
        --vnet ${VNET_NAME} \
        --subnet DatabaseSubnet \
@@ -242,7 +242,7 @@ echo "✅ Resource group and virtual network infrastructure created successfully
        --http-settings-cookie-based-affinity Enabled \
        --frontend-port 443 \
        --http-settings-port 5432 \
-       --http-settings-protocol Https \
+       --http-settings-protocol Http \
        --priority 1000
 
    # Configure backend address pool for PostgreSQL
@@ -308,17 +308,24 @@ echo "✅ Resource group and virtual network infrastructure created successfully
        --virtual-network ${VNET_NAME} \
        --registration-enabled false
 
-   # Create A record for PostgreSQL server
+   # Get PostgreSQL server private IP address for DNS record
    POSTGRES_PRIVATE_IP=$(az postgres flexible-server show \
        --name ${POSTGRES_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query "network.publicAccess" \
+       --query "network.privateEndpointConnections[0].privateEndpoint.networkInterfaces[0].ipConfigurations[0].privateIPAddress" \
        --output tsv)
 
+   # Create A record for PostgreSQL server
    az network private-dns record-set a create \
        --name ${POSTGRES_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --zone-name ${POSTGRES_NAME}.private.postgres.database.azure.com
+
+   az network private-dns record-set a add-record \
+       --resource-group ${RESOURCE_GROUP} \
+       --zone-name ${POSTGRES_NAME}.private.postgres.database.azure.com \
+       --record-set-name ${POSTGRES_NAME} \
+       --ipv4-address ${POSTGRES_PRIVATE_IP}
 
    echo "✅ Private DNS resolution configured for PostgreSQL"
    ```
@@ -335,9 +342,9 @@ echo "✅ Resource group and virtual network infrastructure created successfully
        --resource-group ${RESOURCE_GROUP} \
        --gateway-name ${APPGW_NAME} \
        --name PostgreSQLHealthProbe \
-       --protocol Https \
+       --protocol Http \
        --port 5432 \
-       --path / \
+       --path /health \
        --interval 30 \
        --timeout 30 \
        --threshold 3
@@ -417,6 +424,13 @@ echo "✅ Resource group and virtual network infrastructure created successfully
        --route-table-name rt-database-subnet \
        --address-prefix 10.0.0.0/8 \
        --next-hop-type VnetLocal
+
+   # Associate route table with database subnet
+   az network vnet subnet update \
+       --name DatabaseSubnet \
+       --resource-group ${RESOURCE_GROUP} \
+       --vnet-name ${VNET_NAME} \
+       --route-table rt-database-subnet
 
    echo "✅ Network security groups and route tables configured"
    ```
@@ -606,4 +620,9 @@ Extend this solution by implementing these advanced enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

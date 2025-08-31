@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Video Indexer, Azure Event Grid, Azure Blob Storage, Azure Functions
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: video-processing, serverless, event-driven, media-analytics, transcription
 recipe-generator-version: 1.3
@@ -72,10 +72,10 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions (Contributor role)
-2. Azure CLI v2 installed and configured (or Azure CloudShell)
+2. Azure CLI v2.60+ installed and configured (or Azure CloudShell)
 3. Basic understanding of serverless architectures and event-driven patterns
 4. Familiarity with Azure Functions and blob storage concepts
-5. Azure Video Indexer account (free tier available)
+5. Azure Video Indexer account access (sign up required for ARM-based accounts)
 6. Estimated cost: ~$50/month for moderate usage (100 videos/month)
 
 > **Note**: Azure Video Indexer offers 10 hours of free indexing per month. Additional usage is charged based on video duration and selected features.
@@ -83,7 +83,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables
+# Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-video-indexer-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
@@ -114,7 +114,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Azure Blob Storage provides the foundation for video uploads with built-in Event Grid integration. By enabling event notifications, we create a reactive architecture that automatically responds to new video uploads without polling or manual intervention. This serverless approach ensures immediate processing while maintaining cost efficiency.
 
    ```bash
-   # Create storage account with hierarchical namespace disabled for Video Indexer compatibility
+   # Create storage account with Standard_LRS for cost efficiency
    az storage account create \
        --name ${STORAGE_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
@@ -187,26 +187,35 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Azure Video Indexer leverages multiple Azure AI services to extract insights from videos including transcription, OCR, face detection, and sentiment analysis. The service processes videos asynchronously and provides REST APIs for integration with custom workflows, making it perfect for event-driven architectures.
 
    ```bash
-   # Create Video Indexer account (requires portal for initial setup)
-   echo "⚠️  Azure Video Indexer account creation requires Azure Portal"
-   echo "Please create manually at: https://www.videoindexer.ai/"
-   echo "After creation, obtain:"
-   echo "1. Account ID"
-   echo "2. API Key from the Profile page"
-   echo ""
-   echo "Press enter when Video Indexer account is ready..."
-   read
+   # Create Video Indexer account using Azure Resource Manager
+   az deployment group create \
+       --resource-group ${RESOURCE_GROUP} \
+       --template-uri https://raw.githubusercontent.com/Azure-Samples/azure-video-indexer-samples/master/Deploy-Samples/Arm/videoindexer.template.json \
+       --parameters videoIndexerAccountName=${VI_ACCOUNT} \
+       storageAccountName=${STORAGE_ACCOUNT} \
+       location=${LOCATION}
 
-   # Set Video Indexer credentials (replace with your values)
-   echo "Enter Video Indexer Account ID:"
-   read VI_ACCOUNT_ID
-   echo "Enter Video Indexer API Key:"
-   read -s VI_API_KEY
+   # Wait for deployment to complete
+   echo "⏳ Waiting for Video Indexer account deployment..."
+   sleep 30
+
+   # Get Video Indexer account details
+   VI_ACCOUNT_ID=$(az cognitiveservices account show \
+       --name ${VI_ACCOUNT} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query properties.customSubDomainName \
+       --output tsv)
+
+   # Get Video Indexer API key
+   VI_API_KEY=$(az cognitiveservices account keys list \
+       --name ${VI_ACCOUNT} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query key1 --output tsv)
 
    export VI_ACCOUNT_ID
    export VI_API_KEY
 
-   echo "✅ Video Indexer credentials configured"
+   echo "✅ Video Indexer account created and configured"
    ```
 
 4. **Deploy Azure Functions for Processing Logic**:
@@ -214,14 +223,14 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Azure Functions provides the serverless compute layer that orchestrates video processing workflows. Using consumption plan billing, functions only incur costs during execution, making it cost-effective for sporadic video uploads while automatically scaling to handle bulk processing scenarios.
 
    ```bash
-   # Create Function App with Node.js runtime
+   # Create Function App with Node.js 20 runtime
    az functionapp create \
        --name ${FUNCTION_APP} \
        --resource-group ${RESOURCE_GROUP} \
        --storage-account ${STORAGE_ACCOUNT} \
        --consumption-plan-location ${LOCATION} \
        --runtime node \
-       --runtime-version 18 \
+       --runtime-version 20 \
        --functions-version 4
 
    # Configure application settings
@@ -282,7 +291,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --resource-group ${RESOURCE_GROUP} \
        --query id --output tsv)
 
-   # Create event subscription for blob uploads
+   # Create event subscription for blob uploads with proper subject filter
    az eventgrid event-subscription create \
        --name video-upload-subscription \
        --source-resource-id $(az storage account show \
@@ -292,7 +301,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --endpoint ${FUNCTION_ID}/functions/ProcessVideoUpload \
        --endpoint-type azurefunction \
        --included-event-types Microsoft.Storage.BlobCreated \
-       --subject-filter --subject-begins-with /blobServices/default/containers/videos/
+       --subject-begins-with /blobServices/default/containers/videos/
 
    echo "✅ Blob storage event subscription created"
    ```
@@ -309,9 +318,9 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    func init --worker-runtime node --language javascript
 
    # Create upload processor function
-   func new --name ProcessVideoUpload --template "Azure Event Grid trigger"
+   func new --name ProcessVideoUpload --template "Event Grid trigger"
 
-   # Create sample function code
+   # Create sample function code with proper error handling
    cat > ProcessVideoUpload/index.js << 'EOF'
    const axios = require('axios');
    const { BlobServiceClient } = require('@azure/storage-blob');
@@ -342,7 +351,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
                        accessToken,
                        name: fileName,
                        videoUrl: blobUrl,
-                       callbackUrl: `${process.env.EVENT_GRID_TOPIC_ENDPOINT}?key=${process.env.EVENT_GRID_TOPIC_KEY}`
+                       callbackUrl: process.env.EVENT_GRID_TOPIC_ENDPOINT
                    }
                }
            );
@@ -350,16 +359,34 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
            context.log('Video submitted for indexing:', indexResponse.data.id);
            
        } catch (error) {
-           context.log.error('Error processing video:', error);
+           context.log.error('Error processing video:', error.message);
            throw error;
        }
    };
    EOF
 
-   # Deploy functions to Azure
-   func azure functionapp publish ${FUNCTION_APP}
+   # Create package.json with required dependencies
+   cat > package.json << 'EOF'
+   {
+     "name": "video-functions",
+     "version": "1.0.0",
+     "scripts": {
+       "start": "func start",
+       "test": "echo \"No tests yet...\""
+     },
+     "dependencies": {
+       "@azure/functions": "^4.0.0",
+       "@azure/cosmos": "^4.0.0",
+       "@azure/storage-blob": "^12.17.0",
+       "axios": "^1.6.0"
+     }
+   }
+   EOF
 
-   echo "✅ Function code deployed successfully"
+   # Install dependencies
+   npm install
+
+   echo "✅ Function code created with dependencies"
    ```
 
    The function now automatically processes video uploads by submitting them to Video Indexer and configuring callbacks for completion notifications. This asynchronous pattern ensures the function completes quickly while Video Indexer processes videos in the background.
@@ -370,9 +397,9 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
    ```bash
    # Create results processor function
-   func new --name ProcessVideoResults --template "Azure Event Grid trigger"
+   func new --name ProcessVideoResults --template "Event Grid trigger"
 
-   # Create results processing code
+   # Create results processing code with enhanced error handling
    cat > ProcessVideoResults/index.js << 'EOF'
    const { CosmosClient } = require('@azure/cosmos');
    const { BlobServiceClient } = require('@azure/storage-blob');
@@ -404,22 +431,24 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
            
            const insights = indexResponse.data;
            
-           // Store in Cosmos DB
+           // Store in Cosmos DB with error handling
            const cosmosClient = new CosmosClient(process.env.COSMOS_CONNECTION);
            const container = cosmosClient
                .database('VideoAnalytics')
                .container('VideoMetadata');
            
-           await container.items.create({
+           const metadata = {
                id: videoId,
                videoId: videoId,
                name: insights.name,
                duration: insights.durationInSeconds,
-               transcript: insights.videos[0].insights.transcript,
-               keywords: insights.summarizedInsights.keywords,
-               topics: insights.summarizedInsights.topics,
+               transcript: insights.videos?.[0]?.insights?.transcript || [],
+               keywords: insights.summarizedInsights?.keywords || [],
+               topics: insights.summarizedInsights?.topics || [],
                processedAt: new Date().toISOString()
-           });
+           };
+           
+           await container.items.create(metadata);
            
            // Store full results in blob storage
            const blobClient = BlobServiceClient.fromConnectionString(
@@ -431,25 +460,22 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
                `${videoId}/insights.json`
            );
            
+           const insightsJson = JSON.stringify(insights, null, 2);
            await blockBlobClient.upload(
-               JSON.stringify(insights, null, 2),
-               JSON.stringify(insights).length
+               insightsJson,
+               Buffer.byteLength(insightsJson, 'utf8')
            );
            
            context.log('Results processed successfully:', videoId);
            
        } catch (error) {
-           context.log.error('Error processing results:', error);
+           context.log.error('Error processing results:', error.message);
            throw error;
        }
    };
    EOF
 
-   # Update function configuration
-   cd ..
-   npm install @azure/cosmos @azure/storage-blob axios
-
-   # Deploy updated functions
+   # Deploy functions to Azure
    func azure functionapp publish ${FUNCTION_APP}
 
    echo "✅ Results processing function deployed"
@@ -478,9 +504,9 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 1. Upload a test video to trigger the pipeline:
 
    ```bash
-   # Download a sample video (or use your own)
+   # Download a sample video for testing
    curl -o sample-video.mp4 \
-       "https://sample-videos.com/video321/mp4/720/big_buck_bunny_720p_1mb.mp4"
+       "https://sample-videos.com/video123/mp4/720/big_buck_bunny_720p_1mb.mp4"
 
    # Upload to blob storage
    az storage blob upload \
@@ -495,10 +521,11 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 2. Monitor Function App logs for processing status:
 
    ```bash
-   # Stream function logs
-   az webapp log tail \
-       --name ${FUNCTION_APP} \
-       --resource-group ${RESOURCE_GROUP}
+   # Stream function logs to monitor processing
+   az monitor app-insights events show \
+       --app ${FUNCTION_APP} \
+       --resource-group ${RESOURCE_GROUP} \
+       --start-time 1h
    ```
 
    Expected output: You should see logs indicating video submission to Video Indexer and subsequent processing events.
@@ -531,7 +558,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 1. Delete the resource group and all resources:
 
    ```bash
-   # Delete resource group
+   # Delete resource group and all contained resources
    az group delete \
        --name ${RESOURCE_GROUP} \
        --yes \
@@ -541,11 +568,13 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "Note: Deletion may take several minutes to complete"
    ```
 
-2. Remove Video Indexer account (if created for testing):
+2. Remove local function files:
 
    ```bash
-   echo "⚠️  Remember to delete your Video Indexer account at:"
-   echo "https://www.videoindexer.ai/"
+   # Clean up local function directory
+   cd .. && rm -rf video-functions
+
+   echo "✅ Local function files removed"
    ```
 
 3. Clear local environment variables:
@@ -572,7 +601,7 @@ From a cost perspective, the serverless model ensures you only pay for actual us
 
 Extend this solution by implementing these enhancements:
 
-1. Add language detection and automatic translation of transcripts using Azure Translator
+1. Add language detection and automatic translation of transcripts using Azure Translator Service
 2. Implement content moderation by analyzing Video Indexer's visual and textual moderation scores
 3. Create a notification system using Azure Communication Services to alert users when processing completes
 4. Build a search interface using Azure Cognitive Search to query video content by spoken words
@@ -580,4 +609,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

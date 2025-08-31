@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Build, Security Command Center, Cloud Source Repositories, Binary Authorization
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, security, automation, code-quality, ci-cd, policy-enforcement, compliance-monitoring
 recipe-generator-version: 1.3
@@ -82,13 +82,13 @@ graph TB
 
 ## Prerequisites
 
-1. Google Cloud project with billing enabled and appropriate IAM permissions
+1. Google Cloud project with billing enabled and appropriate IAM permissions (Cloud Build Editor, Binary Authorization Admin, Security Center Admin)
 2. Cloud SDK (gcloud) installed and configured or Cloud Shell access
 3. Basic understanding of CI/CD pipelines, container security, and policy enforcement
 4. Familiarity with Kubernetes deployments and container orchestration
 5. Estimated cost: $20-50 for resources created during this recipe (varies by usage)
 
-> **Note**: This recipe creates multiple Google Cloud services that may incur charges. Monitor your usage through the Google Cloud Console billing dashboard.
+> **Note**: This recipe creates multiple Google Cloud services that may incur charges. Monitor your usage through the Google Cloud Console billing dashboard and consider setting up billing alerts.
 
 ## Preparation
 
@@ -112,13 +112,14 @@ gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
 
 # Enable required APIs
-gcloud services enable cloudbuild.googleapis.com
-gcloud services enable sourcerepo.googleapis.com
-gcloud services enable binaryauthorization.googleapis.com
-gcloud services enable securitycenter.googleapis.com
-gcloud services enable container.googleapis.com
-gcloud services enable containeranalysis.googleapis.com
-gcloud services enable run.googleapis.com
+gcloud services enable cloudbuild.googleapis.com \
+    sourcerepo.googleapis.com \
+    binaryauthorization.googleapis.com \
+    securitycenter.googleapis.com \
+    container.googleapis.com \
+    containeranalysis.googleapis.com \
+    run.googleapis.com \
+    cloudkms.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled for security pipeline"
@@ -144,14 +145,23 @@ echo "✅ APIs enabled for security pipeline"
    # Create sample application structure
    mkdir -p app tests security
    
-   # Create sample Python application
+   # Create sample Python application with security best practices
    cat > app/main.py << 'EOF'
-   from flask import Flask, jsonify
+   from flask import Flask, jsonify, request
    import os
    import logging
+   import secrets
    
    app = Flask(__name__)
    logging.basicConfig(level=logging.INFO)
+   
+   # Security headers middleware
+   @app.after_request
+   def security_headers(response):
+       response.headers['X-Content-Type-Options'] = 'nosniff'
+       response.headers['X-Frame-Options'] = 'DENY'
+       response.headers['X-XSS-Protection'] = '1; mode=block'
+       return response
    
    @app.route('/')
    def hello():
@@ -174,46 +184,53 @@ echo "✅ APIs enabled for security pipeline"
 
 2. **Create Dockerfile with Security Best Practices**:
 
-   Container security begins with secure base images and minimal attack surface. This Dockerfile implements security best practices including non-root user execution, minimal base image, and explicit dependency management. These practices reduce vulnerabilities and support Binary Authorization policy enforcement.
+   Container security begins with secure base images and minimal attack surface. This Dockerfile implements security best practices including non-root user execution, minimal base image, explicit dependency management, and security scanning compatibility. These practices reduce vulnerabilities and support Binary Authorization policy enforcement.
 
    ```bash
-   # Create secure Dockerfile
+   # Create secure Dockerfile following Google Cloud best practices
    cat > Dockerfile << 'EOF'
    FROM python:3.11-slim
-   
+
    # Create non-root user for security
    RUN groupadd -r appuser && useradd -r -g appuser appuser
-   
+
    # Set working directory
    WORKDIR /app
-   
+
+   # Install system dependencies and clean up in same layer
+   RUN apt-get update && apt-get install -y \
+       curl \
+       && rm -rf /var/lib/apt/lists/*
+
    # Install dependencies
    COPY requirements.txt .
-   RUN pip install --no-cache-dir -r requirements.txt
-   
+   RUN pip install --no-cache-dir --upgrade pip \
+       && pip install --no-cache-dir -r requirements.txt
+
    # Copy application code
    COPY app/ .
-   
+
    # Change ownership to non-root user
    RUN chown -R appuser:appuser /app
    USER appuser
-   
+
    # Expose port
    EXPOSE 8080
-   
+
    # Health check
    HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
        CMD curl -f http://localhost:8080/health || exit 1
-   
+
    # Start application
    CMD ["python", "main.py"]
    EOF
    
-   # Create requirements file
+   # Create requirements file with pinned versions
    cat > requirements.txt << 'EOF'
-   Flask==2.3.3
+   Flask==3.0.0
    gunicorn==21.2.0
    requests==2.31.0
+   Werkzeug==3.0.1
    EOF
    
    echo "✅ Secure Dockerfile created with best practices"
@@ -233,8 +250,8 @@ echo "✅ APIs enabled for security pipeline"
      args:
      - '-c'
      - |
-       pip install -r requirements.txt pytest
-       python -m pytest tests/ -v || exit 1
+       pip install -r requirements.txt pytest coverage
+       python -m pytest tests/ -v --cov=app --cov-report=term-missing
      id: 'unit-tests'
    
    # Step 2: Static code analysis with bandit
@@ -244,8 +261,9 @@ echo "✅ APIs enabled for security pipeline"
      - '-c'
      - |
        pip install bandit[toml]
+       mkdir -p security
        bandit -r app/ -f json -o security/bandit-report.json || true
-       bandit -r app/ --severity-level medium || exit 1
+       bandit -r app/ --severity-level medium
      id: 'static-analysis'
    
    # Step 3: Dependency vulnerability scanning
@@ -256,7 +274,7 @@ echo "✅ APIs enabled for security pipeline"
      - |
        pip install safety
        safety check --json --output security/safety-report.json || true
-       safety check --short-report || exit 1
+       safety check --short-report
      id: 'dependency-scan'
    
    # Step 4: Build container image
@@ -264,12 +282,24 @@ echo "✅ APIs enabled for security pipeline"
      args: ['build', '-t', 'gcr.io/$PROJECT_ID/${_IMAGE_NAME}:$BUILD_ID', '.']
      id: 'build-image'
    
-   # Step 5: Container vulnerability scanning
+   # Step 5: Push image for vulnerability scanning
    - name: 'gcr.io/cloud-builders/docker'
      args: ['push', 'gcr.io/$PROJECT_ID/${_IMAGE_NAME}:$BUILD_ID']
      id: 'push-image'
    
-   # Step 6: Create attestation for Binary Authorization
+   # Step 6: Wait for vulnerability scan results
+   - name: 'gcr.io/cloud-builders/gcloud'
+     entrypoint: 'bash'
+     args:
+     - '-c'
+     - |
+       echo "Waiting for vulnerability scan to complete..."
+       sleep 30
+       gcloud container images scan gcr.io/$PROJECT_ID/${_IMAGE_NAME}:$BUILD_ID \
+         --format="value(discovery.analysisStatus)" || echo "Scan initiated"
+     id: 'vulnerability-scan-wait'
+   
+   # Step 7: Create attestation for Binary Authorization
    - name: 'gcr.io/cloud-builders/gcloud'
      entrypoint: 'bash'
      args:
@@ -294,7 +324,7 @@ echo "✅ APIs enabled for security pipeline"
    - 'gcr.io/$PROJECT_ID/${_IMAGE_NAME}:$BUILD_ID'
    EOF
    
-   # Create basic unit test
+   # Create comprehensive unit tests
    cat > tests/test_main.py << 'EOF'
    import sys
    import os
@@ -302,6 +332,7 @@ echo "✅ APIs enabled for security pipeline"
    
    from main import app
    import pytest
+   import json
    
    @pytest.fixture
    def client():
@@ -312,12 +343,21 @@ echo "✅ APIs enabled for security pipeline"
    def test_hello_endpoint(client):
        response = client.get('/')
        assert response.status_code == 200
-       assert b'Secure Hello World' in response.data
+       data = json.loads(response.data)
+       assert 'Secure Hello World' in data['message']
+       assert 'version' in data
    
    def test_health_endpoint(client):
        response = client.get('/health')
        assert response.status_code == 200
-       assert b'healthy' in response.data
+       data = json.loads(response.data)
+       assert data['status'] == 'healthy'
+   
+   def test_security_headers(client):
+       response = client.get('/')
+       assert response.headers.get('X-Content-Type-Options') == 'nosniff'
+       assert response.headers.get('X-Frame-Options') == 'DENY'
+       assert response.headers.get('X-XSS-Protection') == '1; mode=block'
    EOF
    
    echo "✅ Cloud Build configuration created with security scanning"
@@ -328,27 +368,22 @@ echo "✅ APIs enabled for security pipeline"
    Service accounts provide identity and access management for automated systems while following the principle of least privilege. This service account configuration grants only the necessary permissions for Cloud Build to perform security scanning, create attestations, and interact with Security Command Center, ensuring secure automation without over-privileging.
 
    ```bash
-   # Create service account for Cloud Build
+   # Create service account for Cloud Build security pipeline
    gcloud iam service-accounts create ${SERVICE_ACCOUNT} \
        --display-name="Build Security Service Account" \
        --description="Service account for automated security pipeline"
    
-   # Grant necessary IAM roles
-   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
-       --member="serviceAccount:${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com" \
-       --role="roles/cloudbuild.builds.builder"
-   
-   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
-       --member="serviceAccount:${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com" \
-       --role="roles/binaryauthorization.attestorsEditor"
-   
-   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
-       --member="serviceAccount:${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com" \
-       --role="roles/containeranalysis.notes.editor"
-   
-   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
-       --member="serviceAccount:${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com" \
-       --role="roles/securitycenter.findingsEditor"
+   # Grant necessary IAM roles for build and security operations
+   for role in \
+       "roles/cloudbuild.builds.builder" \
+       "roles/binaryauthorization.attestorsEditor" \
+       "roles/containeranalysis.notes.editor" \
+       "roles/securitycenter.findingsEditor" \
+       "roles/storage.admin"; do
+       gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+           --member="serviceAccount:${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com" \
+           --role="$role"
+   done
    
    echo "✅ Service account created with security permissions"
    ```
@@ -368,6 +403,24 @@ echo "✅ APIs enabled for security pipeline"
        --purpose=asymmetric-signing \
        --default-algorithm=rsa-sign-pkcs1-4096-sha512
    
+   # Create Binary Authorization note for attestations
+   cat > note.json << EOF
+   {
+     "name": "projects/${PROJECT_ID}/notes/${ATTESTOR_NAME}",
+     "attestation": {
+       "hint": {
+         "human_readable_name": "Quality enforcement attestor"
+       }
+     }
+   }
+   EOF
+   
+   curl -X POST \
+       -H "Content-Type: application/json" \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       -d @note.json \
+       "https://containeranalysis.googleapis.com/v1/projects/${PROJECT_ID}/notes?noteId=${ATTESTOR_NAME}"
+   
    # Create Binary Authorization attestor
    gcloud container binauthz attestors create ${ATTESTOR_NAME} \
        --attestation-authority-note=${ATTESTOR_NAME} \
@@ -382,7 +435,7 @@ echo "✅ APIs enabled for security pipeline"
        --keyversion-key=attestor-key \
        --keyversion=1
    
-   # Create Binary Authorization policy
+   # Create Binary Authorization policy with strict enforcement
    cat > binauthz-policy.yaml << EOF
    defaultAdmissionRule:
      requireAttestationsBy:
@@ -390,9 +443,10 @@ echo "✅ APIs enabled for security pipeline"
      enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
    globalPolicyEvaluationMode: ENABLE
    admissionWhitelistPatterns:
-   - namePattern: gcr.io/my-project/allowlisted-image*
+   - namePattern: gcr.io/distroless/*
+   - namePattern: gcr.io/google-containers/*
    clusterAdmissionRules:
-     us-central1-a.${CLUSTER_NAME}:
+     ${ZONE}.${CLUSTER_NAME}:
        requireAttestationsBy:
        - projects/${PROJECT_ID}/attestors/${ATTESTOR_NAME}
        enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
@@ -421,9 +475,11 @@ echo "✅ APIs enabled for security pipeline"
    # Commit and push code to trigger the pipeline
    git add .
    git commit -m "Initial commit: Secure application with quality enforcement"
+   git config credential.helper gcloud.sh
    git push origin main
    
    echo "✅ Cloud Build trigger created and pipeline initiated"
+   echo "Monitor build progress: https://console.cloud.google.com/cloud-build/builds"
    ```
 
 7. **Deploy GKE Cluster with Binary Authorization Enabled**:
@@ -431,7 +487,7 @@ echo "✅ APIs enabled for security pipeline"
    Google Kubernetes Engine with Binary Authorization integration provides runtime security policy enforcement for containerized applications. Enabling Binary Authorization on the cluster ensures that only attested, security-scanned images can be deployed, creating a secure deployment environment that maintains compliance with organizational security policies.
 
    ```bash
-   # Create GKE cluster with Binary Authorization enabled
+   # Create GKE cluster with comprehensive security features
    gcloud container clusters create ${CLUSTER_NAME} \
        --zone=${ZONE} \
        --num-nodes=3 \
@@ -440,13 +496,22 @@ echo "✅ APIs enabled for security pipeline"
        --enable-shielded-nodes \
        --shielded-secure-boot \
        --shielded-integrity-monitoring \
-       --workload-pool=${PROJECT_ID}.svc.id.goog
+       --workload-pool=${PROJECT_ID}.svc.id.goog \
+       --enable-autorepair \
+       --enable-autoupgrade \
+       --disk-encryption-key=projects/${PROJECT_ID}/locations/global/keyRings/binauthz-ring/cryptoKeys/attestor-key
    
    # Get cluster credentials
    gcloud container clusters get-credentials ${CLUSTER_NAME} \
        --zone=${ZONE}
    
-   # Create Kubernetes deployment manifest
+   # Wait for build to complete and get BUILD_ID
+   echo "Waiting for build to complete..."
+   sleep 120
+   BUILD_ID=$(gcloud builds list --limit=1 --format="value(id)")
+   echo "Latest build ID: ${BUILD_ID}"
+   
+   # Create Kubernetes deployment manifest with security contexts
    cat > k8s-deployment.yaml << EOF
    apiVersion: apps/v1
    kind: Deployment
@@ -464,9 +529,14 @@ echo "✅ APIs enabled for security pipeline"
          labels:
            app: secure-app
        spec:
+         serviceAccountName: default
+         securityContext:
+           runAsNonRoot: true
+           runAsUser: 1000
+           fsGroup: 2000
          containers:
          - name: secure-app
-           image: gcr.io/${PROJECT_ID}/secure-app:latest
+           image: gcr.io/${PROJECT_ID}/secure-app:${BUILD_ID}
            ports:
            - containerPort: 8080
            resources:
@@ -477,10 +547,23 @@ echo "✅ APIs enabled for security pipeline"
                memory: "128Mi"
                cpu: "500m"
            securityContext:
-             runAsNonRoot: true
-             runAsUser: 1000
              allowPrivilegeEscalation: false
-             readOnlyRootFilesystem: true
+             readOnlyRootFilesystem: false
+             capabilities:
+               drop:
+               - ALL
+           livenessProbe:
+             httpGet:
+               path: /health
+               port: 8080
+             initialDelaySeconds: 30
+             periodSeconds: 10
+           readinessProbe:
+             httpGet:
+               path: /health
+               port: 8080
+             initialDelaySeconds: 5
+             periodSeconds: 5
    ---
    apiVersion: v1
    kind: Service
@@ -504,25 +587,44 @@ echo "✅ APIs enabled for security pipeline"
    Security Command Center provides centralized security and compliance monitoring across Google Cloud resources. Configuring SCC integration enables real-time visibility into security findings from container scanning, policy violations, and compliance status, creating a comprehensive security dashboard for the entire code quality enforcement pipeline.
 
    ```bash
-   # Enable Security Command Center API (if not already enabled)
-   gcloud services enable securitycenter.googleapis.com
+   # Create custom security finding source for the pipeline
+   SCC_SOURCE_DISPLAY_NAME="Code Quality Enforcement Pipeline"
    
-   # Create custom security finding source
-   gcloud scc sources create \
-       --display-name="Code Quality Enforcement Pipeline" \
-       --description="Security findings from automated code quality pipeline"
+   # Create SCC source using REST API
+   SCC_SOURCE_ID=$(curl -s -X POST \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       -H "Content-Type: application/json" \
+       -d "{
+         \"source\": {
+           \"displayName\": \"${SCC_SOURCE_DISPLAY_NAME}\",
+           \"description\": \"Security findings from automated code quality pipeline\"
+         }
+       }" \
+       "https://securitycenter.googleapis.com/v1/organizations/$(gcloud organizations list --format='value(name)')/sources" | \
+       python3 -c "import sys, json; print(json.load(sys.stdin)['name'].split('/')[-1])")
    
-   # Get the source ID for future reference
-   export SCC_SOURCE=$(gcloud scc sources list --format="value(name)" \
-       --filter="displayName:'Code Quality Enforcement Pipeline'")
+   export SCC_SOURCE="organizations/$(gcloud organizations list --format='value(name)')/sources/${SCC_SOURCE_ID}"
    
-   # Create sample security finding
-   gcloud scc findings create finding-code-quality-001 \
-       --source=${SCC_SOURCE} \
-       --state=ACTIVE \
-       --category="SECURITY_SCAN_RESULT" \
-       --external-uri="https://console.cloud.google.com/cloud-build/builds" \
-       --source-properties="scanType=container-scan,severity=medium,pipeline=${TRIGGER_NAME}"
+   # Create sample security finding with build context
+   curl -X POST \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       -H "Content-Type: application/json" \
+       -d "{
+         \"finding\": {
+           \"state\": \"ACTIVE\",
+           \"category\": \"SECURITY_SCAN_RESULT\",
+           \"externalUri\": \"https://console.cloud.google.com/cloud-build/builds\",
+           \"sourceProperties\": {
+             \"scanType\": \"container-scan\",
+             \"severity\": \"medium\",
+             \"pipeline\": \"${TRIGGER_NAME}\",
+             \"buildId\": \"${BUILD_ID}\"
+           },
+           \"eventTime\": \"$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)\",
+           \"createTime\": \"$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)\"
+         }
+       }" \
+       "${SCC_SOURCE}/findings?findingId=finding-code-quality-$(date +%s)"
    
    echo "✅ Security Command Center configured for compliance monitoring"
    echo "SCC Source: ${SCC_SOURCE}"
@@ -533,40 +635,46 @@ echo "✅ APIs enabled for security pipeline"
 1. **Verify Cloud Build Pipeline Execution**:
 
    ```bash
-   # Check recent build status
-   gcloud builds list --limit=5 --format="table(id,status,source.repoSource.repoName,createTime)"
+   # Check recent build status and details
+   gcloud builds list --limit=5 \
+       --format="table(id,status,source.repoSource.repoName,createTime)"
    
-   # Get detailed build information
+   # Get detailed build information for the latest build
    BUILD_ID=$(gcloud builds list --limit=1 --format="value(id)")
-   gcloud builds describe ${BUILD_ID}
+   gcloud builds describe ${BUILD_ID} \
+       --format="yaml(steps[].name,steps[].status,timing)"
    ```
 
-   Expected output: Build status should show "SUCCESS" with all security scanning steps completed.
+   Expected output: Build status should show "SUCCESS" with all security scanning steps completed successfully.
 
 2. **Test Binary Authorization Policy Enforcement**:
 
    ```bash
-   # Attempt to deploy without attestation (should fail)
-   kubectl run test-pod --image=nginx:latest --dry-run=server
+   # Attempt to deploy unauthorized image (should fail)
+   kubectl run test-pod --image=nginx:latest --dry-run=server || \
+       echo "✅ Binary Authorization correctly blocked unauthorized image"
    
-   # Check attestation status
+   # Check attestation status for our secure image
    gcloud container binauthz attestations list \
        --attestor=${ATTESTOR_NAME} \
-       --artifact-url=gcr.io/${PROJECT_ID}/secure-app:${BUILD_ID}
+       --artifact-url=gcr.io/${PROJECT_ID}/secure-app:${BUILD_ID} \
+       --format="table(name,attestation.pgpSignedAttestation.signature)"
    ```
 
-   Expected output: Deployment without attestation should be blocked by Binary Authorization policy.
+   Expected output: Deployment without attestation should be blocked; attested image should show valid attestation.
 
 3. **Validate Security Command Center Integration**:
 
    ```bash
-   # List security findings
+   # List security findings from our pipeline
    gcloud scc findings list --source=${SCC_SOURCE} \
-       --format="table(name,category,state,createTime)"
+       --format="table(name,category,state,createTime)" || \
+       echo "Note: SCC findings may take time to appear"
    
-   # Check container analysis results
+   # Check container vulnerability scan results
    gcloud container images scan gcr.io/${PROJECT_ID}/secure-app:${BUILD_ID} \
-       --format="table(vulnerability.severity,vulnerability.cvssScore,vulnerability.packageIssue[0].affectedPackage)"
+       --format="table(vulnerability.severity,vulnerability.cvssScore,vulnerability.packageIssue[0].affectedPackage)" || \
+       echo "Vulnerability scan results may still be processing"
    ```
 
    Expected output: Security findings should appear in SCC dashboard with vulnerability scan results.
@@ -575,15 +683,25 @@ echo "✅ APIs enabled for security pipeline"
 
    ```bash
    # Deploy application with valid attestation
-   sed -i "s/:latest/:${BUILD_ID}/g" k8s-deployment.yaml
    kubectl apply -f k8s-deployment.yaml
    
-   # Verify deployment status
+   # Wait for deployment to be ready
+   kubectl wait --for=condition=available --timeout=300s deployment/secure-app
+   
+   # Verify deployment status and get service endpoint
    kubectl get pods -l app=secure-app
    kubectl get service secure-app-service
+   
+   # Test application functionality
+   EXTERNAL_IP=$(kubectl get service secure-app-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+   if [ ! -z "$EXTERNAL_IP" ]; then
+       curl -s http://${EXTERNAL_IP}/health | python3 -m json.tool
+   else
+       echo "Service is still provisioning external IP..."
+   fi
    ```
 
-   Expected output: Application should deploy successfully with valid attestation.
+   Expected output: Application should deploy successfully with valid attestation and respond to health checks.
 
 ## Cleanup
 
@@ -591,7 +709,7 @@ echo "✅ APIs enabled for security pipeline"
 
    ```bash
    # Delete Kubernetes deployments and services
-   kubectl delete -f k8s-deployment.yaml
+   kubectl delete -f k8s-deployment.yaml --ignore-not-found=true
    
    echo "✅ Kubernetes resources removed"
    ```
@@ -621,6 +739,11 @@ echo "✅ APIs enabled for security pipeline"
    # Delete attestor
    gcloud container binauthz attestors delete ${ATTESTOR_NAME} --quiet
    
+   # Delete Container Analysis note
+   curl -X DELETE \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       "https://containeranalysis.googleapis.com/v1/projects/${PROJECT_ID}/notes/${ATTESTOR_NAME}"
+   
    # Delete KMS resources
    gcloud kms keys versions destroy 1 \
        --key=attestor-key \
@@ -630,6 +753,10 @@ echo "✅ APIs enabled for security pipeline"
    
    gcloud kms keys destroy attestor-key \
        --keyring=binauthz-ring \
+       --location=global \
+       --quiet
+   
+   gcloud kms keyrings destroy binauthz-ring \
        --location=global \
        --quiet
    
@@ -657,22 +784,24 @@ echo "✅ APIs enabled for security pipeline"
 
    ```bash
    # Delete SCC custom source
-   gcloud scc sources delete ${SCC_SOURCE} --quiet
+   curl -X DELETE \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       "${SCC_SOURCE}" || echo "SCC source may have been already removed"
    
    echo "✅ Security Command Center resources cleaned up"
    ```
 
 ## Discussion
 
-This intelligent code quality enforcement pipeline demonstrates how Google Cloud's integrated security services create a comprehensive DevSecOps environment. The solution addresses the critical challenge of maintaining security and quality standards while enabling rapid development cycles through automated policy enforcement and continuous monitoring.
+This intelligent code quality enforcement pipeline demonstrates how Google Cloud's integrated security services create a comprehensive DevSecOps environment that addresses the critical challenge of maintaining security and quality standards while enabling rapid development cycles. The solution implements automated policy enforcement and continuous monitoring without disrupting developer productivity, following Google Cloud's security best practices and the Well-Architected Framework principles.
 
-The integration of Cloud Build Triggers with Binary Authorization provides deployment-time security controls that prevent vulnerable or non-compliant code from reaching production environments. This approach implements the "shift-left" security philosophy by incorporating security scanning early in the development pipeline while maintaining strict policy enforcement at deployment time. The attestation-based approach ensures that only images that have passed comprehensive security checks can be deployed, creating a verifiable chain of trust from source code to production.
+The integration of Cloud Build Triggers with Binary Authorization provides deployment-time security controls that prevent vulnerable or non-compliant code from reaching production environments. This approach implements the "shift-left" security philosophy by incorporating security scanning early in the development pipeline while maintaining strict policy enforcement at deployment time. The attestation-based approach ensures that only images that have passed comprehensive security checks can be deployed, creating a verifiable chain of trust from source code to production deployment.
 
-Security Command Center integration provides centralized visibility and compliance monitoring across the entire pipeline. By consolidating security findings from container scanning, policy violations, and compliance checks, SCC enables security teams to maintain oversight without becoming a bottleneck in the development process. The real-time monitoring capabilities help organizations demonstrate compliance with industry standards and quickly respond to emerging security threats.
+Security Command Center integration provides centralized visibility and compliance monitoring across the entire pipeline, consolidating security findings from container scanning, policy violations, and compliance checks. This enables security teams to maintain oversight without becoming a bottleneck in the development process, while the real-time monitoring capabilities help organizations demonstrate compliance with industry standards and quickly respond to emerging security threats.
 
-The pipeline's multi-layered security approach combines static code analysis, dependency vulnerability scanning, container image assessment, and runtime policy enforcement. This comprehensive coverage addresses various attack vectors and ensures that security considerations are embedded throughout the software development lifecycle. The automated nature of these controls reduces the risk of human error while providing consistent policy enforcement across all environments.
+The pipeline's multi-layered security approach combines static code analysis with Bandit, dependency vulnerability scanning with Safety, container image assessment through Container Analysis, and runtime policy enforcement via Binary Authorization. This comprehensive coverage addresses various attack vectors and ensures that security considerations are embedded throughout the software development lifecycle, while the automated nature of these controls reduces the risk of human error and provides consistent policy enforcement.
 
-> **Tip**: Implement gradual policy enforcement by starting with Binary Authorization in "dry-run" mode, allowing teams to understand policy impacts before enabling blocking enforcement. This approach facilitates smooth adoption while maintaining security standards.
+> **Tip**: Implement gradual policy enforcement by starting with Binary Authorization in "dry-run" mode, allowing development teams to understand policy impacts before enabling blocking enforcement. This approach facilitates smooth adoption while maintaining security standards and provides valuable feedback for policy refinement.
 
 For more information on implementing secure CI/CD pipelines, see the [Google Cloud Build Security Best Practices](https://cloud.google.com/build/docs/securing-builds/overview), [Binary Authorization Documentation](https://cloud.google.com/binary-authorization/docs), [Security Command Center User Guide](https://cloud.google.com/security-command-center/docs), [Container Analysis Documentation](https://cloud.google.com/container-analysis/docs), and [Google Cloud Architecture Framework Security Pillar](https://cloud.google.com/architecture/framework/security).
 
@@ -680,16 +809,21 @@ For more information on implementing secure CI/CD pipelines, see the [Google Clo
 
 Extend this intelligent code quality enforcement solution by implementing these advanced capabilities:
 
-1. **Multi-Environment Policy Progression**: Configure different Binary Authorization policies for development, staging, and production environments with progressively stricter requirements, including separate attestors for each environment and automated policy promotion based on testing results.
+1. **Multi-Environment Policy Progression**: Configure different Binary Authorization policies for development, staging, and production environments with progressively stricter requirements, including separate attestors for each environment and automated policy promotion based on testing results and vulnerability thresholds.
 
-2. **Advanced Security Scanning Integration**: Integrate additional security tools such as Container Registry vulnerability scanning, Cloud Security Scanner for web application testing, and third-party SAST/DAST tools through custom Cloud Build steps with findings aggregation in Security Command Center.
+2. **Advanced Security Scanning Integration**: Integrate additional security tools such as Twistlock/Prisma Cloud for runtime protection, Snyk for advanced dependency scanning, and OWASP ZAP for dynamic application security testing through custom Cloud Build steps with centralized findings aggregation in Security Command Center.
 
-3. **Automated Compliance Reporting**: Build automated compliance reporting that aggregates security findings, policy violations, and attestation status into executive dashboards and regulatory reports, with automated notifications for critical security events and policy violations.
+3. **Automated Compliance Reporting**: Build automated compliance reporting that aggregates security findings, policy violations, and attestation status into executive dashboards and regulatory reports using Data Studio, with automated notifications for critical security events and policy violations through Pub/Sub and Cloud Functions.
 
-4. **Dynamic Policy Adjustment**: Implement machine learning-based policy recommendations that analyze historical security findings and deployment patterns to suggest optimal policy configurations and automatically adjust policies based on threat intelligence feeds.
+4. **Dynamic Policy Adjustment**: Implement machine learning-based policy recommendations using Vertex AI that analyze historical security findings and deployment patterns to suggest optimal policy configurations, automatically adjusting policies based on threat intelligence feeds and organizational risk tolerance.
 
-5. **Cross-Project Security Governance**: Extend the solution to operate across multiple Google Cloud projects with centralized policy management, organization-level security monitoring, and federated attestation services for enterprise-scale code quality enforcement.
+5. **Cross-Project Security Governance**: Extend the solution to operate across multiple Google Cloud projects with centralized policy management through Organization Policies, organization-level security monitoring in Security Command Center, and federated attestation services for enterprise-scale code quality enforcement across business units.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

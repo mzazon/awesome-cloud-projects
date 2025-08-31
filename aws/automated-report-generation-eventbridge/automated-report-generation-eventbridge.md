@@ -1,21 +1,21 @@
 ---
-title: Automated Report Generation with EventBridge
+title: Automated Report Generation with EventBridge Scheduler
 id: a7f3e2d8
 category: serverless
 difficulty: 100
 subject: aws
 services: EventBridge Scheduler, S3, Lambda, SES
 estimated-time: 60 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: automation, reporting, scheduling, email, serverless, data-processing
 recipe-generator-version: 1.3
 ---
 
-# Automated Report Generation with EventBridge
+# Automated Report Generation with EventBridge Scheduler
 
 ## Problem
 
@@ -383,7 +383,7 @@ echo "✅ AWS environment configured with region: ${AWS_REGION}"
    # Create Lambda function with appropriate timeout and memory
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/ReportGeneratorRole \
        --handler report_generator.lambda_handler \
        --zip-file fileb://function.zip \
@@ -640,4 +640,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

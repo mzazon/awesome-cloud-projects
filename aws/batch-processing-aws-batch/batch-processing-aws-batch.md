@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: AWS Batch, EC2, ECR, CloudWatch
 estimated-time: 150 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: batch-processing, compute, containers, scaling
 recipe-generator-version: 1.3
@@ -68,10 +68,9 @@ graph TB
     EC2-->LOGS
     SCH-->CW
     
-    style AWS_BATCH fill:#FF9900
+    style CE fill:#FF9900
     style ECR fill:#FF9900
     style EC2 fill:#FF9900
-    style EFS fill:#FF9900
     style CW fill:#FF9900
 ```
 
@@ -185,7 +184,6 @@ echo "✅ Security group created: ${SECURITY_GROUP_ID}"
 
    ```bash
    # Create ECR repository for storing container images
-   # ECR provides a fully managed Docker container registry
    aws ecr create-repository \
        --repository-name ${ECR_REPO_NAME} \
        --image-scanning-configuration scanOnPush=true
@@ -287,21 +285,38 @@ EOF
    echo "Waiting for instance profile to be available..."
    sleep 30
    
-   # Create managed compute environment
+   # Create managed compute environment using JSON input
+   cat > compute-environment.json << EOF
+{
+    "computeEnvironmentName": "${BATCH_COMPUTE_ENV_NAME}",
+    "type": "MANAGED",
+    "state": "ENABLED",
+    "serviceRole": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${BATCH_SERVICE_ROLE_NAME}",
+    "computeResources": {
+        "type": "EC2",
+        "minvCpus": 0,
+        "maxvCpus": 100,
+        "desiredvCpus": 0,
+        "instanceTypes": ["optimal"],
+        "subnets": ["${SUBNET_IDS//,/\",\"}"],
+        "securityGroupIds": ["${SECURITY_GROUP_ID}"],
+        "instanceRole": "arn:aws:iam::${AWS_ACCOUNT_ID}:instance-profile/${BATCH_INSTANCE_PROFILE_NAME}",
+        "bidPercentage": 50,
+        "ec2Configuration": [
+            {
+                "imageType": "ECS_AL2"
+            }
+        ]
+    }
+}
+EOF
+
+   # Create compute environment
    aws batch create-compute-environment \
-       --compute-environment-name ${BATCH_COMPUTE_ENV_NAME} \
-       --type MANAGED \
-       --state ENABLED \
-       --service-role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${BATCH_SERVICE_ROLE_NAME} \
-       --compute-resources type=EC2,minvCpus=0,maxvCpus=100,desiredvCpus=0,instanceTypes=optimal,subnets=${SUBNET_IDS},securityGroupIds=${SECURITY_GROUP_ID},instanceRole=arn:aws:iam::${AWS_ACCOUNT_ID}:instance-profile/${BATCH_INSTANCE_PROFILE_NAME},bidPercentage=50,ec2Configuration=[{imageType=ECS_AL2}]
-   
-   # Wait for compute environment to be ready
-   echo "Waiting for compute environment to be ready..."
-   aws batch describe-compute-environments \
-       --compute-environments ${BATCH_COMPUTE_ENV_NAME} \
-       --query 'computeEnvironments[0].status' --output text
+       --cli-input-json file://compute-environment.json
    
    # Monitor status until VALID
+   echo "Waiting for compute environment to be ready..."
    while true; do
        STATUS=$(aws batch describe-compute-environments \
            --compute-environments ${BATCH_COMPUTE_ENV_NAME} \
@@ -361,6 +376,11 @@ EOF
    Job definitions serve as blueprints that specify how containers should run in AWS Batch. They define resource requirements (CPU, memory), container images, environment variables, and logging configurations. This declarative approach ensures consistent job execution while enabling parameterization for different workload scenarios. The timeout setting provides protection against runaway jobs that could consume resources indefinitely.
 
    ```bash
+   # Create log group first (required for job definition)
+   aws logs create-log-group \
+       --log-group-name /aws/batch/job \
+       --retention-in-days 30
+   
    # Create job definition
    aws batch register-job-definition \
        --job-definition-name ${BATCH_JOB_DEFINITION_NAME} \
@@ -394,22 +414,7 @@ EOF
 
    The job definition is now registered and can be referenced by job submissions. This reusable template ensures consistent execution environments while allowing runtime parameterization through environment variables. The integrated CloudWatch Logs configuration provides centralized logging for debugging and monitoring purposes, essential for production batch processing workloads.
 
-5. **Create CloudWatch Log Group**:
-
-   CloudWatch Logs provides centralized log aggregation and management for batch processing workloads. This logging infrastructure enables real-time monitoring, troubleshooting, and compliance auditing. The 30-day retention policy balances operational needs with cost management, though this can be adjusted based on regulatory requirements. Structured logging through CloudWatch enables advanced analytics and alerting capabilities.
-
-   ```bash
-   # Create log group for batch jobs
-   aws logs create-log-group \
-       --log-group-name /aws/batch/job \
-       --retention-in-days 30
-   
-   echo "✅ CloudWatch log group created: /aws/batch/job"
-   ```
-
-   The log group is now ready to receive logs from batch jobs. This centralized logging approach enables comprehensive observability across all job executions, supporting operational excellence and troubleshooting workflows. CloudWatch Logs Insights can be used to query and analyze log data for performance optimization and error analysis.
-
-6. **Submit and Monitor Batch Jobs**:
+5. **Submit and Monitor Batch Jobs**:
 
    Job submission represents the culmination of the batch processing infrastructure setup. AWS Batch accepts job submissions and places them in the queue for scheduling based on resource availability and priority. The parameterization capability allows the same job definition to process different workloads by passing runtime configuration through environment variables. This flexibility enables efficient resource utilization across diverse processing requirements.
 
@@ -446,7 +451,7 @@ EOF
 
    The jobs are now submitted and will progress through various states: SUBMITTED, PENDING, RUNNABLE, STARTING, RUNNING, and finally SUCCEEDED or FAILED. AWS Batch automatically provisions compute resources as needed, ensuring jobs execute efficiently while optimizing costs through intelligent instance selection and scaling.
 
-7. **Create Job Array for Parallel Processing**:
+6. **Create Job Array for Parallel Processing**:
 
    Array jobs enable massively parallel processing by automatically creating multiple job instances from a single submission. Each array index runs independently with access to the AWS_BATCH_JOB_ARRAY_INDEX environment variable, allowing tasks to process different data partitions concurrently. This pattern is ideal for embarrassingly parallel workloads such as financial simulations, scientific computing, and large-scale data processing where tasks don't depend on each other.
 
@@ -468,7 +473,7 @@ EOF
 
    > **Warning**: Array jobs are ideal for embarrassingly parallel workloads where tasks can run independently. Be mindful of resource limits and costs when submitting large array jobs, as each array index consumes compute resources. Monitor job queue utilization to ensure optimal resource allocation.
 
-8. **Set up Job Monitoring and Alerts**:
+7. **Set up Job Monitoring and Alerts**:
 
    Comprehensive monitoring ensures operational excellence for production batch processing workloads. CloudWatch alarms provide proactive notification of failures and resource constraints, enabling rapid response to issues. The AWS/Batch namespace provides metrics for job success rates, queue depth, and resource utilization. Integrating these alarms with Amazon SNS enables automated notifications to operations teams and can trigger automated remediation workflows.
 
@@ -486,15 +491,15 @@ EOF
        --evaluation-periods 1 \
        --dimensions Name=JobQueue,Value=${BATCH_JOB_QUEUE_NAME}
    
-   # Create alarm for high job queue utilization
+   # Create alarm for queue depth monitoring
    aws cloudwatch put-metric-alarm \
-       --alarm-name "BatchQueueUtilization-${RANDOM_SUFFIX}" \
-       --alarm-description "Alert when job queue has high utilization" \
-       --metric-name QueueUtilization \
+       --alarm-name "BatchQueueDepth-${RANDOM_SUFFIX}" \
+       --alarm-description "Alert when job queue has many pending jobs" \
+       --metric-name SubmittedJobs \
        --namespace AWS/Batch \
        --statistic Average \
        --period 300 \
-       --threshold 80 \
+       --threshold 10 \
        --comparison-operator GreaterThanThreshold \
        --evaluation-periods 2 \
        --dimensions Name=JobQueue,Value=${BATCH_JOB_QUEUE_NAME}
@@ -590,6 +595,8 @@ EOF
            echo "Cancelled job: $JOB_ID"
        done
    fi
+   
+   echo "✅ Running jobs cancelled"
    ```
 
 2. **Delete Job Queue**:
@@ -666,7 +673,7 @@ EOF
    # Delete CloudWatch alarms
    aws cloudwatch delete-alarms \
        --alarm-names "BatchJobFailures-${RANDOM_SUFFIX}" \
-                     "BatchQueueUtilization-${RANDOM_SUFFIX}"
+                     "BatchQueueDepth-${RANDOM_SUFFIX}"
    
    # Delete log group
    aws logs delete-log-group \
@@ -676,6 +683,9 @@ EOF
    aws ecr delete-repository \
        --repository-name ${ECR_REPO_NAME} \
        --force
+   
+   # Clean up temporary files
+   rm -f compute-environment.json Dockerfile batch_processor.py
    
    echo "✅ All resources cleaned up successfully"
    ```
@@ -688,7 +698,9 @@ The key architectural components work together seamlessly: compute environments 
 
 Cost optimization is achieved through several mechanisms including Spot instance integration, automatic scaling, and efficient resource utilization. The service supports both EC2 and Fargate launch types, allowing organizations to choose the most appropriate compute model for their workloads. Multi-node parallel jobs enable high-performance computing scenarios, while array jobs provide efficient parallel processing capabilities.
 
-Security is built-in through IAM integration for access control, VPC support for network isolation, and container-level security through ECR image scanning. The service integrates with AWS services like CloudWatch Logs for centralized logging and AWS X-Ray for distributed tracing, providing comprehensive observability for batch processing workloads. For detailed implementation guidance, refer to the [AWS Batch best practices documentation](https://docs.aws.amazon.com/batch/latest/userguide/best-practices.html) and [monitoring strategies](https://docs.aws.amazon.com/batch/latest/userguide/logging-and-moritoring-batch.html).
+Security is built-in through IAM integration for access control, VPC support for network isolation, and container-level security through ECR image scanning. The service integrates with AWS services like CloudWatch Logs for centralized logging and AWS X-Ray for distributed tracing, providing comprehensive observability for batch processing workloads. For detailed implementation guidance, refer to the [AWS Batch best practices documentation](https://docs.aws.amazon.com/batch/latest/userguide/best-practices.html) and [monitoring strategies](https://docs.aws.amazon.com/batch/latest/userguide/logging-and-monitoring.html).
+
+> **Tip**: Use AWS Batch with AWS Step Functions to orchestrate complex workflows with dependencies between batch jobs. This combination enables sophisticated data processing pipelines with error handling and retry logic.
 
 ## Challenge
 
@@ -706,4 +718,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

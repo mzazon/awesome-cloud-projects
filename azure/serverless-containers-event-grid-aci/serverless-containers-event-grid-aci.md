@@ -4,12 +4,12 @@ id: 7c5d2e9f
 category: serverless
 difficulty: 200
 subject: azure
-services: Azure Event Grid, Azure Container Instances, Azure Storage Account
+services: Azure Event Grid, Azure Container Instances, Azure Storage Account, Azure Functions
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: event-driven, serverless, containers, storage-events, automation, microservices
 recipe-generator-version: 1.3
@@ -65,8 +65,8 @@ graph TB
 
 ## Prerequisites
 
-1. Azure subscription with appropriate permissions for creating resource groups, storage accounts, Event Grid topics, and Container Instances
-2. Azure CLI v2.15.0 or higher installed and configured (or Azure Cloud Shell)
+1. Azure subscription with appropriate permissions for creating resource groups, storage accounts, Event Grid topics, Container Instances, and Azure Functions
+2. Azure CLI v2.50.0 or higher installed and configured (or Azure Cloud Shell)
 3. Basic understanding of containerization concepts and Azure storage events
 4. Docker knowledge for creating custom container images (optional for basic scenarios)
 5. Estimated cost: $10-20 for testing resources (Container Instances charged per second, Event Grid per operation)
@@ -76,16 +76,18 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for consistent resource naming
+# Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-event-driven-containers"
 export LOCATION="eastus"
-export STORAGE_ACCOUNT="steventcontainers$(openssl rand -hex 4)"
-export CONTAINER_REGISTRY="acreventcontainers$(openssl rand -hex 4)"
-export EVENT_GRID_TOPIC="egt-container-events"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
+
+# Set unique resource names
+export STORAGE_ACCOUNT="stevcontainers${RANDOM_SUFFIX}"
+export CONTAINER_REGISTRY="acrevtcontainers${RANDOM_SUFFIX}"
+export EVENT_GRID_TOPIC="egt-container-events"
 
 # Create resource group for all related resources
 az group create \
@@ -122,7 +124,7 @@ echo "✅ Container registry created: ${CONTAINER_REGISTRY}"
 
 1. **Create Azure Event Grid Custom Topic**:
 
-   Azure Event Grid provides a fully managed event routing service that enables event-driven architectures with automatic scaling and delivery guarantees. Creating a custom topic allows you to publish and subscribe to application-specific events beyond the built-in Azure service events. This foundational component will coordinate between storage events and container execution, providing reliable event delivery with built-in retry mechanisms and dead-letter handling.
+   Azure Event Grid provides a fully managed event routing service that enables event-driven architectures with automatic scaling and delivery guarantees. Creating a custom topic allows you to publish and subscribe to application-specific events beyond the built-in Azure service events. This foundational component coordinates between storage events and container execution, providing reliable event delivery with built-in retry mechanisms and dead-letter handling.
 
    ```bash
    # Create custom Event Grid topic for container orchestration
@@ -148,65 +150,7 @@ echo "✅ Container registry created: ${CONTAINER_REGISTRY}"
 
    The Event Grid topic is now ready to receive and route events with enterprise-grade reliability. This managed service handles event filtering, routing, and delivery, eliminating the need for custom messaging infrastructure while providing exactly-once delivery semantics.
 
-2. **Create Container Instance for Event Processing**:
-
-   Azure Container Instances provides serverless containers that start in seconds and scale based on demand. Creating a processing container with Event Grid webhook capabilities enables automatic execution when events occur. This approach eliminates the need for always-on compute resources while providing immediate response to storage events with built-in monitoring and logging through Azure Monitor.
-
-   ```bash
-   # Create container instance with webhook processing capabilities
-   az container create \
-       --name "event-processor-${RANDOM_SUFFIX}" \
-       --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --image mcr.microsoft.com/azure-functions/dotnet:3.0 \
-       --cpu 1 \
-       --memory 1.5 \
-       --restart-policy OnFailure \
-       --environment-variables \
-           STORAGE_ACCOUNT_NAME=${STORAGE_ACCOUNT} \
-           EVENT_GRID_TOPIC=${EVENT_GRID_TOPIC} \
-       --ports 80 \
-       --dns-name-label "event-processor-${RANDOM_SUFFIX}"
-   
-   # Get container instance FQDN for webhook configuration
-   CONTAINER_FQDN=$(az container show \
-       --name "event-processor-${RANDOM_SUFFIX}" \
-       --resource-group ${RESOURCE_GROUP} \
-       --query ipAddress.fqdn --output tsv)
-   
-   echo "✅ Container instance created with FQDN: ${CONTAINER_FQDN}"
-   ```
-
-   The container instance is now running and ready to receive webhook events from Event Grid. This serverless approach provides automatic scaling, built-in health monitoring, and pay-per-use pricing that makes it ideal for event-driven workloads.
-
-3. **Configure Storage Account Event Subscription**:
-
-   Event subscriptions connect Azure services to Event Grid topics, enabling automatic event publishing when specific actions occur. Configuring the storage account to publish blob events creates the foundation for event-driven processing. This integration provides real-time notifications for file uploads, modifications, and deletions while supporting advanced filtering and routing capabilities.
-
-   ```bash
-   # Create storage account event subscription for blob events
-   az eventgrid event-subscription create \
-       --name "blob-events-subscription" \
-       --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}" \
-       --endpoint-type webhook \
-       --endpoint "https://${CONTAINER_FQDN}/api/events" \
-       --event-delivery-schema EventGridSchema \
-       --included-event-types "Microsoft.Storage.BlobCreated" \
-       --subject-begins-with "/blobServices/default/containers/input/" \
-       --advanced-filter data.contentType StringContains "image"
-   
-   # Verify event subscription status
-   az eventgrid event-subscription show \
-       --name "blob-events-subscription" \
-       --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}" \
-       --query provisioningState --output tsv
-   
-   echo "✅ Storage event subscription configured for blob events"
-   ```
-
-   The event subscription now automatically publishes storage events to Event Grid when new blobs are created in the input container. This configuration includes advanced filtering for image files and specific container paths, ensuring only relevant events trigger container processing.
-
-4. **Create Storage Container and Sample Processing Logic**:
+2. **Create Storage Containers for Event Processing**:
 
    Storage containers provide organized blob storage with access control and metadata management. Creating dedicated input and output containers establishes clear data flow patterns for event-driven processing. This separation enables secure access control, efficient monitoring, and clean workflow organization while supporting various file types and processing scenarios.
 
@@ -229,26 +173,12 @@ echo "✅ Container registry created: ${CONTAINER_REGISTRY}"
        --account-key ${STORAGE_KEY} \
        --public-access off
    
-   # Create sample processing container with custom logic
-   az container create \
-       --name "image-processor-${RANDOM_SUFFIX}" \
-       --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --image mcr.microsoft.com/azure-cli:latest \
-       --cpu 0.5 \
-       --memory 1 \
-       --restart-policy OnFailure \
-       --command-line "sleep 3600" \
-       --environment-variables \
-           STORAGE_ACCOUNT=${STORAGE_ACCOUNT} \
-           STORAGE_KEY=${STORAGE_KEY}
-   
-   echo "✅ Storage containers and processing container created"
+   echo "✅ Storage containers created for input and output"
    ```
 
-   The storage containers now provide secure, organized storage for input and output data with proper access controls. The processing container demonstrates how custom logic can be deployed as serverless containers that respond to storage events automatically.
+   The storage containers now provide secure, organized storage for input and output data with proper access controls. This foundation supports the event-driven processing workflow by providing clearly defined data sources and destinations.
 
-5. **Deploy Function App for Event Grid Integration**:
+3. **Deploy Function App for Event Grid Integration**:
 
    Azure Function Apps provide serverless compute with built-in Event Grid triggers and bindings. Deploying a function app creates a scalable webhook endpoint that can receive Event Grid events and trigger container instances programmatically. This approach provides advanced event handling capabilities including retry logic, dead-letter queues, and detailed monitoring while integrating seamlessly with the Azure ecosystem.
 
@@ -284,35 +214,66 @@ echo "✅ Container registry created: ${CONTAINER_REGISTRY}"
 
    The function app now provides a serverless webhook endpoint that can receive Event Grid events and orchestrate container instances dynamically. This integration enables sophisticated event processing logic while maintaining the serverless benefits of automatic scaling and pay-per-execution pricing.
 
-6. **Configure Event Grid Webhook Integration**:
+4. **Configure Storage Account Event Subscription**:
 
-   Event Grid webhooks provide HTTP-based event delivery to custom endpoints with automatic retry and failure handling. Configuring webhook integration between Event Grid and the function app creates a reliable event processing pipeline. This setup enables real-time event handling with built-in security features including webhook validation and Azure Active Directory authentication.
+   Event subscriptions connect Azure services to Event Grid topics, enabling automatic event publishing when specific actions occur. Configuring the storage account to publish blob events creates the foundation for event-driven processing. This integration provides real-time notifications for file uploads, modifications, and deletions while supporting advanced filtering and routing capabilities.
 
    ```bash
-   # Create Event Grid subscription to function app webhook
+   # Create storage account event subscription for blob events
    az eventgrid event-subscription create \
-       --name "function-webhook-subscription" \
+       --name "blob-events-subscription" \
        --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}" \
        --endpoint-type webhook \
        --endpoint "https://${FUNCTION_APP_URL}/api/ProcessStorageEvent" \
        --event-delivery-schema EventGridSchema \
        --included-event-types "Microsoft.Storage.BlobCreated" \
+       --subject-begins-with "/blobServices/default/containers/input/" \
        --max-delivery-attempts 3 \
        --event-ttl 1440
    
-   # Verify webhook configuration
+   # Verify event subscription status
    az eventgrid event-subscription show \
-       --name "function-webhook-subscription" \
+       --name "blob-events-subscription" \
        --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}" \
-       --query "{status: provisioningState, endpoint: destination.endpointUrl}" \
-       --output table
+       --query provisioningState --output tsv
    
-   echo "✅ Event Grid webhook integration configured"
+   echo "✅ Storage event subscription configured for blob events"
    ```
 
-   The webhook integration now provides reliable event delivery from storage events to the function app with automatic retry mechanisms and failure handling. This configuration ensures robust event processing even during temporary service outages or processing failures.
+   The event subscription now automatically publishes storage events to the Function App when new blobs are created in the input container. This configuration includes advanced filtering for specific container paths and retry mechanisms, ensuring only relevant events trigger container processing.
 
-7. **Create Container Instance Template for Dynamic Scaling**:
+5. **Create Container Instance for Event Processing**:
+
+   Azure Container Instances provides serverless containers that start in seconds and scale based on demand. Creating a processing container with Event Grid webhook capabilities enables automatic execution when events occur. This approach eliminates the need for always-on compute resources while providing immediate response to storage events with built-in monitoring and logging through Azure Monitor.
+
+   ```bash
+   # Create container instance with webhook processing capabilities
+   az container create \
+       --name "event-processor-${RANDOM_SUFFIX}" \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --image mcr.microsoft.com/azure-cli:latest \
+       --cpu 1 \
+       --memory 1.5 \
+       --restart-policy OnFailure \
+       --environment-variables \
+           STORAGE_ACCOUNT_NAME=${STORAGE_ACCOUNT} \
+           EVENT_GRID_TOPIC=${EVENT_GRID_TOPIC} \
+       --ports 80 \
+       --dns-name-label "event-processor-${RANDOM_SUFFIX}"
+   
+   # Get container instance FQDN for reference
+   CONTAINER_FQDN=$(az container show \
+       --name "event-processor-${RANDOM_SUFFIX}" \
+       --resource-group ${RESOURCE_GROUP} \
+       --query ipAddress.fqdn --output tsv)
+   
+   echo "✅ Container instance created with FQDN: ${CONTAINER_FQDN}"
+   ```
+
+   The container instance is now running and ready to process events. This serverless approach provides automatic scaling, built-in health monitoring, and pay-per-use pricing that makes it ideal for event-driven workloads.
+
+6. **Create Container Instance Template for Dynamic Scaling**:
 
    Container instance templates define reusable container configurations that can be deployed dynamically in response to events. Creating templates with parameterized configurations enables efficient scaling and consistent deployment patterns. This approach provides infrastructure-as-code benefits while supporting dynamic container creation based on event characteristics and processing requirements.
 
@@ -376,7 +337,7 @@ echo "✅ Container registry created: ${CONTAINER_REGISTRY}"
 
    The container template now provides a reusable configuration for dynamic container deployment that can be customized based on event data. This approach enables consistent, scalable container processing while supporting various workload types and processing requirements.
 
-8. **Set Up Monitoring and Logging**:
+7. **Set Up Monitoring and Logging**:
 
    Azure Monitor provides comprehensive observability for containerized workloads with metrics, logs, and alerting capabilities. Configuring monitoring and logging enables real-time visibility into container performance, event processing metrics, and failure detection. This observability foundation supports production operations with detailed insights into system behavior and performance optimization opportunities.
 
@@ -483,13 +444,11 @@ echo "✅ Container registry created: ${CONTAINER_REGISTRY}"
        --query "{name: name, state: state, location: location}" \
        --output table
    
-   # Test webhook endpoint availability
-   curl -X POST "https://${FUNCTION_APP_URL}/api/ProcessStorageEvent" \
-       -H "Content-Type: application/json" \
-       -d '{"eventType": "Microsoft.Storage.BlobCreated", "data": {"url": "test"}}'
+   # Test webhook endpoint availability (basic connectivity test)
+   curl -I "https://${FUNCTION_APP_URL}"
    ```
 
-   Expected output: Function app should be in "Running" state and webhook endpoint should respond successfully.
+   Expected output: Function app should be in "Running" state and webhook endpoint should respond with HTTP headers.
 
 ## Cleanup
 
@@ -501,10 +460,6 @@ echo "✅ Container registry created: ${CONTAINER_REGISTRY}"
        --name "blob-events-subscription" \
        --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}"
    
-   az eventgrid event-subscription delete \
-       --name "function-webhook-subscription" \
-       --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}"
-   
    echo "✅ Event Grid subscriptions removed"
    ```
 
@@ -514,11 +469,6 @@ echo "✅ Container registry created: ${CONTAINER_REGISTRY}"
    # Remove all container instances
    az container delete \
        --name "event-processor-${RANDOM_SUFFIX}" \
-       --resource-group ${RESOURCE_GROUP} \
-       --yes
-   
-   az container delete \
-       --name "image-processor-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
        --yes
    
@@ -543,9 +493,9 @@ echo "✅ Container registry created: ${CONTAINER_REGISTRY}"
 
 ## Discussion
 
-Azure Event Grid and Container Instances create a powerful serverless architecture for event-driven processing that automatically scales based on demand. This combination eliminates the need for persistent infrastructure while providing rapid response to storage events, making it ideal for file processing, data transformation, and automated workflows. The pay-per-execution model ensures cost efficiency for variable workloads, while the managed services reduce operational overhead. For comprehensive guidance on event-driven architectures, see the [Azure Event Grid documentation](https://docs.microsoft.com/en-us/azure/event-grid/overview) and [Container Instances best practices](https://docs.microsoft.com/en-us/azure/container-instances/container-instances-best-practices).
+Azure Event Grid and Container Instances create a powerful serverless architecture for event-driven processing that automatically scales based on demand. This combination eliminates the need for persistent infrastructure while providing rapid response to storage events, making it ideal for file processing, data transformation, and automated workflows. The pay-per-execution model ensures cost efficiency for variable workloads, while the managed services reduce operational overhead. This architecture follows [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of reliability, cost optimization, and operational excellence.
 
-The serverless container approach provides significant advantages over traditional compute models, including zero cold start times for container instances, automatic scaling based on event volume, and granular cost control through per-second billing. Event Grid's reliability features such as dead-letter queues, retry policies, and delivery guarantees ensure robust event processing even during system failures. This architecture follows [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of reliability, cost optimization, and operational excellence.
+The serverless container approach provides significant advantages over traditional compute models, including zero cold start times for container instances, automatic scaling based on event volume, and granular cost control through per-second billing. Event Grid's reliability features such as dead-letter queues, retry policies, and delivery guarantees ensure robust event processing even during system failures. For comprehensive guidance on event-driven architectures, see the [Azure Event Grid documentation](https://docs.microsoft.com/en-us/azure/event-grid/overview) and [Container Instances best practices](https://docs.microsoft.com/en-us/azure/container-instances/container-instances-best-practices).
 
 Container Instances integrate seamlessly with Azure Container Registry for custom image deployment, Azure Monitor for comprehensive observability, and Azure Key Vault for secure credential management. The service supports both Windows and Linux containers with customizable resource allocation, making it suitable for diverse processing requirements. For production deployments, consider implementing advanced monitoring, proper error handling, and security best practices as outlined in the [Azure Container Instances security guide](https://docs.microsoft.com/en-us/azure/container-instances/container-instances-security).
 
@@ -567,4 +517,9 @@ Extend this event-driven container solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,475 @@
+# Infrastructure Manager Configuration for Task Queue System with Cloud Tasks and Functions
+# This configuration deploys a complete serverless task processing system using:
+# - Cloud Tasks for reliable task queuing with retry mechanisms
+# - Cloud Functions (Gen2) for scalable task processing
+# - Cloud Storage for persistent result storage
+# - Appropriate IAM permissions for secure service integration
+
+# Input variables for customization
+parameters:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID where resources will be deployed"
+    
+  region:
+    type: string
+    description: "Google Cloud region for regional resources"
+    default: "us-central1"
+    
+  # Resource naming
+  queue_name:
+    type: string
+    description: "Name for the Cloud Tasks queue"
+    default: "background-tasks"
+    
+  function_name:
+    type: string
+    description: "Name for the Cloud Function"
+    default: "task-processor"
+    
+  bucket_suffix:
+    type: string
+    description: "Suffix for the storage bucket name to ensure uniqueness"
+    default: "task-results"
+    
+  # Function configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for the Cloud Function"
+    default: "256MB"
+    
+  function_timeout:
+    type: string
+    description: "Timeout for the Cloud Function in seconds"
+    default: "60s"
+    
+  # Queue configuration
+  max_attempts:
+    type: integer
+    description: "Maximum retry attempts for failed tasks"
+    default: 3
+    
+  max_retry_duration:
+    type: string
+    description: "Maximum duration for task retries"
+    default: "300s"
+    
+  max_doublings:
+    type: integer
+    description: "Maximum number of times to double the retry delay"
+    default: 5
+
+# Resource definitions
+resources:
+
+  # Enable required Google Cloud APIs
+  # Cloud Functions API for serverless function deployment
+  cloudfunctions_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudfunctions-api
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudfunctions.googleapis.com
+      
+  # Cloud Tasks API for task queue management
+  cloudtasks_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudtasks-api
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudtasks.googleapis.com
+      
+  # Cloud Build API for function deployment
+  cloudbuild_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudbuild-api
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudbuild.googleapis.com
+      
+  # Cloud Storage API for persistent storage
+  storage_api:
+    type: gcp-types/serviceusage-v1:services
+    name: storage-api
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/$(ref.project_id.name)/services/storage.googleapis.com
+      
+  # Cloud Logging API for function logs
+  logging_api:
+    type: gcp-types/serviceusage-v1:services
+    name: logging-api
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/$(ref.project_id.name)/services/logging.googleapis.com
+
+  # Cloud Storage bucket for storing processed task results
+  # Configured with standard storage class for cost-effectiveness
+  storage_bucket:
+    type: storage.v1.bucket
+    name: $(ref.bucket_name.name)
+    metadata:
+      dependsOn:
+        - storage_api
+    properties:
+      name: $(ref.project_id.name)-$(ref.bucket_suffix)
+      project: $(ref.project_id.name)
+      location: $(ref.region)
+      storageClass: STANDARD
+      # Enable uniform bucket-level access for simplified IAM
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90  # Delete files older than 90 days
+              matchesStorageClass: [STANDARD]
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30  # Move to Nearline after 30 days
+              matchesStorageClass: [STANDARD]
+      # Enable versioning for data protection
+      versioning:
+        enabled: true
+      # Encryption configuration (uses Google-managed keys by default)
+      encryption:
+        defaultKmsKeyName: null  # Use Google-managed encryption
+
+  # Cloud Tasks queue for reliable background job processing
+  # Configured with intelligent retry policies and rate limiting
+  task_queue:
+    type: gcp-types/cloudtasks-v2:projects.locations.queues
+    name: $(ref.queue_name.name)
+    metadata:
+      dependsOn:
+        - cloudtasks_api
+    properties:
+      parent: projects/$(ref.project_id.name)/locations/$(ref.region)
+      name: projects/$(ref.project_id.name)/locations/$(ref.region)/queues/$(ref.queue_name)
+      # Retry configuration for robust task processing
+      retryConfig:
+        maxAttempts: $(ref.max_attempts)
+        maxRetryDuration: $(ref.max_retry_duration)
+        maxDoublings: $(ref.max_doublings)
+        # Initial retry delay starts at 100ms
+        minBackoff: "0.100s"
+        # Maximum retry delay capped at 10 minutes
+        maxBackoff: "600s"
+      # Rate limiting configuration to prevent overwhelming downstream services
+      rateLimits:
+        # Maximum 100 tasks dispatched per second
+        maxDispatchesPerSecond: 100.0
+        # Maximum 500 concurrent tasks
+        maxConcurrentDispatches: 500
+        # Burst capacity for handling traffic spikes
+        maxBurstSize: 100
+      # Queue state (can be RUNNING, PAUSED, or DISABLED)
+      state: RUNNING
+
+  # Cloud Function (Gen2) for processing tasks from the queue
+  # Configured with HTTP trigger to receive tasks from Cloud Tasks
+  task_processor_function:
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    name: $(ref.function_name.name)
+    metadata:
+      dependsOn:
+        - cloudfunctions_api
+        - cloudbuild_api
+        - storage_bucket
+        - task_queue
+    properties:
+      parent: projects/$(ref.project_id.name)/locations/$(ref.region)
+      name: projects/$(ref.project_id.name)/locations/$(ref.region)/functions/$(ref.function_name)
+      description: "Serverless function to process background tasks from Cloud Tasks queue"
+      
+      # Build configuration for the function
+      buildConfig:
+        runtime: python311
+        entryPoint: task_processor
+        # Source code will be uploaded separately or from Cloud Source Repositories
+        source:
+          # For this configuration, assume source code is uploaded manually
+          # In production, you would specify a Cloud Storage object or repository
+          storageSource:
+            bucket: $(ref.storage_bucket.name)
+            object: "function-source.zip"  # Source code archive
+            
+      # Service configuration defines runtime parameters
+      serviceConfig:
+        # Maximum number of concurrent instances
+        maxInstanceCount: 100
+        # Minimum number of instances (0 for cost optimization)
+        minInstanceCount: 0
+        # Available memory for the function
+        availableMemory: $(ref.function_memory)
+        # Execution timeout
+        timeoutSeconds: 60
+        # Environment variables for function configuration
+        environmentVariables:
+          STORAGE_BUCKET: $(ref.storage_bucket.name)
+          PROJECT_ID: $(ref.project_id.name)
+          REGION: $(ref.region)
+        # Service account for the function (uses default Compute Engine service account)
+        serviceAccountEmail: $(ref.project_id.name)-compute@developer.gserviceaccount.com
+        # Ingress settings to allow Cloud Tasks to invoke the function
+        ingressSettings: ALLOW_ALL
+        # VPC connector configuration (optional, for private network access)
+        # vpcConnector: ""
+        # vpcConnectorEgressSettings: PRIVATE_RANGES_ONLY
+        
+      # Event trigger configuration for HTTP requests
+      eventTrigger:
+        triggerRegion: $(ref.region)
+        eventType: providers/cloud.firestore/eventTypes/document.write
+        # For HTTP trigger, we'll use the default HTTP trigger instead
+        
+  # Alternative: Use HTTP trigger for Cloud Tasks integration
+  # Cloud Functions Gen2 with HTTP trigger
+  http_function:
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    name: $(ref.function_name.name)-http
+    metadata:
+      dependsOn:
+        - cloudfunctions_api
+        - cloudbuild_api
+        - storage_bucket
+        - task_queue
+    properties:
+      parent: projects/$(ref.project_id.name)/locations/$(ref.region)
+      name: projects/$(ref.project_id.name)/locations/$(ref.region)/functions/$(ref.function_name.name)-http
+      description: "HTTP-triggered function for processing Cloud Tasks"
+      
+      buildConfig:
+        runtime: python311
+        entryPoint: task_processor
+        source:
+          # Inline source code for the function
+          # In production, upload to Cloud Storage first
+          inlineSource:
+            # This would contain the Python source code
+            # For Infrastructure Manager, source must be provided externally
+
+      serviceConfig:
+        maxInstanceCount: 100
+        minInstanceCount: 0
+        availableMemory: $(ref.function_memory)
+        timeoutSeconds: 60
+        environmentVariables:
+          STORAGE_BUCKET: $(ref.storage_bucket.name)
+          PROJECT_ID: $(ref.project_id.name)
+          REGION: $(ref.region)
+        serviceAccountEmail: $(ref.project_id.name)-compute@developer.gserviceaccount.com
+        ingressSettings: ALLOW_ALL
+        # Security settings
+        allTrafficOnLatestRevision: true
+
+  # IAM binding to allow Cloud Tasks to invoke the function
+  function_invoker_binding:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    name: function-invoker-policy
+    metadata:
+      dependsOn:
+        - http_function
+    properties:
+      resource: projects/$(ref.project_id.name)/locations/$(ref.region)/functions/$(ref.function_name.name)-http
+      policy:
+        bindings:
+          # Allow unauthenticated access for Cloud Tasks
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+          # Allow Cloud Tasks service account to invoke the function
+          - role: roles/cloudfunctions.invoker
+            members:
+              - serviceAccount:service-$(ref.project_number):@gcp-sa-cloudtasks.iam.gserviceaccount.com
+
+  # IAM binding for Cloud Function to access Cloud Storage
+  storage_access_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    name: storage-access-policy
+    metadata:
+      dependsOn:
+        - storage_bucket
+        - http_function
+    properties:
+      resource: $(ref.project_id.name)
+      policy:
+        bindings:
+          # Grant the function's service account access to the storage bucket
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.project_id.name)-compute@developer.gserviceaccount.com
+          # Grant Cloud Tasks service account necessary permissions
+          - role: roles/cloudtasks.enqueuer
+            members:
+              - serviceAccount:$(ref.project_id.name)-compute@developer.gserviceaccount.com
+
+  # Cloud Monitoring notification channel for alerts (optional)
+  monitoring_notification:
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    name: task-queue-alerts
+    metadata:
+      dependsOn:
+        - task_queue
+        - http_function
+    properties:
+      parent: projects/$(ref.project_id.name)
+      name: projects/$(ref.project_id.name)/notificationChannels/task-queue-email
+      type: email
+      displayName: "Task Queue System Alerts"
+      description: "Email notifications for task queue system issues"
+      labels:
+        email_address: "admin@example.com"  # Replace with actual email
+      enabled: true
+
+  # Cloud Monitoring alert policy for queue depth
+  queue_depth_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    name: queue-depth-policy
+    metadata:
+      dependsOn:
+        - task_queue
+        - monitoring_notification
+    properties:
+      parent: projects/$(ref.project_id.name)
+      displayName: "High Task Queue Depth"
+      documentation:
+        content: "Alert when task queue depth exceeds threshold, indicating potential processing issues"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "Task queue depth"
+          conditionThreshold:
+            filter: 'resource.type="cloud_tasks_queue" AND resource.label.queue_id="$(ref.queue_name)"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 100
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.label.queue_id
+      notificationChannels:
+        - $(ref.monitoring_notification.name)
+      enabled: true
+
+  # Cloud Monitoring alert policy for function errors
+  function_error_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    name: function-error-policy
+    metadata:
+      dependsOn:
+        - http_function
+        - monitoring_notification
+    properties:
+      parent: projects/$(ref.project_id.name)
+      displayName: "Cloud Function Error Rate"
+      documentation:
+        content: "Alert when Cloud Function error rate exceeds acceptable threshold"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "Function error rate"
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" AND resource.label.function_name="$(ref.function_name.name)-http"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.05  # 5% error rate
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_MEAN
+      notificationChannels:
+        - $(ref.monitoring_notification.name)
+      enabled: true
+
+# Output values for use by other systems or for reference
+outputs:
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.name)
+    
+  region:
+    description: "Deployment region"
+    value: $(ref.region)
+    
+  # Storage bucket information
+  bucket_name:
+    description: "Name of the Cloud Storage bucket for processed files"
+    value: $(ref.storage_bucket.name)
+    
+  bucket_url:
+    description: "URL of the Cloud Storage bucket"
+    value: "gs://$(ref.storage_bucket.name)"
+    
+  # Task queue information
+  queue_name:
+    description: "Name of the Cloud Tasks queue"
+    value: $(ref.task_queue.name)
+    
+  queue_full_name:
+    description: "Full resource name of the Cloud Tasks queue"
+    value: "projects/$(ref.project_id.name)/locations/$(ref.region)/queues/$(ref.queue_name)"
+    
+  # Cloud Function information
+  function_name:
+    description: "Name of the Cloud Function"
+    value: $(ref.http_function.name)
+    
+  function_url:
+    description: "HTTP trigger URL for the Cloud Function"
+    value: $(ref.http_function.serviceConfig.uri)
+    
+  function_service_account:
+    description: "Service account used by the Cloud Function"
+    value: "$(ref.project_id.name)-compute@developer.gserviceaccount.com"
+    
+  # Monitoring information
+  monitoring_dashboard_url:
+    description: "URL to view monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards?project=$(ref.project_id.name)"
+    
+  logs_url:
+    description: "URL to view Cloud Function logs"
+    value: "https://console.cloud.google.com/functions/details/$(ref.region)/$(ref.function_name.name)-http?project=$(ref.project_id.name)&tab=logs"
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Complete serverless task processing system using Cloud Tasks and Cloud Functions"
+  author: "Google Cloud Recipe Generator"
+  created: "2025-01-12"
+  tags:
+    - serverless
+    - task-queue
+    - cloud-functions
+    - cloud-tasks
+    - background-processing
+    - asynchronous
+  # Dependencies and requirements
+  requirements:
+    apis:
+      - cloudfunctions.googleapis.com
+      - cloudtasks.googleapis.com
+      - cloudbuild.googleapis.com
+      - storage.googleapis.com
+      - logging.googleapis.com
+      - monitoring.googleapis.com
+    permissions:
+      - roles/cloudfunctions.admin
+      - roles/cloudtasks.admin
+      - roles/storage.admin
+      - roles/iam.serviceAccountUser
+      - roles/monitoring.editor

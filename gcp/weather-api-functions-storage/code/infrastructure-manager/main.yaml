@@ -1,0 +1,361 @@
+# Infrastructure Manager Configuration for Weather API with Cloud Functions and Storage
+# This configuration deploys a serverless weather API using Google Cloud Functions
+# with intelligent caching via Cloud Storage
+
+# Import required resource types
+imports:
+  - path: https://www.googleapis.com/compute/v1/projects/
+    name: compute
+  - path: https://storage.googleapis.com/
+    name: storage
+  - path: https://cloudfunctions.googleapis.com/v1/projects/
+    name: cloudfunctions
+
+# Global variables for resource configuration
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    default: "weather-api-demo"
+  
+  # Regional configuration
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+  
+  # Function configuration
+  function_name:
+    type: string
+    description: "Name of the Cloud Function"
+    default: "weather-api"
+  
+  # Storage configuration
+  bucket_name:
+    type: string
+    description: "Name of the Cloud Storage bucket for caching (must be globally unique)"
+    default: "weather-cache-bucket"
+  
+  # API configuration
+  weather_api_key:
+    type: string
+    description: "OpenWeatherMap API key for external weather service"
+    default: "demo_key"
+  
+  # Function runtime configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function"
+    default: "256Mi"
+  
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution"
+    default: "60s"
+  
+  max_instances:
+    type: integer
+    description: "Maximum number of function instances"
+    default: 10
+  
+  min_instances:
+    type: integer
+    description: "Minimum number of function instances"
+    default: 0
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  # Cloud Functions API
+  cloudfunctions_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudfunctions.googleapis.com
+      project: $(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Cloud Storage API
+  storage_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/storage.googleapis.com
+      project: $(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Cloud Build API (required for Cloud Functions deployment)
+  cloudbuild_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudbuild.googleapis.com
+      project: $(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Cloud Run API (required for Gen2 Cloud Functions)
+  cloudrun_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/run.googleapis.com
+      project: $(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Project reference for dependency management
+  project_id:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(var.project_id)
+      name: "Weather API Demo Project"
+
+  # Cloud Storage bucket for weather data caching
+  weather_cache_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.bucket_name)
+      project: $(ref.project_id.projectId)
+      location: $(var.region)
+      storageClass: STANDARD
+      # Enable uniform bucket-level access for better security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Configure lifecycle management for cache cleanup
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 1  # Delete cached files older than 1 day
+              matchesStorageClass:
+                - STANDARD
+      # Enable versioning for data protection
+      versioning:
+        enabled: false  # Disabled for cache use case to save costs
+      # Public access prevention
+      publicAccessPrevention: enforced
+    metadata:
+      dependsOn:
+        - storage_api
+        - project_id
+
+  # Service Account for Cloud Function
+  weather_function_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: weather-function-sa
+      project: $(ref.project_id.projectId)
+      serviceAccount:
+        displayName: "Weather Function Service Account"
+        description: "Service account for weather API Cloud Function with Storage access"
+    metadata:
+      dependsOn:
+        - project_id
+
+  # IAM binding for Storage Object Admin role on the cache bucket
+  storage_iam_binding:
+    type: gcp-types/storage-v1:buckets.iamPolicy
+    properties:
+      bucket: $(ref.weather_cache_bucket.name)
+      project: $(ref.project_id.projectId)
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.weather_function_service_account.email)
+    metadata:
+      dependsOn:
+        - weather_cache_bucket
+        - weather_function_service_account
+
+  # Cloud Function source code archive
+  function_source_archive:
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.weather_cache_bucket.name)
+      name: function-source.zip
+      # In a real deployment, this would reference the actual source code
+      # For this example, we'll use a placeholder
+      contentType: application/zip
+      # Note: In practice, you would upload the actual function source code
+      # This is a placeholder for the deployment configuration
+    metadata:
+      dependsOn:
+        - weather_cache_bucket
+
+  # Cloud Function for weather API
+  weather_api_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id.projectId)/locations/$(var.region)
+      function:
+        name: projects/$(ref.project_id.projectId)/locations/$(var.region)/functions/$(var.function_name)
+        description: "Serverless weather API with intelligent caching using Cloud Storage"
+        # Source code configuration
+        sourceArchiveUrl: gs://$(ref.weather_cache_bucket.name)/function-source.zip
+        # Function entry point
+        entryPoint: weather_api
+        # Runtime configuration
+        runtime: python312
+        # HTTP trigger configuration
+        httpsTrigger:
+          # Allow unauthenticated access for public API
+          securityLevel: SECURE_ALWAYS
+        # Resource allocation
+        availableMemoryMb: 256
+        timeout: $(var.function_timeout)
+        # Service account configuration
+        serviceAccountEmail: $(ref.weather_function_service_account.email)
+        # Environment variables for function configuration
+        environmentVariables:
+          CACHE_BUCKET: $(ref.weather_cache_bucket.name)
+          WEATHER_API_KEY: $(var.weather_api_key)
+          FUNCTION_REGION: $(var.region)
+          PROJECT_ID: $(ref.project_id.projectId)
+        # Scaling configuration
+        maxInstances: $(var.max_instances)
+        minInstances: $(var.min_instances)
+        # VPC configuration (using default network)
+        network: projects/$(ref.project_id.projectId)/global/networks/default
+        # Labels for resource management
+        labels:
+          environment: demo
+          application: weather-api
+          cost-center: development
+    metadata:
+      dependsOn:
+        - cloudfunctions_api
+        - cloudrun_api
+        - cloudbuild_api
+        - weather_function_service_account
+        - storage_iam_binding
+        - function_source_archive
+
+  # IAM policy for public access to the Cloud Function
+  function_iam_member:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.iamPolicy
+    properties:
+      resource: $(ref.weather_api_function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - weather_api_function
+
+  # Cloud Monitoring Alert Policy for function errors (optional)
+  function_error_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      project: projects/$(ref.project_id.projectId)
+      alertPolicy:
+        displayName: "Weather API Function Error Rate"
+        documentation:
+          content: "Alert when weather API function error rate exceeds threshold"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "Function Error Rate"
+            conditionThreshold:
+              filter: >
+                resource.type="cloud_function"
+                resource.labels.function_name="$(var.function_name)"
+                metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                metric.labels.status!="ok"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        combiner: OR
+        enabled: true
+        notificationChannels: []  # Add notification channels as needed
+    metadata:
+      dependsOn:
+        - weather_api_function
+
+# Output values for reference and validation
+outputs:
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.projectId)
+
+  # Storage bucket information
+  cache_bucket_name:
+    description: "Name of the Cloud Storage bucket used for caching"
+    value: $(ref.weather_cache_bucket.name)
+  
+  cache_bucket_url:
+    description: "URL of the Cloud Storage bucket"
+    value: gs://$(ref.weather_cache_bucket.name)
+
+  # Function information
+  function_name:
+    description: "Name of the deployed Cloud Function"
+    value: $(var.function_name)
+  
+  function_url:
+    description: "HTTPS URL of the weather API function"
+    value: $(ref.weather_api_function.httpsTrigger.url)
+  
+  function_service_account:
+    description: "Service account email used by the Cloud Function"
+    value: $(ref.weather_function_service_account.email)
+
+  # Deployment region
+  deployment_region:
+    description: "Google Cloud region where resources are deployed"
+    value: $(var.region)
+
+  # API testing information
+  test_urls:
+    description: "Sample URLs for testing the weather API"
+    value:
+      - "$(ref.weather_api_function.httpsTrigger.url)?city=London"
+      - "$(ref.weather_api_function.httpsTrigger.url)?city=Tokyo"
+      - "$(ref.weather_api_function.httpsTrigger.url)?city=New%20York"
+
+  # Monitoring and management
+  function_logs_url:
+    description: "URL to view function logs in Cloud Console"
+    value: "https://console.cloud.google.com/functions/details/$(var.region)/$(var.function_name)?project=$(ref.project_id.projectId)&tab=logs"
+  
+  storage_console_url:
+    description: "URL to view storage bucket in Cloud Console"
+    value: "https://console.cloud.google.com/storage/browser/$(ref.weather_cache_bucket.name)?project=$(ref.project_id.projectId)"
+
+# Deployment metadata
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for Weather API with Cloud Functions and Storage"
+  author: "Google Cloud Infrastructure Manager"
+  created: "2025-01-12"
+  tags:
+    - serverless
+    - api
+    - caching
+    - weather
+    - cloud-functions
+    - cloud-storage
+    - python
+  # Resource dependencies and deployment order
+  deployment_order:
+    - project_id
+    - APIs (cloudfunctions_api, storage_api, cloudbuild_api, cloudrun_api)
+    - weather_cache_bucket
+    - weather_function_service_account
+    - storage_iam_binding
+    - function_source_archive
+    - weather_api_function
+    - function_iam_member
+    - function_error_alert

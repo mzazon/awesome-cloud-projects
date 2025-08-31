@@ -1,21 +1,21 @@
 ---
-title: Document Analysis with Amazon Textract
+title: Document Analysis Solutions with Amazon Textract
 id: b3e5f7a9
-category: machine learning & ai
+category: machine learning
 difficulty: 300
 subject: aws
 services: textract, step-functions, s3, lambda
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: amazon-textract,document-analysis,machine-learning,ocr,step-functions,lambda,s3
 recipe-generator-version: 1.3
 ---
 
-# Implementing Document Analysis with Amazon Textract
+# Document Analysis Solutions with Amazon Textract
 
 ## Problem
 
@@ -71,9 +71,9 @@ graph TB
 3. Basic understanding of document processing and machine learning concepts
 4. Familiarity with JSON data structures and AWS serverless services
 5. Sample documents for testing (PDF, PNG, JPEG formats)
-6. Estimated cost: $10-15 for processing sample documents and infrastructure (varies by document volume)
+6. Estimated cost: $15-25 for processing sample documents and infrastructure (varies by document volume)
 
-> **Note**: Amazon Textract charges per page processed. Monitor usage during testing to avoid unexpected costs.
+> **Note**: Amazon Textract charges per page processed ($0.0015 per page for Detect Document Text, $0.065 per page for Analyze Document). Monitor usage during testing to avoid unexpected costs.
 
 ## Preparation
 
@@ -99,15 +99,25 @@ export SNS_TOPIC="${PROJECT_NAME}-notifications"
 aws s3 mb s3://${INPUT_BUCKET} --region ${AWS_REGION}
 aws s3 mb s3://${OUTPUT_BUCKET} --region ${AWS_REGION}
 
-# Create DynamoDB table for document metadata
+# Enable server-side encryption for buckets
+aws s3api put-bucket-encryption \
+    --bucket ${INPUT_BUCKET} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
+aws s3api put-bucket-encryption \
+    --bucket ${OUTPUT_BUCKET} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
+# Create DynamoDB table with on-demand billing
 aws dynamodb create-table \
     --table-name ${METADATA_TABLE} \
     --attribute-definitions \
         AttributeName=documentId,AttributeType=S \
     --key-schema \
         AttributeName=documentId,KeyType=HASH \
-    --provisioned-throughput \
-        ReadCapacityUnits=5,WriteCapacityUnits=5 \
+    --billing-mode PAY_PER_REQUEST \
     --region ${AWS_REGION}
 
 # Create SNS topic for notifications
@@ -135,9 +145,59 @@ echo "✅ Infrastructure created successfully"
        {
          "Effect": "Allow",
          "Principal": {
-           "Service": ["lambda.amazonaws.com", "states.amazonaws.com"]
+           "Service": [
+             "lambda.amazonaws.com",
+             "states.amazonaws.com"
+           ]
          },
          "Action": "sts:AssumeRole"
+       }
+     ]
+   }
+   EOF
+   
+   # Create custom policy with least privilege access
+   cat > /tmp/textract-execution-policy.json << EOF
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": [
+           "textract:AnalyzeDocument",
+           "textract:DetectDocumentText",
+           "textract:StartDocumentAnalysis",
+           "textract:GetDocumentAnalysis"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "s3:GetObject",
+           "s3:PutObject"
+         ],
+         "Resource": [
+           "arn:aws:s3:::${INPUT_BUCKET}/*",
+           "arn:aws:s3:::${OUTPUT_BUCKET}/*"
+         ]
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "dynamodb:PutItem",
+           "dynamodb:GetItem",
+           "dynamodb:UpdateItem",
+           "dynamodb:Scan"
+         ],
+         "Resource": "arn:aws:dynamodb:${AWS_REGION}:${AWS_ACCOUNT_ID}:table/${METADATA_TABLE}"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "sns:Publish"
+         ],
+         "Resource": "${SNS_TOPIC_ARN}"
        }
      ]
    }
@@ -148,37 +208,32 @@ echo "✅ Infrastructure created successfully"
        --role-name ${PROJECT_NAME}-execution-role \
        --assume-role-policy-document file:///tmp/textract-trust-policy.json
    
-   # Attach necessary policies
+   # Create and attach custom policy
+   aws iam create-policy \
+       --policy-name ${PROJECT_NAME}-execution-policy \
+       --policy-document file:///tmp/textract-execution-policy.json
+   
+   aws iam attach-role-policy \
+       --role-name ${PROJECT_NAME}-execution-role \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-execution-policy
+   
+   # Attach basic Lambda execution role
    aws iam attach-role-policy \
        --role-name ${PROJECT_NAME}-execution-role \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
-   aws iam attach-role-policy \
-       --role-name ${PROJECT_NAME}-execution-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonTextractFullAccess
-   
-   aws iam attach-role-policy \
-       --role-name ${PROJECT_NAME}-execution-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-   
-   aws iam attach-role-policy \
-       --role-name ${PROJECT_NAME}-execution-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
-   
-   aws iam attach-role-policy \
-       --role-name ${PROJECT_NAME}-execution-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonSNSFullAccess
+   # Wait for role propagation
+   sleep 10
    
    # Get role ARN
    export EXECUTION_ROLE_ARN=$(aws iam get-role \
        --role-name ${PROJECT_NAME}-execution-role \
        --query Role.Arn --output text)
    
-   
-   echo "✅ IAM role and policies configured for Textract operations"
+   echo "✅ IAM role with least-privilege policies configured"
    ```
 
-   The IAM role is now established with appropriate permissions for all AWS services in our pipeline. This security foundation enables secure, credential-free communication between services while maintaining the principle of least privilege that's essential for production deployments.
+   The IAM role is now established with specific, scoped permissions following AWS security best practices. This security foundation enables secure, credential-free communication between services while maintaining the principle of least privilege that's essential for production deployments.
 
 2. **Create Document Classifier Lambda Function**:
 
@@ -203,13 +258,27 @@ echo "✅ Infrastructure created successfully"
            # Get object metadata
            response = s3.head_object(Bucket=bucket, Key=key)
            file_size = response['ContentLength']
+           content_type = response.get('ContentType', '')
            
-           # Determine processing type based on file size and type
+           # Validate file type
+           allowed_types = ['application/pdf', 'image/jpeg', 'image/png', 'image/tiff']
+           if content_type not in allowed_types:
+               raise ValueError(f"Unsupported file type: {content_type}")
+           
+           # Determine processing type based on file size
            # Files under 5MB for synchronous, larger for asynchronous
            processing_type = 'sync' if file_size < 5 * 1024 * 1024 else 'async'
            
            # Determine document type based on filename
-           doc_type = 'invoice' if 'invoice' in key.lower() else 'form' if 'form' in key.lower() else 'general'
+           key_lower = key.lower()
+           if 'invoice' in key_lower:
+               doc_type = 'invoice'
+           elif 'form' in key_lower:
+               doc_type = 'form'
+           elif 'contract' in key_lower:
+               doc_type = 'contract'
+           else:
+               doc_type = 'general'
            
            return {
                'statusCode': 200,
@@ -218,11 +287,12 @@ echo "✅ Infrastructure created successfully"
                    'key': key,
                    'processingType': processing_type,
                    'documentType': doc_type,
-                   'fileSize': file_size
+                   'fileSize': file_size,
+                   'contentType': content_type
                }
            }
        except Exception as e:
-           print(f"Error: {str(e)}")
+           print(f"Error classifying document: {str(e)}")
            return {
                'statusCode': 500,
                'body': json.dumps({'error': str(e)})
@@ -233,24 +303,25 @@ echo "✅ Infrastructure created successfully"
    cd /tmp
    zip document-classifier.zip document-classifier.py
    
-   # Create Lambda function
+   # Create Lambda function with latest Python runtime
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-document-classifier \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${EXECUTION_ROLE_ARN} \
        --handler document-classifier.lambda_handler \
        --zip-file fileb://document-classifier.zip \
        --timeout 30 \
+       --memory-size 256 \
        --environment Variables="{OUTPUT_BUCKET=${OUTPUT_BUCKET},METADATA_TABLE=${METADATA_TABLE}}"
    
    export CLASSIFIER_FUNCTION_ARN=$(aws lambda get-function \
        --function-name ${PROJECT_NAME}-document-classifier \
        --query Configuration.FunctionArn --output text)
    
-   echo "✅ Document classifier Lambda created"
+   echo "✅ Document classifier Lambda created with enhanced validation"
    ```
 
-   The classifier function is now deployed and ready to analyze incoming documents. This intelligent routing mechanism will automatically determine the most efficient processing path based on document characteristics, optimizing both cost and performance for your document processing pipeline.
+   The classifier function is now deployed with improved file type validation and enhanced document categorization. This intelligent routing mechanism will automatically determine the most efficient processing path based on document characteristics, optimizing both cost and performance for your document processing pipeline.
 
 3. **Create Textract Processing Lambda Function**:
 
@@ -264,6 +335,7 @@ echo "✅ Infrastructure created successfully"
    import uuid
    import os
    from datetime import datetime
+   from botocore.exceptions import ClientError
    
    textract = boto3.client('textract')
    s3 = boto3.client('s3')
@@ -272,11 +344,12 @@ echo "✅ Infrastructure created successfully"
    
    def lambda_handler(event, context):
        try:
-           # Get input parameters
-           bucket = event['bucket']
-           key = event['key']
-           processing_type = event['processingType']
-           document_type = event['documentType']
+           # Get input parameters from classifier output
+           body = event.get('body', event)
+           bucket = body['bucket']
+           key = body['key']
+           processing_type = body['processingType']
+           document_type = body['documentType']
            
            document_id = str(uuid.uuid4())
            
@@ -301,7 +374,7 @@ echo "✅ Infrastructure created successfully"
                }
            }
        except Exception as e:
-           print(f"Error: {str(e)}")
+           print(f"Error processing document: {str(e)}")
            return {
                'statusCode': 500,
                'body': json.dumps({'error': str(e)})
@@ -311,7 +384,7 @@ echo "✅ Infrastructure created successfully"
        """Process single-page document synchronously"""
        try:
            # Determine features based on document type
-           features = ['TABLES', 'FORMS'] if document_type in ['invoice', 'form'] else ['TABLES']
+           features = ['TABLES', 'FORMS'] if document_type in ['invoice', 'form', 'contract'] else ['TABLES']
            
            response = textract.analyze_document(
                Document={'S3Object': {'Bucket': bucket, 'Name': key}},
@@ -327,14 +400,19 @@ echo "✅ Infrastructure created successfully"
                Bucket=os.environ['OUTPUT_BUCKET'],
                Key=output_key,
                Body=json.dumps(extracted_data, indent=2),
-               ContentType='application/json'
+               ContentType='application/json',
+               ServerSideEncryption='AES256'
            )
            
            return {
                'status': 'completed',
                'outputLocation': f"s3://{os.environ['OUTPUT_BUCKET']}/{output_key}",
-               'extractedData': extracted_data
+               'extractedData': extracted_data,
+               'confidence': calculate_average_confidence(extracted_data)
            }
+       except ClientError as e:
+           print(f"AWS service error in sync processing: {str(e)}")
+           raise
        except Exception as e:
            print(f"Sync processing error: {str(e)}")
            raise
@@ -342,7 +420,7 @@ echo "✅ Infrastructure created successfully"
    def process_async_document(bucket, key, document_type):
        """Start asynchronous document processing"""
        try:
-           features = ['TABLES', 'FORMS'] if document_type in ['invoice', 'form'] else ['TABLES']
+           features = ['TABLES', 'FORMS'] if document_type in ['invoice', 'form', 'contract'] else ['TABLES']
            
            response = textract.start_document_analysis(
                DocumentLocation={'S3Object': {'Bucket': bucket, 'Name': key}},
@@ -357,6 +435,9 @@ echo "✅ Infrastructure created successfully"
                'status': 'in_progress',
                'jobId': response['JobId']
            }
+       except ClientError as e:
+           print(f"AWS service error in async processing: {str(e)}")
+           raise
        except Exception as e:
            print(f"Async processing error: {str(e)}")
            raise
@@ -365,7 +446,6 @@ echo "✅ Infrastructure created successfully"
        """Extract structured data from Textract response"""
        blocks = response['Blocks']
        
-       # Extract text lines
        lines = []
        tables = []
        forms = []
@@ -374,7 +454,8 @@ echo "✅ Infrastructure created successfully"
            if block['BlockType'] == 'LINE':
                lines.append({
                    'text': block.get('Text', ''),
-                   'confidence': block.get('Confidence', 0)
+                   'confidence': block.get('Confidence', 0),
+                   'geometry': block.get('Geometry', {})
                })
            elif block['BlockType'] == 'TABLE':
                tables.append(extract_table_data(block, blocks))
@@ -385,46 +466,122 @@ echo "✅ Infrastructure created successfully"
            'text_lines': lines,
            'tables': tables,
            'forms': forms,
-           'document_metadata': response.get('DocumentMetadata', {})
+           'document_metadata': response.get('DocumentMetadata', {}),
+           'total_pages': response.get('DocumentMetadata', {}).get('Pages', 1)
        }
    
    def extract_table_data(table_block, all_blocks):
-       """Extract table structure and data"""
-       # This is a simplified table extraction
-       # In production, you'd implement more sophisticated table parsing
+       """Extract table structure and data with enhanced parsing"""
+       # Create a more detailed table extraction
+       cells = []
+       if 'Relationships' in table_block:
+           for relationship in table_block['Relationships']:
+               if relationship['Type'] == 'CHILD':
+                   for cell_id in relationship['Ids']:
+                       cell_block = next((block for block in all_blocks if block['Id'] == cell_id), None)
+                       if cell_block and cell_block['BlockType'] == 'CELL':
+                           cells.append({
+                               'row': cell_block.get('RowIndex', 0),
+                               'column': cell_block.get('ColumnIndex', 0),
+                               'text': get_cell_text(cell_block, all_blocks),
+                               'confidence': cell_block.get('Confidence', 0)
+                           })
+       
        return {
            'id': table_block['Id'],
            'confidence': table_block.get('Confidence', 0),
-           'geometry': table_block.get('Geometry', {})
+           'geometry': table_block.get('Geometry', {}),
+           'cells': cells
        }
    
    def extract_form_data(form_block, all_blocks):
-       """Extract form key-value pairs"""
-       # This is a simplified form extraction
-       # In production, you'd implement more sophisticated form parsing
-       return {
-           'id': form_block['Id'],
-           'confidence': form_block.get('Confidence', 0),
-           'entity_types': form_block.get('EntityTypes', [])
-       }
+       """Extract form key-value pairs with enhanced parsing"""
+       if form_block.get('EntityTypes') and 'KEY' in form_block['EntityTypes']:
+           # This is a key block, find its corresponding value
+           key_text = get_block_text(form_block, all_blocks)
+           value_text = ""
+           
+           if 'Relationships' in form_block:
+               for relationship in form_block['Relationships']:
+                   if relationship['Type'] == 'VALUE':
+                       for value_id in relationship['Ids']:
+                           value_block = next((block for block in all_blocks if block['Id'] == value_id), None)
+                           if value_block:
+                               value_text = get_block_text(value_block, all_blocks)
+           
+           return {
+               'id': form_block['Id'],
+               'key': key_text,
+               'value': value_text,
+               'confidence': form_block.get('Confidence', 0),
+               'geometry': form_block.get('Geometry', {})
+           }
+       
+       return None
+   
+   def get_cell_text(cell_block, all_blocks):
+       """Get text content from a cell block"""
+       text = ""
+       if 'Relationships' in cell_block:
+           for relationship in cell_block['Relationships']:
+               if relationship['Type'] == 'CHILD':
+                   for word_id in relationship['Ids']:
+                       word_block = next((block for block in all_blocks if block['Id'] == word_id), None)
+                       if word_block and word_block['BlockType'] == 'WORD':
+                           text += word_block.get('Text', '') + " "
+       return text.strip()
+   
+   def get_block_text(block, all_blocks):
+       """Get text content from any block type"""
+       text = ""
+       if 'Relationships' in block:
+           for relationship in block['Relationships']:
+               if relationship['Type'] == 'CHILD':
+                   for child_id in relationship['Ids']:
+                       child_block = next((b for b in all_blocks if b['Id'] == child_id), None)
+                       if child_block and child_block['BlockType'] == 'WORD':
+                           text += child_block.get('Text', '') + " "
+       return text.strip()
+   
+   def calculate_average_confidence(extracted_data):
+       """Calculate average confidence score for the extraction"""
+       all_confidences = []
+       
+       for line in extracted_data.get('text_lines', []):
+           all_confidences.append(line.get('confidence', 0))
+       
+       for table in extracted_data.get('tables', []):
+           all_confidences.append(table.get('confidence', 0))
+       
+       for form in extracted_data.get('forms', []):
+           if form:
+               all_confidences.append(form.get('confidence', 0))
+       
+       return sum(all_confidences) / len(all_confidences) if all_confidences else 0
    
    def store_metadata(document_id, bucket, key, document_type, result):
        """Store document metadata in DynamoDB"""
        table = dynamodb.Table(os.environ['METADATA_TABLE'])
        
-       table.put_item(
-           Item={
-               'documentId': document_id,
-               'bucket': bucket,
-               'key': key,
-               'documentType': document_type,
-               'processingStatus': result.get('status', 'completed'),
-               'jobId': result.get('jobId'),
-               'outputLocation': result.get('outputLocation'),
-               'timestamp': datetime.utcnow().isoformat(),
-               'extractedData': result.get('extractedData')
-           }
-       )
+       item = {
+           'documentId': document_id,
+           'bucket': bucket,
+           'key': key,
+           'documentType': document_type,
+           'processingStatus': result.get('status', 'completed'),
+           'timestamp': datetime.utcnow().isoformat(),
+           'ttl': int((datetime.utcnow().timestamp() + 86400 * 30))  # 30 days TTL
+       }
+       
+       # Add optional fields if they exist
+       if result.get('jobId'):
+           item['jobId'] = result['jobId']
+       if result.get('outputLocation'):
+           item['outputLocation'] = result['outputLocation']
+       if result.get('confidence'):
+           item['confidence'] = result['confidence']
+       
+       table.put_item(Item=item)
    
    def send_notification(document_id, document_type, status):
        """Send processing notification"""
@@ -432,37 +589,39 @@ echo "✅ Infrastructure created successfully"
            'documentId': document_id,
            'documentType': document_type,
            'status': status,
-           'timestamp': datetime.utcnow().isoformat()
+           'timestamp': datetime.utcnow().isoformat(),
+           'service': 'textract-processor'
        }
        
        sns.publish(
            TopicArn=os.environ['SNS_TOPIC_ARN'],
            Message=json.dumps(message),
-           Subject=f'Document Processing {status.title()}'
+           Subject=f'Document Processing {status.title()}: {document_type}'
        )
    EOF
    
    # Create deployment package
    zip textract-processor.zip textract-processor.py
    
-   # Create Lambda function
+   # Create Lambda function with enhanced configuration
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-textract-processor \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${EXECUTION_ROLE_ARN} \
        --handler textract-processor.lambda_handler \
        --zip-file fileb://textract-processor.zip \
        --timeout 300 \
+       --memory-size 512 \
        --environment Variables="{OUTPUT_BUCKET=${OUTPUT_BUCKET},METADATA_TABLE=${METADATA_TABLE},SNS_TOPIC_ARN=${SNS_TOPIC_ARN},EXECUTION_ROLE_ARN=${EXECUTION_ROLE_ARN}}"
    
    export PROCESSOR_FUNCTION_ARN=$(aws lambda get-function \
        --function-name ${PROJECT_NAME}-textract-processor \
        --query Configuration.FunctionArn --output text)
    
-   echo "✅ Textract processor Lambda created"
+   echo "✅ Enhanced Textract processor Lambda created"
    ```
 
-   The Textract processor is now deployed and configured to handle both synchronous and asynchronous document analysis patterns. This function will extract text, identify table structures, and analyze form data, providing structured output that downstream applications can easily consume for business process automation.
+   The Textract processor is now deployed with enhanced error handling, improved data extraction capabilities, and better table and form parsing. This function will extract text, identify table structures, and analyze form data with higher accuracy, providing structured output that downstream applications can easily consume for business process automation.
 
 > **Warning**: Amazon Textract has service limits for concurrent jobs and document size. Review [Textract quotas](https://docs.aws.amazon.com/textract/latest/dg/limits.html) before processing large volumes of documents.
 
@@ -471,20 +630,50 @@ echo "✅ Infrastructure created successfully"
    [AWS Step Functions](https://docs.aws.amazon.com/step-functions/latest/dg/welcome.html) provides visual workflow orchestration that coordinates multiple AWS services in a reliable, scalable manner. The state machine manages the entire document processing lifecycle, from initial classification through Textract analysis to final result storage. Step Functions automatically handles error conditions, implements retry logic, and provides comprehensive logging for troubleshooting, ensuring robust operation even when processing thousands of documents simultaneously.
 
    ```bash
-   # Create Step Functions definition
+   # Create Step Functions definition with enhanced error handling
    cat > /tmp/textract-workflow.json << EOF
    {
-     "Comment": "Document Analysis Workflow with Amazon Textract",
+     "Comment": "Enhanced Document Analysis Workflow with Amazon Textract",
      "StartAt": "ClassifyDocument",
      "States": {
        "ClassifyDocument": {
          "Type": "Task",
          "Resource": "${CLASSIFIER_FUNCTION_ARN}",
+         "Retry": [
+           {
+             "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+             "IntervalSeconds": 2,
+             "MaxAttempts": 3,
+             "BackoffRate": 2.0
+           }
+         ],
+         "Catch": [
+           {
+             "ErrorEquals": ["States.ALL"],
+             "Next": "ClassificationFailed",
+             "ResultPath": "$.error"
+           }
+         ],
          "Next": "ProcessDocument"
        },
        "ProcessDocument": {
          "Type": "Task",
          "Resource": "${PROCESSOR_FUNCTION_ARN}",
+         "Retry": [
+           {
+             "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+             "IntervalSeconds": 2,
+             "MaxAttempts": 3,
+             "BackoffRate": 2.0
+           }
+         ],
+         "Catch": [
+           {
+             "ErrorEquals": ["States.ALL"],
+             "Next": "ProcessingFailed",
+             "ResultPath": "$.error"
+           }
+         ],
          "Next": "CheckProcessingType"
        },
        "CheckProcessingType": {
@@ -509,6 +698,21 @@ echo "✅ Infrastructure created successfully"
          "Parameters": {
            "JobId.$": "$.body.result.jobId"
          },
+         "Retry": [
+           {
+             "ErrorEquals": ["Textract.ThrottlingException"],
+             "IntervalSeconds": 5,
+             "MaxAttempts": 5,
+             "BackoffRate": 2.0
+           }
+         ],
+         "Catch": [
+           {
+             "ErrorEquals": ["States.ALL"],
+             "Next": "AsyncCheckFailed",
+             "ResultPath": "$.error"
+           }
+         ],
          "Next": "IsAsyncComplete"
        },
        "IsAsyncComplete": {
@@ -523,19 +727,45 @@ echo "✅ Infrastructure created successfully"
              "Variable": "$.JobStatus",
              "StringEquals": "FAILED",
              "Next": "ProcessingFailed"
+           },
+           {
+             "Variable": "$.JobStatus",
+             "StringEquals": "PARTIAL_SUCCESS",
+             "Next": "ProcessingPartialSuccess"
            }
          ],
          "Default": "WaitForAsyncCompletion"
        },
        "ProcessingComplete": {
          "Type": "Pass",
-         "Result": "Document processing completed successfully",
+         "Result": {
+           "status": "SUCCESS",
+           "message": "Document processing completed successfully"
+         },
          "End": true
+       },
+       "ProcessingPartialSuccess": {
+         "Type": "Pass",
+         "Result": {
+           "status": "PARTIAL_SUCCESS",
+           "message": "Document processing completed with some issues"
+         },
+         "End": true
+       },
+       "ClassificationFailed": {
+         "Type": "Fail",
+         "Error": "DocumentClassificationFailed",
+         "Cause": "Failed to classify the document"
        },
        "ProcessingFailed": {
          "Type": "Fail",
          "Error": "DocumentProcessingFailed",
          "Cause": "Textract processing failed"
+       },
+       "AsyncCheckFailed": {
+         "Type": "Fail",
+         "Error": "AsyncStatusCheckFailed",
+         "Cause": "Failed to check async job status"
        }
      }
    }
@@ -545,28 +775,29 @@ echo "✅ Infrastructure created successfully"
    aws stepfunctions create-state-machine \
        --name ${PROJECT_NAME}-workflow \
        --definition file:///tmp/textract-workflow.json \
-       --role-arn ${EXECUTION_ROLE_ARN}
+       --role-arn ${EXECUTION_ROLE_ARN} \
+       --type STANDARD
    
    export STATE_MACHINE_ARN=$(aws stepfunctions list-state-machines \
        --query "stateMachines[?name=='${PROJECT_NAME}-workflow'].stateMachineArn" \
        --output text)
    
-   echo "✅ Step Functions workflow created"
+   echo "✅ Enhanced Step Functions workflow created with retry logic"
    ```
 
-   The Step Functions state machine is now orchestrating your document processing workflow. This serverless workflow engine provides reliable coordination between all components, automatic error handling, and comprehensive visibility into processing status for operational monitoring and troubleshooting.
+   The Step Functions state machine now includes comprehensive error handling, retry logic, and support for partial success scenarios. This serverless workflow engine provides reliable coordination between all components, automatic error recovery, and comprehensive visibility into processing status for operational monitoring and troubleshooting.
 
 5. **Configure S3 Event Trigger**:
 
    [Amazon S3 event notifications](https://docs.aws.amazon.com/AmazonS3/latest/userguide/NotificationHowTo.html) create an event-driven architecture that automatically triggers document processing workflows when new files are uploaded. This eliminates the need for polling or manual intervention, ensuring documents are processed immediately upon arrival. The event-driven pattern scales automatically with document volume and provides loose coupling between storage and processing components, enabling independent scaling and maintenance of each service.
 
    ```bash
-   # Create S3 event notification configuration
+   # Create S3 event notification configuration for multiple file types
    cat > /tmp/s3-notification.json << EOF
    {
      "LambdaConfigurations": [
        {
-         "Id": "DocumentUploadTrigger",
+         "Id": "DocumentUploadTriggerPDF",
          "LambdaFunctionArn": "${CLASSIFIER_FUNCTION_ARN}",
          "Events": ["s3:ObjectCreated:*"],
          "Filter": {
@@ -579,6 +810,44 @@ echo "✅ Infrastructure created successfully"
                {
                  "Name": "suffix",
                  "Value": ".pdf"
+               }
+             ]
+           }
+         }
+       },
+       {
+         "Id": "DocumentUploadTriggerJPG",
+         "LambdaFunctionArn": "${CLASSIFIER_FUNCTION_ARN}",
+         "Events": ["s3:ObjectCreated:*"],
+         "Filter": {
+           "Key": {
+             "FilterRules": [
+               {
+                 "Name": "prefix",
+                 "Value": "documents/"
+               },
+               {
+                 "Name": "suffix",
+                 "Value": ".jpg"
+               }
+             ]
+           }
+         }
+       },
+       {
+         "Id": "DocumentUploadTriggerPNG",
+         "LambdaFunctionArn": "${CLASSIFIER_FUNCTION_ARN}",
+         "Events": ["s3:ObjectCreated:*"],
+         "Filter": {
+           "Key": {
+             "FilterRules": [
+               {
+                 "Name": "prefix",
+                 "Value": "documents/"
+               },
+               {
+                 "Name": "suffix",
+                 "Value": ".png"
                }
              ]
            }
@@ -601,22 +870,23 @@ echo "✅ Infrastructure created successfully"
        --bucket ${INPUT_BUCKET} \
        --notification-configuration file:///tmp/s3-notification.json
    
-   echo "✅ S3 event trigger configured"
+   echo "✅ S3 event trigger configured for multiple file types"
    ```
 
-   The S3 event trigger is now active and monitoring for new document uploads. This event-driven architecture ensures immediate processing response times and eliminates the need for manual intervention, creating a fully automated document processing pipeline that scales seamlessly with your business needs.
+   The S3 event trigger now supports multiple document formats (PDF, JPG, PNG) and is actively monitoring for new document uploads. This event-driven architecture ensures immediate processing response times and eliminates the need for manual intervention, creating a fully automated document processing pipeline that scales seamlessly with your business needs.
 
 6. **Create Results Processing Lambda**:
 
    Asynchronous Textract jobs require specialized handling to process completion notifications and retrieve final results. This Lambda function integrates with SNS to receive job completion notifications and automatically retrieves analysis results from Textract. The function then stores structured data in both S3 for detailed analysis and DynamoDB for quick metadata queries, providing comprehensive result management for long-running document processing tasks.
 
    ```bash
-   # Create results processor for async jobs
+   # Create enhanced results processor for async jobs
    cat > /tmp/async-results-processor.py << 'EOF'
    import json
    import boto3
    import os
    from datetime import datetime
+   from botocore.exceptions import ClientError
    
    textract = boto3.client('textract')
    s3 = boto3.client('s3')
@@ -629,35 +899,67 @@ echo "✅ Infrastructure created successfully"
            job_id = sns_message['JobId']
            status = sns_message['Status']
            
+           print(f"Processing async job {job_id} with status {status}")
+           
            if status == 'SUCCEEDED':
-               # Get results from Textract
-               response = textract.get_document_analysis(JobId=job_id)
+               # Get results from Textract with pagination support
+               extracted_data = get_complete_results(job_id)
                
-               # Process results
-               extracted_data = extract_structured_data(response)
-               
-               # Save to S3
+               # Save to S3 with enhanced metadata
                output_key = f"async-results/{job_id}-analysis.json"
                s3.put_object(
                    Bucket=os.environ['OUTPUT_BUCKET'],
                    Key=output_key,
                    Body=json.dumps(extracted_data, indent=2),
-                   ContentType='application/json'
+                   ContentType='application/json',
+                   ServerSideEncryption='AES256',
+                   Metadata={
+                       'jobId': job_id,
+                       'processedAt': datetime.utcnow().isoformat(),
+                       'status': status
+                   }
                )
                
-               # Update DynamoDB
-               update_document_metadata(job_id, 'completed', output_key)
+               # Update DynamoDB with success status
+               update_document_metadata(job_id, 'completed', output_key, extracted_data)
                
-               print(f"Successfully processed job {job_id}")
-           else:
-               # Update DynamoDB with failed status
-               update_document_metadata(job_id, 'failed', None)
-               print(f"Job {job_id} failed")
-               
+               print(f"Successfully processed async job {job_id}")
+           
+           elif status in ['FAILED', 'PARTIAL_SUCCESS']:
+               # Update DynamoDB with failed or partial status
+               update_document_metadata(job_id, status.lower(), None, None)
+               print(f"Job {job_id} finished with status: {status}")
+           
            return {'statusCode': 200}
+           
        except Exception as e:
-           print(f"Error: {str(e)}")
-           return {'statusCode': 500}
+           print(f"Error processing async result: {str(e)}")
+           return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+   
+   def get_complete_results(job_id):
+       """Get complete results with pagination support"""
+       all_blocks = []
+       next_token = None
+       
+       try:
+           while True:
+               params = {'JobId': job_id}
+               if next_token:
+                   params['NextToken'] = next_token
+               
+               response = textract.get_document_analysis(**params)
+               all_blocks.extend(response.get('Blocks', []))
+               
+               next_token = response.get('NextToken')
+               if not next_token:
+                   break
+           
+           # Process all blocks into structured data
+           return extract_structured_data({'Blocks': all_blocks})
+           
+       except ClientError as e:
+           print(f"Error retrieving Textract results: {str(e)}")
+           raise
    
    def extract_structured_data(response):
        """Extract structured data from Textract response"""
@@ -671,61 +973,101 @@ echo "✅ Infrastructure created successfully"
            if block['BlockType'] == 'LINE':
                lines.append({
                    'text': block.get('Text', ''),
-                   'confidence': block.get('Confidence', 0)
+                   'confidence': block.get('Confidence', 0),
+                   'page': block.get('Page', 1)
                })
            elif block['BlockType'] == 'TABLE':
                tables.append({
                    'id': block['Id'],
-                   'confidence': block.get('Confidence', 0)
+                   'confidence': block.get('Confidence', 0),
+                   'page': block.get('Page', 1),
+                   'rowCount': block.get('RowCount', 0),
+                   'columnCount': block.get('ColumnCount', 0)
                })
            elif block['BlockType'] == 'KEY_VALUE_SET':
-               forms.append({
-                   'id': block['Id'],
-                   'confidence': block.get('Confidence', 0)
-               })
+               if block.get('EntityTypes') and 'KEY' in block['EntityTypes']:
+                   forms.append({
+                       'id': block['Id'],
+                       'confidence': block.get('Confidence', 0),
+                       'page': block.get('Page', 1),
+                       'entityType': 'KEY'
+                   })
        
        return {
            'text_lines': lines,
            'tables': tables,
            'forms': forms,
-           'document_metadata': response.get('DocumentMetadata', {})
+           'total_lines': len(lines),
+           'total_tables': len(tables),
+           'total_forms': len([f for f in forms if f['entityType'] == 'KEY']),
+           'average_confidence': calculate_average_confidence(lines + tables + forms),
+           'processing_timestamp': datetime.utcnow().isoformat()
        }
    
-   def update_document_metadata(job_id, status, output_location):
-       """Update document metadata in DynamoDB"""
+   def calculate_average_confidence(items):
+       """Calculate average confidence score"""
+       confidences = [item.get('confidence', 0) for item in items if item.get('confidence')]
+       return sum(confidences) / len(confidences) if confidences else 0
+   
+   def update_document_metadata(job_id, status, output_location, extracted_data):
+       """Update document metadata in DynamoDB with enhanced data"""
        table = dynamodb.Table(os.environ['METADATA_TABLE'])
        
-       # Find document by job ID
-       response = table.scan(
-           FilterExpression='jobId = :jid',
-           ExpressionAttributeValues={':jid': job_id}
-       )
-       
-       if response['Items']:
-           document_id = response['Items'][0]['documentId']
+       try:
+           # Find document by job ID
+           response = table.scan(
+               FilterExpression='jobId = :jid',
+               ExpressionAttributeValues={':jid': job_id}
+           )
            
-           table.update_item(
-               Key={'documentId': document_id},
-               UpdateExpression='SET processingStatus = :status, outputLocation = :location, completedAt = :timestamp',
-               ExpressionAttributeValues={
+           if response['Items']:
+               document_id = response['Items'][0]['documentId']
+               
+               update_expression = 'SET processingStatus = :status, completedAt = :timestamp'
+               expression_values = {
                    ':status': status,
-                   ':location': output_location,
                    ':timestamp': datetime.utcnow().isoformat()
                }
-           )
+               
+               if output_location:
+                   update_expression += ', outputLocation = :location'
+                   expression_values[':location'] = output_location
+               
+               if extracted_data:
+                   update_expression += ', totalLines = :lines, totalTables = :tables, averageConfidence = :confidence'
+                   expression_values.update({
+                       ':lines': extracted_data.get('total_lines', 0),
+                       ':tables': extracted_data.get('total_tables', 0),
+                       ':confidence': extracted_data.get('average_confidence', 0)
+                   })
+               
+               table.update_item(
+                   Key={'documentId': document_id},
+                   UpdateExpression=update_expression,
+                   ExpressionAttributeValues=expression_values
+               )
+               
+               print(f"Updated metadata for document {document_id}")
+           else:
+               print(f"No document found for job ID {job_id}")
+               
+       except Exception as e:
+           print(f"Error updating document metadata: {str(e)}")
+           raise
    EOF
    
    # Create deployment package
    zip async-results-processor.zip async-results-processor.py
    
-   # Create Lambda function
+   # Create Lambda function with enhanced configuration
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-async-results-processor \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${EXECUTION_ROLE_ARN} \
        --handler async-results-processor.lambda_handler \
        --zip-file fileb://async-results-processor.zip \
        --timeout 300 \
+       --memory-size 512 \
        --environment Variables="{OUTPUT_BUCKET=${OUTPUT_BUCKET},METADATA_TABLE=${METADATA_TABLE}}"
    
    # Subscribe Lambda to SNS topic
@@ -744,10 +1086,10 @@ echo "✅ Infrastructure created successfully"
        --statement-id sns-trigger-permission \
        --source-arn ${SNS_TOPIC_ARN}
    
-   echo "✅ Async results processor created"
+   echo "✅ Enhanced async results processor created with pagination support"
    ```
 
-   The asynchronous results processor is now configured to handle completion notifications from Textract jobs. This component ensures that even large, complex documents are processed reliably and their results are properly stored and indexed for downstream applications.
+   The asynchronous results processor now includes pagination support for large documents, enhanced error handling, and improved metadata storage. This component ensures that even large, complex documents are processed reliably and their results are properly stored and indexed for downstream applications.
 
 7. **Create Sample Documents and Test Processing**:
 
@@ -757,49 +1099,130 @@ echo "✅ Infrastructure created successfully"
    # Create sample documents directory
    mkdir -p /tmp/sample-documents
    
-   # Create a simple test document (text file for demo)
+   # Create a comprehensive test document
    cat > /tmp/sample-documents/sample-invoice.txt << 'EOF'
+   ████████████████████████████████████████
+   █          ACME CORPORATION            █
+   █         123 Business Street          █
+   █        Enterprise City, ST 12345     █
+   █         Phone: (555) 123-4567        █
+   █         Email: billing@acme.com      █
+   ████████████████████████████████████████
+   
    INVOICE
    
    Invoice Number: INV-2024-001
    Date: January 15, 2024
+   Due Date: February 15, 2024
+   Customer ID: CUST-5678
    
    Bill To:
-   John Doe
-   123 Main Street
-   Anytown, ST 12345
+   TechStart Solutions LLC
+   456 Innovation Drive
+   Silicon Valley, CA 94000
    
-   Item                    Quantity    Price    Total
-   Website Development         1      $5000    $5000
-   Hosting Services           12       $100    $1200
+   Ship To:
+   TechStart Solutions LLC
+   789 Development Avenue
+   Silicon Valley, CA 94000
    
-   Subtotal:                                   $6200
-   Tax (8%):                                    $496
-   Total:                                      $6696
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ Item Description          │ Qty │ Unit Price │ Line Total      │
+   ├─────────────────────────────────────────────────────────────────┤
+   │ Cloud Infrastructure      │  1  │  $2,500.00 │    $2,500.00   │
+   │ Setup & Configuration     │     │            │                 │
+   ├─────────────────────────────────────────────────────────────────┤
+   │ Monthly Hosting Services  │ 12  │    $150.00 │    $1,800.00   │
+   │ (Annual Contract)         │     │            │                 │
+   ├─────────────────────────────────────────────────────────────────┤
+   │ Premium Support Package   │  1  │    $800.00 │      $800.00   │
+   │ (24/7 Coverage)           │     │            │                 │
+   ├─────────────────────────────────────────────────────────────────┤
+   │ SSL Certificate           │  2  │     $99.00 │      $198.00   │
+   │ (Wildcard Premium)        │     │            │                 │
+   └─────────────────────────────────────────────────────────────────┘
+   
+   Subtotal:                                      $5,298.00
+   Tax (8.25%):                                     $437.09
+   Total Amount Due:                              $5,735.09
+   
+   Payment Terms: Net 30 Days
+   Payment Method: Wire Transfer or ACH
+   
+   Wire Transfer Details:
+   Bank: First National Bank
+   Account: 1234567890
+   Routing: 123456789
+   
+   Notes:
+   - Payment is due within 30 days of invoice date
+   - Late payments subject to 1.5% monthly fee
+   - Questions? Contact: billing@acme.com
+   
+   Thank you for your business!
    EOF
    
-   # Convert to PDF (or use actual PDF if available)
-   # Note: For actual implementation, upload real PDF/image files
+   # Create a second test document with form-like structure
+   cat > /tmp/sample-documents/application-form.txt << 'EOF'
+   APPLICATION FOR BUSINESS SERVICES
    
-   # Upload test document
+   Applicant Information:
+   
+   Company Name: ___TechStart Solutions LLC___
+   
+   Contact Person: ___John Smith___
+   
+   Title: ___CTO___
+   
+   Email Address: ___john.smith@techstart.com___
+   
+   Phone Number: ___(555) 987-6543___
+   
+   Services Requested:
+   
+   ☑ Cloud Infrastructure
+   ☑ Managed Services  
+   ☐ Data Backup
+   ☑ Security Services
+   ☐ Custom Development
+   
+   Expected Start Date: ___February 1, 2024___
+   
+   Budget Range: ___$5,000 - $10,000___
+   
+   Additional Requirements:
+   ___24/7 monitoring and support required___
+   ___Must comply with SOC 2 requirements___
+   
+   Signature: ___John Smith___
+   
+   Date: ___January 10, 2024___
+   EOF
+   
+   # Upload test documents to different paths
    aws s3 cp /tmp/sample-documents/sample-invoice.txt \
-       s3://${INPUT_BUCKET}/documents/sample-invoice.pdf
+       s3://${INPUT_BUCKET}/documents/invoice-sample.pdf
    
-   echo "✅ Sample document uploaded for testing"
+   aws s3 cp /tmp/sample-documents/application-form.txt \
+       s3://${INPUT_BUCKET}/documents/form-application.pdf
+   
+   echo "✅ Enhanced sample documents uploaded for comprehensive testing"
    ```
 
-   The sample document is now uploaded and should trigger the complete processing pipeline. This test validates the end-to-end workflow from document upload through classification, Textract analysis, and results storage, ensuring all components work together properly.
+   The sample documents are now uploaded and should trigger the complete processing pipeline. These enhanced test documents include both invoice and form structures that will validate Textract's ability to extract various types of structured data, ensuring comprehensive end-to-end workflow validation.
 
 8. **Create Query Function for Document Analysis**:
 
    A dedicated query function provides structured access to processed document metadata and results stored in DynamoDB. This API enables downstream applications to retrieve document information by various criteria, supporting use cases like compliance reporting, audit trails, and business intelligence. The function demonstrates how to build queryable interfaces on top of the document processing pipeline for operational and analytical purposes.
 
    ```bash
-   # Create query function for retrieving results
+   # Create enhanced query function for retrieving results
    cat > /tmp/document-query.py << 'EOF'
    import json
    import boto3
    from datetime import datetime
+   from decimal import Decimal
+   from botocore.exceptions import ClientError
    
    dynamodb = boto3.resource('dynamodb')
    s3 = boto3.client('s3')
@@ -809,6 +1232,8 @@ echo "✅ Infrastructure created successfully"
            # Get query parameters
            document_id = event.get('documentId')
            document_type = event.get('documentType')
+           status = event.get('status')
+           include_content = event.get('includeContent', False)
            
            table = dynamodb.Table(os.environ['METADATA_TABLE'])
            
@@ -816,9 +1241,12 @@ echo "✅ Infrastructure created successfully"
                # Query specific document
                response = table.get_item(Key={'documentId': document_id})
                if 'Item' in response:
+                   item = response['Item']
+                   if include_content and item.get('outputLocation'):
+                       item['content'] = get_document_content(item['outputLocation'])
                    return {
                        'statusCode': 200,
-                       'body': json.dumps(response['Item'], default=str)
+                       'body': json.dumps(item, cls=DecimalEncoder)
                    }
                else:
                    return {
@@ -826,49 +1254,112 @@ echo "✅ Infrastructure created successfully"
                        'body': json.dumps({'error': 'Document not found'})
                    }
            
-           elif document_type:
-               # Query by document type
-               response = table.scan(
-                   FilterExpression='documentType = :dt',
-                   ExpressionAttributeValues={':dt': document_type}
-               )
+           elif document_type or status:
+               # Query by document type or status with filters
+               filter_expression = None
+               expression_values = {}
+               
+               if document_type:
+                   filter_expression = 'documentType = :dt'
+                   expression_values[':dt'] = document_type
+               
+               if status:
+                   if filter_expression:
+                       filter_expression += ' AND processingStatus = :status'
+                   else:
+                       filter_expression = 'processingStatus = :status'
+                   expression_values[':status'] = status
+               
+               scan_params = {
+                   'FilterExpression': filter_expression,
+                   'ExpressionAttributeValues': expression_values
+               }
+               
+               response = table.scan(**scan_params)
+               
                return {
                    'statusCode': 200,
-                   'body': json.dumps(response['Items'], default=str)
+                   'body': json.dumps({
+                       'items': response['Items'],
+                       'count': len(response['Items']),
+                       'scannedCount': response['ScannedCount']
+                   }, cls=DecimalEncoder)
                }
            
            else:
-               # Return all documents
-               response = table.scan()
+               # Return recent documents (last 100)
+               response = table.scan(Limit=100)
+               # Sort by timestamp descending
+               items = sorted(
+                   response['Items'],
+                   key=lambda x: x.get('timestamp', ''),
+                   reverse=True
+               )
+               
                return {
                    'statusCode': 200,
-                   'body': json.dumps(response['Items'], default=str)
+                   'body': json.dumps({
+                       'items': items,
+                       'count': len(items),
+                       'message': 'Showing most recent 100 documents'
+                   }, cls=DecimalEncoder)
                }
                
-       except Exception as e:
+       except ClientError as e:
+           print(f"DynamoDB error: {str(e)}")
            return {
                'statusCode': 500,
-               'body': json.dumps({'error': str(e)})
+               'body': json.dumps({'error': f'Database error: {str(e)}'})
            }
+       except Exception as e:
+           print(f"Unexpected error: {str(e)}")
+           return {
+               'statusCode': 500,
+               'body': json.dumps({'error': f'Internal server error: {str(e)}'})
+           }
+   
+   def get_document_content(s3_location):
+       """Retrieve document content from S3"""
+       try:
+           # Parse S3 location (format: s3://bucket/key)
+           s3_parts = s3_location.replace('s3://', '').split('/', 1)
+           bucket = s3_parts[0]
+           key = s3_parts[1]
+           
+           response = s3.get_object(Bucket=bucket, Key=key)
+           content = response['Body'].read().decode('utf-8')
+           return json.loads(content)
+           
+       except Exception as e:
+           print(f"Error retrieving S3 content: {str(e)}")
+           return {'error': f'Could not retrieve content: {str(e)}'}
+   
+   class DecimalEncoder(json.JSONEncoder):
+       """Helper class to handle Decimal types from DynamoDB"""
+       def default(self, obj):
+           if isinstance(obj, Decimal):
+               return float(obj)
+           return super(DecimalEncoder, self).default(obj)
    EOF
    
    # Create deployment package
    zip document-query.zip document-query.py
    
-   # Create Lambda function
+   # Create Lambda function with enhanced query capabilities
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-document-query \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${EXECUTION_ROLE_ARN} \
        --handler document-query.lambda_handler \
        --zip-file fileb://document-query.zip \
-       --timeout 30 \
+       --timeout 60 \
+       --memory-size 256 \
        --environment Variables="{METADATA_TABLE=${METADATA_TABLE}}"
    
-   echo "✅ Document query function created"
+   echo "✅ Enhanced document query function created with filtering capabilities"
    ```
 
-   The document query function is now available to retrieve processing results and metadata. This provides a structured API interface for applications to access document analysis results, enabling integration with business systems and reporting tools.
+   The document query function now provides advanced filtering capabilities, content retrieval options, and proper error handling. This provides a comprehensive API interface for applications to access document analysis results, enabling integration with business systems and reporting tools with enhanced query flexibility.
 
 ## Validation & Testing
 
@@ -886,11 +1377,16 @@ echo "✅ Infrastructure created successfully"
    # Check Lambda functions
    aws lambda list-functions \
        --query 'Functions[?contains(FunctionName, `'${PROJECT_NAME}'`)].FunctionName'
+   
+   # Check Step Functions state machine
+   aws stepfunctions describe-state-machine \
+       --state-machine-arn ${STATE_MACHINE_ARN} \
+       --query 'status'
    ```
 
-   Expected output: Should show created S3 buckets, DynamoDB table in ACTIVE status, and Lambda functions
+   Expected output: Should show created S3 buckets, DynamoDB table in ACTIVE status, Lambda functions, and Step Functions state machine in ACTIVE status
 
-2. **Test document processing**:
+2. **Test document processing end-to-end**:
 
    ```bash
    # Upload a test document to trigger processing
@@ -898,61 +1394,74 @@ echo "✅ Infrastructure created successfully"
        s3://${INPUT_BUCKET}/documents/test-invoice.pdf
    
    # Wait for processing
-   sleep 30
+   sleep 45
    
    # Check DynamoDB for processing results
    aws dynamodb scan \
        --table-name ${METADATA_TABLE} \
        --query 'Items[0]'
+   
+   # Verify output bucket contains results
+   aws s3 ls s3://${OUTPUT_BUCKET}/results/ --recursive
    ```
 
-   Expected output: Document metadata with processing status and results
+   Expected output: Document metadata with processing status, results, and confidence scores
 
 3. **Test Textract analysis directly**:
 
    ```bash
    # Test synchronous text detection
    aws textract detect-document-text \
-       --document '{"S3Object":{"Bucket":"'${INPUT_BUCKET}'","Name":"documents/test-invoice.pdf"}}'
+       --document '{"S3Object":{"Bucket":"'${INPUT_BUCKET}'","Name":"documents/test-invoice.pdf"}}' \
+       --query 'DocumentMetadata'
    
    # Test document analysis with forms and tables
    aws textract analyze-document \
        --document '{"S3Object":{"Bucket":"'${INPUT_BUCKET}'","Name":"documents/test-invoice.pdf"}}' \
-       --feature-types '["TABLES","FORMS"]'
+       --feature-types '["TABLES","FORMS"]' \
+       --query 'DocumentMetadata'
    ```
 
-   Expected output: JSON response with detected text, tables, and forms
+   Expected output: JSON response with document metadata and processing information
 
 4. **Test Step Functions workflow**:
 
    ```bash
-   # Start workflow execution
-   aws stepfunctions start-execution \
+   # Start workflow execution manually
+   EXECUTION_ARN=$(aws stepfunctions start-execution \
        --state-machine-arn ${STATE_MACHINE_ARN} \
-       --input '{"Records":[{"s3":{"bucket":{"name":"'${INPUT_BUCKET}'"},"object":{"key":"documents/test-invoice.pdf"}}}]}'
+       --input '{"Records":[{"s3":{"bucket":{"name":"'${INPUT_BUCKET}'"},"object":{"key":"documents/test-invoice.pdf"}}}]}' \
+       --query 'executionArn' --output text)
    
    # Check execution status
-   aws stepfunctions list-executions \
-       --state-machine-arn ${STATE_MACHINE_ARN} \
-       --query 'executions[0].status'
+   aws stepfunctions describe-execution \
+       --execution-arn ${EXECUTION_ARN} \
+       --query '{status:status,startDate:startDate,stopDate:stopDate}'
    ```
 
-   Expected output: Execution status showing SUCCEEDED
+   Expected output: Execution status showing SUCCEEDED with start and stop timestamps
 
-5. **Verify results storage**:
+5. **Test query function capabilities**:
 
    ```bash
-   # Check output bucket for results
-   aws s3 ls s3://${OUTPUT_BUCKET}/results/ --recursive
+   # Query all documents
+   aws lambda invoke \
+       --function-name ${PROJECT_NAME}-document-query \
+       --payload '{}' \
+       /tmp/query-response.json
    
-   # Download and examine results
-   aws s3 cp s3://${OUTPUT_BUCKET}/results/ /tmp/results/ --recursive
+   cat /tmp/query-response.json | jq '.'
    
-   # View extracted data
-   cat /tmp/results/*.json | jq '.text_lines[].text'
+   # Query by document type
+   aws lambda invoke \
+       --function-name ${PROJECT_NAME}-document-query \
+       --payload '{"documentType":"invoice"}' \
+       /tmp/query-type-response.json
+   
+   cat /tmp/query-type-response.json | jq '.body' | jq '.'
    ```
 
-   Expected output: Extracted text and structured data from the processed document
+   Expected output: JSON responses with document metadata and query results
 
 ## Cleanup
 
@@ -1007,26 +1516,17 @@ echo "✅ Infrastructure created successfully"
    # Delete SNS topic
    aws sns delete-topic --topic-arn ${SNS_TOPIC_ARN}
    
-   # Delete IAM role and policies
+   # Delete custom IAM policy and role
+   aws iam detach-role-policy \
+       --role-name ${PROJECT_NAME}-execution-role \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-execution-policy
+   
    aws iam detach-role-policy \
        --role-name ${PROJECT_NAME}-execution-role \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
-   aws iam detach-role-policy \
-       --role-name ${PROJECT_NAME}-execution-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonTextractFullAccess
-   
-   aws iam detach-role-policy \
-       --role-name ${PROJECT_NAME}-execution-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-   
-   aws iam detach-role-policy \
-       --role-name ${PROJECT_NAME}-execution-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
-   
-   aws iam detach-role-policy \
-       --role-name ${PROJECT_NAME}-execution-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonSNSFullAccess
+   aws iam delete-policy \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-execution-policy
    
    aws iam delete-role --role-name ${PROJECT_NAME}-execution-role
    
@@ -1045,30 +1545,37 @@ echo "✅ Infrastructure created successfully"
 
 ## Discussion
 
-This recipe demonstrates a comprehensive approach to document analysis using [Amazon Textract](https://docs.aws.amazon.com/textract/latest/dg/what-is.html), showcasing both synchronous and asynchronous processing patterns. The solution addresses real-world challenges in document processing by providing intelligent extraction of text, forms, and tables from various document types. The architecture leverages AWS serverless technologies to create a scalable, cost-effective solution that can handle documents of varying sizes and complexities.
+This recipe demonstrates a comprehensive approach to document analysis using [Amazon Textract](https://docs.aws.amazon.com/textract/latest/dg/what-is.html), showcasing both synchronous and asynchronous processing patterns optimized for production workloads. The solution addresses real-world challenges in document processing by providing intelligent extraction of text, forms, and tables from various document types with enhanced error handling and monitoring capabilities. The architecture leverages AWS serverless technologies following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) to create a scalable, cost-effective solution that can handle documents of varying sizes and complexities.
 
-The key architectural decisions include using [Step Functions](https://docs.aws.amazon.com/step-functions/latest/dg/welcome.html) for workflow orchestration, which provides visibility into the processing pipeline and allows for complex business logic. The separation of concerns between document classification, processing, and result handling ensures maintainability and scalability. The use of [DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html) for metadata storage enables quick querying and tracking of document processing status, while [S3](https://docs.aws.amazon.com/s3/index.html) serves as both input and output storage for documents and results.
+The key architectural decisions include using [Step Functions](https://docs.aws.amazon.com/step-functions/latest/dg/welcome.html) for workflow orchestration with comprehensive retry logic and error handling, which provides visibility into the processing pipeline and allows for complex business logic. The implementation of least-privilege [IAM policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html) ensures security while maintaining operational flexibility. The separation of concerns between document classification, processing, and result handling ensures maintainability and scalability, while the use of [DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html) with on-demand billing and TTL settings enables quick querying and automatic data lifecycle management.
 
-Amazon Textract's machine learning capabilities eliminate the need for manual OCR configuration and provide high-accuracy text extraction even from complex document layouts. The service's ability to understand document structure, including tables and forms, makes it particularly valuable for business document processing. The [asynchronous processing capability](https://docs.aws.amazon.com/textract/latest/dg/async.html) allows handling of large, multi-page documents without timeout concerns, while the synchronous option provides immediate results for simple documents.
+Amazon Textract's machine learning capabilities eliminate the need for manual OCR configuration and provide high-accuracy text extraction even from complex document layouts. The service's ability to understand document structure, including tables and forms, makes it particularly valuable for business document processing. The [asynchronous processing capability](https://docs.aws.amazon.com/textract/latest/dg/async.html) with pagination support allows handling of large, multi-page documents without timeout concerns, while the synchronous option provides immediate results for simple documents. Enhanced table and form extraction logic provides more structured data for downstream processing.
 
-The solution implements best practices for error handling, monitoring, and notifications through [SNS integration](https://docs.aws.amazon.com/sns/latest/dg/welcome.html). The modular [Lambda function design](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html) allows for easy extension and customization based on specific business requirements. Security is addressed through [IAM roles with least privilege access](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html), and the architecture supports encryption at rest and in transit.
+The solution implements best practices for error handling, monitoring, and notifications through [SNS integration](https://docs.aws.amazon.com/sns/latest/dg/welcome.html), with improved Lambda functions that include enhanced error handling and confidence scoring. The modular [Lambda function design](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html) using the latest Python runtime allows for easy extension and customization based on specific business requirements. Security is addressed through least-privilege IAM roles and [S3 encryption](https://docs.aws.amazon.com/s3/latest/userguide/UsingEncryption.html), and the architecture supports encryption at rest and in transit.
 
-> **Tip**: For production deployments, consider implementing additional features like document validation, custom entity recognition, and integration with downstream business systems for automated workflow processing.
+> **Tip**: For production deployments, consider implementing additional features like document validation, custom entity recognition using [Amazon Comprehend](https://docs.aws.amazon.com/comprehend/latest/dg/what-is.html), and integration with downstream business systems for automated workflow processing. Monitor costs using [AWS Cost Explorer](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-what-is.html) as Textract charges per page processed.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Enhanced Document Classification**: Implement a machine learning model using Amazon Comprehend or SageMaker to automatically classify documents into categories like invoices, contracts, forms, and reports, with confidence scoring and manual review workflows for uncertain classifications.
+1. **Enhanced Document Classification**: Implement a machine learning model using [Amazon Comprehend Custom Classification](https://docs.aws.amazon.com/comprehend/latest/dg/how-document-classification.html) or [SageMaker](https://docs.aws.amazon.com/sagemaker/latest/dg/whatis.html) to automatically classify documents into categories like invoices, contracts, forms, and reports, with confidence scoring and manual review workflows for uncertain classifications.
 
-2. **Custom Entity Recognition**: Develop custom entity extraction using Amazon Comprehend Custom Entity Recognition to identify domain-specific entities like product codes, vendor IDs, or regulatory reference numbers, and integrate this with the existing Textract pipeline for comprehensive document understanding.
+2. **Custom Entity Recognition**: Develop custom entity extraction using [Amazon Comprehend Custom Entity Recognition](https://docs.aws.amazon.com/comprehend/latest/dg/custom-entity-recognition.html) to identify domain-specific entities like product codes, vendor IDs, or regulatory reference numbers, and integrate this with the existing Textract pipeline for comprehensive document understanding.
 
-3. **Advanced Table Processing**: Implement sophisticated table extraction logic that can handle complex table structures, nested tables, and multi-page tables, with the ability to convert extracted table data into structured formats like CSV or JSON for downstream processing.
+3. **Advanced Table Processing**: Implement sophisticated table extraction logic that can handle complex table structures, nested tables, and multi-page tables, with the ability to convert extracted table data into structured formats like CSV or JSON for downstream processing using enhanced parsing algorithms.
 
-4. **Real-time Document Validation**: Create a validation layer that verifies extracted data against business rules, performs data quality checks, and flags potential errors or inconsistencies for human review, including integration with external validation services.
+4. **Real-time Document Validation**: Create a validation layer using [AWS Lambda](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html) and [Amazon EventBridge](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-what-is.html) that verifies extracted data against business rules, performs data quality checks, and flags potential errors or inconsistencies for human review, including integration with external validation services.
 
-5. **Multi-language Support**: Extend the solution to handle documents in multiple languages by implementing language detection, appropriate Textract language configuration, and translation services for extracted text using Amazon Translate.
+5. **Multi-language Support**: Extend the solution to handle documents in multiple languages by implementing language detection using [Amazon Comprehend](https://docs.aws.amazon.com/comprehend/latest/dg/how-languages.html), appropriate Textract language configuration, and translation services for extracted text using [Amazon Translate](https://docs.aws.amazon.com/translate/latest/dg/what-is.html).
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

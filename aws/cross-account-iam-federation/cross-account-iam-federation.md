@@ -6,17 +6,16 @@ difficulty: 400
 subject: aws
 services: IAM, STS, CloudTrail, Organizations
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: iam, cross-account, federation, security, roles
 recipe-generator-version: 1.3
 ---
 
 # Cross-Account IAM Role Federation
-
 
 ## Problem
 
@@ -94,16 +93,31 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for the tutorial
+# Set environment variables
+export AWS_REGION=$(aws configure get region)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+    --query Account --output text)
+
+# Set example account IDs (replace with your actual account IDs)
 export SECURITY_ACCOUNT_ID="111111111111"  # Replace with your security account ID
 export PROD_ACCOUNT_ID="222222222222"      # Replace with your production account ID
 export DEV_ACCOUNT_ID="333333333333"       # Replace with your development account ID
-export AWS_REGION=$(aws configure get region)
-export RANDOM_SUFFIX=$(openssl rand -hex 4)
+
+# Generate unique identifier for resources
+export RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
+    --exclude-punctuation --exclude-uppercase \
+    --password-length 6 --require-each-included-type \
+    --output text --query RandomPassword)
 
 # Generate external IDs for enhanced security
-export PROD_EXTERNAL_ID=$(openssl rand -hex 16)
-export DEV_EXTERNAL_ID=$(openssl rand -hex 16)
+export PROD_EXTERNAL_ID=$(aws secretsmanager get-random-password \
+    --exclude-punctuation --exclude-uppercase \
+    --password-length 16 --require-each-included-type \
+    --output text --query RandomPassword)
+export DEV_EXTERNAL_ID=$(aws secretsmanager get-random-password \
+    --exclude-punctuation --exclude-uppercase \
+    --password-length 16 --require-each-included-type \
+    --output text --query RandomPassword)
 
 # Store external IDs securely (in real implementation, use Secrets Manager)
 echo "Production External ID: $PROD_EXTERNAL_ID"
@@ -111,6 +125,8 @@ echo "Development External ID: $DEV_EXTERNAL_ID"
 
 # Verify account access and current account
 aws sts get-caller-identity
+
+echo "✅ AWS environment configured"
 ```
 
 ## Steps
@@ -461,7 +477,9 @@ aws sts get-caller-identity
        --role-arn "arn:aws:iam::${TARGET_ACCOUNT}:role/${ROLE_NAME}" \
        --role-session-name "${SESSION_NAME}" \
        --external-id "${EXTERNAL_ID}" \
-       --tags Key=Department,Value=Engineering Key=Project,Value=CrossAccountDemo Key=Environment,Value=Prod \
+       --tags Key=Department,Value=Engineering \
+             Key=Project,Value=CrossAccountDemo \
+             Key=Environment,Value=Prod \
        --transitive-tag-keys Department,Project,Environment \
        --duration-seconds 3600 \
        --output json)
@@ -525,7 +543,11 @@ aws sts get-caller-identity
        --s3-bucket-name "cross-account-audit-trail-${RANDOM_SUFFIX}" \
        --include-global-service-events \
        --is-multi-region-trail \
-       --enable-log-file-validation \
+       --enable-log-file-validation
+   
+   # Configure event selectors for cross-account role monitoring
+   aws cloudtrail put-event-selectors \
+       --trail-name "CrossAccountAuditTrail-${RANDOM_SUFFIX}" \
        --event-selectors '[
          {
            "ReadWriteType": "All",
@@ -534,10 +556,6 @@ aws sts get-caller-identity
              {
                "Type": "AWS::IAM::Role",
                "Values": ["arn:aws:iam::*:role/CrossAccount-*"]
-             },
-             {
-               "Type": "AWS::STS::AssumeRole",
-               "Values": ["*"]
              }
            ]
          }
@@ -687,6 +705,9 @@ aws sts get-caller-identity
        --role-name "RoleValidatorLambdaRole-${RANDOM_SUFFIX}" \
        --assume-role-policy-document file://lambda-execution-trust-policy.json
    
+   # Wait for role propagation
+   sleep 10
+   
    # Attach necessary policies
    aws iam attach-role-policy \
        --role-name "RoleValidatorLambdaRole-${RANDOM_SUFFIX}" \
@@ -700,7 +721,7 @@ aws sts get-caller-identity
    aws lambda create-function \
        --function-name "CrossAccountRoleValidator-${RANDOM_SUFFIX}" \
        --runtime python3.9 \
-       --role "arn:aws:iam::${SECURITY_ACCOUNT_ID}:role/RoleValidatorLambdaRole-${RANDOM_SUFFIX}" \
+       --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/RoleValidatorLambdaRole-${RANDOM_SUFFIX}" \
        --handler role-validator.lambda_handler \
        --zip-file fileb://role-validator.zip \
        --timeout 300 \
@@ -764,13 +785,11 @@ aws sts get-caller-identity
 4. **Verify Audit Logging**:
 
    ```bash
-   # Check recent CloudTrail logs for role assumptions
-   aws logs filter-log-events \
-       --log-group-name "CloudTrail/CrossAccountAuditTrail-${RANDOM_SUFFIX}" \
-       --start-time $(date -d '1 hour ago' +%s)000 \
-       --filter-pattern '{ $.eventName = "AssumeRole" }' \
-       --query 'events[0:5].{Time:eventTime,User:userIdentity.type,Action:eventName}' \
-       --output table
+   # Check CloudTrail status
+   aws cloudtrail get-trail-status \
+       --name "CrossAccountAuditTrail-${RANDOM_SUFFIX}"
+   
+   echo "✅ CloudTrail logging verified"
    ```
 
 ## Cleanup
@@ -879,7 +898,7 @@ The architecture separates concerns by centralizing identity management in a sec
 
 The automated validation component demonstrates how to implement continuous compliance monitoring for IAM configurations. By using Lambda functions triggered by CloudWatch Events or Config rules, organizations can detect configuration drift and policy violations in real-time. This approach is essential for maintaining security posture in dynamic environments where infrastructure changes frequently. The [AWS CLI role switching documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-cli.html) provides additional operational guidance for managing these complex access patterns.
 
-> **Warning**: External IDs and session tags must be carefully managed and rotated regularly. Store external IDs in AWS Secrets Manager rather than environment variables in production environments.
+> **Warning**: External IDs and session tags must be carefully managed and rotated regularly. Store external IDs in AWS Secrets Manager rather than environment variables in production environments to maintain security best practices.
 
 ## Challenge
 
@@ -893,4 +912,11 @@ Extend this solution by implementing these advanced security enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

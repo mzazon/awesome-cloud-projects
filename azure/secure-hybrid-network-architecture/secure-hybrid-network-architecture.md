@@ -4,12 +4,12 @@ id: a7b3c8d9
 category: networking
 difficulty: 200
 subject: azure
-services: Azure VPN Gateway, Azure Private Link, Azure Key Vault, Azure Virtual Network
+services: VPN Gateway, Private Link, Key Vault, Virtual Network
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: hybrid-network, vpn-gateway, private-link, security, encryption, key-vault
 recipe-generator-version: 1.3
@@ -77,7 +77,7 @@ graph TB
 5. Familiarity with IPsec VPN fundamentals and certificate management
 6. Estimated cost: $150-200 for VPN Gateway, $50-100 for other resources during recipe execution
 
-> **Note**: VPN Gateway charges apply immediately upon creation. The Basic SKU costs approximately $0.04/hour while VpnGw1 costs $0.19/hour. Consider using the Basic SKU for testing purposes.
+> **Note**: VPN Gateway charges apply immediately upon creation. The Basic SKU costs approximately $0.04/hour while VpnGw1AZ costs $0.19/hour. Starting 2025, Basic SKU VPN Gateways must use Standard SKU public IP addresses instead of Basic SKU public IPs.
 
 ## Preparation
 
@@ -158,7 +158,7 @@ echo "✅ Using subscription: $(az account show --query name --output tsv)"
        --name ApplicationSubnet \
        --address-prefixes 10.1.1.0/24
 
-   # Create private endpoint subnet with private endpoint policies disabled
+   # Create private endpoint subnet with network policies disabled
    az network vnet subnet create \
        --resource-group ${RESOURCE_GROUP} \
        --vnet-name ${SPOKE_VNET_NAME} \
@@ -201,10 +201,10 @@ echo "✅ Using subscription: $(az account show --query name --output tsv)"
 
 4. **Create Public IP and VPN Gateway**:
 
-   Azure VPN Gateway requires a public IP address for establishing IPsec tunnels with on-premises VPN devices. The VPN Gateway provides enterprise-grade connectivity with built-in high availability and supports multiple connection types including site-to-site, point-to-site, and ExpressRoute coexistence. The Basic SKU is sufficient for testing while VpnGw1 and higher SKUs provide production-ready performance and features.
+   Azure VPN Gateway requires a Standard SKU public IP address for establishing IPsec tunnels with on-premises VPN devices. The VPN Gateway provides enterprise-grade connectivity with built-in high availability and supports multiple connection types including site-to-site, point-to-site, and ExpressRoute coexistence. The Basic SKU is sufficient for testing while VpnGw1AZ and higher SKUs provide production-ready performance and features.
 
    ```bash
-   # Create public IP for VPN Gateway with Standard SKU
+   # Create Standard public IP for VPN Gateway (required for Basic SKU gateways)
    az network public-ip create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${VPN_GATEWAY_NAME}-pip \
@@ -279,7 +279,7 @@ echo "✅ Using subscription: $(az account show --query name --output tsv)"
 
    The storage account is configured with public access disabled by default, requiring private endpoint connectivity for secure access. This configuration demonstrates zero-trust networking principles where services are inaccessible via the public internet and require explicit private connectivity.
 
-7. **Create Private DNS Zone for Service Resolution**:
+7. **Create Private DNS Zones for Service Resolution**:
 
    Azure Private DNS zones provide name resolution for private endpoints within virtual networks. The privatelink.vault.azure.net zone enables automatic DNS resolution for Key Vault private endpoints, ensuring applications can connect using standard service URLs while traffic remains on the private network. This configuration supports seamless application integration without code changes.
 
@@ -309,6 +309,21 @@ echo "✅ Using subscription: $(az account show --query name --output tsv)"
        --virtual-network ${SPOKE_VNET_NAME} \
        --registration-enabled false
 
+   # Link storage DNS zone to both VNets
+   az network private-dns link vnet create \
+       --resource-group ${RESOURCE_GROUP} \
+       --zone-name privatelink.blob.core.windows.net \
+       --name hub-storage-link \
+       --virtual-network ${HUB_VNET_NAME} \
+       --registration-enabled false
+
+   az network private-dns link vnet create \
+       --resource-group ${RESOURCE_GROUP} \
+       --zone-name privatelink.blob.core.windows.net \
+       --name spoke-storage-link \
+       --virtual-network ${SPOKE_VNET_NAME} \
+       --registration-enabled false
+
    echo "✅ Private DNS zones created and linked to virtual networks"
    ```
 
@@ -319,7 +334,7 @@ echo "✅ Using subscription: $(az account show --query name --output tsv)"
    Private endpoints provide secure, private connectivity to Azure PaaS services by creating network interfaces with private IP addresses in your virtual network. These endpoints eliminate internet exposure while maintaining full service functionality. Each private endpoint creates DNS records in the associated private DNS zone for seamless service discovery.
 
    ```bash
-   # Wait for VPN Gateway creation to complete (check status)
+   # Check VPN Gateway creation status (optional)
    echo "Checking VPN Gateway status..."
    az network vnet-gateway show \
        --resource-group ${RESOURCE_GROUP} \
@@ -353,85 +368,41 @@ echo "✅ Using subscription: $(az account show --query name --output tsv)"
 
    The private endpoints now provide secure access to Azure services through the virtual network, eliminating internet exposure while maintaining full service functionality. Applications can access these services using standard service URLs while traffic remains within the Azure backbone network.
 
-9. **Configure Private DNS Records for Service Resolution**:
+9. **Create Test Virtual Machine for Validation**:
 
-   Private DNS records ensure that service FQDNs resolve to private endpoint IP addresses instead of public IP addresses. This configuration enables seamless application integration where existing connection strings continue to work while traffic is automatically routed through private endpoints. The DNS integration supports both Azure-native and on-premises applications.
+   A test virtual machine provides a platform for validating private endpoint connectivity and demonstrating the end-to-end hybrid network functionality. The VM is configured with managed identity to securely access Azure services without storing credentials, following Azure security best practices for identity and access management.
 
    ```bash
-   # Create DNS records for Key Vault private endpoint
-   KV_PE_IP=$(az network private-endpoint show \
+   # Create test VM in the spoke network
+   az vm create \
        --resource-group ${RESOURCE_GROUP} \
-       --name pe-keyvault-${RANDOM_SUFFIX} \
-       --query 'customDnsConfigs[0].ipAddresses[0]' --output tsv)
+       --name vm-test-${RANDOM_SUFFIX} \
+       --vnet-name ${SPOKE_VNET_NAME} \
+       --subnet ApplicationSubnet \
+       --image Ubuntu2204 \
+       --admin-username azureuser \
+       --generate-ssh-keys \
+       --size Standard_B2s \
+       --assign-identity \
+       --location ${LOCATION} \
+       --tags purpose=testing
 
-   az network private-dns record-set a create \
+   # Get VM managed identity
+   VM_IDENTITY=$(az vm identity show \
        --resource-group ${RESOURCE_GROUP} \
-       --zone-name ${PRIVATE_DNS_ZONE} \
-       --name ${KEY_VAULT_NAME}
+       --name vm-test-${RANDOM_SUFFIX} \
+       --query principalId --output tsv)
 
-   az network private-dns record-set a add-record \
-       --resource-group ${RESOURCE_GROUP} \
-       --zone-name ${PRIVATE_DNS_ZONE} \
-       --record-set-name ${KEY_VAULT_NAME} \
-       --ipv4-address ${KV_PE_IP}
+   # Grant VM access to Key Vault
+   az role assignment create \
+       --assignee ${VM_IDENTITY} \
+       --role "Key Vault Secrets User" \
+       --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.KeyVault/vaults/${KEY_VAULT_NAME}"
 
-   # Create DNS records for Storage Account private endpoint
-   STORAGE_PE_IP=$(az network private-endpoint show \
-       --resource-group ${RESOURCE_GROUP} \
-       --name pe-storage-${RANDOM_SUFFIX} \
-       --query 'customDnsConfigs[0].ipAddresses[0]' --output tsv)
-
-   az network private-dns record-set a create \
-       --resource-group ${RESOURCE_GROUP} \
-       --zone-name privatelink.blob.core.windows.net \
-       --name ${STORAGE_ACCOUNT_NAME}
-
-   az network private-dns record-set a add-record \
-       --resource-group ${RESOURCE_GROUP} \
-       --zone-name privatelink.blob.core.windows.net \
-       --record-set-name ${STORAGE_ACCOUNT_NAME} \
-       --ipv4-address ${STORAGE_PE_IP}
-
-   echo "✅ Private DNS records configured for service resolution"
+   echo "✅ Test VM created with managed identity and Key Vault access"
    ```
 
-   The DNS configuration now ensures that service URLs resolve to private IP addresses, enabling seamless private connectivity. This setup supports both Azure-native applications and on-premises applications that need to access Azure services through the VPN connection.
-
-10. **Create Test Virtual Machine for Validation**:
-
-    A test virtual machine provides a platform for validating private endpoint connectivity and demonstrating the end-to-end hybrid network functionality. The VM is configured with managed identity to securely access Azure services without storing credentials, following Azure security best practices for identity and access management.
-
-    ```bash
-    # Create test VM in the spoke network
-    az vm create \
-        --resource-group ${RESOURCE_GROUP} \
-        --name vm-test-${RANDOM_SUFFIX} \
-        --vnet-name ${SPOKE_VNET_NAME} \
-        --subnet ApplicationSubnet \
-        --image Ubuntu2204 \
-        --admin-username azureuser \
-        --generate-ssh-keys \
-        --size Standard_B2s \
-        --assign-identity \
-        --location ${LOCATION} \
-        --tags purpose=testing
-
-    # Get VM managed identity
-    VM_IDENTITY=$(az vm identity show \
-        --resource-group ${RESOURCE_GROUP} \
-        --name vm-test-${RANDOM_SUFFIX} \
-        --query principalId --output tsv)
-
-    # Grant VM access to Key Vault
-    az role assignment create \
-        --assignee ${VM_IDENTITY} \
-        --role "Key Vault Secrets User" \
-        --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.KeyVault/vaults/${KEY_VAULT_NAME}"
-
-    echo "✅ Test VM created with managed identity and Key Vault access"
-    ```
-
-    The test VM is now configured with managed identity authentication to Azure services, eliminating the need for stored credentials while providing secure access to Key Vault through the private endpoint. This configuration demonstrates modern Azure security practices for service-to-service authentication.
+   The test VM is now configured with managed identity authentication to Azure services, eliminating the need for stored credentials while providing secure access to Key Vault through the private endpoint. This configuration demonstrates modern Azure security practices for service-to-service authentication.
 
 ## Validation & Testing
 
@@ -522,20 +493,10 @@ echo "✅ Using subscription: $(az account show --query name --output tsv)"
    az vm delete \
        --resource-group ${RESOURCE_GROUP} \
        --name vm-test-${RANDOM_SUFFIX} \
-       --yes
+       --yes \
+       --no-wait
    
-   # Delete VM network interface
-   az network nic delete \
-       --resource-group ${RESOURCE_GROUP} \
-       --name vm-test-${RANDOM_SUFFIX}VMNic
-   
-   # Delete VM OS disk
-   az disk delete \
-       --resource-group ${RESOURCE_GROUP} \
-       --name vm-test-${RANDOM_SUFFIX}_OsDisk_1_* \
-       --yes
-   
-   echo "✅ Test VM and associated resources deleted"
+   echo "✅ Test VM deletion initiated"
    ```
 
 2. **Remove Private Endpoints and DNS Records**:
@@ -570,20 +531,21 @@ echo "✅ Using subscription: $(az account show --query name --output tsv)"
    # Delete VPN Gateway (this takes 10-20 minutes)
    az network vnet-gateway delete \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${VPN_GATEWAY_NAME}
+       --name ${VPN_GATEWAY_NAME} \
+       --no-wait
    
    # Delete VPN Gateway public IP
    az network public-ip delete \
        --resource-group ${RESOURCE_GROUP} \
        --name ${VPN_GATEWAY_NAME}-pip
    
-   echo "✅ VPN Gateway and public IP deleted"
+   echo "✅ VPN Gateway deletion initiated"
    ```
 
 4. **Remove Azure Services and Virtual Networks**:
 
    ```bash
-   # Delete Key Vault
+   # Delete Key Vault (with purge protection disabled for testing)
    az keyvault delete \
        --resource-group ${RESOURCE_GROUP} \
        --name ${KEY_VAULT_NAME}
@@ -594,7 +556,10 @@ echo "✅ Using subscription: $(az account show --query name --output tsv)"
        --name ${STORAGE_ACCOUNT_NAME} \
        --yes
    
-   # Delete virtual networks
+   # Delete virtual networks (wait for gateway deletion)
+   echo "Waiting for VPN Gateway deletion to complete..."
+   sleep 30
+   
    az network vnet delete \
        --resource-group ${RESOURCE_GROUP} \
        --name ${SPOKE_VNET_NAME}
@@ -627,7 +592,7 @@ The hub-and-spoke network topology implemented in this recipe follows the [Azure
 
 Private Link integration with Key Vault demonstrates modern secrets management practices where sensitive information is accessed through secure, private connections rather than public endpoints. This approach supports compliance requirements and reduces security risks associated with credential management. The managed identity integration eliminates the need for stored credentials while providing secure authentication between Azure services. For detailed security guidance, consult the [Azure Security Best Practices](https://learn.microsoft.com/en-us/azure/security/fundamentals/network-best-practices) documentation.
 
-Cost optimization is achieved through the shared VPN Gateway model and appropriate SKU selection. The Basic SKU provides sufficient functionality for development and testing scenarios, while production environments may require VpnGw1 or higher SKUs for enhanced performance and availability features. Private endpoints incur minimal costs compared to the security benefits they provide, making this architecture cost-effective for organizations requiring secure hybrid connectivity. For detailed cost analysis, review the [Azure VPN Gateway pricing](https://azure.microsoft.com/pricing/details/vpn-gateway/) and [Private Link pricing](https://azure.microsoft.com/pricing/details/private-link/) documentation.
+Cost optimization is achieved through the shared VPN Gateway model and appropriate SKU selection. The Basic SKU provides sufficient functionality for development and testing scenarios, while production environments may require VpnGw1AZ or higher SKUs for enhanced performance and availability features. Note that starting in 2025, Basic SKU VPN Gateways require Standard SKU public IP addresses due to the retirement of Basic SKU public IPs. Private endpoints incur minimal costs compared to the security benefits they provide, making this architecture cost-effective for organizations requiring secure hybrid connectivity. For detailed cost analysis, review the [Azure VPN Gateway pricing](https://azure.microsoft.com/pricing/details/vpn-gateway/) and [Private Link pricing](https://azure.microsoft.com/pricing/details/private-link/) documentation.
 
 > **Tip**: Use Azure Monitor and Network Watcher to monitor VPN Gateway performance and troubleshoot connectivity issues. The [Azure VPN Gateway monitoring guide](https://learn.microsoft.com/en-us/azure/vpn-gateway/vpn-gateway-howto-setup-alerts-virtual-network-gateway-metric) provides comprehensive guidance on setting up alerts and performance monitoring for production environments.
 
@@ -647,4 +612,9 @@ Extend this hybrid network security solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

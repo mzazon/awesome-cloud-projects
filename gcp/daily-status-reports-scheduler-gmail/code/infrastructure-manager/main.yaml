@@ -1,0 +1,399 @@
+# Infrastructure Manager Configuration for Daily Status Reports with Cloud Scheduler and Gmail
+# This configuration deploys the complete infrastructure needed for automated daily system status reports
+# Includes: Service Account, Cloud Function, and Cloud Scheduler Job
+
+# Import required provider configurations
+imports:
+  - path: https://storage.googleapis.com/cloud-foundation-templates/dm/compute-v1.py
+    name: compute-v1.py
+  - path: https://storage.googleapis.com/cloud-foundation-templates/dm/iam-v1.py
+    name: iam-v1.py
+
+# Configuration metadata and labels
+metadata:
+  version: "1.0"
+  description: "Daily System Status Reports Infrastructure"
+  labels:
+    component: "monitoring"
+    environment: "production"
+    managed-by: "infrastructure-manager"
+
+# Input parameters for customization
+parameters:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    default: "${PROJECT_ID}"
+  
+  # Regional configuration
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+  
+  # Resource naming configuration
+  resource_prefix:
+    type: string
+    description: "Prefix for all resource names"
+    default: "daily-status-report"
+  
+  # Email configuration
+  sender_email:
+    type: string
+    description: "Gmail address for sending reports"
+    default: "your-email@gmail.com"
+  
+  sender_password:
+    type: string
+    description: "Gmail app password or OAuth token"
+    default: "your-app-password"
+    # In production, use Secret Manager for credentials
+  
+  recipient_email:
+    type: string
+    description: "Email address to receive status reports"
+    default: "admin@example.com"
+  
+  # Scheduling configuration
+  report_schedule:
+    type: string
+    description: "Cron schedule for daily reports (UTC)"
+    default: "0 9 * * *"  # 9 AM UTC daily
+  
+  # Cloud Function configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function"
+    default: "256MB"
+  
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution"
+    default: "60s"
+  
+  function_runtime:
+    type: string
+    description: "Python runtime version for Cloud Function"
+    default: "python312"
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-cloudfunctions-api
+    type: google.servicemanagement.v1.servicemanagement.services.enable
+    properties:
+      serviceName: cloudfunctions.googleapis.com
+      
+  - name: enable-cloudscheduler-api
+    type: google.servicemanagement.v1.servicemanagement.services.enable
+    properties:
+      serviceName: cloudscheduler.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: google.servicemanagement.v1.servicemanagement.services.enable
+    properties:
+      serviceName: monitoring.googleapis.com
+      
+  - name: enable-gmail-api
+    type: google.servicemanagement.v1.servicemanagement.services.enable
+    properties:
+      serviceName: gmail.googleapis.com
+
+  # Service Account for automated reporting with least privilege access
+  - name: status-reporter-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      project: $(ref.project_id.value)
+      accountId: $(ref.resource_prefix.value)-sa
+      serviceAccount:
+        displayName: "Daily Status Reporter Service Account"
+        description: "Service account for automated system status reports with monitoring access"
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - enable-monitoring-api
+
+  # IAM binding for Cloud Monitoring Viewer role (least privilege)
+  - name: monitoring-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/monitoring.viewer
+      member: serviceAccount:$(ref.status-reporter-service-account.email)
+    metadata:
+      dependsOn:
+        - status-reporter-service-account
+
+  # Cloud Function for status report generation
+  # Contains Python code for collecting metrics and sending email reports
+  - name: status-report-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      function:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/functions/$(ref.resource_prefix.value)-function
+        description: "Automated daily system status report generator"
+        
+        # Function source code configuration
+        sourceArchiveUrl: gs://$(ref.project_id.value)-function-source/status-report-function.zip
+        
+        # Runtime and execution configuration
+        runtime: $(ref.function_runtime.value)
+        entryPoint: "generate_status_report"
+        availableMemoryMb: 256
+        timeout: $(ref.function_timeout.value)
+        
+        # HTTP trigger for Cloud Scheduler integration
+        httpsTrigger: {}
+        
+        # Environment variables for function configuration
+        environmentVariables:
+          GCP_PROJECT: $(ref.project_id.value)
+          SENDER_EMAIL: $(ref.sender_email.value)
+          SENDER_PASSWORD: $(ref.sender_password.value)
+          RECIPIENT_EMAIL: $(ref.recipient_email.value)
+        
+        # Service account for secure API access
+        serviceAccountEmail: $(ref.status-reporter-service-account.email)
+        
+        # Security configuration - requires authentication
+        ingressSettings: "ALLOW_INTERNAL_AND_GCLB"
+        
+        # Labels for resource management
+        labels:
+          component: "monitoring"
+          function-type: "status-reporting"
+          managed-by: "infrastructure-manager"
+    
+    metadata:
+      dependsOn:
+        - status-reporter-service-account
+        - monitoring-viewer-binding
+        - enable-cloudfunctions-api
+
+  # Cloud Scheduler Job for daily report triggers
+  # Provides reliable cron-like scheduling with retry logic
+  - name: daily-report-scheduler-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      job:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/jobs/$(ref.resource_prefix.value)-job
+        description: "Daily system status report scheduler job"
+        
+        # Cron schedule configuration (9 AM UTC daily)
+        schedule: $(ref.report_schedule.value)
+        timeZone: "UTC"
+        
+        # HTTP target configuration for Cloud Function invocation
+        httpTarget:
+          uri: $(ref.status-report-function.httpsTrigger.url)
+          httpMethod: "POST"
+          
+          # OIDC authentication for secure function invocation
+          oidcToken:
+            serviceAccountEmail: $(ref.status-reporter-service-account.email)
+            audience: $(ref.status-report-function.httpsTrigger.url)
+        
+        # Retry configuration for reliability
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: "300s"
+          minBackoffDuration: "5s"
+          maxBackoffDuration: "60s"
+          maxDoublings: 3
+        
+        # Job execution state
+        state: "ENABLED"
+    
+    metadata:
+      dependsOn:
+        - status-report-function
+        - enable-cloudscheduler-api
+
+  # Cloud Storage bucket for function source code (if needed)
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      project: $(ref.project_id.value)
+      name: $(ref.project_id.value)-function-source
+      location: $(ref.region.value)
+      
+      # Storage configuration for function code
+      storageClass: "REGIONAL"
+      
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: "Delete"
+            condition:
+              age: 30  # Delete old versions after 30 days
+      
+      # Security configuration
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      
+      # Labels for resource management
+      labels:
+        component: "function-storage"
+        managed-by: "infrastructure-manager"
+
+  # IAM binding for Storage Object Admin on source bucket
+  - name: function-source-bucket-access
+    type: gcp-types/storage-v1:buckets.iamMemberBinding
+    properties:
+      bucket: $(ref.function-source-bucket.name)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.status-reporter-service-account.email)
+    metadata:
+      dependsOn:
+        - function-source-bucket
+        - status-reporter-service-account
+
+# Output values for verification and integration
+outputs:
+  # Service Account Information
+  service_account_email:
+    description: "Email address of the created service account"
+    value: $(ref.status-reporter-service-account.email)
+  
+  service_account_name:
+    description: "Full resource name of the service account"
+    value: $(ref.status-reporter-service-account.name)
+  
+  # Cloud Function Information
+  function_name:
+    description: "Name of the deployed Cloud Function"
+    value: $(ref.status-report-function.name)
+  
+  function_url:
+    description: "HTTPS trigger URL for the Cloud Function"
+    value: $(ref.status-report-function.httpsTrigger.url)
+  
+  function_runtime:
+    description: "Runtime version used by the Cloud Function"
+    value: $(ref.status-report-function.runtime)
+  
+  # Cloud Scheduler Information
+  scheduler_job_name:
+    description: "Name of the Cloud Scheduler job"
+    value: $(ref.daily-report-scheduler-job.name)
+  
+  scheduler_job_schedule:
+    description: "Cron schedule for the daily reports"
+    value: $(ref.daily-report-scheduler-job.schedule)
+  
+  scheduler_job_state:
+    description: "Current state of the scheduler job"
+    value: $(ref.daily-report-scheduler-job.state)
+  
+  # Storage Information
+  source_bucket_name:
+    description: "Name of the Cloud Storage bucket for function source"
+    value: $(ref.function-source-bucket.name)
+  
+  source_bucket_url:
+    description: "URL of the source bucket"
+    value: gs://$(ref.function-source-bucket.name)
+  
+  # Configuration Summary
+  deployment_region:
+    description: "Region where resources are deployed"
+    value: $(ref.region.value)
+  
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.value)
+  
+  # Email Configuration (for reference only)
+  configured_sender:
+    description: "Sender email address configured for reports"
+    value: $(ref.sender_email.value)
+  
+  configured_recipient:
+    description: "Recipient email address for status reports"
+    value: $(ref.recipient_email.value)
+
+# Deployment configuration and constraints
+constraints:
+  # Resource requirements
+  - type: "gcp.resourcemanager.allowedLocations"
+    values:
+      - "projects/*/locations/us-central1"
+      - "projects/*/locations/us-east1"
+      - "projects/*/locations/europe-west1"
+  
+  # Service enablement requirements
+  - type: "gcp.services.requiredApis"
+    values:
+      - "cloudfunctions.googleapis.com"
+      - "cloudscheduler.googleapis.com"
+      - "monitoring.googleapis.com"
+      - "storage.googleapis.com"
+
+# Deployment validation rules
+validation:
+  # Verify required APIs are enabled
+  - name: "verify-apis-enabled"
+    description: "Ensure all required Google Cloud APIs are enabled"
+    type: "api-enablement-check"
+  
+  # Validate IAM permissions
+  - name: "verify-iam-permissions"
+    description: "Verify service account has required monitoring permissions"
+    type: "iam-permission-check"
+  
+  # Function deployment validation
+  - name: "verify-function-deployment"
+    description: "Ensure Cloud Function is deployed and accessible"
+    type: "function-health-check"
+  
+  # Scheduler job validation
+  - name: "verify-scheduler-configuration"
+    description: "Validate scheduler job configuration and state"
+    type: "scheduler-validation-check"
+
+# Documentation and metadata
+documentation:
+  description: |
+    This Infrastructure Manager configuration deploys a complete automated daily 
+    status reporting system using Google Cloud services. The solution includes:
+    
+    1. Service Account with minimal required permissions for monitoring access
+    2. Cloud Function for collecting system metrics and sending email reports
+    3. Cloud Scheduler job for reliable daily execution
+    4. Cloud Storage bucket for function source code management
+    
+    The architecture follows Google Cloud security best practices with:
+    - Least privilege IAM roles
+    - Service account authentication
+    - Secure function invocation via OIDC tokens
+    - Encrypted communication channels
+    
+    The system provides automated visibility into Google Cloud infrastructure 
+    health and resource utilization through daily email reports sent via SMTP.
+  
+  prerequisites:
+    - "Google Cloud Project with billing enabled"
+    - "Owner or Editor permissions for resource creation"
+    - "Gmail account configured for application access"
+    - "Basic understanding of serverless monitoring concepts"
+  
+  estimated_cost:
+    monthly: "$0.50-$2.00 USD"
+    details: "Minimal cost from Cloud Functions invocations and Cloud Scheduler jobs"
+  
+  support_contacts:
+    technical: "cloud-architecture-team@company.com"
+    operations: "devops-team@company.com"
+  
+  tags:
+    - "monitoring"
+    - "automation" 
+    - "serverless"
+    - "email-notifications"
+    - "daily-reporting"
+    - "infrastructure-visibility"

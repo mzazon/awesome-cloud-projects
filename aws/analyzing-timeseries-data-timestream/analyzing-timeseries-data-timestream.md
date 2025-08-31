@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: timestream, lambda, iot-core, cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: time-series, iot, analytics, serverless, real-time
 recipe-generator-version: 1.3
 ---
 
 # Analyzing Time-Series Data with Timestream
-
 
 ## Problem
 
@@ -612,6 +611,10 @@ echo "✅ Environment prepared with unique identifiers"
    Advanced lifecycle management optimizes storage costs by automatically transitioning data between storage tiers and handling rejected records. The magnetic store configuration with S3 integration provides long-term archival capabilities while maintaining query performance for recent data.
 
    ```bash
+   # Create S3 bucket for rejected records
+   aws s3 mb s3://timestream-rejected-data-${RANDOM_SUFFIX} \
+       --region ${AWS_REGION}
+   
    # Update table with magnetic store write properties
    aws timestream-write update-table \
        --database-name "${DATABASE_NAME}" \
@@ -875,9 +878,13 @@ echo "✅ Environment prepared with unique identifiers"
    echo "✅ Deleted IAM roles and policies"
    ```
 
-5. **Remove Timestream Table and Database**:
+5. **Remove S3 Bucket and Timestream Resources**:
 
    ```bash
+   # Delete S3 bucket for rejected records
+   aws s3 rb s3://timestream-rejected-data-${RANDOM_SUFFIX} \
+       --force
+   
    # Delete Timestream table
    aws timestream-write delete-table \
        --database-name "${DATABASE_NAME}" \
@@ -890,7 +897,7 @@ echo "✅ Environment prepared with unique identifiers"
    aws timestream-write delete-database \
        --database-name "${DATABASE_NAME}"
    
-   echo "✅ Deleted Timestream table and database"
+   echo "✅ Deleted Timestream resources and S3 bucket"
    ```
 
 6. **Clean Up Local Files**:
@@ -922,7 +929,7 @@ The solution demonstrates several key architectural patterns for time-series dat
 
 Integration with the broader AWS ecosystem makes this solution particularly powerful. CloudWatch integration provides comprehensive monitoring of ingestion rates, query performance, and storage utilization. The solution can easily extend to include Amazon QuickSight for business intelligence dashboards, Amazon SageMaker for machine learning on time-series data, and Amazon Kinesis Analytics for real-time stream processing. IAM integration ensures fine-grained access control, while VPC endpoints enable private connectivity for sensitive industrial applications.
 
-> **Tip**: Use Timestream's adaptive query processing engine to automatically optimize query performance across memory and magnetic stores without manual intervention.
+> **Tip**: Use Timestream's adaptive query processing engine to automatically optimize query performance across memory and magnetic stores without manual intervention. See the [AWS Timestream Developer Guide](https://docs.aws.amazon.com/timestream/latest/developerguide/storage.html) for detailed storage architecture information.
 
 ## Challenge
 
@@ -940,4 +947,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

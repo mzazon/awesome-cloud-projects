@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: DynamoDB, Kinesis Data Streams, Lambda, EventBridge
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: dynamodb, global-tables, streaming, database, real-time
 recipe-generator-version: 1.3
@@ -185,6 +185,10 @@ aws iam attach-role-policy \
     --role-name $LAMBDA_ROLE_NAME \
     --policy-arn arn:aws:iam::aws:policy/AmazonKinesisFullAccess
 
+aws iam attach-role-policy \
+    --role-name $LAMBDA_ROLE_NAME \
+    --policy-arn arn:aws:iam::aws:policy/AmazonEventBridgeFullAccess
+
 echo "✅ Environment variables and IAM roles configured"
 ```
 
@@ -328,129 +332,131 @@ echo "✅ Environment variables and IAM roles configured"
 
 5. **Create Lambda Functions for Stream Processing**:
 
+   Lambda functions provide serverless event processing capabilities that automatically scale based on stream activity. By processing DynamoDB Streams, these functions enable real-time business logic execution, inventory management, and event-driven notifications. The Lambda integration ensures reliable, ordered processing of stream records while maintaining cost efficiency through pay-per-invocation pricing.
+
    ```bash
    # Create Lambda function for DynamoDB Streams processing
    cat > stream-processor.py << 'EOF'
-   import json
-   import boto3
-   import os
-   from decimal import Decimal
-   
-   dynamodb = boto3.resource('dynamodb')
-   eventbridge = boto3.client('events')
-   
-   def decimal_default(obj):
-       if isinstance(obj, Decimal):
-           return float(obj)
-       raise TypeError
-   
-   def lambda_handler(event, context):
-       for record in event['Records']:
-           if record['eventName'] in ['INSERT', 'MODIFY', 'REMOVE']:
-               process_record(record)
-       return {'statusCode': 200}
-   
-   def process_record(record):
-       event_name = record['eventName']
-       table_name = record['eventSourceARN'].split('/')[-3]
-       
-       # Extract item data
-       if 'NewImage' in record['dynamodb']:
-           new_image = record['dynamodb']['NewImage']
-           pk = new_image.get('PK', {}).get('S', '')
-           
-           # Process different entity types
-           if pk.startswith('PRODUCT#'):
-               process_product_event(event_name, new_image, record.get('dynamodb', {}).get('OldImage'))
-           elif pk.startswith('ORDER#'):
-               process_order_event(event_name, new_image, record.get('dynamodb', {}).get('OldImage'))
-           elif pk.startswith('USER#'):
-               process_user_event(event_name, new_image, record.get('dynamodb', {}).get('OldImage'))
-   
-   def process_product_event(event_name, new_image, old_image):
-       # Inventory management logic
-       if event_name == 'MODIFY' and old_image:
-           old_stock = int(old_image.get('Stock', {}).get('N', '0'))
-           new_stock = int(new_image.get('Stock', {}).get('N', '0'))
-           
-           if old_stock != new_stock:
-               send_inventory_alert(new_image, old_stock, new_stock)
-   
-   def process_order_event(event_name, new_image, old_image):
-       # Order processing logic
-       if event_name == 'INSERT':
-           send_order_notification(new_image)
-       elif event_name == 'MODIFY':
-           status_changed = check_order_status_change(new_image, old_image)
-           if status_changed:
-               send_status_update(new_image)
-   
-   def process_user_event(event_name, new_image, old_image):
-       # User activity tracking
-       if event_name == 'MODIFY':
-           send_user_activity_event(new_image)
-   
-   def send_inventory_alert(product, old_stock, new_stock):
-       eventbridge.put_events(
-           Entries=[{
-               'Source': 'ecommerce.inventory',
-               'DetailType': 'Inventory Change',
-               'Detail': json.dumps({
-                   'productId': product.get('PK', {}).get('S', ''),
-                   'oldStock': old_stock,
-                   'newStock': new_stock,
-                   'timestamp': product.get('UpdatedAt', {}).get('S', '')
-               })
-           }]
-       )
-   
-   def send_order_notification(order):
-       eventbridge.put_events(
-           Entries=[{
-               'Source': 'ecommerce.orders',
-               'DetailType': 'New Order',
-               'Detail': json.dumps({
-                   'orderId': order.get('PK', {}).get('S', ''),
-                   'customerId': order.get('CustomerId', {}).get('S', ''),
-                   'amount': order.get('TotalAmount', {}).get('N', ''),
-                   'timestamp': order.get('CreatedAt', {}).get('S', '')
-               })
-           }]
-       )
-   
-   def send_status_update(order):
-       eventbridge.put_events(
-           Entries=[{
-               'Source': 'ecommerce.orders',
-               'DetailType': 'Order Status Update',
-               'Detail': json.dumps({
-                   'orderId': order.get('PK', {}).get('S', ''),
-                   'status': order.get('Status', {}).get('S', ''),
-                   'timestamp': order.get('UpdatedAt', {}).get('S', '')
-               })
-           }]
-       )
-   
-   def send_user_activity_event(user):
-       eventbridge.put_events(
-           Entries=[{
-               'Source': 'ecommerce.users',
-               'DetailType': 'User Activity',
-               'Detail': json.dumps({
-                   'userId': user.get('PK', {}).get('S', ''),
-                   'lastActive': user.get('LastActiveAt', {}).get('S', ''),
-                   'timestamp': user.get('UpdatedAt', {}).get('S', '')
-               })
-           }]
-       )
-   
-   def check_order_status_change(new_image, old_image):
-       if not old_image:
-           return False
-       old_status = old_image.get('Status', {}).get('S', '')
-       new_status = new_image.get('Status', {}).get('S', '')
-       return old_status != new_status
-   EOF
+import json
+import boto3
+import os
+from decimal import Decimal
+
+dynamodb = boto3.resource('dynamodb')
+eventbridge = boto3.client('events')
+
+def decimal_default(obj):
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError
+
+def lambda_handler(event, context):
+    for record in event['Records']:
+        if record['eventName'] in ['INSERT', 'MODIFY', 'REMOVE']:
+            process_record(record)
+    return {'statusCode': 200}
+
+def process_record(record):
+    event_name = record['eventName']
+    table_name = record['eventSourceARN'].split('/')[-3]
+    
+    # Extract item data
+    if 'NewImage' in record['dynamodb']:
+        new_image = record['dynamodb']['NewImage']
+        pk = new_image.get('PK', {}).get('S', '')
+        
+        # Process different entity types
+        if pk.startswith('PRODUCT#'):
+            process_product_event(event_name, new_image, record.get('dynamodb', {}).get('OldImage'))
+        elif pk.startswith('ORDER#'):
+            process_order_event(event_name, new_image, record.get('dynamodb', {}).get('OldImage'))
+        elif pk.startswith('USER#'):
+            process_user_event(event_name, new_image, record.get('dynamodb', {}).get('OldImage'))
+
+def process_product_event(event_name, new_image, old_image):
+    # Inventory management logic
+    if event_name == 'MODIFY' and old_image:
+        old_stock = int(old_image.get('Stock', {}).get('N', '0'))
+        new_stock = int(new_image.get('Stock', {}).get('N', '0'))
+        
+        if old_stock != new_stock:
+            send_inventory_alert(new_image, old_stock, new_stock)
+
+def process_order_event(event_name, new_image, old_image):
+    # Order processing logic
+    if event_name == 'INSERT':
+        send_order_notification(new_image)
+    elif event_name == 'MODIFY':
+        status_changed = check_order_status_change(new_image, old_image)
+        if status_changed:
+            send_status_update(new_image)
+
+def process_user_event(event_name, new_image, old_image):
+    # User activity tracking
+    if event_name == 'MODIFY':
+        send_user_activity_event(new_image)
+
+def send_inventory_alert(product, old_stock, new_stock):
+    eventbridge.put_events(
+        Entries=[{
+            'Source': 'ecommerce.inventory',
+            'DetailType': 'Inventory Change',
+            'Detail': json.dumps({
+                'productId': product.get('PK', {}).get('S', ''),
+                'oldStock': old_stock,
+                'newStock': new_stock,
+                'timestamp': product.get('UpdatedAt', {}).get('S', '')
+            })
+        }]
+    )
+
+def send_order_notification(order):
+    eventbridge.put_events(
+        Entries=[{
+            'Source': 'ecommerce.orders',
+            'DetailType': 'New Order',
+            'Detail': json.dumps({
+                'orderId': order.get('PK', {}).get('S', ''),
+                'customerId': order.get('CustomerId', {}).get('S', ''),
+                'amount': order.get('TotalAmount', {}).get('N', ''),
+                'timestamp': order.get('CreatedAt', {}).get('S', '')
+            })
+        }]
+    )
+
+def send_status_update(order):
+    eventbridge.put_events(
+        Entries=[{
+            'Source': 'ecommerce.orders',
+            'DetailType': 'Order Status Update',
+            'Detail': json.dumps({
+                'orderId': order.get('PK', {}).get('S', ''),
+                'status': order.get('Status', {}).get('S', ''),
+                'timestamp': order.get('UpdatedAt', {}).get('S', '')
+            })
+        }]
+    )
+
+def send_user_activity_event(user):
+    eventbridge.put_events(
+        Entries=[{
+            'Source': 'ecommerce.users',
+            'DetailType': 'User Activity',
+            'Detail': json.dumps({
+                'userId': user.get('PK', {}).get('S', ''),
+                'lastActive': user.get('LastActiveAt', {}).get('S', ''),
+                'timestamp': user.get('UpdatedAt', {}).get('S', '')
+            })
+        }]
+    )
+
+def check_order_status_change(new_image, old_image):
+    if not old_image:
+        return False
+    old_status = old_image.get('Status', {}).get('S', '')
+    new_status = new_image.get('Status', {}).get('S', '')
+    return old_status != new_status
+EOF
    
    # Package and deploy Lambda function in all regions
    zip stream-processor.zip stream-processor.py
@@ -473,110 +479,114 @@ echo "✅ Environment variables and IAM roles configured"
    rm stream-processor.zip stream-processor.py
    ```
 
+   The Lambda functions are now deployed across all regions, ready to process DynamoDB stream events and generate EventBridge notifications for downstream business processes.
+
 6. **Create Kinesis Analytics Processor**:
+
+   Kinesis Data Streams enable advanced analytics processing with configurable retention periods and high throughput capabilities. This analytics processor generates custom CloudWatch metrics for business intelligence, real-time monitoring, and performance optimization. The serverless architecture automatically scales based on stream throughput while providing cost-effective analytics processing.
 
    ```bash
    # Create Lambda function for Kinesis Data Streams processing
    cat > kinesis-processor.py << 'EOF'
-   import json
-   import boto3
-   import base64
-   from datetime import datetime
-   
-   cloudwatch = boto3.client('cloudwatch')
-   
-   def lambda_handler(event, context):
-       metrics_data = []
-       
-       for record in event['Records']:
-           # Decode Kinesis data
-           payload = json.loads(base64.b64decode(record['kinesis']['data']))
-           
-           # Extract metrics based on event type
-           if payload.get('eventName') == 'INSERT':
-               process_insert_metrics(payload, metrics_data)
-           elif payload.get('eventName') == 'MODIFY':
-               process_modify_metrics(payload, metrics_data)
-           elif payload.get('eventName') == 'REMOVE':
-               process_remove_metrics(payload, metrics_data)
-       
-       # Send metrics to CloudWatch
-       if metrics_data:
-           send_metrics(metrics_data)
-       
-       return {'statusCode': 200, 'body': f'Processed {len(event["Records"])} records'}
-   
-   def process_insert_metrics(payload, metrics_data):
-       dynamodb_data = payload.get('dynamodb', {})
-       new_image = dynamodb_data.get('NewImage', {})
-       pk = new_image.get('PK', {}).get('S', '')
-       
-       if pk.startswith('ORDER#'):
-           amount = float(new_image.get('TotalAmount', {}).get('N', '0'))
-           metrics_data.append({
-               'MetricName': 'NewOrders',
-               'Value': 1,
-               'Unit': 'Count',
-               'Dimensions': [{'Name': 'EntityType', 'Value': 'Order'}]
-           })
-           metrics_data.append({
-               'MetricName': 'OrderValue',
-               'Value': amount,
-               'Unit': 'None',
-               'Dimensions': [{'Name': 'EntityType', 'Value': 'Order'}]
-           })
-       elif pk.startswith('PRODUCT#'):
-           metrics_data.append({
-               'MetricName': 'NewProducts',
-               'Value': 1,
-               'Unit': 'Count',
-               'Dimensions': [{'Name': 'EntityType', 'Value': 'Product'}]
-           })
-   
-   def process_modify_metrics(payload, metrics_data):
-       dynamodb_data = payload.get('dynamodb', {})
-       new_image = dynamodb_data.get('NewImage', {})
-       old_image = dynamodb_data.get('OldImage', {})
-       pk = new_image.get('PK', {}).get('S', '')
-       
-       if pk.startswith('PRODUCT#'):
-           old_stock = int(old_image.get('Stock', {}).get('N', '0'))
-           new_stock = int(new_image.get('Stock', {}).get('N', '0'))
-           stock_change = new_stock - old_stock
-           
-           if stock_change != 0:
-               metrics_data.append({
-                   'MetricName': 'InventoryChange',
-                   'Value': abs(stock_change),
-                   'Unit': 'Count',
-                   'Dimensions': [
-                       {'Name': 'EntityType', 'Value': 'Product'},
-                       {'Name': 'ChangeType', 'Value': 'Increase' if stock_change > 0 else 'Decrease'}
-                   ]
-               })
-   
-   def process_remove_metrics(payload, metrics_data):
-       dynamodb_data = payload.get('dynamodb', {})
-       old_image = dynamodb_data.get('OldImage', {})
-       pk = old_image.get('PK', {}).get('S', '')
-       
-       if pk.startswith('ORDER#'):
-           metrics_data.append({
-               'MetricName': 'CancelledOrders',
-               'Value': 1,
-               'Unit': 'Count',
-               'Dimensions': [{'Name': 'EntityType', 'Value': 'Order'}]
-           })
-   
-   def send_metrics(metrics_data):
-       cloudwatch.put_metric_data(
-           Namespace='ECommerce/Global',
-           MetricData=[{
-               **metric,
-               'Timestamp': datetime.utcnow()
-           } for metric in metrics_data]
-       )
-   EOF
+import json
+import boto3
+import base64
+from datetime import datetime
+
+cloudwatch = boto3.client('cloudwatch')
+
+def lambda_handler(event, context):
+    metrics_data = []
+    
+    for record in event['Records']:
+        # Decode Kinesis data
+        payload = json.loads(base64.b64decode(record['kinesis']['data']))
+        
+        # Extract metrics based on event type
+        if payload.get('eventName') == 'INSERT':
+            process_insert_metrics(payload, metrics_data)
+        elif payload.get('eventName') == 'MODIFY':
+            process_modify_metrics(payload, metrics_data)
+        elif payload.get('eventName') == 'REMOVE':
+            process_remove_metrics(payload, metrics_data)
+    
+    # Send metrics to CloudWatch
+    if metrics_data:
+        send_metrics(metrics_data)
+    
+    return {'statusCode': 200, 'body': f'Processed {len(event["Records"])} records'}
+
+def process_insert_metrics(payload, metrics_data):
+    dynamodb_data = payload.get('dynamodb', {})
+    new_image = dynamodb_data.get('NewImage', {})
+    pk = new_image.get('PK', {}).get('S', '')
+    
+    if pk.startswith('ORDER#'):
+        amount = float(new_image.get('TotalAmount', {}).get('N', '0'))
+        metrics_data.append({
+            'MetricName': 'NewOrders',
+            'Value': 1,
+            'Unit': 'Count',
+            'Dimensions': [{'Name': 'EntityType', 'Value': 'Order'}]
+        })
+        metrics_data.append({
+            'MetricName': 'OrderValue',
+            'Value': amount,
+            'Unit': 'None',
+            'Dimensions': [{'Name': 'EntityType', 'Value': 'Order'}]
+        })
+    elif pk.startswith('PRODUCT#'):
+        metrics_data.append({
+            'MetricName': 'NewProducts',
+            'Value': 1,
+            'Unit': 'Count',
+            'Dimensions': [{'Name': 'EntityType', 'Value': 'Product'}]
+        })
+
+def process_modify_metrics(payload, metrics_data):
+    dynamodb_data = payload.get('dynamodb', {})
+    new_image = dynamodb_data.get('NewImage', {})
+    old_image = dynamodb_data.get('OldImage', {})
+    pk = new_image.get('PK', {}).get('S', '')
+    
+    if pk.startswith('PRODUCT#'):
+        old_stock = int(old_image.get('Stock', {}).get('N', '0'))
+        new_stock = int(new_image.get('Stock', {}).get('N', '0'))
+        stock_change = new_stock - old_stock
+        
+        if stock_change != 0:
+            metrics_data.append({
+                'MetricName': 'InventoryChange',
+                'Value': abs(stock_change),
+                'Unit': 'Count',
+                'Dimensions': [
+                    {'Name': 'EntityType', 'Value': 'Product'},
+                    {'Name': 'ChangeType', 'Value': 'Increase' if stock_change > 0 else 'Decrease'}
+                ]
+            })
+
+def process_remove_metrics(payload, metrics_data):
+    dynamodb_data = payload.get('dynamodb', {})
+    old_image = dynamodb_data.get('OldImage', {})
+    pk = old_image.get('PK', {}).get('S', '')
+    
+    if pk.startswith('ORDER#'):
+        metrics_data.append({
+            'MetricName': 'CancelledOrders',
+            'Value': 1,
+            'Unit': 'Count',
+            'Dimensions': [{'Name': 'EntityType', 'Value': 'Order'}]
+        })
+
+def send_metrics(metrics_data):
+    cloudwatch.put_metric_data(
+        Namespace='ECommerce/Global',
+        MetricData=[{
+            **metric,
+            'Timestamp': datetime.utcnow()
+        } for metric in metrics_data]
+    )
+EOF
    
    # Deploy Kinesis processor
    zip kinesis-processor.zip kinesis-processor.py
@@ -598,7 +608,11 @@ echo "✅ Environment variables and IAM roles configured"
    rm kinesis-processor.zip kinesis-processor.py
    ```
 
+   The Kinesis analytics processors now generate comprehensive business metrics from stream data, enabling real-time dashboards and proactive monitoring of e-commerce operations.
+
 7. **Configure Event Source Mappings**:
+
+   Event source mappings connect DynamoDB Streams and Kinesis Data Streams to Lambda functions, enabling automatic invocation when new records are available. These mappings provide configurable batch sizes, parallelization factors, and error handling options to optimize throughput and reliability. The different configuration parameters enable fine-tuning based on processing requirements and latency tolerance.
 
    ```bash
    # Set up DynamoDB Streams event source mappings
@@ -640,69 +654,73 @@ echo "✅ Environment variables and IAM roles configured"
    done
    ```
 
+   The event source mappings now automatically invoke Lambda functions when stream records are available, enabling real-time processing with optimized batch sizes and parallelization for maximum throughput.
+
 8. **Create CloudWatch Dashboards for Global Monitoring**:
+
+   CloudWatch dashboards provide centralized visibility into global operations, enabling real-time monitoring of business metrics, system performance, and operational health. The dashboard aggregates metrics from all regions, providing comprehensive insights into order volumes, inventory changes, and system utilization patterns essential for operational excellence and proactive issue resolution.
 
    ```bash
    # Create CloudWatch dashboard for global monitoring
    cat > dashboard-config.json << EOF
-   {
-     "widgets": [
-       {
-         "type": "metric",
-         "properties": {
-           "metrics": [
-             ["ECommerce/Global", "NewOrders", "EntityType", "Order"],
-             [".", "OrderValue", ".", "."],
-             [".", "CancelledOrders", ".", "."]
-           ],
-           "period": 300,
-           "stat": "Sum",
-           "region": "$PRIMARY_REGION",
-           "title": "Order Metrics - Global"
-         }
-       },
-       {
-         "type": "metric",
-         "properties": {
-           "metrics": [
-             ["ECommerce/Global", "InventoryChange", "EntityType", "Product", "ChangeType", "Increase"],
-             ["...", "Decrease"]
-           ],
-           "period": 300,
-           "stat": "Sum",
-           "region": "$PRIMARY_REGION",
-           "title": "Inventory Changes - Global"
-         }
-       },
-       {
-         "type": "metric",
-         "properties": {
-           "metrics": [
-             ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "$TABLE_NAME"],
-             [".", "ConsumedWriteCapacityUnits", ".", "."]
-           ],
-           "period": 300,
-           "stat": "Sum",
-           "region": "$PRIMARY_REGION",
-           "title": "DynamoDB Capacity - Primary Region"
-         }
-       },
-       {
-         "type": "metric",
-         "properties": {
-           "metrics": [
-             ["AWS/Kinesis", "IncomingRecords", "StreamName", "$STREAM_NAME"],
-             [".", "OutgoingRecords", ".", "."]
-           ],
-           "period": 300,
-           "stat": "Sum",
-           "region": "$PRIMARY_REGION",
-           "title": "Kinesis Stream Metrics - Primary Region"
-         }
-       }
-     ]
-   }
-   EOF
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["ECommerce/Global", "NewOrders", "EntityType", "Order"],
+          [".", "OrderValue", ".", "."],
+          [".", "CancelledOrders", ".", "."]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "$PRIMARY_REGION",
+        "title": "Order Metrics - Global"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["ECommerce/Global", "InventoryChange", "EntityType", "Product", "ChangeType", "Increase"],
+          ["...", "Decrease"]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "$PRIMARY_REGION",
+        "title": "Inventory Changes - Global"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "$TABLE_NAME"],
+          [".", "ConsumedWriteCapacityUnits", ".", "."]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "$PRIMARY_REGION",
+        "title": "DynamoDB Capacity - Primary Region"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["AWS/Kinesis", "IncomingRecords", "StreamName", "$STREAM_NAME"],
+          [".", "OutgoingRecords", ".", "."]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "$PRIMARY_REGION",
+        "title": "Kinesis Stream Metrics - Primary Region"
+      }
+    }
+  ]
+}
+EOF
    
    aws cloudwatch put-dashboard \
        --region $PRIMARY_REGION \
@@ -710,7 +728,10 @@ echo "✅ Environment variables and IAM roles configured"
        --dashboard-body file://dashboard-config.json
    
    echo "✅ CloudWatch dashboard created"
+   rm dashboard-config.json
    ```
+
+   The CloudWatch dashboard now provides comprehensive visibility into global e-commerce operations, enabling data-driven decision making and proactive system management.
 
 ## Validation & Testing
 
@@ -746,6 +767,8 @@ echo "✅ Environment variables and IAM roles configured"
    done
    ```
 
+   Expected output: "Test Product" should appear in all regions, confirming global replication is working.
+
 2. **Test Stream Processing**:
 
    ```bash
@@ -767,6 +790,13 @@ echo "✅ Environment variables and IAM roles configured"
    # Check CloudWatch Events
    sleep 30
    echo "Check EventBridge for new order events..."
+   
+   # Verify Lambda function was invoked
+   aws logs describe-log-groups \
+       --region $PRIMARY_REGION \
+       --log-group-name-prefix "/aws/lambda/${TABLE_NAME}-stream-processor" \
+       --query 'logGroups[0].logGroupName' \
+       --output text
    ```
 
 3. **Verify Kinesis Data Streams Integration**:
@@ -815,6 +845,8 @@ echo "✅ Environment variables and IAM roles configured"
        --period 300 \
        --statistics Sum
    ```
+
+   Expected output: Metric data showing order counts from the analytics processing.
 
 ## Cleanup
 
@@ -921,6 +953,10 @@ echo "✅ Environment variables and IAM roles configured"
        --role-name $LAMBDA_ROLE_NAME \
        --policy-arn arn:aws:iam::aws:policy/AmazonKinesisFullAccess
    
+   aws iam detach-role-policy \
+       --role-name $LAMBDA_ROLE_NAME \
+       --policy-arn arn:aws:iam::aws:policy/AmazonEventBridgeFullAccess
+   
    aws iam delete-role --role-name $LAMBDA_ROLE_NAME
    
    # Delete CloudWatch dashboard
@@ -928,37 +964,45 @@ echo "✅ Environment variables and IAM roles configured"
        --region $PRIMARY_REGION \
        --dashboard-names "ECommerce-Global-Monitoring"
    
+   # Clean up temporary files
+   rm -f lambda-trust-policy.json
+   
    echo "✅ All resources cleaned up"
    ```
 
 ## Discussion
 
-This advanced DynamoDB streaming architecture demonstrates the power of combining Global Tables with comprehensive event processing capabilities. The dual-streaming approach using both DynamoDB Streams and Kinesis Data Streams provides distinct advantages: DynamoDB Streams excel at real-time application logic triggers with guaranteed ordering and exactly-once delivery, while Kinesis Data Streams enable high-throughput analytics and complex event processing with configurable retention periods.
+This advanced DynamoDB streaming architecture demonstrates the power of combining Global Tables with comprehensive event processing capabilities. The dual-streaming approach using both DynamoDB Streams and Kinesis Data Streams provides distinct advantages: DynamoDB Streams excel at real-time application logic triggers with guaranteed ordering and exactly-once delivery, while Kinesis Data Streams enable high-throughput analytics and complex event processing with configurable retention periods up to 365 days.
 
-The Global Tables configuration ensures that data modifications in any region are automatically replicated to all other regions, typically within one second, providing users with sub-millisecond local read and write performance regardless of their geographic location. This is crucial for global e-commerce platforms where user experience directly impacts conversion rates and revenue.
+The Global Tables configuration ensures that data modifications in any region are automatically replicated to all other regions, typically within one second, providing users with sub-millisecond local read and write performance regardless of their geographic location. This is crucial for global e-commerce platforms where user experience directly impacts conversion rates and revenue. The eventual consistency model requires careful application design to handle temporary inconsistencies and implement proper conflict resolution for critical business operations.
 
-The Lambda-based processing layer enables sophisticated business logic implementation, including real-time inventory management, fraud detection, and personalized recommendation updates. By processing events at the stream level, the system can react to data changes immediately, enabling features like real-time inventory alerts, automatic reorder point notifications, and immediate cache invalidation for frequently accessed products.
+The Lambda-based processing layer enables sophisticated business logic implementation, including real-time inventory management, fraud detection, and personalized recommendation updates. By processing events at the stream level, the system can react to data changes immediately, enabling features like real-time inventory alerts, automatic reorder point notifications, and immediate cache invalidation for frequently accessed products. The serverless architecture provides automatic scaling and cost optimization through pay-per-invocation pricing.
 
-The integration with EventBridge provides a robust event-driven architecture foundation, enabling loose coupling between microservices and facilitating easy addition of new business logic without modifying existing systems. Custom CloudWatch metrics provide comprehensive visibility into business operations, enabling proactive monitoring and data-driven decision making.
+The integration with EventBridge provides a robust event-driven architecture foundation, enabling loose coupling between microservices and facilitating easy addition of new business logic without modifying existing systems. Custom CloudWatch metrics provide comprehensive visibility into business operations, enabling proactive monitoring and data-driven decision making. This architecture follows AWS Well-Architected Framework principles for operational excellence, reliability, and performance efficiency.
 
-The architecture's resilience is enhanced through point-in-time recovery, enhanced monitoring, and the ability to process events even during partial system failures. The multi-region active-active setup ensures business continuity and provides excellent disaster recovery capabilities.
-
-> **Warning**: Global Tables replication operates on eventual consistency principles. Design your application to handle temporary inconsistencies and implement proper conflict resolution for critical business operations. Learn more about [Global Tables architecture](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GlobalTables.html).
+> **Warning**: Global Tables replication operates on eventual consistency principles. Design your application to handle temporary inconsistencies and implement proper conflict resolution for critical business operations. Learn more about [Global Tables best practices](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/globaltables_bestpractices.html).
 
 ## Challenge
 
 Extend this solution by implementing these advanced capabilities:
 
-1. **Real-time Fraud Detection**: Implement ML-based fraud detection using Amazon Kinesis Data Analytics and SageMaker to analyze transaction patterns in real-time across all regions.
+1. **Real-time Fraud Detection**: Implement ML-based fraud detection using Kinesis Data Analytics and SageMaker to analyze transaction patterns in real-time across all regions with automated response mechanisms.
 
-2. **Advanced Event Replay System**: Create an event replay mechanism using Kinesis Data Firehose to store all events in S3, with Lambda functions that can replay specific time periods for debugging or reprocessing.
+2. **Advanced Event Replay System**: Create an event replay mechanism using Kinesis Data Firehose to store all events in S3, with Lambda functions that can replay specific time periods for debugging or reprocessing business logic.
 
-3. **Cross-Region Event Ordering**: Implement vector clocks or logical timestamps to maintain causal ordering of related events across regions, particularly important for inventory management operations.
+3. **Cross-Region Event Ordering**: Implement vector clocks or logical timestamps to maintain causal ordering of related events across regions, particularly important for inventory management and distributed transaction scenarios.
 
-4. **Dynamic Auto-Scaling**: Create Lambda functions that automatically adjust DynamoDB capacity and Kinesis shard counts based on real-time traffic patterns and regional load distribution.
+4. **Dynamic Auto-Scaling**: Create Lambda functions that automatically adjust DynamoDB capacity and Kinesis shard counts based on real-time traffic patterns and regional load distribution using CloudWatch metrics and predictive scaling.
 
-5. **Advanced Analytics Pipeline**: Integrate with Amazon OpenSearch Service and Kinesis Data Analytics to build real-time dashboards showing global sales patterns, inventory optimization recommendations, and customer behavior analysis.
+5. **Advanced Analytics Pipeline**: Integrate with Amazon OpenSearch Service and Kinesis Data Analytics to build real-time dashboards showing global sales patterns, inventory optimization recommendations, and customer behavior analysis with machine learning insights.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Cloud Billing API, Cloud Recommender, Cloud Pub/Sub, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-24
 passed-qa: null
 tags: cost-optimization, finops, automation, billing, recommendations, multi-cloud
 recipe-generator-version: 1.3
@@ -90,7 +90,8 @@ graph TB
 export PROJECT_ID="cost-optimization-$(date +%s)"
 export REGION="us-central1"
 export ZONE="us-central1-a"
-export BILLING_ACCOUNT_ID=$(gcloud billing accounts list --format="value(name)" --limit=1)
+export BILLING_ACCOUNT_ID=$(gcloud billing accounts list \
+    --format="value(name)" --limit=1)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -138,15 +139,15 @@ echo "✅ Billing account linked: ${BILLING_ACCOUNT_ID}"
        --description="Cost optimization analytics dataset" \
        ${PROJECT_ID}:${DATASET_NAME}
    
-   # Create cost analysis table
+   # Create cost analysis table with optimized schema
    bq mk --table \
        ${PROJECT_ID}:${DATASET_NAME}.cost_analysis \
-       project_id:STRING,billing_account_id:STRING,service:STRING,cost:FLOAT,currency:STRING,usage_date:DATE,optimization_potential:FLOAT
+       project_id:STRING,billing_account_id:STRING,service:STRING,cost:FLOAT,currency:STRING,usage_date:DATE,optimization_potential:FLOAT,created_timestamp:TIMESTAMP
    
-   # Create recommendations table
+   # Create recommendations table with comprehensive tracking
    bq mk --table \
        ${PROJECT_ID}:${DATASET_NAME}.recommendations \
-       project_id:STRING,recommender_type:STRING,recommendation_id:STRING,description:STRING,potential_savings:FLOAT,priority:STRING,created_date:TIMESTAMP
+       project_id:STRING,recommender_type:STRING,recommendation_id:STRING,description:STRING,potential_savings:FLOAT,priority:STRING,created_date:TIMESTAMP,status:STRING
    
    echo "✅ BigQuery dataset and tables created successfully"
    ```
@@ -168,9 +169,9 @@ echo "✅ Billing account linked: ${BILLING_ACCOUNT_ID}"
    gsutil versioning set on gs://${BUCKET_NAME}
    
    # Create folder structure for organized data storage
-   gsutil -m cp /dev/null gs://${BUCKET_NAME}/reports/.gitkeep
-   gsutil -m cp /dev/null gs://${BUCKET_NAME}/recommendations/.gitkeep
-   gsutil -m cp /dev/null gs://${BUCKET_NAME}/exports/.gitkeep
+   echo "" | gsutil cp - gs://${BUCKET_NAME}/reports/.gitkeep
+   echo "" | gsutil cp - gs://${BUCKET_NAME}/recommendations/.gitkeep
+   echo "" | gsutil cp - gs://${BUCKET_NAME}/exports/.gitkeep
    
    echo "✅ Cloud Storage bucket created: gs://${BUCKET_NAME}"
    ```
@@ -253,15 +254,16 @@ def analyze_costs(event, context):
                 if project.billing_enabled:
                     project_id_clean = project.project_id
                     
-                    # Analyze project costs (simplified example)
+                    # Analyze project costs (simplified example - would use actual Billing Export data)
                     cost_data = {
                         'project_id': project_id_clean,
                         'billing_account_id': account_id,
                         'service': 'compute',
-                        'cost': 150.00,  # Would be actual API call
+                        'cost': 150.00,  # In production, this would come from actual billing data
                         'currency': 'USD',
                         'usage_date': datetime.now().strftime('%Y-%m-%d'),
-                        'optimization_potential': 30.00
+                        'optimization_potential': 30.00,
+                        'created_timestamp': datetime.utcnow().isoformat()
                     }
                     
                     # Insert into BigQuery
@@ -292,17 +294,17 @@ def analyze_costs(event, context):
         return {"status": "error", "message": str(e)}
 EOF
    
-   # Create requirements file
+   # Create requirements file with updated versions
    cat > requirements.txt << 'EOF'
-google-cloud-billing==1.12.0
-google-cloud-bigquery==3.13.0
-google-cloud-pubsub==2.18.4
-google-cloud-recommender==2.11.1
+google-cloud-billing==1.13.3
+google-cloud-bigquery==3.25.0
+google-cloud-pubsub==2.23.0
+google-cloud-recommender==2.12.1
 EOF
    
-   # Deploy the function
+   # Deploy the function with Python 3.12 runtime
    gcloud functions deploy analyze-costs \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-topic ${TOPIC_NAME} \
        --source . \
        --entry-point analyze_costs \
@@ -314,7 +316,7 @@ EOF
    echo "✅ Cost analysis function deployed successfully"
    ```
 
-   The cost analysis function now automatically processes billing events, performs multi-project cost analysis, and stores results in BigQuery while triggering downstream recommendation workflows through Pub/Sub messaging.
+   The cost analysis function now automatically processes billing events, performs multi-project cost analysis, and stores results in BigQuery while triggering downstream recommendation workflows through Pub/Sub messaging. The function uses the latest Python 3.12 runtime for improved performance and security.
 
 5. **Deploy Recommendation Engine Function**:
 
@@ -353,68 +355,85 @@ def generate_recommendations(event, context):
         message_data = json.loads(event['data'].decode('utf-8'))
         target_project = message_data.get('project_id')
         
-        # Get cost recommendations for the project
-        parent = f"projects/{target_project}/locations/global/recommenders/google.compute.instance.MachineTypeRecommender"
+        # Define multiple recommender types for comprehensive analysis
+        recommender_types = [
+            'google.compute.instance.MachineTypeRecommender',
+            'google.compute.disk.IdleResourceRecommender',
+            'google.cloudsql.instance.OutOfDiskRecommender'
+        ]
         
-        try:
-            recommendations = recommender_client.list_recommendations(
-                parent=parent
-            )
-            
-            recommendation_data = []
-            
-            for recommendation in recommendations:
-                # Extract recommendation details
-                rec_data = {
-                    'project_id': target_project,
-                    'recommender_type': 'machine_type',
-                    'recommendation_id': recommendation.name.split('/')[-1],
-                    'description': recommendation.description,
-                    'potential_savings': float(recommendation.primary_impact.cost_projection.cost.units) if recommendation.primary_impact.cost_projection.cost.units else 0,
-                    'priority': recommendation.priority.name,
-                    'created_date': datetime.now().isoformat()
-                }
+        all_recommendations = []
+        
+        for recommender_type in recommender_types:
+            try:
+                # Get cost recommendations for the project
+                parent = f"projects/{target_project}/locations/global/recommenders/{recommender_type}"
                 
-                recommendation_data.append(rec_data)
+                recommendations = recommender_client.list_recommendations(
+                    parent=parent
+                )
                 
-                # Store recommendation in BigQuery
-                table_id = f"{project_id}.{dataset_id}.recommendations"
-                table = bq_client.get_table(table_id)
-                
-                errors = bq_client.insert_rows_json(table, [rec_data])
-                
-                if not errors:
-                    logging.info(f"Recommendation stored: {rec_data['recommendation_id']}")
-                else:
-                    logging.error(f"BigQuery insert errors: {errors}")
-            
-            # Generate summary report
-            report_content = {
-                'project_id': target_project,
-                'timestamp': datetime.now().isoformat(),
-                'total_recommendations': len(recommendation_data),
-                'total_potential_savings': sum(r['potential_savings'] for r in recommendation_data),
-                'recommendations': recommendation_data
-            }
-            
-            # Save report to Cloud Storage
-            bucket = storage_client.bucket(bucket_name)
-            blob_name = f"recommendations/{target_project}_recommendations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            blob = bucket.blob(blob_name)
-            blob.upload_from_string(json.dumps(report_content, indent=2))
-            
-            logging.info(f"Recommendation report saved: gs://{bucket_name}/{blob_name}")
-            
-            return {
-                "status": "success",
-                "project_id": target_project,
-                "recommendations_count": len(recommendation_data),
-                "potential_savings": sum(r['potential_savings'] for r in recommendation_data)
-            }
-            
-        except Exception as e:
-            logging.warning(f"No recommendations available for project {target_project}: {str(e)}")
-            return {"status": "no_recommendations", "project_id": target_project}
+                for recommendation in recommendations:
+                    # Extract recommendation details with improved error handling
+                    potential_savings = 0.0
+                    if (recommendation.primary_impact and 
+                        recommendation.primary_impact.cost_projection and 
+                        recommendation.primary_impact.cost_projection.cost and
+                        recommendation.primary_impact.cost_projection.cost.units):
+                        potential_savings = float(recommendation.primary_impact.cost_projection.cost.units)
+                    
+                    rec_data = {
+                        'project_id': target_project,
+                        'recommender_type': recommender_type.split('.')[-1],
+                        'recommendation_id': recommendation.name.split('/')[-1],
+                        'description': recommendation.description,
+                        'potential_savings': potential_savings,
+                        'priority': recommendation.priority.name if recommendation.priority else 'UNKNOWN',
+                        'created_date': datetime.utcnow().isoformat(),
+                        'status': 'ACTIVE'
+                    }
+                    
+                    all_recommendations.append(rec_data)
+                    
+                    # Store recommendation in BigQuery
+                    table_id = f"{project_id}.{dataset_id}.recommendations"
+                    table = bq_client.get_table(table_id)
+                    
+                    errors = bq_client.insert_rows_json(table, [rec_data])
+                    
+                    if not errors:
+                        logging.info(f"Recommendation stored: {rec_data['recommendation_id']}")
+                    else:
+                        logging.error(f"BigQuery insert errors: {errors}")
+                        
+            except Exception as e:
+                logging.warning(f"No recommendations available for {recommender_type} in project {target_project}: {str(e)}")
+                continue
+        
+        # Generate summary report
+        total_savings = sum(r['potential_savings'] for r in all_recommendations)
+        report_content = {
+            'project_id': target_project,
+            'timestamp': datetime.utcnow().isoformat(),
+            'total_recommendations': len(all_recommendations),
+            'total_potential_savings': total_savings,
+            'recommendations': all_recommendations
+        }
+        
+        # Save report to Cloud Storage
+        bucket = storage_client.bucket(bucket_name)
+        blob_name = f"recommendations/{target_project}_recommendations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        blob = bucket.blob(blob_name)
+        blob.upload_from_string(json.dumps(report_content, indent=2))
+        
+        logging.info(f"Recommendation report saved: gs://{bucket_name}/{blob_name}")
+        
+        return {
+            "status": "success",
+            "project_id": target_project,
+            "recommendations_count": len(all_recommendations),
+            "potential_savings": total_savings
+        }
             
     except Exception as e:
         logging.error(f"Recommendation generation failed: {str(e)}")
@@ -423,14 +442,14 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-google-cloud-recommender==2.11.1
-google-cloud-bigquery==3.13.0
-google-cloud-storage==2.10.0
+google-cloud-recommender==2.12.1
+google-cloud-bigquery==3.25.0
+google-cloud-storage==2.18.0
 EOF
    
    # Deploy the function
    gcloud functions deploy generate-recommendations \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-topic recommendations-generated \
        --source . \
        --entry-point generate_recommendations \
@@ -442,7 +461,7 @@ EOF
    echo "✅ Recommendation engine function deployed successfully"
    ```
 
-   The recommendation engine now automatically generates actionable cost optimization suggestions using Google Cloud Recommender, stores recommendations in BigQuery, and creates detailed reports in Cloud Storage for stakeholder review and implementation tracking.
+   The recommendation engine now automatically generates actionable cost optimization suggestions using Google Cloud Recommender, analyzes multiple recommender types for comprehensive coverage, and creates detailed reports in Cloud Storage for stakeholder review and implementation tracking.
 
 6. **Create Optimization Automation Function**:
 
@@ -481,14 +500,16 @@ def optimize_resources(event, context):
         message_data = json.loads(event['data'].decode('utf-8'))
         
         # Check for high-value optimization opportunities
-        if message_data.get('potential_savings', 0) > 100:  # $100+ savings
+        potential_savings = message_data.get('potential_savings', 0)
+        
+        if potential_savings > 100:  # $100+ savings threshold
             
             # Create alert for high-value opportunities
             alert_data = {
                 'project_id': message_data.get('project_id'),
-                'savings_potential': message_data.get('potential_savings'),
+                'savings_potential': potential_savings,
                 'recommendations_count': message_data.get('recommendations_count', 0),
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.utcnow().isoformat(),
                 'alert_type': 'high_value_optimization'
             }
             
@@ -520,30 +541,28 @@ def optimize_resources(event, context):
                     ]
                 }
                 
-                response = requests.post(webhook_url, json=slack_message)
-                if response.status_code == 200:
-                    logging.info("Slack notification sent successfully")
-                else:
-                    logging.error(f"Slack notification failed: {response.status_code}")
+                try:
+                    response = requests.post(webhook_url, json=slack_message, timeout=10)
+                    if response.status_code == 200:
+                        logging.info("Slack notification sent successfully")
+                    else:
+                        logging.error(f"Slack notification failed: {response.status_code}")
+                except requests.RequestException as e:
+                    logging.error(f"Slack notification request failed: {str(e)}")
             
             # Publish alert to monitoring topic
             alert_topic = f"projects/{project_id}/topics/optimization-alerts"
-            publisher.publish(alert_topic, json.dumps(alert_data).encode('utf-8'))
-            
-            logging.info(f"High-value optimization alert created for project: {alert_data['project_id']}")
-            
-        # Log optimization actions
-        optimization_log = {
-            'project_id': message_data.get('project_id'),
-            'action': 'alert_created',
-            'savings_potential': message_data.get('potential_savings', 0),
-            'timestamp': datetime.now().isoformat()
-        }
+            try:
+                publisher.publish(alert_topic, json.dumps(alert_data).encode('utf-8'))
+                logging.info(f"High-value optimization alert created for project: {alert_data['project_id']}")
+            except Exception as e:
+                logging.error(f"Failed to publish alert: {str(e)}")
         
         return {
             "status": "success",
             "message": "Optimization automation completed",
-            "actions_taken": ["alert_created"] if message_data.get('potential_savings', 0) > 100 else []
+            "actions_taken": ["alert_created"] if potential_savings > 100 else [],
+            "savings_analyzed": potential_savings
         }
         
     except Exception as e:
@@ -553,15 +572,15 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-google-cloud-monitoring==2.16.0
-google-cloud-pubsub==2.18.4
-google-cloud-bigquery==3.13.0
-requests==2.31.0
+google-cloud-monitoring==2.21.0
+google-cloud-pubsub==2.23.0
+google-cloud-bigquery==3.25.0
+requests==2.32.3
 EOF
    
    # Deploy the function
    gcloud functions deploy optimize-resources \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-topic recommendations-generated \
        --source . \
        --entry-point optimize_resources \
@@ -573,7 +592,7 @@ EOF
    echo "✅ Optimization automation function deployed successfully"
    ```
 
-   The optimization automation system now monitors recommendation values, creates alerts for high-impact opportunities, and can integrate with collaboration tools like Slack for real-time notifications to engineering and finance teams.
+   The optimization automation system now monitors recommendation values, creates alerts for high-impact opportunities, and includes enhanced error handling and timeout protection for external integrations like Slack notifications.
 
 7. **Create Scheduled Job for Regular Analysis**:
 
@@ -630,7 +649,7 @@ EOF
               {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "resource.type=\"cloud_function\"",
+                    "filter": "resource.type=\"cloud_function\" AND resource.labels.function_name=~\"analyze-costs|generate-recommendations|optimize-resources\"",
                     "aggregation": {
                       "alignmentPeriod": "60s",
                       "perSeriesAligner": "ALIGN_RATE"
@@ -647,7 +666,7 @@ EOF
         "height": 4,
         "xPos": 6,
         "widget": {
-          "title": "Optimization Savings",
+          "title": "Total Potential Savings",
           "scorecard": {
             "timeSeriesQuery": {
               "timeSeriesFilter": {
@@ -667,7 +686,8 @@ EOF
 EOF
    
    # Create the dashboard
-   gcloud monitoring dashboards create --config-from-file=monitoring-dashboard.json
+   gcloud monitoring dashboards create \
+       --config-from-file=monitoring-dashboard.json
    
    # Create alerting policy for high costs
    cat > alert-policy.json << 'EOF'
@@ -678,7 +698,7 @@ EOF
     {
       "displayName": "High potential savings detected",
       "conditionThreshold": {
-        "filter": "resource.type=\"global\"",
+        "filter": "resource.type=\"cloud_function\" AND resource.labels.function_name=\"optimize-resources\"",
         "comparison": "COMPARISON_GT",
         "thresholdValue": 500,
         "duration": "300s",
@@ -698,7 +718,7 @@ EOF
 }
 EOF
    
-   # Create notification channel (email)
+   # Create notification channel (email) - update with your email
    NOTIFICATION_EMAIL="admin@example.com"
    gcloud alpha monitoring channels create \
        --display-name="Cost Optimization Alerts" \
@@ -709,7 +729,7 @@ EOF
    echo "✅ Monitoring dashboard and alerting configured"
    ```
 
-   The monitoring system now provides comprehensive visibility into cost optimization performance with automated alerting for high-value opportunities and system health issues, ensuring reliable operation and timely response to optimization events.
+   The monitoring system now provides comprehensive visibility into cost optimization performance with improved dashboard filters and automated alerting for high-value opportunities and system health issues, ensuring reliable operation and timely response to optimization events.
 
 ## Validation & Testing
 
@@ -717,13 +737,14 @@ EOF
 
    ```bash
    # Check function deployment status
-   gcloud functions list --filter="name:analyze-costs OR name:generate-recommendations OR name:optimize-resources"
+   gcloud functions list \
+       --filter="name:analyze-costs OR name:generate-recommendations OR name:optimize-resources"
    
    # Test cost analysis function
    gcloud pubsub topics publish ${TOPIC_NAME} \
        --message='{"test": true, "trigger": "manual_test"}'
    
-   # Check function logs
+   # Check function logs for successful execution
    gcloud functions logs read analyze-costs --limit=10
    ```
 
@@ -732,13 +753,13 @@ EOF
 2. **Test BigQuery data insertion and querying**:
 
    ```bash
-   # Query cost analysis table
+   # Query cost analysis table for recent data
    bq query --use_legacy_sql=false \
-       "SELECT project_id, SUM(cost) as total_cost, SUM(optimization_potential) as total_savings FROM \`${PROJECT_ID}.${DATASET_NAME}.cost_analysis\` GROUP BY project_id"
+       "SELECT project_id, SUM(cost) as total_cost, SUM(optimization_potential) as total_savings FROM \`${PROJECT_ID}.${DATASET_NAME}.cost_analysis\` WHERE usage_date >= CURRENT_DATE() - 1 GROUP BY project_id"
    
-   # Query recommendations table
+   # Query recommendations table for active recommendations
    bq query --use_legacy_sql=false \
-       "SELECT recommender_type, COUNT(*) as recommendation_count, AVG(potential_savings) as avg_savings FROM \`${PROJECT_ID}.${DATASET_NAME}.recommendations\` GROUP BY recommender_type"
+       "SELECT recommender_type, COUNT(*) as recommendation_count, AVG(potential_savings) as avg_savings FROM \`${PROJECT_ID}.${DATASET_NAME}.recommendations\` WHERE status = 'ACTIVE' GROUP BY recommender_type"
    ```
 
    Expected output: Query results showing cost data and recommendations stored in BigQuery tables.
@@ -747,7 +768,8 @@ EOF
 
    ```bash
    # Check topic and subscription status
-   gcloud pubsub topics list --filter="name:${TOPIC_NAME} OR name:recommendations-generated OR name:optimization-alerts"
+   gcloud pubsub topics list \
+       --filter="name:${TOPIC_NAME} OR name:recommendations-generated OR name:optimization-alerts"
    
    # Monitor subscription metrics
    gcloud pubsub subscriptions describe cost-analysis-sub
@@ -760,7 +782,8 @@ EOF
 
    ```bash
    # Check scheduler job status
-   gcloud scheduler jobs list --filter="name:daily-cost-analysis OR name:weekly-cost-report"
+   gcloud scheduler jobs list \
+       --filter="name:daily-cost-analysis OR name:weekly-cost-report"
    
    # Run job manually for testing
    gcloud scheduler jobs run daily-cost-analysis
@@ -779,8 +802,12 @@ EOF
    gsutil ls gs://${BUCKET_NAME}/reports/
    
    # Download and examine a sample report
-   gsutil cp gs://${BUCKET_NAME}/recommendations/* ./sample-report.json
-   cat sample-report.json
+   gsutil cp gs://${BUCKET_NAME}/recommendations/*.json ./sample-report.json 2>/dev/null || echo "No reports generated yet"
+   
+   # Display report structure if available
+   if [ -f ./sample-report.json ]; then
+       cat sample-report.json | head -20
+   fi
    ```
 
    Expected output: Reports should be generated and stored in Cloud Storage with proper JSON structure.
@@ -862,9 +889,9 @@ EOF
 
 This intelligent cost optimization system demonstrates the power of combining Google Cloud's native cost management services with serverless automation. The Cloud Billing API provides comprehensive access to billing data across multiple projects, while Cloud Recommender delivers machine learning-powered optimization suggestions based on actual usage patterns. The event-driven architecture using Pub/Sub ensures scalable, reliable processing of cost events without infrastructure overhead.
 
-The system's strength lies in its automated approach to cost optimization, moving beyond manual analysis to continuous monitoring and proactive recommendations. BigQuery's serverless data warehouse capabilities enable complex cost trend analysis and forecasting, while Cloud Functions provide cost-effective execution of optimization logic. The integration with Cloud Scheduler ensures regular analysis without manual intervention, making cost optimization a continuous, automated process rather than a periodic manual task.
+The system's strength lies in its automated approach to cost optimization, moving beyond manual analysis to continuous monitoring and proactive recommendations. BigQuery's serverless data warehouse capabilities enable complex cost trend analysis and forecasting, while Cloud Functions provide cost-effective execution of optimization logic with the latest Python 3.12 runtime for enhanced performance and security. The integration with Cloud Scheduler ensures regular analysis without manual intervention, making cost optimization a continuous, automated process rather than a periodic manual task.
 
-The architecture follows Google Cloud best practices for serverless applications, with proper error handling, monitoring, and security controls. The use of managed services minimizes operational overhead while providing enterprise-grade reliability and scalability. Organizations can expect 15-25% cost savings through automated optimization, with some customers achieving higher savings through committed use discount optimization and idle resource cleanup.
+The architecture follows Google Cloud best practices for serverless applications, with proper error handling, monitoring, and security controls. The use of managed services minimizes operational overhead while providing enterprise-grade reliability and scalability. Organizations can expect 15-25% cost savings through automated optimization, with some customers achieving higher savings through committed use discount optimization and idle resource cleanup. The improved error handling and multiple recommender types provide more comprehensive coverage of optimization opportunities.
 
 > **Tip**: Implement gradual rollout of automated optimizations, starting with low-risk recommendations like idle resource cleanup before enabling automated rightsizing or committed use discount purchases.
 
@@ -874,16 +901,21 @@ For detailed implementation guidance, refer to the [Google Cloud FinOps Hub docu
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Cloud Cost Integration**: Integrate AWS Cost Management and Azure Cost Management APIs to provide unified cost optimization across multiple cloud providers, enabling true multi-cloud FinOps capabilities.
+1. **Multi-Cloud Cost Integration**: Integrate AWS Cost Management and Azure Cost Management APIs to provide unified cost optimization across multiple cloud providers, enabling true multi-cloud FinOps capabilities with standardized reporting and alerting.
 
 2. **Advanced ML-Powered Forecasting**: Implement custom machine learning models using Vertex AI to predict cost trends, detect anomalies, and optimize committed use discount purchases based on historical usage patterns and business growth projections.
 
-3. **Automated Rightsizing with Safety Controls**: Develop intelligent rightsizing automation that analyzes resource utilization patterns and automatically applies safe optimizations during maintenance windows with rollback capabilities.
+3. **Automated Rightsizing with Safety Controls**: Develop intelligent rightsizing automation that analyzes resource utilization patterns and automatically applies safe optimizations during maintenance windows with rollback capabilities and approval workflows.
 
 4. **Custom Recommendation Engine**: Build domain-specific recommendation algorithms that consider business context, compliance requirements, and operational constraints to provide more targeted optimization suggestions than generic cloud recommendations.
 
-5. **Real-Time Cost Anomaly Detection**: Implement streaming cost analysis using Cloud Dataflow to detect cost anomalies in real-time and trigger immediate alerts or automated responses to prevent cost overruns.
+5. **Real-Time Cost Anomaly Detection**: Implement streaming cost analysis using Cloud Dataflow to detect cost anomalies in real-time and trigger immediate alerts or automated responses to prevent cost overruns before they impact monthly budgets.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

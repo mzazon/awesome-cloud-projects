@@ -1,0 +1,397 @@
+# Infrastructure Manager Configuration for Automated Storage Lifecycle Management
+# This configuration deploys Cloud Storage buckets with lifecycle policies and Cloud Scheduler jobs
+# for automated data governance and cost optimization.
+
+# Import required resources
+imports:
+  - path: https://www.gstatic.com/clouddm/templates/storage-1.1.0.jinja
+    name: storage.jinja
+  - path: https://www.gstatic.com/clouddm/templates/scheduler-1.0.0.jinja  
+    name: scheduler.jinja
+  - path: https://www.gstatic.com/clouddm/templates/logging-sink-1.0.0.jinja
+    name: logging.jinja
+
+resources:
+  # Main Cloud Storage bucket with lifecycle policies for automated cost optimization
+  - name: storage-lifecycle-bucket
+    type: storage.jinja
+    properties:
+      # Bucket configuration with uniform access controls
+      name: $(ref.bucket-name.value)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      uniformBucketLevelAccess: true
+      versioning:
+        enabled: false
+      
+      # Comprehensive lifecycle policy for automated storage class transitions
+      lifecycle:
+        rule:
+          # Transition from Standard to Nearline after 30 days
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              matchesStorageClass: 
+                - STANDARD
+          
+          # Transition from Nearline to Coldline after 90 days total
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+              matchesStorageClass:
+                - NEARLINE
+          
+          # Transition from Coldline to Archive after 365 days total
+          - action:
+              type: SetStorageClass
+              storageClass: ARCHIVE
+            condition:
+              age: 365
+              matchesStorageClass:
+                - COLDLINE
+          
+          # Delete objects older than 7 years (2555 days) for compliance
+          - action:
+              type: Delete
+            condition:
+              age: 2555
+      
+      # IAM configuration for secure access
+      iam:
+        bindings:
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:$(ref.scheduler-service-account.email)
+          - role: roles/storage.legacyBucketReader
+            members:
+              - serviceAccount:$(ref.scheduler-service-account.email)
+      
+      # Labels for resource management and cost tracking
+      labels:
+        purpose: lifecycle-management
+        environment: demo
+        cost-center: storage-optimization
+
+  # Dedicated logging bucket for lifecycle event monitoring
+  - name: storage-lifecycle-logs-bucket
+    type: storage.jinja
+    properties:
+      name: $(ref.bucket-name.value)-logs
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      uniformBucketLevelAccess: true
+      
+      # Shorter lifecycle for logs to control log storage costs
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 30
+          - action:
+              type: Delete
+            condition:
+              age: 365
+      
+      labels:
+        purpose: lifecycle-logging
+        environment: demo
+
+  # Service account for Cloud Scheduler job authentication
+  - name: scheduler-service-account
+    type: gcp-types/iam-v1:serviceAccounts
+    properties:
+      accountId: lifecycle-scheduler-sa
+      displayName: Storage Lifecycle Scheduler Service Account
+      description: Service account for automated storage lifecycle management tasks
+
+  # IAM binding for scheduler service account
+  - name: scheduler-sa-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.value)
+      role: roles/storage.objectViewer
+      member: serviceAccount:$(ref.scheduler-service-account.email)
+    dependsOn:
+      - scheduler-service-account
+
+  # Cloud Scheduler job for weekly lifecycle reporting and governance
+  - name: lifecycle-cleanup-job
+    type: scheduler.jinja
+    properties:
+      name: $(ref.job-name.value)
+      description: Weekly automated lifecycle management and reporting job
+      region: $(ref.region.value)
+      schedule: "0 9 * * 1"  # Every Monday at 9 AM
+      timeZone: "America/New_York"
+      
+      # HTTP target configuration for webhook integration
+      httpTarget:
+        uri: https://httpbin.org/post
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {
+            "bucket": "$(ref.storage-lifecycle-bucket.name)",
+            "action": "lifecycle_report",
+            "timestamp": "$(timestamp)",
+            "project": "$(ref.project-id.value)",
+            "region": "$(ref.region.value)"
+          }
+        
+        # OAuth authentication using service account
+        oauthToken:
+          serviceAccountEmail: $(ref.scheduler-service-account.email)
+          scope: https://www.googleapis.com/auth/cloud-platform
+      
+      # Retry configuration for reliability
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 60s
+        maxDoublings: 3
+    
+    dependsOn:
+      - storage-lifecycle-bucket
+      - scheduler-service-account
+
+  # Cloud Logging sink for storage lifecycle event monitoring
+  - name: storage-lifecycle-logging-sink
+    type: logging.jinja
+    properties:
+      name: storage-lifecycle-sink
+      description: Capture storage lifecycle events for monitoring and analysis
+      destination: storage.googleapis.com/$(ref.storage-lifecycle-logs-bucket.name)
+      
+      # Filter for storage bucket lifecycle events
+      filter: |
+        resource.type="gcs_bucket"
+        resource.labels.bucket_name="$(ref.storage-lifecycle-bucket.name)"
+        (protoPayload.methodName="storage.objects.create" OR
+         protoPayload.methodName="storage.objects.delete" OR
+         protoPayload.methodName="storage.setStorageClass")
+      
+      # Include children resources in logging
+      includeChildren: true
+      
+      # Unique writer identity for log sink
+      uniqueWriterIdentity: true
+    
+    dependsOn:
+      - storage-lifecycle-bucket
+      - storage-lifecycle-logs-bucket
+
+  # IAM binding for logging sink service account
+  - name: logging-sink-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.value)
+      role: roles/storage.objectCreator
+      member: $(ref.storage-lifecycle-logging-sink.writerIdentity)
+    dependsOn:
+      - storage-lifecycle-logging-sink
+
+  # Cloud Monitoring notification channel for lifecycle alerts
+  - name: lifecycle-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      type: email
+      displayName: Storage Lifecycle Alerts
+      description: Email notifications for storage lifecycle policy violations
+      labels:
+        email_address: admin@example.com  # Replace with actual email
+      userLabels:
+        purpose: lifecycle-monitoring
+
+  # Cloud Monitoring alert policy for unusual storage patterns
+  - name: storage-anomaly-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: Storage Lifecycle Anomaly Detection
+      documentation:
+        content: |
+          Alert triggered when storage usage patterns deviate significantly from expected lifecycle transitions.
+          This may indicate issues with lifecycle policies or unusual data access patterns.
+        mimeType: text/markdown
+      
+      # Condition for monitoring storage class distribution
+      conditions:
+        - displayName: Unexpected Storage Class Distribution
+          conditionThreshold:
+            filter: |
+              resource.type="gcs_bucket"
+              resource.labels.bucket_name="$(ref.storage-lifecycle-bucket.name)"
+              metric.type="storage.googleapis.com/storage/object_count"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 1000
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - resource.labels.bucket_name
+      
+      # Notification configuration
+      notificationChannels:
+        - $(ref.lifecycle-notification-channel.name)
+      
+      # Alert policy configuration
+      combiner: OR
+      enabled: true
+    
+    dependsOn:
+      - storage-lifecycle-bucket
+      - lifecycle-notification-channel
+
+# Template parameters for customization
+parameters:
+  # Project configuration
+  - name: project-id
+    type: string
+    description: Google Cloud Project ID for resource deployment
+    default: lifecycle-demo-project
+  
+  # Regional configuration
+  - name: region
+    type: string
+    description: Google Cloud region for resource deployment
+    default: us-central1
+    allowedValues:
+      - us-central1
+      - us-east1
+      - us-west1
+      - europe-west1
+      - asia-southeast1
+  
+  # Bucket naming with uniqueness
+  - name: bucket-name
+    type: string
+    description: Unique name for the storage lifecycle bucket
+    default: storage-lifecycle-demo
+    pattern: ^[a-z0-9][a-z0-9-_]{1,61}[a-z0-9]$
+  
+  # Scheduler job configuration
+  - name: job-name
+    type: string
+    description: Name for the Cloud Scheduler lifecycle job
+    default: lifecycle-cleanup-job
+    pattern: ^[a-zA-Z0-9-_]{1,500}$
+  
+  # Lifecycle policy timing (in days)
+  - name: nearline-transition-days
+    type: integer
+    description: Days after creation to transition to Nearline storage
+    default: 30
+    minimum: 1
+    maximum: 365
+  
+  - name: coldline-transition-days
+    type: integer
+    description: Days after creation to transition to Coldline storage
+    default: 90
+    minimum: 30
+    maximum: 730
+  
+  - name: archive-transition-days
+    type: integer
+    description: Days after creation to transition to Archive storage
+    default: 365
+    minimum: 90
+    maximum: 1095
+  
+  - name: deletion-age-days
+    type: integer
+    description: Days after creation to delete objects (compliance requirement)
+    default: 2555
+    minimum: 365
+    maximum: 3650
+  
+  # Monitoring configuration
+  - name: notification-email
+    type: string
+    description: Email address for lifecycle monitoring alerts
+    default: admin@example.com
+    pattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+
+# Template outputs for integration and verification
+outputs:
+  # Primary bucket information
+  - name: storage-bucket-name
+    description: Name of the created storage bucket with lifecycle policies
+    value: $(ref.storage-lifecycle-bucket.name)
+  
+  - name: storage-bucket-url
+    description: Console URL for the storage bucket
+    value: https://console.cloud.google.com/storage/browser/$(ref.storage-lifecycle-bucket.name)
+  
+  # Logging bucket information
+  - name: logs-bucket-name
+    description: Name of the logging bucket for lifecycle events
+    value: $(ref.storage-lifecycle-logs-bucket.name)
+  
+  # Scheduler job information
+  - name: scheduler-job-name
+    description: Name of the Cloud Scheduler job for lifecycle automation
+    value: $(ref.lifecycle-cleanup-job.name)
+  
+  - name: scheduler-job-url
+    description: Console URL for the Cloud Scheduler job
+    value: https://console.cloud.google.com/cloudscheduler/jobs/detail/$(ref.region.value)/$(ref.lifecycle-cleanup-job.name)
+  
+  # Service account information
+  - name: service-account-email
+    description: Email of the service account used for lifecycle automation
+    value: $(ref.scheduler-service-account.email)
+  
+  # Monitoring information
+  - name: logging-sink-name
+    description: Name of the Cloud Logging sink for lifecycle events
+    value: $(ref.storage-lifecycle-logging-sink.name)
+  
+  - name: monitoring-dashboard-url
+    description: URL to view storage monitoring dashboard
+    value: https://console.cloud.google.com/monitoring/dashboards
+  
+  # Lifecycle policy summary
+  - name: lifecycle-policy-summary
+    description: Summary of configured lifecycle transitions
+    value: |
+      Standard -> Nearline: $(ref.nearline-transition-days.value) days
+      Nearline -> Coldline: $(ref.coldline-transition-days.value) days  
+      Coldline -> Archive: $(ref.archive-transition-days.value) days
+      Deletion: $(ref.deletion-age-days.value) days
+  
+  # Cost optimization information
+  - name: expected-cost-savings
+    description: Expected storage cost savings from lifecycle policies
+    value: "60-80% reduction in storage costs through automated tiering"
+
+# Resource dependencies and deployment order
+# Infrastructure Manager will automatically resolve dependencies, but explicit dependencies
+# are defined above using dependsOn properties to ensure proper resource creation sequence:
+# 1. Service accounts and IAM bindings
+# 2. Storage buckets with lifecycle policies
+# 3. Cloud Scheduler jobs with authentication
+# 4. Logging sinks and monitoring configuration
+# 5. Alert policies and notification channels
+
+# Metadata for Infrastructure Manager deployment tracking
+metadata:
+  version: "1.0"
+  author: "GCP Recipe Infrastructure Generator"
+  description: "Automated storage lifecycle management with Cloud Storage and Cloud Scheduler"
+  tags:
+    - storage
+    - lifecycle
+    - automation
+    - cost-optimization
+    - data-governance
+  lastModified: "2025-07-12"

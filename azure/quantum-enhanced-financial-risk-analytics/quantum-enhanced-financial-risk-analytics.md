@@ -6,10 +6,10 @@ difficulty: 400
 subject: azure
 services: Azure Quantum, Azure Synapse Analytics, Azure Machine Learning, Azure Key Vault
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: quantum computing, financial analytics, risk modeling, monte carlo, optimization, machine learning
 recipe-generator-version: 1.3
@@ -200,7 +200,8 @@ echo "✅ Resource providers registered successfully"
    STORAGE_KEY=$(az storage account keys list \
        --resource-group ${RESOURCE_GROUP} \
        --account-name ${DATA_LAKE_NAME} \
-       --query '[0].value' --output tsv)
+       --query '[0].value' \
+       --output tsv)
    
    # Create containers for financial data organization
    az storage container create \
@@ -215,6 +216,12 @@ echo "✅ Resource providers registered successfully"
    
    az storage container create \
        --name "risk-models" \
+       --account-name ${DATA_LAKE_NAME} \
+       --account-key ${STORAGE_KEY}
+   
+   # Create file system for Synapse workspace
+   az storage fs create \
+       --name "synapsefilesystem" \
        --account-name ${DATA_LAKE_NAME} \
        --account-key ${STORAGE_KEY}
    
@@ -268,25 +275,21 @@ echo "✅ Resource providers registered successfully"
    Azure Quantum provides access to quantum hardware and simulators from leading quantum computing providers. This managed service enables financial institutions to experiment with quantum algorithms for portfolio optimization, risk analysis, and correlation modeling without requiring specialized quantum hardware expertise.
 
    ```bash
-   # Create Azure Quantum workspace
+   # Create Azure Quantum workspace with provider configuration
    az quantum workspace create \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${QUANTUM_WORKSPACE} \
        --location ${LOCATION} \
-       --storage-account ${DATA_LAKE_NAME}
+       --storage-account ${DATA_LAKE_NAME} \
+       --provider-sku-list "Microsoft/DZI-Standard" \
+       --auto-accept
    
-   # Add quantum computing providers to workspace
-   az quantum workspace provider add \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${QUANTUM_WORKSPACE} \
-       --provider-id "Microsoft" \
-       --provider-sku "DZI-Standard"
-   
-   # Configure quantum development environment
+   # Verify quantum workspace deployment
    az quantum workspace show \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${QUANTUM_WORKSPACE} \
-       --query "id" --output tsv
+       --query "provisioningState" \
+       --output tsv
    
    echo "✅ Azure Quantum workspace configured for financial optimization"
    ```
@@ -333,7 +336,6 @@ echo "✅ Resource providers registered successfully"
    The integration between Synapse Analytics and Azure Quantum enables seamless data flow between classical analytics and quantum optimization algorithms. This hybrid approach maximizes the computational advantages of both classical and quantum computing for complex financial modeling scenarios.
 
    ```bash
-   # Install Azure Quantum Python SDK in Synapse Spark pool
    # Create notebook configuration for quantum integration
    cat > quantum_integration_config.json << EOF
    {
@@ -827,4 +829,9 @@ Extend this quantum-enhanced financial risk analytics platform by implementing t
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,16 +6,16 @@ difficulty: 200
 subject: aws
 services: Amazon Q Developer, AWS Infrastructure Composer, AWS Lambda, Amazon S3
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai-assisted-development, infrastructure-as-code, serverless, automation, code-generation
 recipe-generator-version: 1.3
 ---
 
-# AI-Powered Infrastructure Code Generation
+# AI-Powered Infrastructure Code Generation with Amazon Q Developer
 
 ## Problem
 
@@ -1025,7 +1025,7 @@ Creating AI-powered infrastructure code generation with Amazon Q Developer and A
 
 The serverless automation pipeline created in this recipe demonstrates the power of event-driven architecture for infrastructure lifecycle management. By leveraging S3 event notifications and Lambda functions, the system provides immediate feedback on template validity and can automatically deploy infrastructure when appropriate. This approach reduces the time between infrastructure design and deployment while maintaining quality control through automated validation. The CloudFormation integration ensures that all deployed infrastructure follows AWS-native approaches and can be managed through standard AWS tooling. For detailed information on Lambda integration patterns, review the [AWS Lambda Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/) and [S3 event notification documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/notification-how-to.html).
 
-From a security and governance perspective, this architecture implements several important patterns including least-privilege IAM roles, encrypted storage, and comprehensive logging. The Lambda function operates with precisely the permissions needed for its operations, and all template processing activities are logged to CloudWatch for audit and troubleshooting purposes. The S3 bucket configuration follows security best practices with versioning, encryption, and public access restrictions. For additional security guidance, see the [AWS Security Best Practices](https://docs.aws.amazon.com/security/latest/userguide/best-practices.html) and [IAM best practices documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
+From a security and governance perspective, this architecture implements several important patterns including least-privilege IAM roles, encrypted storage, and comprehensive logging. The Lambda function operates with precisely the permissions needed for its operations, and all template processing activities are logged to CloudWatch for audit and troubleshooting purposes. The S3 bucket configuration follows security best practices with versioning, encryption, and public access restrictions. This design aligns with the AWS Well-Architected Framework's Security Pillar, ensuring that infrastructure automation maintains enterprise-grade security standards. For additional security guidance, see the [AWS Security Best Practices](https://docs.aws.amazon.com/security/latest/userguide/best-practices.html) and [IAM best practices documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
 
 The combination of Amazon Q Developer's AI capabilities with Infrastructure Composer's visual design interface creates an accessible entry point for infrastructure development while maintaining the rigor and reliability required for production environments. This approach democratizes infrastructure development, enabling teams to focus on business logic and application features rather than complex infrastructure syntax and configuration details. The automated validation and deployment pipeline ensures that AI-generated infrastructure code meets quality standards and can be safely deployed across multiple environments.
 
@@ -1049,4 +1049,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

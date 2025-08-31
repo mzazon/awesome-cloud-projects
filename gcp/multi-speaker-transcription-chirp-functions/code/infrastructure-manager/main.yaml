@@ -1,0 +1,385 @@
+# Google Cloud Infrastructure Manager Configuration
+# Multi-Speaker Transcription with Chirp and Cloud Functions
+# This configuration deploys a complete serverless audio transcription pipeline
+# using Google Cloud Speech-to-Text with Chirp 3 models and speaker diarization
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: Blueprint
+metadata:
+  name: multi-speaker-transcription-pipeline
+  description: "Serverless audio transcription with speaker diarization using Chirp 3"
+  version: "1.0"
+
+# Configuration variables for deployment customization
+variables:
+  # Project and location configuration
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+      
+  region:
+    description: "Google Cloud region for deployment"
+    type: string
+    default: "us-central1"
+    validation:
+      pattern: "^[a-z]+-[a-z]+[0-9]+$"
+      
+  # Storage configuration
+  input_bucket_name:
+    description: "Name for the input audio files bucket"
+    type: string
+    default: "audio-input"
+    
+  output_bucket_name:
+    description: "Name for the transcript output bucket"
+    type: string
+    default: "transcripts-output"
+    
+  # Function configuration
+  function_memory:
+    description: "Memory allocation for Cloud Function (MB)"
+    type: integer
+    default: 2048
+    validation:
+      minimum: 512
+      maximum: 8192
+      
+  function_timeout:
+    description: "Timeout for Cloud Function (seconds)"
+    type: integer
+    default: 540
+    validation:
+      minimum: 60
+      maximum: 3600
+      
+  max_instances:
+    description: "Maximum number of Cloud Function instances"
+    type: integer
+    default: 5
+    validation:
+      minimum: 1
+      maximum: 100
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  speech_api:
+    type: gcp-types/serviceusage-v1:services
+    name: speech-api-enablement
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/speech.googleapis.com
+      
+  functions_api:
+    type: gcp-types/serviceusage-v1:services
+    name: functions-api-enablement
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudfunctions.googleapis.com
+      
+  storage_api:
+    type: gcp-types/serviceusage-v1:services
+    name: storage-api-enablement
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/storage.googleapis.com
+      
+  cloudbuild_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudbuild-api-enablement
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudbuild.googleapis.com
+
+  # Cloud Storage bucket for input audio files
+  input_audio_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: input-audio-bucket
+    properties:
+      name: "$(var.project_id)-$(var.input_bucket_name)-$(uniqueId)"
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: false
+      cors:
+        - origin: ["*"]
+          method: ["GET", "POST", "PUT"]
+          responseHeader: ["Content-Type"]
+          maxAgeSeconds: 3600
+      lifecycle:
+        rule:
+          - condition:
+              age: 30
+            action:
+              type: Delete
+    metadata:
+      dependsOn:
+        - storage_api
+
+  # Cloud Storage bucket for output transcripts
+  output_transcripts_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: output-transcripts-bucket
+    properties:
+      name: "$(var.project_id)-$(var.output_bucket_name)-$(uniqueId)"
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - condition:
+              age: 90
+            action:
+              type: Delete
+    metadata:
+      dependsOn:
+        - storage_api
+
+  # IAM Service Account for Cloud Function execution
+  function_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    name: transcription-function-sa
+    properties:
+      accountId: transcription-function-sa
+      serviceAccount:
+        displayName: "Multi-Speaker Transcription Function Service Account"
+        description: "Service account for audio transcription Cloud Function"
+    metadata:
+      dependsOn:
+        - functions_api
+
+  # IAM binding for Speech-to-Text API access
+  speech_api_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: speech-api-binding
+    properties:
+      resource: $(var.project_id)
+      role: roles/speech.client
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+
+  # IAM binding for Cloud Storage access (input bucket)
+  storage_input_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: storage-input-binding
+    properties:
+      resource: $(var.project_id)
+      role: roles/storage.objectViewer
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+
+  # IAM binding for Cloud Storage access (output bucket)
+  storage_output_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: storage-output-binding
+    properties:
+      resource: $(var.project_id)
+      role: roles/storage.objectCreator
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+
+  # Cloud Storage bucket for function source code
+  function_source_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: function-source-bucket
+    properties:
+      name: "$(var.project_id)-function-source-$(uniqueId)"
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+    metadata:
+      dependsOn:
+        - storage_api
+
+  # Cloud Storage object for function source code
+  function_source_archive:
+    type: gcp-types/storage-v1:objects
+    name: function-source-archive
+    properties:
+      bucket: $(ref.function_source_bucket.name)
+      name: transcription-function-source.zip
+      # Note: In a real deployment, you would upload the actual function code here
+      # For this template, we're creating a placeholder that would contain:
+      # - main.py (with the transcription logic)
+      # - requirements.txt (with dependencies)
+      metadata:
+        description: "Cloud Function source code for multi-speaker transcription"
+    metadata:
+      dependsOn:
+        - function_source_bucket
+
+  # Cloud Function for audio transcription processing
+  transcription_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    name: process-audio-transcription
+    properties:
+      location: projects/$(var.project_id)/locations/$(var.region)
+      function:
+        name: process-audio-transcription
+        description: "Processes audio files for multi-speaker transcription using Chirp 3"
+        sourceArchiveUrl: gs://$(ref.function_source_bucket.name)/$(ref.function_source_archive.name)
+        entryPoint: process_audio_upload
+        runtime: python312
+        availableMemoryMb: $(var.function_memory)
+        timeout: $(var.function_timeout)s
+        maxInstances: $(var.max_instances)
+        serviceAccountEmail: $(ref.function_service_account.email)
+        environmentVariables:
+          OUTPUT_BUCKET: $(ref.output_transcripts_bucket.name)
+          GCP_PROJECT: $(var.project_id)
+        eventTrigger:
+          eventType: google.storage.object.finalize
+          resource: projects/_/buckets/$(ref.input_audio_bucket.name)
+          failurePolicy:
+            retry: {}
+        labels:
+          deployment-tool: "infrastructure-manager"
+          function-type: "audio-transcription"
+          ai-model: "chirp-3"
+    metadata:
+      dependsOn:
+        - functions_api
+        - speech_api
+        - function_service_account
+        - input_audio_bucket
+        - output_transcripts_bucket
+        - function_source_archive
+        - speech_api_binding
+        - storage_input_binding
+        - storage_output_binding
+
+  # Cloud Monitoring notification channel (optional)
+  notification_channel:
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    name: transcription-alerts
+    properties:
+      type: email
+      displayName: "Transcription Pipeline Alerts"
+      description: "Email notifications for transcription function errors"
+      labels:
+        email_address: "admin@example.com"  # Replace with actual email
+      enabled: true
+    metadata:
+      dependsOn:
+        - transcription_function
+
+  # Cloud Monitoring alert policy for function errors
+  error_alert_policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    name: transcription-function-errors
+    properties:
+      displayName: "Transcription Function Error Rate"
+      documentation:
+        content: "Alert when transcription function error rate exceeds threshold"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Function error rate"
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" AND resource.label.function_name="process-audio-transcription"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.1
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.label.function_name
+      combiner: OR
+      enabled: true
+      notificationChannels:
+        - $(ref.notification_channel.name)
+      alertStrategy:
+        autoClose: 86400s  # 24 hours
+    metadata:
+      dependsOn:
+        - transcription_function
+        - notification_channel
+
+# Output values for verification and integration
+outputs:
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(var.project_id)
+    
+  deployment_region:
+    description: "Deployment region"
+    value: $(var.region)
+
+  # Storage bucket information
+  input_bucket_name:
+    description: "Name of the input audio bucket"
+    value: $(ref.input_audio_bucket.name)
+    
+  input_bucket_url:
+    description: "URL of the input audio bucket"
+    value: "gs://$(ref.input_audio_bucket.name)"
+    
+  output_bucket_name:
+    description: "Name of the output transcripts bucket"
+    value: $(ref.output_transcripts_bucket.name)
+    
+  output_bucket_url:
+    description: "URL of the output transcripts bucket"
+    value: "gs://$(ref.output_transcripts_bucket.name)"
+
+  # Cloud Function information
+  function_name:
+    description: "Name of the transcription Cloud Function"
+    value: $(ref.transcription_function.name)
+    
+  function_trigger_bucket:
+    description: "Bucket that triggers the transcription function"
+    value: $(ref.input_audio_bucket.name)
+    
+  function_service_account:
+    description: "Service account used by the Cloud Function"
+    value: $(ref.function_service_account.email)
+
+  # Monitoring information
+  alert_policy_name:
+    description: "Name of the error alert policy"
+    value: $(ref.error_alert_policy.name)
+
+  # Usage instructions
+  upload_command:
+    description: "Command to upload audio files for processing"
+    value: "gsutil cp your-audio-file.wav gs://$(ref.input_audio_bucket.name)/"
+    
+  download_command:
+    description: "Command to download transcript results"
+    value: "gsutil cp -r gs://$(ref.output_transcripts_bucket.name)/transcripts/ ./results/"
+
+  # Test commands
+  function_logs_command:
+    description: "Command to view function execution logs"
+    value: "gcloud functions logs read process-audio-transcription --region $(var.region)"
+    
+  function_status_command:
+    description: "Command to check function deployment status"
+    value: "gcloud functions describe process-audio-transcription --region $(var.region)"
+
+# Deployment metadata
+metadata:
+  annotations:
+    cost-center: "ai-ml-operations"
+    environment: "production"
+    managed-by: "infrastructure-manager"
+    component: "audio-transcription"
+    ai-model: "chirp-3"
+    last-updated: "2025-07-12"
+  labels:
+    project-type: "serverless-ai"
+    use-case: "speech-transcription"
+    complexity: "intermediate"

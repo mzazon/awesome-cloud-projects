@@ -1,0 +1,607 @@
+# Infrastructure Manager configuration for Simple Voting System with Cloud Functions and Firestore
+# This template deploys a serverless voting system using Google Cloud Functions and Firestore
+# for real-time data storage, duplicate vote prevention, and automatic scaling.
+
+apiVersion: blueprint.goog/v1alpha1
+kind: Blueprint
+metadata:
+  name: simple-voting-system
+  description: Simple voting system using Cloud Functions and Firestore
+  labels:
+    category: serverless
+    use-case: voting-system
+    difficulty: beginner
+
+# Input variables for customizing the deployment
+inputs:
+  # Project and location configuration
+  - name: project_id
+    description: Google Cloud Project ID
+    type: string
+    required: true
+    
+  - name: region
+    description: Region for deploying resources
+    type: string
+    default: us-central1
+    required: false
+    
+  - name: zone
+    description: Zone for resources requiring zone specification
+    type: string
+    default: us-central1-a
+    required: false
+
+  # Resource naming configuration
+  - name: function_name_prefix
+    description: Prefix for Cloud Function names
+    type: string
+    default: vote-handler
+    required: false
+    
+  - name: random_suffix
+    description: Random suffix for unique resource naming
+    type: string
+    default: ${random_id.suffix.hex}
+    required: false
+
+  # Function configuration
+  - name: node_runtime
+    description: Node.js runtime version for Cloud Functions
+    type: string
+    default: nodejs20
+    required: false
+    
+  - name: function_memory
+    description: Memory allocated to Cloud Functions (in MB)
+    type: number
+    default: 256
+    required: false
+    
+  - name: function_timeout
+    description: Function timeout in seconds
+    type: number
+    default: 60
+    required: false
+
+  # Firestore configuration
+  - name: firestore_location
+    description: Firestore database location
+    type: string
+    default: us-central
+    required: false
+
+# Resource definitions
+resources:
+  # Generate random suffix for unique resource naming
+  - name: suffix
+    type: random_id
+    properties:
+      byte_length: 3
+
+  # Enable required Google Cloud APIs
+  - name: cloudfunctions_api
+    type: google_project_service
+    properties:
+      project: ${inputs.project_id}
+      service: cloudfunctions.googleapis.com
+      disable_on_destroy: false
+
+  - name: firestore_api
+    type: google_project_service
+    properties:
+      project: ${inputs.project_id}
+      service: firestore.googleapis.com
+      disable_on_destroy: false
+      depends_on:
+        - ${resources.cloudfunctions_api}
+
+  - name: cloudbuild_api
+    type: google_project_service
+    properties:
+      project: ${inputs.project_id}
+      service: cloudbuild.googleapis.com
+      disable_on_destroy: false
+      depends_on:
+        - ${resources.firestore_api}
+
+  # Create Firestore database in Native mode for ACID transactions
+  # Native mode provides strong consistency and ACID transactions
+  # required for the voting system's duplicate prevention mechanism
+  - name: firestore_database
+    type: google_firestore_database
+    properties:
+      project: ${inputs.project_id}
+      name: "(default)"
+      location_id: ${inputs.firestore_location}
+      type: FIRESTORE_NATIVE
+      # Concurrency control for atomic vote operations
+      concurrency_mode: OPTIMISTIC
+      # Point-in-time recovery for data protection
+      point_in_time_recovery_enablement: POINT_IN_TIME_RECOVERY_ENABLED
+      depends_on:
+        - ${resources.cloudbuild_api}
+
+  # Cloud Storage bucket for storing function source code
+  # Versioning enabled for function deployment history
+  - name: function_source_bucket
+    type: google_storage_bucket
+    properties:
+      project: ${inputs.project_id}
+      name: ${inputs.project_id}-voting-functions-${random_id.suffix.hex}
+      location: ${inputs.region}
+      # Enable versioning for function source code management
+      versioning:
+        enabled: true
+      # Lifecycle rule to manage old function versions
+      lifecycle_rule:
+        - condition:
+            age: 30
+            num_newer_versions: 5
+          action:
+            type: Delete
+      # Uniform bucket-level access for simplified IAM
+      uniform_bucket_level_access: true
+      depends_on:
+        - ${resources.firestore_database}
+
+  # Create function source archive with Node.js application code
+  # This archive contains the voting logic with duplicate prevention
+  - name: function_source_archive
+    type: google_storage_bucket_object
+    properties:
+      name: voting-functions-source.zip
+      bucket: ${resources.function_source_bucket.name}
+      # Source code archive containing package.json and index.js
+      source:
+        content: |
+          # Function source will be uploaded separately
+          # Contains Node.js application with Firestore integration
+        filename: voting-functions-source.zip
+      depends_on:
+        - ${resources.function_source_bucket}
+
+  # IAM service account for Cloud Functions with minimal required permissions
+  # Follows principle of least privilege for security
+  - name: function_service_account
+    type: google_service_account
+    properties:
+      project: ${inputs.project_id}
+      account_id: voting-functions-sa-${random_id.suffix.hex}
+      display_name: "Voting System Functions Service Account"
+      description: "Service account for voting system Cloud Functions with Firestore access"
+
+  # Grant Firestore User role to function service account
+  # Allows read/write access to Firestore collections for vote storage
+  - name: firestore_user_binding
+    type: google_project_iam_member
+    properties:
+      project: ${inputs.project_id}
+      role: roles/datastore.user
+      member: serviceAccount:${resources.function_service_account.email}
+      depends_on:
+        - ${resources.function_service_account}
+
+  # Grant Cloud Functions Invoker role for HTTP triggers
+  # Allows public access to voting endpoints
+  - name: function_invoker_binding
+    type: google_project_iam_member
+    properties:
+      project: ${inputs.project_id}
+      role: roles/cloudfunctions.invoker
+      member: allUsers
+      depends_on:
+        - ${resources.firestore_user_binding}
+
+  # Vote submission Cloud Function (2nd generation)
+  # Handles vote processing with atomic transactions and duplicate prevention
+  - name: submit_vote_function
+    type: google_cloudfunctions2_function
+    properties:
+      project: ${inputs.project_id}
+      name: ${inputs.function_name_prefix}-submit-${random_id.suffix.hex}
+      location: ${inputs.region}
+      description: "Processes vote submissions with duplicate prevention and atomic transactions"
+      
+      # Build configuration for Node.js runtime
+      build_config:
+        runtime: ${inputs.node_runtime}
+        entry_point: submitVote
+        source:
+          storage_source:
+            bucket: ${resources.function_source_bucket.name}
+            object: ${resources.function_source_archive.name}
+        environment_variables:
+          NODE_ENV: production
+
+      # Service configuration with security and performance settings
+      service_config:
+        # Maximum instances for cost control and resource management
+        max_instance_count: 100
+        # Minimum instances for reduced cold start latency
+        min_instance_count: 0
+        # Memory allocation optimized for Firestore operations
+        available_memory: ${inputs.function_memory}MB
+        # Timeout sufficient for database transactions
+        timeout_seconds: ${inputs.function_timeout}s
+        # Environment variables for function configuration
+        environment_variables:
+          FIRESTORE_PROJECT_ID: ${inputs.project_id}
+          CORS_ORIGINS: "*"
+        # Service account with minimal required permissions
+        service_account_email: ${resources.function_service_account.email}
+        # Ingress settings for public HTTP access
+        ingress_settings: ALLOW_ALL
+        # VPC connector not required for Firestore access
+
+      # HTTP trigger configuration for vote submission endpoint
+      event_trigger:
+        trigger_region: ${inputs.region}
+        event_type: google.cloud.functions.http
+        retry_policy: RETRY_POLICY_RETRY
+
+      depends_on:
+        - ${resources.function_invoker_binding}
+        - ${resources.function_source_archive}
+
+  # Results retrieval Cloud Function (2nd generation)
+  # Provides read-only access to voting results with efficient querying
+  - name: get_results_function
+    type: google_cloudfunctions2_function
+    properties:
+      project: ${inputs.project_id}
+      name: ${inputs.function_name_prefix}-results-${random_id.suffix.hex}
+      location: ${inputs.region}
+      description: "Retrieves voting results with optimized Firestore queries"
+      
+      # Build configuration identical to submit function
+      build_config:
+        runtime: ${inputs.node_runtime}
+        entry_point: getResults
+        source:
+          storage_source:
+            bucket: ${resources.function_source_bucket.name}
+            object: ${resources.function_source_archive.name}
+        environment_variables:
+          NODE_ENV: production
+
+      # Service configuration optimized for read operations
+      service_config:
+        # Lower resource requirements for read-only operations
+        max_instance_count: 50
+        min_instance_count: 0
+        available_memory: ${inputs.function_memory}MB
+        timeout_seconds: ${inputs.function_timeout}s
+        environment_variables:
+          FIRESTORE_PROJECT_ID: ${inputs.project_id}
+          CORS_ORIGINS: "*"
+        service_account_email: ${resources.function_service_account.email}
+        ingress_settings: ALLOW_ALL
+
+      # HTTP trigger for results endpoint
+      event_trigger:
+        trigger_region: ${inputs.region}
+        event_type: google.cloud.functions.http
+        retry_policy: RETRY_POLICY_RETRY
+
+      depends_on:
+        - ${resources.submit_vote_function}
+
+  # Cloud Monitoring alerts for function health and performance
+  # Alert policy for function error rates
+  - name: function_error_alert_policy
+    type: google_monitoring_alert_policy
+    properties:
+      project: ${inputs.project_id}
+      display_name: "Voting Functions Error Rate Alert"
+      documentation:
+        content: "Alert when Cloud Functions error rate exceeds threshold"
+        mime_type: text/markdown
+      
+      # Condition for error rate monitoring
+      conditions:
+        - display_name: "Function Error Rate"
+          condition_threshold:
+            filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/execution_count"'
+            comparison: COMPARISON_GT
+            threshold_value: 10
+            duration: 300s
+            aggregations:
+              - alignment_period: 60s
+                per_series_aligner: ALIGN_RATE
+                cross_series_reducer: REDUCE_SUM
+                group_by_fields:
+                  - resource.labels.function_name
+
+      # Notification channels would be configured separately
+      enabled: true
+      depends_on:
+        - ${resources.get_results_function}
+
+  # Firestore security rules for vote data protection
+  # Rules ensure data integrity and prevent unauthorized access
+  - name: firestore_rules
+    type: google_firebaserules_ruleset
+    properties:
+      project: ${inputs.project_id}
+      source:
+        files:
+          - name: firestore.rules
+            content: |
+              rules_version = '2';
+              service cloud.firestore {
+                match /databases/{database}/documents {
+                  // Allow read access to vote counts for results display
+                  match /voteCounts/{document} {
+                    allow read: if true;
+                    allow write: if false; // Only functions can write
+                  }
+                  
+                  // Restrict direct access to individual votes
+                  match /votes/{document} {
+                    allow read, write: if false; // Only functions can access
+                  }
+                  
+                  // Allow read access to topics metadata
+                  match /topics/{document} {
+                    allow read: if true;
+                    allow write: if false; // Only functions can write
+                  }
+                }
+              }
+      depends_on:
+        - ${resources.function_error_alert_policy}
+
+  # Deploy Firestore security rules
+  - name: firestore_rules_release
+    type: google_firebaserules_release
+    properties:
+      project: ${inputs.project_id}
+      name: "cloud.firestore"
+      ruleset_name: ${resources.firestore_rules.name}
+      depends_on:
+        - ${resources.firestore_rules}
+
+# Output values for integration and testing
+outputs:
+  # Function URLs for API access
+  - name: submit_vote_url
+    description: URL for vote submission endpoint
+    value: ${resources.submit_vote_function.service_config[0].uri}
+
+  - name: get_results_url
+    description: URL for results retrieval endpoint
+    value: ${resources.get_results_function.service_config[0].uri}
+
+  # Firestore information
+  - name: firestore_database_name
+    description: Firestore database name
+    value: ${resources.firestore_database.name}
+
+  - name: firestore_location
+    description: Firestore database location
+    value: ${resources.firestore_database.location_id}
+
+  # Function details
+  - name: submit_function_name
+    description: Vote submission function name
+    value: ${resources.submit_vote_function.name}
+
+  - name: results_function_name
+    description: Results retrieval function name
+    value: ${resources.get_results_function.name}
+
+  # Service account for additional integrations
+  - name: function_service_account_email
+    description: Service account email for Cloud Functions
+    value: ${resources.function_service_account.email}
+
+  # Storage bucket for function source
+  - name: source_bucket_name
+    description: Storage bucket for function source code
+    value: ${resources.function_source_bucket.name}
+
+  # Project configuration
+  - name: project_id
+    description: Google Cloud Project ID
+    value: ${inputs.project_id}
+
+  - name: deployment_region
+    description: Deployment region
+    value: ${inputs.region}
+
+# Deployment instructions and usage examples
+deployment:
+  steps:
+    - description: "Prepare function source code"
+      command: |
+        # Create function source directory
+        mkdir -p voting-functions
+        cd voting-functions
+        
+        # Create package.json
+        cat > package.json << 'EOF'
+        {
+          "name": "voting-system-functions",
+          "version": "1.0.0",
+          "description": "Serverless voting system using Cloud Functions and Firestore",
+          "main": "index.js",
+          "dependencies": {
+            "@google-cloud/firestore": "^7.9.0",
+            "@google-cloud/functions-framework": "^3.4.0"
+          },
+          "engines": {
+            "node": "20"
+          }
+        }
+        EOF
+        
+        # Create function code with vote handling logic
+        cat > index.js << 'EOF'
+        const { Firestore } = require('@google-cloud/firestore');
+        const functions = require('@google-cloud/functions-framework');
+        
+        const firestore = new Firestore();
+        
+        // Vote submission endpoint with duplicate prevention
+        functions.http('submitVote', async (req, res) => {
+          // CORS headers for web access
+          res.set('Access-Control-Allow-Origin', '*');
+          res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+          res.set('Access-Control-Allow-Headers', 'Content-Type');
+          
+          if (req.method === 'OPTIONS') {
+            res.status(204).send('');
+            return;
+          }
+          
+          try {
+            const { topicId, option, userId } = req.body;
+            
+            // Validate required fields
+            if (!topicId || !option || !userId) {
+              res.status(400).json({ error: 'Missing required fields' });
+              return;
+            }
+            
+            // Check for duplicate votes using composite key
+            const userVoteRef = firestore
+              .collection('votes')
+              .doc(`${topicId}_${userId}`);
+            
+            const userVoteDoc = await userVoteRef.get();
+            
+            if (userVoteDoc.exists) {
+              res.status(409).json({ error: 'User already voted on this topic' });
+              return;
+            }
+            
+            // Atomic transaction for vote recording and count update
+            await firestore.runTransaction(async (transaction) => {
+              // Record individual vote
+              transaction.set(userVoteRef, {
+                topicId,
+                option,
+                userId,
+                timestamp: Firestore.Timestamp.now()
+              });
+              
+              // Update aggregated count
+              const countRef = firestore
+                .collection('voteCounts')
+                .doc(`${topicId}_${option}`);
+              
+              const countDoc = await transaction.get(countRef);
+              const currentCount = countDoc.exists ? countDoc.data().count : 0;
+              
+              transaction.set(countRef, {
+                topicId,
+                option,
+                count: currentCount + 1,
+                lastUpdated: Firestore.Timestamp.now()
+              });
+            });
+            
+            res.status(200).json({ success: true, message: 'Vote recorded' });
+          } catch (error) {
+            console.error('Error processing vote:', error);
+            res.status(500).json({ error: 'Internal server error' });
+          }
+        });
+        
+        // Results retrieval endpoint with optimized queries
+        functions.http('getResults', async (req, res) => {
+          res.set('Access-Control-Allow-Origin', '*');
+          res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+          
+          if (req.method === 'OPTIONS') {
+            res.status(204).send('');
+            return;
+          }
+          
+          try {
+            const { topicId } = req.query;
+            
+            if (!topicId) {
+              res.status(400).json({ error: 'Missing topicId parameter' });
+              return;
+            }
+            
+            // Query vote counts for the specified topic
+            const countsSnapshot = await firestore
+              .collection('voteCounts')
+              .where('topicId', '==', topicId)
+              .get();
+            
+            const results = {};
+            countsSnapshot.forEach(doc => {
+              const data = doc.data();
+              results[data.option] = data.count;
+            });
+            
+            res.status(200).json({ topicId, results });
+          } catch (error) {
+            console.error('Error getting results:', error);
+            res.status(500).json({ error: 'Internal server error' });
+          }
+        });
+        EOF
+        
+        # Create deployment archive
+        zip -r ../voting-functions-source.zip .
+        cd ..
+
+    - description: "Deploy with Infrastructure Manager"
+      command: |
+        # Upload function source to the bucket created by Infrastructure Manager
+        gsutil cp voting-functions-source.zip gs://$(OUTPUT:source_bucket_name)/
+
+    - description: "Test the deployment"
+      command: |
+        # Test vote submission
+        curl -X POST $(OUTPUT:submit_vote_url) \
+          -H "Content-Type: application/json" \
+          -d '{"topicId": "test-poll", "option": "option-a", "userId": "user-123"}'
+        
+        # Test results retrieval
+        curl "$(OUTPUT:get_results_url)?topicId=test-poll"
+
+# Cleanup instructions
+cleanup:
+  steps:
+    - description: "Remove function source files"
+      command: |
+        rm -rf voting-functions voting-functions-source.zip
+    
+    - description: "Delete Infrastructure Manager deployment"
+      command: |
+        # This will remove all resources created by the blueprint
+        gcloud infra-manager deployments delete simple-voting-system \
+          --location=${inputs.region} \
+          --quiet
+
+# Best practices and recommendations
+recommendations:
+  security:
+    - "Enable authentication for production deployments using Firebase Auth"
+    - "Implement rate limiting to prevent abuse of voting endpoints"
+    - "Use VPC Service Controls for additional network security"
+    - "Enable audit logging for compliance requirements"
+  
+  performance:
+    - "Configure appropriate memory and timeout settings based on usage patterns"
+    - "Enable Cloud CDN for faster response times globally"
+    - "Implement caching strategies for frequently accessed results"
+    - "Use Cloud Load Balancer for high availability"
+  
+  cost_optimization:
+    - "Set maximum instance limits to control costs"
+    - "Use Cloud Scheduler to warm up functions during peak hours"
+    - "Implement data lifecycle policies for old voting data"
+    - "Monitor function execution metrics to optimize resource allocation"
+  
+  monitoring:
+    - "Set up Cloud Monitoring dashboards for function metrics"
+    - "Configure alerts for error rates and latency thresholds"
+    - "Enable Cloud Logging for debugging and analysis"
+    - "Use Cloud Trace for performance analysis"

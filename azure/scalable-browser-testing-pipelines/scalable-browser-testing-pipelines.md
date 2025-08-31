@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Playwright Testing, Azure DevOps, Azure Container Registry
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: testing, browser-testing, ci-cd, automation, playwright, devops
 recipe-generator-version: 1.3
@@ -89,9 +89,9 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables
-export AZURE_REGION="eastus"
-export RESOURCE_GROUP="rg-playwright-testing"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-playwright-testing-${RANDOM_SUFFIX}"
+export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 export DEVOPS_ORG="your-devops-org"
 export PROJECT_NAME="playwright-testing-project"
@@ -104,7 +104,7 @@ export ACR_NAME="acr${RANDOM_SUFFIX}"
 # Create resource group
 az group create \
     --name ${RESOURCE_GROUP} \
-    --location ${AZURE_REGION} \
+    --location ${LOCATION} \
     --tags purpose=browser-testing environment=production
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
@@ -126,14 +126,14 @@ echo "✅ Environment prepared successfully"
 
    ```bash
    # Create the Playwright Testing workspace
-   az playwright workspace create \
+   az playwright-testing workspace create \
        --name ${PLAYWRIGHT_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
-       --location ${AZURE_REGION} \
+       --location ${LOCATION} \
        --tags project=browser-testing tier=production
    
    # Get workspace details and store service endpoint
-   PLAYWRIGHT_SERVICE_URL=$(az playwright workspace show \
+   PLAYWRIGHT_SERVICE_URL=$(az playwright-testing workspace show \
        --name ${PLAYWRIGHT_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
        --query properties.serviceEndpoint \
@@ -154,7 +154,7 @@ echo "✅ Environment prepared successfully"
    az acr create \
        --name ${ACR_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location ${AZURE_REGION} \
+       --location ${LOCATION} \
        --sku Basic \
        --admin-enabled true
    
@@ -248,7 +248,7 @@ echo "✅ Environment prepared successfully"
    
    # Create Playwright configuration
    cat > playwright.config.js << 'EOF'
-   const { defineConfig } = require('@playwright/test');
+   const { defineConfig, devices } = require('@playwright/test');
    const { getServiceConfig } = require('@azure/microsoft-playwright-testing');
    
    module.exports = defineConfig({
@@ -441,7 +441,8 @@ echo "✅ Environment prepared successfully"
                displayName: 'Install dependencies'
    
              - script: |
-                 npx playwright test --reporter=junit,html,@azure/microsoft-playwright-testing/reporter
+                 npx playwright test \
+                   --reporter=junit,html,@azure/microsoft-playwright-testing/reporter
                displayName: 'Run Playwright tests'
                env:
                  PLAYWRIGHT_SERVICE_URL: $(PLAYWRIGHT_SERVICE_URL)
@@ -482,7 +483,8 @@ echo "✅ Environment prepared successfully"
                displayName: 'Deploy application'
    
              - script: |
-                 npx playwright test --grep="@smoke" --reporter=@azure/microsoft-playwright-testing/reporter
+                 npx playwright test --grep="@smoke" \
+                   --reporter=@azure/microsoft-playwright-testing/reporter
                displayName: 'Run smoke tests'
                env:
                  PLAYWRIGHT_SERVICE_URL: $(PLAYWRIGHT_SERVICE_URL)
@@ -501,7 +503,7 @@ echo "✅ Environment prepared successfully"
 
    ```bash
    # Get Playwright service access token
-   PLAYWRIGHT_ACCESS_TOKEN=$(az playwright workspace show \
+   PLAYWRIGHT_ACCESS_TOKEN=$(az playwright-testing workspace show \
        --name ${PLAYWRIGHT_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
        --query properties.accessToken \
@@ -590,7 +592,7 @@ echo "✅ Environment prepared successfully"
 
    ```bash
    # Check workspace status
-   az playwright workspace show \
+   az playwright-testing workspace show \
        --name ${PLAYWRIGHT_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
        --query properties.provisioningState \
@@ -629,7 +631,8 @@ echo "✅ Environment prepared successfully"
    # Run tests locally using Azure service
    PLAYWRIGHT_SERVICE_URL=${PLAYWRIGHT_SERVICE_URL} \
    PLAYWRIGHT_SERVICE_ACCESS_TOKEN=${PLAYWRIGHT_ACCESS_TOKEN} \
-   npx playwright test --reporter=@azure/microsoft-playwright-testing/reporter
+   npx playwright test \
+     --reporter=@azure/microsoft-playwright-testing/reporter
    ```
 
    Expected output: Tests should execute successfully with results uploaded to Azure Playwright Testing portal.
@@ -651,7 +654,7 @@ echo "✅ Environment prepared successfully"
 
    ```bash
    # Delete the workspace
-   az playwright workspace delete \
+   az playwright-testing workspace delete \
        --name ${PLAYWRIGHT_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
        --yes
@@ -710,4 +713,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,552 @@
+# Infrastructure Manager Configuration for Smart Survey Analysis with Gemini and Cloud Functions
+# This configuration deploys a complete AI-powered survey analysis system using:
+# - Vertex AI Gemini for intelligent analysis
+# - Cloud Functions for serverless processing
+# - Firestore for data persistence
+# - Required APIs and IAM permissions
+
+imports:
+- path: modules/apis.yaml
+- path: modules/storage.yaml  
+- path: modules/compute.yaml
+- path: modules/iam.yaml
+
+resources:
+# ========================================
+# VARIABLES AND CONFIGURATION
+# ========================================
+- name: project-config
+  type: gcp-types/cloudresourcemanager-v1:projects
+  properties:
+    projectId: ${PROJECT_ID}
+  metadata:
+    dependsOn: []
+
+# ========================================
+# API SERVICES ACTIVATION
+# ========================================
+- name: enable-cloudfunctions-api
+  type: gcp-types/serviceusage-v1:services
+  properties:
+    name: projects/${PROJECT_ID}/services/cloudfunctions.googleapis.com
+    parent: projects/${PROJECT_ID}
+  metadata:
+    dependsOn:
+    - project-config
+
+- name: enable-aiplatform-api
+  type: gcp-types/serviceusage-v1:services
+  properties:
+    name: projects/${PROJECT_ID}/services/aiplatform.googleapis.com
+    parent: projects/${PROJECT_ID}
+  metadata:
+    dependsOn:
+    - project-config
+
+- name: enable-firestore-api
+  type: gcp-types/serviceusage-v1:services
+  properties:
+    name: projects/${PROJECT_ID}/services/firestore.googleapis.com
+    parent: projects/${PROJECT_ID}
+  metadata:
+    dependsOn:
+    - project-config
+
+- name: enable-cloudbuild-api
+  type: gcp-types/serviceusage-v1:services
+  properties:
+    name: projects/${PROJECT_ID}/services/cloudbuild.googleapis.com
+    parent: projects/${PROJECT_ID}
+  metadata:
+    dependsOn:
+    - project-config
+
+- name: enable-logging-api
+  type: gcp-types/serviceusage-v1:services
+  properties:
+    name: projects/${PROJECT_ID}/services/logging.googleapis.com
+    parent: projects/${PROJECT_ID}
+  metadata:
+    dependsOn:
+    - project-config
+
+- name: enable-monitoring-api
+  type: gcp-types/serviceusage-v1:services
+  properties:
+    name: projects/${PROJECT_ID}/services/monitoring.googleapis.com
+    parent: projects/${PROJECT_ID}
+  metadata:
+    dependsOn:
+    - project-config
+
+# ========================================
+# FIRESTORE DATABASE
+# ========================================
+- name: firestore-database
+  type: gcp-types/firestore-v1:projects.databases
+  properties:
+    parent: projects/${PROJECT_ID}
+    databaseId: survey-db
+    type: FIRESTORE_NATIVE
+    locationId: ${REGION}
+    # Enable point-in-time recovery for production workloads
+    pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+    # Enable delete protection to prevent accidental deletion
+    deleteProtectionState: DELETE_PROTECTION_ENABLED
+    # Configure backup settings for data protection
+    appEngineIntegrationMode: DISABLED
+  metadata:
+    dependsOn:
+    - enable-firestore-api
+
+# Firestore security rules for survey analysis collections
+- name: firestore-security-rules
+  type: gcp-types/firestore-v1:projects.databases.documents
+  properties:
+    parent: $(ref.firestore-database.name)
+    documentId: __security_rules__
+    fields:
+      rules:
+        stringValue: |
+          rules_version = '2';
+          service cloud.firestore {
+            match /databases/{database}/documents {
+              // Allow read/write access to survey analyses collection
+              // for authenticated Cloud Functions service account
+              match /survey_analyses/{document=**} {
+                allow read, write: if request.auth != null;
+              }
+              
+              // Allow read-only access to aggregated insights
+              match /insights/{document=**} {
+                allow read: if request.auth != null;
+                allow write: if request.auth != null && 
+                  request.auth.token.service_account_id != null;
+              }
+              
+              // Deny all other access by default
+              match /{document=**} {
+                allow read, write: if false;
+              }
+            }
+          }
+  metadata:
+    dependsOn:
+    - firestore-database
+
+# ========================================
+# IAM SERVICE ACCOUNTS AND ROLES
+# ========================================
+- name: survey-analyzer-sa
+  type: gcp-types/iam-v1:projects.serviceAccounts
+  properties:
+    accountId: survey-analyzer
+    displayName: Survey Analysis Function Service Account
+    description: Service account for Cloud Function survey analysis with Vertex AI and Firestore access
+    serviceAccount:
+      description: Dedicated service account with minimal permissions for survey analysis operations
+  metadata:
+    dependsOn:
+    - project-config
+
+# Grant Vertex AI User role for Gemini API access
+- name: sa-vertexai-binding
+  type: gcp-types/cloudresourcemanager-v1:projects
+  properties:
+    projectId: ${PROJECT_ID}
+    setIamPolicy:
+      policy:
+        bindings:
+        - role: roles/aiplatform.user
+          members:
+          - serviceAccount:$(ref.survey-analyzer-sa.email)
+        - role: roles/ml.developer
+          members:
+          - serviceAccount:$(ref.survey-analyzer-sa.email)
+  metadata:
+    dependsOn:
+    - survey-analyzer-sa
+    - enable-aiplatform-api
+
+# Grant Firestore access for data operations
+- name: sa-firestore-binding
+  type: gcp-types/cloudresourcemanager-v1:projects
+  properties:
+    projectId: ${PROJECT_ID}
+    setIamPolicy:
+      policy:
+        bindings:
+        - role: roles/datastore.user
+          members:
+          - serviceAccount:$(ref.survey-analyzer-sa.email)
+        - role: roles/firestore.databaseAdmin
+          members:
+          - serviceAccount:$(ref.survey-analyzer-sa.email)
+  metadata:
+    dependsOn:
+    - survey-analyzer-sa
+    - firestore-database
+
+# Grant logging permissions for function monitoring
+- name: sa-logging-binding
+  type: gcp-types/cloudresourcemanager-v1:projects
+  properties:
+    projectId: ${PROJECT_ID}
+    setIamPolicy:
+      policy:
+        bindings:
+        - role: roles/logging.logWriter
+          members:
+          - serviceAccount:$(ref.survey-analyzer-sa.email)
+        - role: roles/monitoring.metricWriter
+          members:
+          - serviceAccount:$(ref.survey-analyzer-sa.email)
+  metadata:
+    dependsOn:
+    - survey-analyzer-sa
+    - enable-logging-api
+    - enable-monitoring-api
+
+# ========================================
+# CLOUD STORAGE BUCKET FOR FUNCTION SOURCE
+# ========================================
+- name: function-source-bucket
+  type: gcp-types/storage-v1:buckets
+  properties:
+    name: ${PROJECT_ID}-survey-function-source
+    location: ${REGION}
+    storageClass: REGIONAL
+    # Enable versioning for source code management
+    versioning:
+      enabled: true
+    # Lifecycle management to clean up old versions
+    lifecycle:
+      rule:
+      - action:
+          type: Delete
+        condition:
+          age: 30
+          numNewerVersions: 5
+    # Security settings
+    iamConfiguration:
+      uniformBucketLevelAccess:
+        enabled: true
+    # Encryption settings
+    encryption:
+      defaultKmsKeyName: ""
+    # CORS settings for web access
+    cors:
+    - origin: ["*"]
+      method: ["GET", "POST"]
+      responseHeader: ["Content-Type"]
+      maxAgeSeconds: 3600
+  metadata:
+    dependsOn:
+    - project-config
+
+# Grant Cloud Functions service access to source bucket
+- name: function-bucket-iam
+  type: gcp-types/storage-v1:buckets
+  properties:
+    bucket: $(ref.function-source-bucket.name)
+    setIamPolicy:
+      policy:
+        bindings:
+        - role: roles/storage.objectViewer
+          members:
+          - serviceAccount:$(ref.survey-analyzer-sa.email)
+        - role: roles/storage.legacyBucketReader
+          members:
+          - serviceAccount:$(ref.survey-analyzer-sa.email)
+  metadata:
+    dependsOn:
+    - function-source-bucket
+    - survey-analyzer-sa
+
+# ========================================
+# CLOUD FUNCTION FOR SURVEY ANALYSIS
+# ========================================
+- name: survey-analyzer-function
+  type: gcp-types/cloudfunctions-v1:projects.locations.functions
+  properties:
+    location: projects/${PROJECT_ID}/locations/${REGION}
+    functionId: survey-analyzer-${RANDOM_SUFFIX}
+    function:
+      name: projects/${PROJECT_ID}/locations/${REGION}/functions/survey-analyzer-${RANDOM_SUFFIX}
+      description: AI-powered survey analysis using Vertex AI Gemini and Firestore
+      # Source code configuration
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/function-source.zip
+      # Runtime configuration
+      runtime: python312
+      entryPoint: analyze_survey
+      # Resource allocation
+      availableMemoryMb: 1024
+      timeout: 300s
+      maxInstances: 100
+      minInstances: 0
+      # HTTP trigger configuration
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+        url: ""
+      # Environment variables
+      environmentVariables:
+        GCP_PROJECT: ${PROJECT_ID}
+        FIRESTORE_DATABASE: survey-db
+        GEMINI_MODEL: gemini-1.5-flash
+        LOG_LEVEL: INFO
+      # Service account
+      serviceAccountEmail: $(ref.survey-analyzer-sa.email)
+      # VPC connector (optional for private resources)
+      # vpcConnector: ""
+      # vpcConnectorEgressSettings: PRIVATE_RANGES_ONLY
+      # Ingress settings for security
+      ingressSettings: ALLOW_ALL
+      # Labels for resource management
+      labels:
+        application: survey-analysis
+        environment: production
+        component: ai-processor
+        version: v1-1
+        cost-center: analytics
+  metadata:
+    dependsOn:
+    - enable-cloudfunctions-api
+    - enable-cloudbuild-api
+    - survey-analyzer-sa
+    - firestore-database
+    - function-source-bucket
+    - sa-vertexai-binding
+    - sa-firestore-binding
+    - sa-logging-binding
+
+# Make Cloud Function publicly accessible (remove for production)
+- name: function-iam-invoker
+  type: gcp-types/cloudfunctions-v1:projects.locations.functions
+  properties:
+    name: $(ref.survey-analyzer-function.name)
+    setIamPolicy:
+      policy:
+        bindings:
+        - role: roles/cloudfunctions.invoker
+          members:
+          - allUsers
+        version: 1
+  metadata:
+    dependsOn:
+    - survey-analyzer-function
+
+# ========================================
+# MONITORING AND ALERTING
+# ========================================
+- name: function-error-alert-policy
+  type: gcp-types/monitoring-v1:projects.alertPolicies
+  properties:
+    parent: projects/${PROJECT_ID}
+    alertPolicy:
+      displayName: Survey Function Error Rate Alert
+      documentation:
+        content: |
+          This alert triggers when the survey analysis function has a high error rate,
+          indicating potential issues with AI processing or data storage operations.
+        mimeType: text/markdown
+      # Alert conditions
+      conditions:
+      - displayName: Function Error Rate
+        conditionThreshold:
+          filter: resource.type="cloud_function" resource.label.function_name="survey-analyzer-${RANDOM_SUFFIX}"
+          comparison: COMPARISON_GREATER_THAN
+          thresholdValue: 0.1
+          duration: 300s
+          aggregations:
+          - alignmentPeriod: 300s
+            perSeriesAligner: ALIGN_RATE
+            crossSeriesReducer: REDUCE_MEAN
+            groupByFields:
+            - resource.label.function_name
+      # Notification channels (configure as needed)
+      notificationChannels: []
+      # Alert policy settings
+      enabled: true
+      combiner: OR
+  metadata:
+    dependsOn:
+    - survey-analyzer-function
+    - enable-monitoring-api
+
+# Function latency monitoring
+- name: function-latency-alert-policy
+  type: gcp-types/monitoring-v1:projects.alertPolicies
+  properties:
+    parent: projects/${PROJECT_ID}
+    alertPolicy:
+      displayName: Survey Function High Latency Alert
+      documentation:
+        content: |
+          This alert triggers when survey analysis function latency exceeds acceptable thresholds,
+          which may indicate Gemini API performance issues or resource constraints.
+        mimeType: text/markdown
+      conditions:
+      - displayName: Function Latency
+        conditionThreshold:
+          filter: resource.type="cloud_function" resource.label.function_name="survey-analyzer-${RANDOM_SUFFIX}"
+          comparison: COMPARISON_GREATER_THAN
+          thresholdValue: 30000
+          duration: 600s
+          aggregations:
+          - alignmentPeriod: 300s
+            perSeriesAligner: ALIGN_MEAN
+            crossSeriesReducer: REDUCE_MEAN
+            groupByFields:
+            - resource.label.function_name
+      notificationChannels: []
+      enabled: true
+      combiner: OR
+  metadata:
+    dependsOn:
+    - survey-analyzer-function
+    - enable-monitoring-api
+
+# ========================================
+# LOGGING CONFIGURATION
+# ========================================
+- name: function-log-sink
+  type: gcp-types/logging-v2:projects.sinks
+  properties:
+    parent: projects/${PROJECT_ID}
+    sinkId: survey-function-logs
+    sink:
+      name: projects/${PROJECT_ID}/sinks/survey-function-logs
+      description: Centralized logging for survey analysis function
+      destination: storage.googleapis.com/$(ref.function-source-bucket.name)/logs
+      filter: |
+        resource.type="cloud_function"
+        resource.labels.function_name="survey-analyzer-${RANDOM_SUFFIX}"
+        (severity>=ERROR OR textPayload:"error" OR textPayload:"Error")
+      # Include all children logs
+      includeChildren: true
+      # Writer identity for log export
+      writerIdentity: ""
+  metadata:
+    dependsOn:
+    - survey-analyzer-function
+    - function-source-bucket
+    - enable-logging-api
+
+# ========================================
+# SECURITY AND COMPLIANCE
+# ========================================
+# Security scan configuration for function
+- name: function-security-policy
+  type: gcp-types/cloudresourcemanager-v1:projects
+  properties:
+    projectId: ${PROJECT_ID}
+    setIamPolicy:
+      policy:
+        bindings:
+        # Restrict access to security-sensitive operations
+        - role: roles/cloudfunctions.admin
+          members:
+          - group:gcp-security-team@${ORGANIZATION_DOMAIN}
+        # Allow developers read access for debugging
+        - role: roles/cloudfunctions.viewer
+          members:
+          - group:developers@${ORGANIZATION_DOMAIN}
+        # Grant monitoring access for operations team
+        - role: roles/monitoring.viewer
+          members:
+          - group:operations@${ORGANIZATION_DOMAIN}
+        version: 1
+  metadata:
+    dependsOn:
+    - survey-analyzer-function
+
+# ========================================
+# OUTPUTS AND REFERENCES
+# ========================================
+outputs:
+- name: function_url
+  value: $(ref.survey-analyzer-function.httpsTrigger.url)
+  description: HTTP trigger URL for the survey analysis function
+
+- name: function_name
+  value: $(ref.survey-analyzer-function.name)
+  description: Full resource name of the deployed Cloud Function
+
+- name: firestore_database
+  value: $(ref.firestore-database.name)
+  description: Firestore database name for survey data storage
+
+- name: service_account_email
+  value: $(ref.survey-analyzer-sa.email)
+  description: Service account email for the survey analysis function
+
+- name: storage_bucket
+  value: $(ref.function-source-bucket.name)
+  description: Cloud Storage bucket for function source code and logs
+
+- name: project_id
+  value: ${PROJECT_ID}
+  description: Google Cloud project ID where resources are deployed
+
+- name: region
+  value: ${REGION}
+  description: Google Cloud region where resources are deployed
+
+- name: function_service_account
+  value: $(ref.survey-analyzer-sa.email)
+  description: Service account used by the Cloud Function for authentication
+
+- name: firestore_database_id
+  value: survey-db
+  description: Firestore database identifier for application configuration
+
+- name: deployment_status
+  value: complete
+  description: Infrastructure deployment status indicator
+
+# ========================================
+# METADATA AND TAGS
+# ========================================
+metadata:
+  # Deployment information
+  version: "1.1"
+  description: "Smart Survey Analysis infrastructure with Vertex AI Gemini and Cloud Functions"
+  recipe_id: "a4b9c2e7"
+  category: "ai-ml"
+  difficulty: 200
+  estimated_cost: "$5-15 for tutorial completion"
+  
+  # Resource tagging
+  labels:
+    application: survey-analysis
+    version: v1-1
+    environment: production
+    component: infrastructure
+    cost-center: analytics
+    data-classification: internal
+    backup-policy: standard
+    monitoring-level: enhanced
+    
+  # Dependencies and requirements
+  dependencies:
+  - vertex-ai-api
+  - cloud-functions-api
+  - firestore-api
+  - cloud-build-api
+  - logging-api
+  - monitoring-api
+  
+  # Compliance and security
+  compliance:
+    data_residency: ${REGION}
+    encryption_at_rest: enabled
+    encryption_in_transit: enabled
+    audit_logging: enabled
+    access_control: rbac
+    
+  # Operational information
+  maintenance:
+    backup_frequency: daily
+    update_schedule: monthly
+    monitoring_frequency: realtime
+    cost_optimization: enabled

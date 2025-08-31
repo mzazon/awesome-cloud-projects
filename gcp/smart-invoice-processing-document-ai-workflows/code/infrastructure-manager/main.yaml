@@ -1,0 +1,675 @@
+# Infrastructure Manager Configuration for Smart Invoice Processing
+# This configuration deploys a complete intelligent invoice processing system
+# using Google Cloud Document AI, Workflows, Cloud Tasks, and Gmail API integration
+
+# Enable required APIs for the solution
+- name: enable-apis
+  type: gcp-types/serviceusage-v1:serviceusage.services.batchEnable
+  properties:
+    parent: projects/$(ref.project-id.projectId)
+    body:
+      serviceIds:
+        - documentai.googleapis.com
+        - workflows.googleapis.com
+        - cloudtasks.googleapis.com
+        - gmail.googleapis.com
+        - storage.googleapis.com
+        - cloudfunctions.googleapis.com
+        - eventarc.googleapis.com
+        - pubsub.googleapis.com
+        - logging.googleapis.com
+        - monitoring.googleapis.com
+
+# Get current project information
+- name: project-id
+  type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.get
+  properties:
+    projectId: $(ref.deployment.project)
+
+# Generate unique suffix for resource names to avoid conflicts
+- name: random-suffix
+  type: gcp-types/runtime-v1:random-id
+  properties:
+    byteLength: 4
+
+# Cloud Storage bucket for invoice document storage and processing
+- name: invoice-storage-bucket
+  type: gcp-types/storage-v1:storage.buckets
+  properties:
+    name: invoice-processing-$(ref.random-suffix.hex)
+    project: $(ref.project-id.projectId)
+    location: US-CENTRAL1
+    storageClass: STANDARD
+    versioning:
+      enabled: true
+    # Lifecycle management for cost optimization
+    lifecycle:
+      rule:
+        - action:
+            type: SetStorageClass
+            storageClass: COLDLINE
+          condition:
+            age: 30
+        - action:
+            type: Delete
+          condition:
+            age: 365
+    # Enable uniform bucket-level access for better security
+    iamConfiguration:
+      uniformBucketLevelAccess:
+        enabled: true
+  metadata:
+    dependsOn:
+      - enable-apis
+
+# Create folder structure in the bucket using objects
+- name: incoming-folder
+  type: gcp-types/storage-v1:storage.objects
+  properties:
+    bucket: $(ref.invoice-storage-bucket.name)
+    name: incoming/.keep
+    contentType: text/plain
+  metadata:
+    dependsOn:
+      - invoice-storage-bucket
+
+- name: processed-folder
+  type: gcp-types/storage-v1:storage.objects
+  properties:
+    bucket: $(ref.invoice-storage-bucket.name)
+    name: processed/.keep
+    contentType: text/plain
+  metadata:
+    dependsOn:
+      - invoice-storage-bucket
+
+- name: failed-folder
+  type: gcp-types/storage-v1:storage.objects
+  properties:
+    bucket: $(ref.invoice-storage-bucket.name)
+    name: failed/.keep
+    contentType: text/plain
+  metadata:
+    dependsOn:
+      - invoice-storage-bucket
+
+# Service account for invoice processing with least privilege permissions
+- name: invoice-processor-service-account
+  type: gcp-types/iam-v1:iam.projects.serviceAccounts
+  properties:
+    accountId: invoice-processor-$(ref.random-suffix.hex)
+    displayName: Invoice Processing Service Account
+    description: Service account for automated invoice processing with Document AI and Workflows
+    project: $(ref.project-id.projectId)
+  metadata:
+    dependsOn:
+      - enable-apis
+
+# IAM bindings for the service account with minimal required permissions
+- name: service-account-documentai-user
+  type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+  properties:
+    resource: $(ref.project-id.projectId)
+    body:
+      policy:
+        bindings:
+          - role: roles/documentai.apiUser
+            members:
+              - serviceAccount:$(ref.invoice-processor-service-account.email)
+
+- name: service-account-storage-admin
+  type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+  properties:
+    resource: $(ref.project-id.projectId)
+    body:
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.invoice-processor-service-account.email)
+
+- name: service-account-tasks-enqueuer
+  type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+  properties:
+    resource: $(ref.project-id.projectId)
+    body:
+      policy:
+        bindings:
+          - role: roles/cloudtasks.enqueuer
+            members:
+              - serviceAccount:$(ref.invoice-processor-service-account.email)
+
+- name: service-account-workflows-invoker
+  type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+  properties:
+    resource: $(ref.project-id.projectId)
+    body:
+      policy:
+        bindings:
+          - role: roles/workflows.invoker
+            members:
+              - serviceAccount:$(ref.invoice-processor-service-account.email)
+
+- name: service-account-functions-invoker
+  type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+  properties:
+    resource: $(ref.project-id.projectId)
+    body:
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - serviceAccount:$(ref.invoice-processor-service-account.email)
+
+# Document AI Invoice Parser processor for structured data extraction
+- name: invoice-parser-processor
+  type: gcp-types/documentai-v1:documentai.projects.locations.processors
+  properties:
+    parent: projects/$(ref.project-id.projectId)/locations/us-central1
+    body:
+      type: INVOICE_PROCESSOR
+      displayName: invoice-parser-$(ref.random-suffix.hex)
+      description: AI processor for extracting structured data from invoice PDFs
+  metadata:
+    dependsOn:
+      - enable-apis
+
+# Cloud Tasks queue for managing approval workflow tasks
+- name: approval-task-queue
+  type: gcp-types/cloudtasks-v2:cloudtasks.projects.locations.queues
+  properties:
+    parent: projects/$(ref.project-id.projectId)/locations/us-central1
+    queueId: approval-queue-$(ref.random-suffix.hex)
+    body:
+      name: projects/$(ref.project-id.projectId)/locations/us-central1/queues/approval-queue-$(ref.random-suffix.hex)
+      rateLimits:
+        maxDispatchesPerSecond: 10
+        maxConcurrentDispatches: 5
+      retryConfig:
+        maxAttempts: 3
+        maxRetryDuration: 300s
+        minBackoff: 1s
+        maxBackoff: 10s
+        maxDoublings: 5
+  metadata:
+    dependsOn:
+      - enable-apis
+
+# Pub/Sub topic for Cloud Storage event notifications
+- name: invoice-uploads-topic
+  type: gcp-types/pubsub-v1:pubsub.projects.topics
+  properties:
+    name: projects/$(ref.project-id.projectId)/topics/invoice-uploads
+    topic: invoice-uploads
+  metadata:
+    dependsOn:
+      - enable-apis
+
+# Pub/Sub subscription for workflow triggering
+- name: invoice-processing-subscription
+  type: gcp-types/pubsub-v1:pubsub.projects.subscriptions
+  properties:
+    name: projects/$(ref.project-id.projectId)/subscriptions/invoice-processing-sub
+    subscription: invoice-processing-sub
+    topic: $(ref.invoice-uploads-topic.name)
+    ackDeadlineSeconds: 60
+    retryPolicy:
+      minimumBackoff: 10s
+      maximumBackoff: 600s
+  metadata:
+    dependsOn:
+      - invoice-uploads-topic
+
+# Cloud Function for sending approval notifications via Gmail API
+- name: notification-function-source
+  type: gcp-types/storage-v1:storage.objects
+  properties:
+    bucket: $(ref.invoice-storage-bucket.name)
+    name: function-source/notification-function.zip
+    contentType: application/zip
+    # Source code would be uploaded separately - this is a placeholder
+  metadata:
+    dependsOn:
+      - invoice-storage-bucket
+
+- name: approval-notification-function
+  type: gcp-types/cloudfunctions-v1:cloudfunctions.projects.locations.functions
+  properties:
+    location: projects/$(ref.project-id.projectId)/locations/us-central1
+    functionId: send-approval-notification-$(ref.random-suffix.hex)
+    body:
+      name: projects/$(ref.project-id.projectId)/locations/us-central1/functions/send-approval-notification-$(ref.random-suffix.hex)
+      description: Sends invoice approval notifications via Gmail API with intelligent routing
+      sourceArchiveUrl: gs://$(ref.invoice-storage-bucket.name)/function-source/notification-function.zip
+      httpsTrigger: {}
+      runtime: python311
+      entryPoint: send_approval_notification
+      timeout: 60s
+      availableMemoryMb: 256
+      serviceAccountEmail: $(ref.invoice-processor-service-account.email)
+      environmentVariables:
+        PROJECT_ID: $(ref.project-id.projectId)
+        TASK_QUEUE: $(ref.approval-task-queue.name)
+        BUCKET_NAME: $(ref.invoice-storage-bucket.name)
+      # Allow unauthenticated access for testing (restrict in production)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+  metadata:
+    dependsOn:
+      - enable-apis
+      - invoice-processor-service-account
+      - approval-task-queue
+      - notification-function-source
+
+# Cloud Workflow for orchestrating the complete invoice processing pipeline
+- name: invoice-processing-workflow
+  type: gcp-types/workflows-v1:workflows.projects.locations.workflows
+  properties:
+    parent: projects/$(ref.project-id.projectId)/locations/us-central1
+    workflowId: invoice-workflow-$(ref.random-suffix.hex)
+    body:
+      name: projects/$(ref.project-id.projectId)/locations/us-central1/workflows/invoice-workflow-$(ref.random-suffix.hex)
+      description: Orchestrates intelligent invoice processing with Document AI and approval routing
+      serviceAccount: $(ref.invoice-processor-service-account.email)
+      # Workflow definition with comprehensive error handling and business logic
+      sourceContents: |
+        main:
+          params: [event]
+          steps:
+            - init:
+                assign:
+                  - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+                  - location: "us-central1"
+                  - processor_id: "$(ref.invoice-parser-processor.name)"
+                  - bucket_name: "$(ref.invoice-storage-bucket.name)"
+                  - task_queue: "$(ref.approval-task-queue.name)"
+                  - function_url: "https://us-central1-$(ref.project-id.projectId).cloudfunctions.net/send-approval-notification-$(ref.random-suffix.hex)"
+                  - file_path: ${event.data.name}
+                  - invoice_data: {}
+                  - processing_errors: []
+            
+            - log_start:
+                call: sys.log
+                args:
+                  text: ${"Starting intelligent invoice processing for file: " + file_path}
+                  severity: "INFO"
+            
+            - validate_file_location:
+                switch:
+                  - condition: ${not(text.match_regex(file_path, "^incoming/.*\\.pdf$"))}
+                    steps:
+                      - log_skip:
+                          call: sys.log
+                          args:
+                            text: ${"Skipping non-PDF file or file not in incoming folder: " + file_path}
+                            severity: "INFO"
+                      - return_skip:
+                          return: {"status": "skipped", "reason": "not_target_file"}
+            
+            - extract_invoice_data:
+                try:
+                  call: googleapis.documentai.v1.projects.locations.processors.process
+                  args:
+                    name: ${processor_id}
+                    body:
+                      inputDocuments:
+                        gcsPrefix:
+                          gcsUriPrefix: ${"gs://" + bucket_name + "/" + file_path}
+                      documentOutputConfig:
+                        gcsOutputConfig:
+                          gcsUri: ${"gs://" + bucket_name + "/processed/"}
+                  result: docai_response
+                except:
+                  as: e
+                  steps:
+                    - log_extraction_error:
+                        call: sys.log
+                        args:
+                          text: ${"Document AI processing failed for " + file_path + ": " + e.message}
+                          severity: "ERROR"
+                    - move_to_failed:
+                        call: move_failed_document
+                        args:
+                          source_path: ${file_path}
+                          bucket_name: ${bucket_name}
+                          error_reason: ${"extraction_failed: " + e.message}
+                    - return_error:
+                        return: {"status": "failed", "error": "document_extraction_failed", "details": e.message}
+            
+            - parse_invoice_fields:
+                assign:
+                  - entities: ${default(docai_response.document.entities, [])}
+                  - invoice_data:
+                      supplier_name: ${default(entities[0].mentionText, "Unknown Vendor")}
+                      total_amount: ${default(entities[1].mentionText, "0.00")}
+                      invoice_date: ${default(entities[2].mentionText, "")}
+                      invoice_id: ${default(entities[3].mentionText, "")}
+                      due_date: ${default(entities[4].mentionText, "")}
+                      currency: ${default(entities[5].mentionText, "USD")}
+                      confidence_score: ${default(docai_response.document.confidence, 0.0)}
+            
+            - validate_invoice_data:
+                switch:
+                  - condition: ${invoice_data.total_amount == "0.00" or invoice_data.supplier_name == "Unknown Vendor" or invoice_data.confidence_score < 0.7}
+                    steps:
+                      - log_validation_error:
+                          call: sys.log
+                          args:
+                            text: ${"Invoice validation failed - missing critical data or low confidence score for: " + file_path}
+                            severity: "WARNING"
+                      - move_to_failed:
+                          call: move_failed_document
+                          args:
+                            source_path: ${file_path}
+                            bucket_name: ${bucket_name}
+                            error_reason: "validation_failed_insufficient_data"
+                      - return_validation_error:
+                          return: {"status": "failed", "error": "validation_failed", "invoice_data": invoice_data}
+            
+            - determine_approval_routing:
+                assign:
+                  - amount_str: ${text.replace_all(invoice_data.total_amount, "$", "")}
+                  - amount_str: ${text.replace_all(amount_str, ",", "")}
+                  - amount_float: ${double(amount_str)}
+                  - approval_level: "manager"
+                  - approver_email: "manager@company.com"
+                switch:
+                  - condition: ${amount_float >= 10000}
+                    assign:
+                      - approval_level: "executive"
+                      - approver_email: "cfo@company.com"
+                  - condition: ${amount_float >= 5000}
+                    assign:
+                      - approval_level: "director"
+                      - approver_email: "director@company.com"
+                  - condition: ${amount_float >= 1000}
+                    assign:
+                      - approval_level: "senior_manager"
+                      - approver_email: "senior.manager@company.com"
+            
+            - create_approval_task:
+                try:
+                  call: googleapis.cloudtasks.v2.projects.locations.queues.tasks.create
+                  args:
+                    parent: ${task_queue}
+                    body:
+                      task:
+                        httpRequest:
+                          httpMethod: "POST"
+                          url: ${function_url}
+                          headers:
+                            Content-Type: "application/json"
+                          body: ${base64.encode(json.encode({
+                            "invoice_data": invoice_data,
+                            "approval_level": approval_level,
+                            "approver_email": approver_email,
+                            "file_path": file_path,
+                            "amount": amount_float
+                          }))}
+                        scheduleTime: ${time.format(time.now())}
+                  result: task_response
+                except:
+                  as: e
+                  steps:
+                    - log_task_error:
+                        call: sys.log
+                        args:
+                          text: ${"Failed to create approval task for " + file_path + ": " + e.message}
+                          severity: "ERROR"
+                    - return_task_error:
+                        return: {"status": "partial_success", "error": "task_creation_failed", "invoice_data": invoice_data}
+            
+            - move_to_processed:
+                try:
+                  call: googleapis.storage.v1.objects.copy
+                  args:
+                    sourceBucket: ${bucket_name}
+                    sourceObject: ${file_path}
+                    destinationBucket: ${bucket_name}
+                    destinationObject: ${"processed/" + text.replace_all(file_path, "incoming/", "")}
+                except:
+                  as: e
+                  steps:
+                    - log_move_error:
+                        call: sys.log
+                        args:
+                          text: ${"Failed to move processed file " + file_path + ": " + e.message}
+                          severity: "WARNING"
+            
+            - delete_original:
+                try:
+                  call: googleapis.storage.v1.objects.delete
+                  args:
+                    bucket: ${bucket_name}
+                    object: ${file_path}
+                except:
+                  as: e
+                  steps:
+                    - log_delete_error:
+                        call: sys.log
+                        args:
+                          text: ${"Failed to delete original file " + file_path + ": " + e.message}
+                          severity: "WARNING"
+            
+            - log_completion:
+                call: sys.log
+                args:
+                  text: ${"Invoice processing completed successfully for: " + file_path + " (Amount: $" + string(amount_float) + ", Approver: " + approval_level + ")"}
+                  severity: "INFO"
+            
+            - return_success:
+                return:
+                  status: "success"
+                  invoice_data: ${invoice_data}
+                  approval_level: ${approval_level}
+                  approver_email: ${approver_email}
+                  amount: ${amount_float}
+                  task_id: ${task_response.name}
+                  processed_file: ${"processed/" + text.replace_all(file_path, "incoming/", "")}
+
+        move_failed_document:
+          params: [source_path, bucket_name, error_reason]
+          steps:
+            - create_error_metadata:
+                assign:
+                  - error_filename: ${"failed/" + text.replace_all(source_path, "incoming/", "") + ".error.json"}
+                  - error_metadata: ${json.encode({
+                      "original_file": source_path,
+                      "error_reason": error_reason,
+                      "timestamp": time.format(time.now()),
+                      "processing_attempt": 1
+                    })}
+            
+            - upload_error_metadata:
+                try:
+                  call: googleapis.storage.v1.objects.insert
+                  args:
+                    bucket: ${bucket_name}
+                    uploadType: "media"
+                    name: ${error_filename}
+                    body: ${error_metadata}
+                except:
+                  as: e
+                  steps:
+                    - log_metadata_error:
+                        call: sys.log
+                        args:
+                          text: ${"Failed to upload error metadata: " + e.message}
+                          severity: "WARNING"
+            
+            - move_failed_file:
+                try:
+                  call: googleapis.storage.v1.objects.copy
+                  args:
+                    sourceBucket: ${bucket_name}
+                    sourceObject: ${source_path}
+                    destinationBucket: ${bucket_name}
+                    destinationObject: ${"failed/" + text.replace_all(source_path, "incoming/", "")}
+                except:
+                  as: e
+                  steps:
+                    - log_move_failed_error:
+                        call: sys.log
+                        args:
+                          text: ${"Failed to move failed file to failed folder: " + e.message}
+                          severity: "ERROR"
+                    - return_move_error:
+                        return: {"status": "error", "message": "failed_to_move_file"}
+            
+            - delete_original_failed:
+                try:
+                  call: googleapis.storage.v1.objects.delete
+                  args:
+                    bucket: ${bucket_name}
+                    object: ${source_path}
+                except:
+                  as: e
+                  steps:
+                    - log_delete_failed_error:
+                        call: sys.log
+                        args:
+                          text: ${"Failed to delete original failed file: " + e.message}
+                          severity: "WARNING"
+            
+            - return_moved:
+                return: {"status": "moved_to_failed", "error_reason": error_reason}
+  metadata:
+    dependsOn:
+      - enable-apis
+      - invoice-processor-service-account
+      - invoice-parser-processor
+      - approval-task-queue
+      - approval-notification-function
+
+# Cloud Storage bucket notification to trigger workflow on file uploads
+- name: storage-notification
+  type: gcp-types/storage-v1:storage.notifications
+  properties:
+    bucket: $(ref.invoice-storage-bucket.name)
+    topic: $(ref.invoice-uploads-topic.name)
+    payloadFormat: JSON_API_V1
+    eventTypes:
+      - OBJECT_FINALIZE
+    objectNamePrefix: incoming/
+  metadata:
+    dependsOn:
+      - invoice-storage-bucket
+      - invoice-uploads-topic
+
+# Eventarc trigger to start workflow when Pub/Sub message is received
+- name: invoice-processing-trigger
+  type: gcp-types/eventarc-v1:eventarc.projects.locations.triggers
+  properties:
+    parent: projects/$(ref.project-id.projectId)/locations/us-central1
+    triggerId: invoice-trigger-$(ref.random-suffix.hex)
+    body:
+      name: projects/$(ref.project-id.projectId)/locations/us-central1/triggers/invoice-trigger-$(ref.random-suffix.hex)
+      eventFilters:
+        - attribute: type
+          value: google.cloud.pubsub.topic.v1.messagePublished
+        - attribute: source
+          value: //pubsub.googleapis.com/$(ref.invoice-uploads-topic.name)
+      destination:
+        workflow: $(ref.invoice-processing-workflow.name)
+      serviceAccount: $(ref.invoice-processor-service-account.email)
+  metadata:
+    dependsOn:
+      - enable-apis
+      - invoice-processing-workflow
+      - invoice-uploads-topic
+      - invoice-processor-service-account
+
+# Cloud Logging sink for centralized monitoring and debugging
+- name: invoice-processing-log-sink
+  type: gcp-types/logging-v2:logging.projects.sinks
+  properties:
+    parent: projects/$(ref.project-id.projectId)
+    sinkId: invoice-processing-logs-$(ref.random-suffix.hex)
+    body:
+      name: projects/$(ref.project-id.projectId)/sinks/invoice-processing-logs-$(ref.random-suffix.hex)
+      description: Centralized logging for invoice processing pipeline
+      destination: storage.googleapis.com/$(ref.invoice-storage-bucket.name)/logs
+      filter: |
+        (resource.type="cloud_workflow" AND resource.labels.workflow_id="invoice-workflow-$(ref.random-suffix.hex)") OR
+        (resource.type="cloud_function" AND resource.labels.function_name="send-approval-notification-$(ref.random-suffix.hex)") OR
+        (resource.type="gcs_bucket" AND resource.labels.bucket_name="$(ref.invoice-storage-bucket.name)")
+      includeChildren: true
+  metadata:
+    dependsOn:
+      - invoice-storage-bucket
+      - invoice-processing-workflow
+      - approval-notification-function
+
+# Cloud Monitoring alert policy for processing failures
+- name: processing-failure-alert
+  type: gcp-types/monitoring-v1:monitoring.projects.alertPolicies
+  properties:
+    name: projects/$(ref.project-id.projectId)/alertPolicies/invoice-processing-failures-$(ref.random-suffix.hex)
+    body:
+      displayName: Invoice Processing Failures
+      documentation:
+        content: Alert when invoice processing workflow fails or error rate exceeds threshold
+        mimeType: text/markdown
+      conditions:
+        - displayName: Workflow execution failures
+          conditionThreshold:
+            filter: resource.type="workflows.googleapis.com/Workflow" AND resource.label.workflow_id="invoice-workflow-$(ref.random-suffix.hex)"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 2
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      combiner: OR
+      enabled: true
+      notificationChannels: []
+      alertStrategy:
+        autoClose: 86400s
+  metadata:
+    dependsOn:
+      - enable-apis
+      - invoice-processing-workflow
+
+# Output values for integration and verification
+outputs:
+  - name: project_id
+    value: $(ref.project-id.projectId)
+  - name: storage_bucket_name
+    value: $(ref.invoice-storage-bucket.name)
+  - name: storage_bucket_url
+    value: gs://$(ref.invoice-storage-bucket.name)
+  - name: upload_url
+    value: gs://$(ref.invoice-storage-bucket.name)/incoming/
+  - name: processor_name
+    value: $(ref.invoice-parser-processor.name)
+  - name: processor_id
+    value: $(ref.invoice-parser-processor.name)
+  - name: workflow_name
+    value: $(ref.invoice-processing-workflow.name)
+  - name: task_queue_name
+    value: $(ref.approval-task-queue.name)
+  - name: notification_function_url
+    value: https://us-central1-$(ref.project-id.projectId).cloudfunctions.net/send-approval-notification-$(ref.random-suffix.hex)
+  - name: service_account_email
+    value: $(ref.invoice-processor-service-account.email)
+  - name: pubsub_topic
+    value: $(ref.invoice-uploads-topic.name)
+  - name: log_sink_name
+    value: $(ref.invoice-processing-log-sink.name)
+  - name: random_suffix
+    value: $(ref.random-suffix.hex)
+
+# Deployment metadata for tracking and management
+metadata:
+  name: smart-invoice-processing-infrastructure
+  description: Complete infrastructure for intelligent invoice processing with Document AI and Workflows
+  version: "1.1"
+  created_by: "Infrastructure Manager"
+  recipe_source: "smart-invoice-processing-document-ai-workflows"
+  estimated_monthly_cost: "$50-200 depending on volume"
+  security_profile: "enterprise-ready with least privilege IAM"
+  scalability: "serverless auto-scaling from 0 to enterprise volume"

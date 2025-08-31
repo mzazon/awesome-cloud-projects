@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Deployment Stacks, Azure Update Manager, Azure Resource Manager, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: infrastructure, lifecycle, deployment, patching, automation, governance
 recipe-generator-version: 1.3
@@ -400,19 +400,13 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_WORKSPACE}"
        --resource-name ${MAINTENANCE_CONFIG_NAME} \
        --location ${LOCATION} \
        --maintenance-scope InGuestPatch \
-       --recurring-schedules '[{
-         "frequency": "Week",
-         "interval": 1,
-         "startTime": "2024-01-01 02:00",
-         "timeZone": "UTC",
-         "duration": "03:00",
-         "daysOfWeek": ["Sunday"]
-       }]' \
+       --maintenance-window-duration "03:00" \
+       --maintenance-window-recur-every "Week Sunday" \
+       --maintenance-window-start-date-time "2025-07-28 02:00" \
+       --maintenance-window-time-zone "UTC" \
        --reboot-setting IfRequired \
-       --windows-classifications-to-include Critical Security \
-       --linux-classifications-to-include Critical Security \
-       --install-patches-linux-parameters packageNameMasksToInclude='*' \
-       --install-patches-windows-parameters classificationsToInclude='Critical,Security'
+       --linux-parameters packageNameMasksToInclude='*' \
+       --windows-parameters classificationsToInclude='Critical,Security'
 
    echo "✅ Maintenance configuration created: ${MAINTENANCE_CONFIG_NAME}"
    ```
@@ -435,8 +429,9 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_WORKSPACE}"
    az maintenance assignment create \
        --resource-group ${RESOURCE_GROUP} \
        --resource-name maintenance-assignment-vmss \
-       --resource-type Microsoft.Compute/virtualMachineScaleSets \
-       --resource-id "${VMSS_RESOURCE_ID}" \
+       --resource-type virtualMachineScaleSets \
+       --provider-name Microsoft.Compute \
+       --configuration-assignment-name ${MAINTENANCE_CONFIG_NAME} \
        --maintenance-configuration-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Maintenance/maintenanceConfigurations/${MAINTENANCE_CONFIG_NAME}"
 
    echo "✅ Maintenance assignment created for VMSS resources"
@@ -622,7 +617,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_WORKSPACE}"
        --query ipAddress --output tsv)
 
    # Test web server accessibility
-   curl -I http://${LB_IP} || echo "Web server not yet accessible"
+   curl -I "http://${LB_IP}" || echo "Web server not yet accessible"
    
    echo "Load balancer IP: ${LB_IP}"
    ```
@@ -742,4 +737,9 @@ Extend this infrastructure lifecycle management solution by implementing these e
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

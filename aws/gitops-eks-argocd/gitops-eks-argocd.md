@@ -4,12 +4,12 @@ id: f1c7e4b9
 category: devops
 difficulty: 300
 subject: aws
-services: eks,argocd,codecommit
+services: EKS, ArgoCD, CodeCommit, ALB
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops,gitops,eks,argocd,kubernetes,continuous-deployment
 recipe-generator-version: 1.3
@@ -63,7 +63,7 @@ graph TB
     
     style ARGOCD fill:#FF6B6B
     style REPO fill:#4ECDC4
-    style EKS fill:#45B7D1
+    style APP fill:#45B7D1
 ```
 
 ## Prerequisites
@@ -74,7 +74,7 @@ graph TB
 4. eksctl installed (version 0.140.0 or later)
 5. Helm CLI installed (version 3.8 or later)
 6. Basic understanding of Kubernetes concepts and YAML manifests
-7. Estimated cost: $0.20/hour for EKS control plane + $0.05/hour per worker node
+7. Estimated cost: $0.10/hour for EKS control plane + $0.05/hour per worker node
 
 > **Note**: EKS clusters incur charges for the control plane even when no workloads are running. Plan accordingly for cost management.
 
@@ -178,9 +178,10 @@ echo "✅ Environment prepared for GitOps workflow setup"
    Exposing ArgoCD through an Application Load Balancer provides secure, scalable access to the ArgoCD web interface and API. ALB integration with EKS enables SSL termination, path-based routing, and integration with AWS security services for enterprise-grade access control.
 
    ```bash
-   # Install AWS Load Balancer Controller
-   curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.5.4/docs/install/iam_policy.json
+   # Download latest AWS Load Balancer Controller IAM policy
+   curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.13.3/docs/install/iam_policy.json
    
+   # Create IAM policy for Load Balancer Controller
    aws iam create-policy \
        --policy-name AWSLoadBalancerControllerIAMPolicy \
        --policy-document file://iam_policy.json
@@ -226,6 +227,7 @@ echo "✅ Environment prepared for GitOps workflow setup"
        alb.ingress.kubernetes.io/target-type: ip
        alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
        alb.ingress.kubernetes.io/ssl-redirect: '443'
+       alb.ingress.kubernetes.io/backend-protocol: HTTPS
    spec:
      rules:
      - http:
@@ -236,14 +238,14 @@ echo "✅ Environment prepared for GitOps workflow setup"
              service:
                name: argocd-server
                port:
-                 number: 80
+                 number: 443
    EOF
    
    # Apply the Ingress
    kubectl apply -f argocd-ingress.yaml
    
-   # Get ALB hostname
-   sleep 60
+   # Wait for ALB to be provisioned
+   sleep 90
    ALB_HOSTNAME=$(kubectl get ingress argocd-server-ingress \
        -n ${NAMESPACE} \
        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
@@ -268,8 +270,8 @@ echo "✅ Environment prepared for GitOps workflow setup"
    echo "Password: ${ARGOCD_PASSWORD}"
    echo "URL: https://${ALB_HOSTNAME}"
    
-   # Test ArgoCD API access
-   sleep 30
+   # Test ArgoCD API access (wait for ALB to be ready)
+   sleep 60
    curl -k -X POST https://${ALB_HOSTNAME}/api/v1/session \
        -d '{"username":"admin","password":"'${ARGOCD_PASSWORD}'"}' \
        -H "Content-Type: application/json"
@@ -348,7 +350,7 @@ echo "✅ Environment prepared for GitOps workflow setup"
        spec:
          containers:
          - name: nginx
-           image: nginx:1.21
+           image: nginx:1.25
            ports:
            - containerPort: 80
            resources:
@@ -398,13 +400,13 @@ echo "✅ Environment prepared for GitOps workflow setup"
    # Add all files to Git
    git add .
    
-   # Create initial commit
+   # Create initial commit with proper format
    git commit -m "Initial GitOps configuration with sample application
-   
-   - ArgoCD application definition for development environment
-   - Sample NGINX deployment with resource limits
-   - Service configuration for internal access
-   - Kustomization structure for configuration management"
+
+- ArgoCD application definition for development environment
+- Sample NGINX deployment with resource limits
+- Service configuration for internal access
+- Kustomization structure for configuration management"
    
    # Push to CodeCommit
    git push origin main
@@ -419,7 +421,7 @@ echo "✅ Environment prepared for GitOps workflow setup"
     Connecting ArgoCD to the CodeCommit repository enables continuous monitoring and synchronization of the desired state. This connection establishes the critical link between Git-based configuration management and automated deployment execution in the Kubernetes cluster.
 
     ```bash
-    # Create repository connection in ArgoCD
+    # Configure ArgoCD for insecure mode (for demo purposes)
     kubectl patch configmap argocd-cmd-params-cm \
         -n ${NAMESPACE} \
         --type merge \
@@ -431,7 +433,13 @@ echo "✅ Environment prepared for GitOps workflow setup"
         -l app.kubernetes.io/name=argocd-server \
         -n ${NAMESPACE} --timeout=300s
     
-    # Add repository to ArgoCD using CLI
+    # Install ArgoCD CLI (if not already installed)
+    curl -sSL -o argocd-linux-amd64 \
+        https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+    sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+    rm argocd-linux-amd64
+    
+    # Login to ArgoCD and add repository
     argocd login ${ALB_HOSTNAME} --username admin \
         --password ${ARGOCD_PASSWORD} --insecure
     
@@ -452,7 +460,7 @@ echo "✅ Environment prepared for GitOps workflow setup"
     kubectl apply -f applications/development/sample-app.yaml
     
     # Wait for application to sync
-    sleep 30
+    sleep 60
     
     # Check application status
     kubectl get applications -n ${NAMESPACE}
@@ -497,7 +505,7 @@ echo "✅ Environment prepared for GitOps workflow setup"
    git push origin main
    
    # Wait for ArgoCD to detect and sync changes
-   sleep 60
+   sleep 90
    kubectl get pods -l app=sample-app
    ```
 
@@ -556,26 +564,31 @@ echo "✅ Environment prepared for GitOps workflow setup"
    echo "✅ CodeCommit repository deleted"
    ```
 
-6. **Clean up local files**:
+6. **Clean up IAM resources and local files**:
 
    ```bash
+   # Delete IAM policy
+   aws iam delete-policy \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy
+   
+   # Clean up local files
    cd ..
    rm -rf gitops-repo argocd-ingress.yaml iam_policy.json
    
-   echo "✅ Local files cleaned up"
+   echo "✅ All resources and local files cleaned up"
    ```
 
 ## Discussion
 
 GitOps represents a paradigm shift in how organizations approach continuous deployment and infrastructure management. By treating Git repositories as the single source of truth, teams gain unprecedented visibility into configuration changes, deployment history, and system state. This recipe demonstrates the fundamental GitOps principles using enterprise-grade AWS services that provide the security, scalability, and reliability required for production workloads.
 
-The combination of Amazon EKS, ArgoCD, and AWS CodeCommit creates a robust GitOps platform that addresses common DevOps challenges. EKS eliminates the operational overhead of managing Kubernetes control planes while providing seamless integration with AWS security and networking services. ArgoCD provides the GitOps engine that continuously monitors Git repositories and maintains cluster state, while CodeCommit offers enterprise-grade Git hosting with built-in security and compliance features.
+The combination of Amazon EKS, ArgoCD, and AWS CodeCommit creates a robust GitOps platform that addresses common DevOps challenges. EKS eliminates the operational overhead of managing Kubernetes control planes while providing seamless integration with AWS security and networking services. ArgoCD provides the GitOps engine that continuously monitors Git repositories and maintains cluster state, while CodeCommit offers enterprise-grade Git hosting with built-in security and compliance features. This implementation follows AWS Well-Architected Framework principles for operational excellence, security, and reliability.
 
-Key architectural benefits include declarative configuration management, automated drift detection and remediation, complete audit trails for all changes, and simplified rollback capabilities. The pull-based deployment model enhances security by eliminating the need for external systems to have direct cluster access, while Git-based workflows enable familiar collaboration patterns for infrastructure and application teams.
+Key architectural benefits include declarative configuration management, automated drift detection and remediation, complete audit trails for all changes, and simplified rollback capabilities. The pull-based deployment model enhances security by eliminating the need for external systems to have direct cluster access, while Git-based workflows enable familiar collaboration patterns for infrastructure and application teams. This approach significantly reduces deployment risks and enables faster, more reliable software delivery.
 
-This implementation supports advanced deployment strategies including blue-green deployments, canary releases, and progressive delivery through ArgoCD's sophisticated synchronization policies and health checks. Organizations can extend this foundation to support multi-cluster deployments, environment promotion pipelines, and policy-as-code governance frameworks.
+This implementation supports advanced deployment strategies including blue-green deployments, canary releases, and progressive delivery through ArgoCD's sophisticated synchronization policies and health checks. Organizations can extend this foundation to support multi-cluster deployments, environment promotion pipelines, and policy-as-code governance frameworks using tools like Open Policy Agent (OPA) Gatekeeper for additional security and compliance enforcement.
 
-> **Note**: Consider implementing ArgoCD Projects and RBAC policies to provide multi-tenant access control and resource isolation for enterprise environments. See [ArgoCD RBAC Documentation](https://argo-cd.readthedocs.io/en/stable/operator-manual/rbac/) for detailed configuration guidance.
+> **Note**: Consider implementing ArgoCD Projects and RBAC policies to provide multi-tenant access control and resource isolation for enterprise environments. See [ArgoCD RBAC Documentation](https://argo-cd.readthedocs.io/en/stable/operator-manual/rbac/) and [AWS EKS Best Practices](https://aws.github.io/aws-eks-best-practices/) for detailed configuration guidance.
 
 ## Challenge
 
@@ -589,4 +602,11 @@ Extend this GitOps implementation with these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Certificate Authority Service, Cloud Functions, Cloud Scheduler, Secret Manager
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: certificate-management, pki, automation, security, compliance
 recipe-generator-version: 1.3
@@ -243,9 +243,9 @@ echo "✅ Required APIs enabled"
 import json
 import datetime
 import logging
+import os
 from google.cloud import secretmanager
 from google.cloud import privateca_v1
-from google.cloud import functions_v1
 import cryptography
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
@@ -279,10 +279,18 @@ def certificate_monitor(request):
                         request={"name": secret_version_name}
                     )
                     
-                    # Parse certificate
+                    # Parse certificate data (handle JSON format from renewal function)
                     cert_data = response.payload.data.decode('utf-8')
+                    if cert_data.startswith('{'):
+                        # JSON format from renewal function
+                        cert_json = json.loads(cert_data)
+                        cert_pem = cert_json.get('certificate', cert_data)
+                    else:
+                        # Raw PEM format
+                        cert_pem = cert_data
+                    
                     cert = x509.load_pem_x509_certificate(
-                        cert_data.encode(), default_backend()
+                        cert_pem.encode(), default_backend()
                     )
                     
                     # Check expiration
@@ -332,10 +340,9 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-google-cloud-secret-manager==2.20.0
-google-cloud-private-ca==1.11.0
-google-cloud-functions==1.16.0
-cryptography==41.0.7
+google-cloud-secret-manager==2.21.0
+google-cloud-private-ca==1.12.0
+cryptography==42.0.0
 EOF
    
    echo "✅ Certificate monitoring function created"
@@ -510,9 +517,9 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-google-cloud-secret-manager==2.20.0
-google-cloud-private-ca==1.11.0
-cryptography==41.0.7
+google-cloud-secret-manager==2.21.0
+google-cloud-private-ca==1.12.0
+cryptography==42.0.0
 EOF
    
    echo "✅ Certificate renewal function created"
@@ -529,7 +536,7 @@ EOF
    # Deploy certificate monitoring function
    gcloud functions deploy ${MONITOR_FUNCTION_NAME} \
        --source=cert-monitor-function \
-       --runtime=python39 \
+       --runtime=python311 \
        --trigger=http \
        --entry-point=certificate_monitor \
        --service-account=${SERVICE_ACCOUNT_EMAIL} \
@@ -541,7 +548,7 @@ EOF
    # Deploy certificate renewal function
    gcloud functions deploy ${RENEW_FUNCTION_NAME} \
        --source=cert-renewal-function \
-       --runtime=python39 \
+       --runtime=python311 \
        --trigger=http \
        --entry-point=certificate_renewal \
        --service-account=${SERVICE_ACCOUNT_EMAIL} \
@@ -653,7 +660,7 @@ enabled: true
 EOF
     
     # Create the alerting policy
-    gcloud alpha monitoring policies create --policy-from-file=cert-alert-policy.yaml
+    gcloud monitoring policies create --policy-from-file=cert-alert-policy.yaml
     
     echo "✅ Monitoring and alerting configured"
     ```
@@ -850,4 +857,9 @@ Extend this certificate lifecycle management solution with these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,926 @@
+# Infrastructure Manager Configuration for Energy-Efficient Web Hosting
+# This configuration deploys C4A instances with Axion processors and Hyperdisk storage
+# for optimized energy efficiency and performance using Google Cloud Infrastructure Manager
+
+# Terraform configuration block for Infrastructure Manager
+terraform:
+  required_version: ">= 1.3"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.1"
+
+# Input variables for customization
+variable:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+  
+  region:
+    description: "Deployment region for resources (must support C4A instances)"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: contains(["us-central1", "us-east4", "us-east1", "eu-west1", "eu-west4", "eu-west3", "asia-southeast1"], var.region)
+      error_message: "Region must support C4A instances with Axion processors"
+  
+  zone:
+    description: "Deployment zone within region"
+    type: string
+    default: "us-central1-a"
+  
+  instance_count:
+    description: "Number of C4A web server instances"
+    type: number
+    default: 3
+    validation:
+      condition: var.instance_count >= 2 && var.instance_count <= 10
+      error_message: "Instance count must be between 2 and 10"
+  
+  machine_type:
+    description: "C4A machine type for instances"
+    type: string
+    default: "c4a-standard-4"
+    validation:
+      condition: can(regex("^c4a-", var.machine_type))
+      error_message: "Machine type must be a C4A instance type"
+  
+  hyperdisk_size_gb:
+    description: "Size of Hyperdisk volumes in GB"
+    type: number
+    default: 50
+    validation:
+      condition: var.hyperdisk_size_gb >= 10 && var.hyperdisk_size_gb <= 1000
+      error_message: "Hyperdisk size must be between 10 GB and 1000 GB"
+  
+  hyperdisk_iops:
+    description: "Provisioned IOPS for Hyperdisk volumes"
+    type: number
+    default: 3000
+    validation:
+      condition: var.hyperdisk_iops >= 2500 && var.hyperdisk_iops <= 100000
+      error_message: "Hyperdisk IOPS must be between 2500 and 100000"
+  
+  hyperdisk_throughput:
+    description: "Provisioned throughput for Hyperdisk volumes in MB/s"
+    type: number
+    default: 140
+    validation:
+      condition: var.hyperdisk_throughput >= 1 && var.hyperdisk_throughput <= 1200
+      error_message: "Hyperdisk throughput must be between 1 and 1200 MB/s"
+  
+  environment:
+    description: "Environment name for resource tagging"
+    type: string
+    default: "production"
+  
+  enable_monitoring:
+    description: "Enable Cloud Monitoring dashboard"
+    type: bool
+    default: true
+
+# Configure the Google Cloud provider
+provider "google" {
+  project = var.project_id
+  region  = var.region
+  zone    = var.zone
+}
+
+# Random suffix for unique resource naming
+resource "random_id" "suffix" {
+  keepers = {
+    project = var.project_id
+    region  = var.region
+  }
+  byte_length = 3
+}
+
+# Local values for computed configurations
+locals {
+  common_labels = {
+    environment      = var.environment
+    project         = "energy-efficient-web-hosting"
+    managed_by      = "infrastructure-manager"
+    energy_efficient = "true"
+  }
+  
+  instance_template_name = "web-server-template-${random_id.suffix.hex}"
+  network_name          = "energy-web-vpc-${random_id.suffix.hex}"
+  subnet_name           = "energy-web-subnet-${random_id.suffix.hex}"
+}
+
+# VPC Network for secure communication
+resource "google_compute_network" "energy_web_vpc" {
+  name                    = local.network_name
+  description            = "VPC network for energy-efficient web hosting with C4A instances"
+  auto_create_subnetworks = false
+  routing_mode           = "REGIONAL"
+  
+  project = var.project_id
+}
+
+# Subnet for web application instances
+resource "google_compute_subnetwork" "energy_web_subnet" {
+  name                     = local.subnet_name
+  description             = "Subnet for C4A web server instances with Axion processors"
+  ip_cidr_range           = "10.0.0.0/24"
+  region                  = var.region
+  network                 = google_compute_network.energy_web_vpc.id
+  private_ip_google_access = true
+  
+  project = var.project_id
+}
+
+# Firewall rule for HTTP traffic
+resource "google_compute_firewall" "allow_http" {
+  name        = "allow-http-${random_id.suffix.hex}"
+  description = "Allow HTTP traffic to energy-efficient web servers"
+  network     = google_compute_network.energy_web_vpc.name
+  direction   = "INGRESS"
+  priority    = 1000
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["80"]
+  }
+  
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["web-server"]
+  
+  project = var.project_id
+}
+
+# Firewall rule for HTTPS traffic
+resource "google_compute_firewall" "allow_https" {
+  name        = "allow-https-${random_id.suffix.hex}"
+  description = "Allow HTTPS traffic to energy-efficient web servers"
+  network     = google_compute_network.energy_web_vpc.name
+  direction   = "INGRESS"
+  priority    = 1000
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["443"]
+  }
+  
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["web-server"]
+  
+  project = var.project_id
+}
+
+# Firewall rule for health checks
+resource "google_compute_firewall" "allow_health_checks" {
+  name        = "allow-health-checks-${random_id.suffix.hex}"
+  description = "Allow health check traffic from Google Cloud Load Balancer"
+  network     = google_compute_network.energy_web_vpc.name
+  direction   = "INGRESS"
+  priority    = 1000
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["80"]
+  }
+  
+  # Google Cloud health check source ranges
+  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
+  target_tags   = ["web-server"]
+  
+  project = var.project_id
+}
+
+# Hyperdisk volumes for high-performance storage
+resource "google_compute_disk" "web_data_disks" {
+  count = var.instance_count
+  
+  name        = "web-data-disk-${count.index + 1}-${random_id.suffix.hex}"
+  description = "High-performance Hyperdisk for energy-efficient web server ${count.index + 1}"
+  type        = "hyperdisk-balanced"
+  zone        = var.zone
+  size        = var.hyperdisk_size_gb
+  
+  # Hyperdisk performance configuration
+  provisioned_iops       = var.hyperdisk_iops
+  provisioned_throughput = var.hyperdisk_throughput
+  
+  labels = merge(local.common_labels, {
+    instance_number = tostring(count.index + 1)
+    storage_type   = "hyperdisk-balanced"
+    usage          = "web-server-data"
+  })
+  
+  project = var.project_id
+}
+
+# Instance template for C4A web servers with energy-efficient configuration
+resource "google_compute_instance_template" "web_server_template" {
+  name_prefix  = "web-server-template-${random_id.suffix.hex}-"
+  description  = "Template for energy-efficient C4A web servers with Axion processors"
+  machine_type = var.machine_type
+  
+  # Ensure instances can restart during maintenance
+  scheduling {
+    automatic_restart   = true
+    on_host_maintenance = "MIGRATE"
+  }
+  
+  # Configure the boot disk with Ubuntu 20.04 LTS
+  disk {
+    source_image = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts"
+    auto_delete  = true
+    boot         = true
+    disk_type    = "pd-balanced"
+    disk_size_gb = 10
+    
+    # Enable deletion protection in production environments
+    disk_encryption_key {}
+  }
+  
+  # Network configuration for the instances
+  network_interface {
+    network    = google_compute_network.energy_web_vpc.id
+    subnetwork = google_compute_subnetwork.energy_web_subnet.id
+    
+    # Assign external IP for internet access
+    access_config {
+      nat_ip                 = null
+      public_ptr_domain_name = null
+      network_tier          = "PREMIUM"
+    }
+  }
+  
+  # Service account configuration for monitoring and logging
+  service_account {
+    email = "default"
+    scopes = [
+      "https://www.googleapis.com/auth/monitoring.write",
+      "https://www.googleapis.com/auth/logging.write",
+      "https://www.googleapis.com/auth/cloud-platform"
+    ]
+  }
+  
+  # Network tags for firewall rules
+  tags = ["web-server"]
+  
+  # Labels for resource organization and cost tracking
+  labels = merge(local.common_labels, {
+    instance_type = "c4a-web-server"
+    template_type = "energy-efficient"
+  })
+  
+  # Startup script for web server configuration
+  metadata = {
+    startup-script = <<-EOF
+      #!/bin/bash
+      # Update system packages and install required software
+      apt-get update
+      apt-get install -y nginx htop fio curl
+      
+      # Create energy-efficient web page with dynamic content
+      cat > /var/www/html/index.html << 'HTML'
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Energy-Efficient Web Hosting</title>
+          <style>
+              body { 
+                  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+                  margin: 0; 
+                  padding: 40px; 
+                  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                  color: #333;
+                  min-height: 100vh;
+              }
+              .container { 
+                  max-width: 800px; 
+                  margin: 0 auto; 
+                  background: rgba(255,255,255,0.95); 
+                  padding: 40px; 
+                  border-radius: 15px; 
+                  box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+                  backdrop-filter: blur(10px);
+              }
+              .eco-badge { 
+                  background: linear-gradient(45deg, #34A853, #137333); 
+                  color: white; 
+                  padding: 8px 16px; 
+                  border-radius: 25px; 
+                  font-size: 14px; 
+                  font-weight: 600;
+                  display: inline-block;
+                  margin-bottom: 20px;
+                  box-shadow: 0 4px 15px rgba(52, 168, 83, 0.3);
+              }
+              .performance-grid {
+                  display: grid;
+                  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                  gap: 20px;
+                  margin: 30px 0;
+              }
+              .metric-card {
+                  background: #f8f9ff;
+                  padding: 20px;
+                  border-radius: 10px;
+                  text-align: center;
+                  border-left: 4px solid #4285F4;
+              }
+              .metric-value {
+                  font-size: 24px;
+                  font-weight: bold;
+                  color: #1a73e8;
+              }
+              .metric-label {
+                  font-size: 14px;
+                  color: #666;
+                  margin-top: 5px;
+              }
+              h1 { 
+                  color: #1a73e8; 
+                  margin-bottom: 10px;
+                  font-size: 2.5em;
+              }
+              .subtitle {
+                  color: #666;
+                  font-size: 18px;
+                  margin-bottom: 30px;
+              }
+          </style>
+      </head>
+      <body>
+          <div class="container">
+              <h1>🌱 Energy-Efficient Web Hosting</h1>
+              <div class="subtitle">Powered by Google Cloud C4A Axion Processors</div>
+              <div class="eco-badge">🔋 60% More Energy Efficient</div>
+              
+              <div class="performance-grid">
+                  <div class="metric-card">
+                      <div class="metric-value">ARM64</div>
+                      <div class="metric-label">Axion Architecture</div>
+                  </div>
+                  <div class="metric-card">
+                      <div class="metric-value">60%</div>
+                      <div class="metric-label">Energy Reduction</div>
+                  </div>
+                  <div class="metric-card">
+                      <div class="metric-value">Hyperdisk</div>
+                      <div class="metric-label">High-Performance Storage</div>
+                  </div>
+                  <div class="metric-card">
+                      <div class="metric-value">C4A</div>
+                      <div class="metric-label">Instance Type</div>
+                  </div>
+              </div>
+              
+              <p><strong>Server:</strong> <code id="hostname">Loading...</code></p>
+              <p><strong>Timestamp:</strong> <code id="timestamp">Loading...</code></p>
+              <p><strong>Zone:</strong> <code>${var.zone}</code></p>
+              <p><strong>Machine Type:</strong> <code>${var.machine_type}</code></p>
+              <p><strong>Environment:</strong> <code>${var.environment}</code></p>
+              
+              <script>
+                  document.getElementById('hostname').textContent = window.location.hostname;
+                  document.getElementById('timestamp').textContent = new Date().toLocaleString();
+              </script>
+          </div>
+      </body>
+      </html>
+      HTML
+      
+      # Configure nginx for optimal performance and security
+      cat > /etc/nginx/nginx.conf << 'NGINX'
+      user www-data;
+      worker_processes auto;
+      pid /run/nginx.pid;
+      
+      events {
+          worker_connections 768;
+          use epoll;
+          multi_accept on;
+      }
+      
+      http {
+          sendfile on;
+          tcp_nopush on;
+          tcp_nodelay on;
+          keepalive_timeout 65;
+          types_hash_max_size 2048;
+          server_tokens off;
+          
+          include /etc/nginx/mime.types;
+          default_type application/octet-stream;
+          
+          # Gzip compression for better performance and bandwidth efficiency
+          gzip on;
+          gzip_vary on;
+          gzip_min_length 1024;
+          gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+          
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              root /var/www/html;
+              index index.html index.htm;
+              server_name _;
+              
+              # Security headers for better protection
+              add_header X-Frame-Options "SAMEORIGIN" always;
+              add_header X-Content-Type-Options "nosniff" always;
+              add_header X-XSS-Protection "1; mode=block" always;
+              add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+              
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+              
+              # Health check endpoint for load balancer
+              location /health {
+                  access_log off;
+                  return 200 "healthy\n";
+                  add_header Content-Type text/plain;
+              }
+              
+              # Status endpoint for monitoring
+              location /status {
+                  access_log off;
+                  return 200 "C4A Axion - Energy Efficient\n";
+                  add_header Content-Type text/plain;
+              }
+          }
+      }
+      NGINX
+      
+      # Enable and start nginx service
+      systemctl enable nginx
+      systemctl restart nginx
+      
+      # Install Google Cloud Ops Agent for enhanced monitoring
+      curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+      sudo bash add-google-cloud-ops-agent-repo.sh --also-install
+      
+      # Configure ops agent for comprehensive monitoring
+      cat > /etc/google-cloud-ops-agent/config.yaml << 'OPSAGENT'
+      metrics:
+        receivers:
+          nginx:
+            type: nginx
+          hostmetrics:
+            type: hostmetrics
+            collection_interval: 60s
+        service:
+          pipelines:
+            default_pipeline:
+              receivers: [nginx, hostmetrics]
+      logging:
+        receivers:
+          nginx_access:
+            type: nginx_access
+          nginx_error:
+            type: nginx_error
+          syslog:
+            type: files
+            include_paths: [/var/log/syslog]
+        service:
+          pipelines:
+            default_pipeline:
+              receivers: [nginx_access, nginx_error, syslog]
+      OPSAGENT
+      
+      # Restart ops agent to apply configuration
+      systemctl restart google-cloud-ops-agent
+      
+      # Log deployment completion
+      echo "Energy-efficient C4A web server deployment completed at $(date)" >> /var/log/deployment.log
+      echo "Machine type: ${var.machine_type}" >> /var/log/deployment.log
+      echo "Zone: ${var.zone}" >> /var/log/deployment.log
+      echo "Environment: ${var.environment}" >> /var/log/deployment.log
+    EOF
+  }
+  
+  # Lifecycle management to prevent accidental replacement
+  lifecycle {
+    create_before_destroy = true
+  }
+  
+  project = var.project_id
+}
+
+# Health check for load balancer and auto-healing
+resource "google_compute_health_check" "web_health_check" {
+  name        = "web-health-check-${random_id.suffix.hex}"
+  description = "Health check for energy-efficient C4A web servers"
+  
+  timeout_sec         = 10
+  check_interval_sec  = 30
+  healthy_threshold   = 2
+  unhealthy_threshold = 3
+  
+  http_health_check {
+    port         = 80
+    request_path = "/health"
+  }
+  
+  project = var.project_id
+}
+
+# Managed instance group for auto-scaling and load balancing
+resource "google_compute_instance_group_manager" "web_instance_group" {
+  name        = "web-instance-group-${random_id.suffix.hex}"
+  description = "Managed instance group for energy-efficient C4A web servers"
+  zone        = var.zone
+  
+  base_instance_name = "web-server"
+  target_size        = var.instance_count
+  
+  version {
+    instance_template = google_compute_instance_template.web_server_template.id
+  }
+  
+  # Named ports for load balancer integration
+  named_port {
+    name = "http"
+    port = 80
+  }
+  
+  # Auto-healing configuration
+  auto_healing_policies {
+    health_check      = google_compute_health_check.web_health_check.id
+    initial_delay_sec = 300
+  }
+  
+  # Update policy for rolling updates
+  update_policy {
+    type                           = "PROACTIVE"
+    instance_redistribution_type   = "PROACTIVE"
+    minimal_action                 = "REPLACE"
+    most_disruptive_allowed_action = "REPLACE"
+    max_surge_fixed                = 3
+    max_unavailable_fixed          = 0
+    replacement_method             = "SUBSTITUTE"
+  }
+  
+  project = var.project_id
+  
+  depends_on = [
+    google_compute_instance_template.web_server_template,
+    google_compute_health_check.web_health_check
+  ]
+}
+
+# Backend service for load balancer
+resource "google_compute_backend_service" "web_backend_service" {
+  name        = "web-backend-service-${random_id.suffix.hex}"
+  description = "Backend service for energy-efficient web hosting"
+  protocol    = "HTTP"
+  timeout_sec = 30
+  
+  # Health check configuration
+  health_checks = [google_compute_health_check.web_health_check.id]
+  
+  # Backend configuration
+  backend {
+    group           = google_compute_instance_group_manager.web_instance_group.instance_group
+    balancing_mode  = "UTILIZATION"
+    max_utilization = 0.8
+    capacity_scaler = 1.0
+  }
+  
+  # Connection draining configuration
+  connection_draining_timeout_sec = 300
+  
+  # Load balancing scheme
+  load_balancing_scheme = "EXTERNAL"
+  
+  # Disable CDN for this example (can be enabled for better performance)
+  enable_cdn = false
+  
+  project = var.project_id
+  
+  depends_on = [
+    google_compute_instance_group_manager.web_instance_group,
+    google_compute_health_check.web_health_check
+  ]
+}
+
+# URL map for routing configuration
+resource "google_compute_url_map" "web_url_map" {
+  name            = "web-url-map-${random_id.suffix.hex}"
+  description     = "URL map for energy-efficient web hosting routing"
+  default_service = google_compute_backend_service.web_backend_service.id
+  
+  project = var.project_id
+  
+  depends_on = [google_compute_backend_service.web_backend_service]
+}
+
+# HTTP proxy for load balancer
+resource "google_compute_target_http_proxy" "web_http_proxy" {
+  name        = "web-http-proxy-${random_id.suffix.hex}"
+  description = "HTTP proxy for energy-efficient web hosting load balancer"
+  url_map     = google_compute_url_map.web_url_map.id
+  
+  project = var.project_id
+  
+  depends_on = [google_compute_url_map.web_url_map]
+}
+
+# Global forwarding rule (load balancer frontend)
+resource "google_compute_global_forwarding_rule" "web_forwarding_rule" {
+  name        = "web-forwarding-rule-${random_id.suffix.hex}"
+  description = "Global forwarding rule for HTTP load balancer"
+  target      = google_compute_target_http_proxy.web_http_proxy.id
+  port_range  = "80"
+  ip_protocol = "TCP"
+  
+  load_balancing_scheme = "EXTERNAL"
+  
+  project = var.project_id
+  
+  depends_on = [google_compute_target_http_proxy.web_http_proxy]
+}
+
+# Cloud Monitoring dashboard for energy efficiency tracking
+resource "google_monitoring_dashboard" "energy_efficiency_dashboard" {
+  count = var.enable_monitoring ? 1 : 0
+  
+  dashboard_json = jsonencode({
+    displayName = "Energy-Efficient Web Hosting Dashboard - ${random_id.suffix.hex}"
+    mosaicLayout = {
+      tiles = [
+        {
+          width  = 6
+          height = 4
+          widget = {
+            title = "C4A Instance CPU Utilization"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/cpu/utilization\""
+                    aggregation = {
+                      alignmentPeriod     = "60s"
+                      perSeriesAligner    = "ALIGN_MEAN"
+                      crossSeriesReducer  = "REDUCE_MEAN"
+                      groupByFields       = ["resource.label.instance_name"]
+                    }
+                  }
+                }
+              }]
+              yAxis = {
+                label = "CPU Utilization (%)"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          width  = 6
+          height = 4
+          xPos   = 6
+          widget = {
+            title = "Instance Count and Health"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/up\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_MEAN"
+                      crossSeriesReducer = "REDUCE_SUM"
+                    }
+                  }
+                }
+              }]
+              yAxis = {
+                label = "Healthy Instances"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          width  = 6
+          height = 4
+          yPos   = 4
+          widget = {
+            title = "Network Traffic"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/network/received_bytes_count\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_RATE"
+                      crossSeriesReducer = "REDUCE_SUM"
+                    }
+                  }
+                }
+              }]
+              yAxis = {
+                label = "Bytes/sec"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          width  = 6
+          height = 4
+          xPos   = 6
+          yPos   = 4
+          widget = {
+            title = "Hyperdisk Performance"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"gce_disk\" AND metric.type=\"compute.googleapis.com/instance/disk/read_ops_count\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_RATE"
+                      crossSeriesReducer = "REDUCE_SUM"
+                    }
+                  }
+                }
+              }]
+              yAxis = {
+                label = "Read Operations/sec"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          width  = 12
+          height = 3
+          yPos   = 8
+          widget = {
+            title = "Load Balancer Metrics"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"http_load_balancer\" AND metric.type=\"loadbalancing.googleapis.com/https/request_count\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_RATE"
+                      crossSeriesReducer = "REDUCE_SUM"
+                    }
+                  }
+                }
+              }]
+              yAxis = {
+                label = "Requests/sec"
+                scale = "LINEAR"
+              }
+            }
+          }
+        }
+      ]
+    }
+  })
+  
+  project = var.project_id
+}
+
+# Output values for verification and integration
+output "load_balancer_ip" {
+  description = "External IP address of the load balancer"
+  value       = google_compute_global_forwarding_rule.web_forwarding_rule.ip_address
+}
+
+output "vpc_network_name" {
+  description = "Name of the VPC network created"
+  value       = google_compute_network.energy_web_vpc.name
+}
+
+output "vpc_network_id" {
+  description = "ID of the VPC network created"
+  value       = google_compute_network.energy_web_vpc.id
+}
+
+output "subnet_name" {
+  description = "Name of the subnet created"
+  value       = google_compute_subnetwork.energy_web_subnet.name
+}
+
+output "instance_group_name" {
+  description = "Name of the managed instance group"
+  value       = google_compute_instance_group_manager.web_instance_group.name
+}
+
+output "instance_template_name" {
+  description = "Name of the instance template"
+  value       = google_compute_instance_template.web_server_template.name
+}
+
+output "health_check_name" {
+  description = "Name of the health check"
+  value       = google_compute_health_check.web_health_check.name
+}
+
+output "backend_service_name" {
+  description = "Name of the backend service"
+  value       = google_compute_backend_service.web_backend_service.name
+}
+
+output "hyperdisk_names" {
+  description = "Names of the Hyperdisk volumes created"
+  value       = google_compute_disk.web_data_disks[*].name
+}
+
+output "hyperdisk_performance" {
+  description = "Performance specifications of Hyperdisk volumes"
+  value = {
+    size_gb    = var.hyperdisk_size_gb
+    iops       = var.hyperdisk_iops
+    throughput = var.hyperdisk_throughput
+    type       = "hyperdisk-balanced"
+  }
+}
+
+output "monitoring_dashboard_url" {
+  description = "URL to access the Cloud Monitoring dashboard"
+  value       = var.enable_monitoring ? "https://console.cloud.google.com/monitoring/dashboards/custom/${google_monitoring_dashboard.energy_efficiency_dashboard[0].id}?project=${var.project_id}" : "Monitoring dashboard disabled"
+}
+
+output "website_url" {
+  description = "URL to access the deployed website"
+  value       = "http://${google_compute_global_forwarding_rule.web_forwarding_rule.ip_address}"
+}
+
+output "resource_suffix" {
+  description = "Random suffix used for resource naming"
+  value       = random_id.suffix.hex
+}
+
+output "deployment_summary" {
+  description = "Summary of deployed resources"
+  value = <<-EOT
+    Energy-Efficient Web Hosting Deployment Complete:
+    
+    Infrastructure:
+    - ${var.instance_count} C4A instances with Axion processors (${var.machine_type})
+    - ${var.instance_count} Hyperdisk Balanced volumes (${var.hyperdisk_size_gb}GB each)
+    - Global HTTP Load Balancer with health checks
+    - VPC network with security rules
+    - ${var.enable_monitoring ? "Cloud Monitoring dashboard enabled" : "Cloud Monitoring dashboard disabled"}
+    
+    Performance Benefits:
+    - Up to 60% better energy efficiency vs x86 instances
+    - ARM64 Axion processor architecture
+    - High-performance Hyperdisk storage (${var.hyperdisk_iops} IOPS, ${var.hyperdisk_throughput} MB/s)
+    - Auto-healing and auto-scaling capabilities
+    
+    Access Information:
+    - Website URL: http://${google_compute_global_forwarding_rule.web_forwarding_rule.ip_address}
+    - Load Balancer IP: ${google_compute_global_forwarding_rule.web_forwarding_rule.ip_address}
+    - Region: ${var.region}
+    - Zone: ${var.zone}
+    
+    Sustainability Features:
+    - ARM-based Axion processors for energy efficiency
+    - Optimized resource utilization through load balancing
+    - Performance monitoring for efficiency tracking
+  EOT
+}
+
+output "infrastructure_details" {
+  description = "Detailed information about the deployed infrastructure"
+  value = {
+    project_id     = var.project_id
+    region         = var.region
+    zone           = var.zone
+    machine_type   = var.machine_type
+    instance_count = var.instance_count
+    
+    network = {
+      vpc_name    = google_compute_network.energy_web_vpc.name
+      subnet_name = google_compute_subnetwork.energy_web_subnet.name
+      cidr_range  = google_compute_subnetwork.energy_web_subnet.ip_cidr_range
+    }
+    
+    storage = {
+      disk_type       = "hyperdisk-balanced"
+      size_gb         = var.hyperdisk_size_gb
+      provisioned_iops = var.hyperdisk_iops
+      throughput_mbps  = var.hyperdisk_throughput
+    }
+    
+    load_balancer = {
+      external_ip     = google_compute_global_forwarding_rule.web_forwarding_rule.ip_address
+      backend_service = google_compute_backend_service.web_backend_service.name
+      health_check    = google_compute_health_check.web_health_check.name
+    }
+    
+    monitoring_enabled = var.enable_monitoring
+    environment       = var.environment
+    resource_suffix   = random_id.suffix.hex
+  }
+}

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Firebase Studio, Cloud Source Repositories, Vertex AI, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai-development, code-review, automation, firebase-studio, source-repositories, vertex-ai
 recipe-generator-version: 1.3
@@ -19,11 +19,11 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Development teams struggle with inconsistent code review quality, delayed feedback cycles, and the manual effort required to identify code quality issues, security vulnerabilities, and adherence to coding standards. Traditional code review processes are time-consuming, prone to human oversight, and often fail to catch subtle issues that could impact application performance, maintainability, or security. Organizations need an intelligent, automated solution that can provide contextual, real-time code analysis while integrating seamlessly with their existing development workflows.
+Development teams struggle with inconsistent code review quality, delayed feedback cycles, and the manual effort required to identify code quality issues, security vulnerabilities, and adherence to coding standards. Traditional code review processes are time-consuming, prone to human oversight, and often fail to catch subtle issues that could impact application performance, maintainability, or security.
 
 ## Solution
 
-Build an AI-powered code review automation system using Firebase Studio's agentic development environment to create intelligent code analysis agents that integrate with Cloud Source Repositories for automated pull request analysis. The solution leverages Vertex AI's advanced language models to provide contextual code quality feedback, security analysis, and best practice recommendations, while Cloud Functions orchestrate the automated review workflow to ensure consistent, high-quality code standards across development teams.
+Build an AI-powered code review automation system using Firebase Studio's agentic development environment to create intelligent code analysis agents that integrate with Cloud Source Repositories for automated pull request analysis. The solution leverages Vertex AI's advanced language models to provide contextual code quality feedback, security analysis, and best practice recommendations, while Cloud Functions orchestrate the automated review workflow.
 
 ## Architecture Diagram
 
@@ -94,16 +94,17 @@ graph TB
 4. Familiarity with software development practices and code review processes
 5. Estimated cost: $15-30 for 120 minutes of testing (Vertex AI API calls, Cloud Functions execution, repository storage)
 
-> **Note**: Firebase Studio is currently in preview. Access may be limited and features are subject to change. Review the [Firebase Studio documentation](https://firebase.google.com/docs/studio) for current availability and limitations.
+> **Note**: Firebase Studio is currently in preview and available to everyone. Access the latest features at [Firebase Studio](https://studio.firebase.google.com) and review the [Firebase Studio documentation](https://firebase.google.com/docs/studio) for current capabilities and limitations.
 
 ## Preparation
 
-Firebase Studio represents Google Cloud's latest advancement in agentic development environments, providing AI-powered code generation and analysis capabilities through Gemini integration. This cloud-based IDE enables developers to create sophisticated AI agents that can understand, analyze, and provide feedback on code quality, security, and best practices.
+Firebase Studio represents Google Cloud's latest advancement in agentic development environments, providing AI-powered code generation and analysis capabilities through Gemini integration. This cloud-based IDE enables developers to create sophisticated AI agents that can understand, analyze, and provide feedback on code quality, security, and best practices while integrating seamlessly with Google Cloud services.
 
 ```bash
 # Set environment variables for the project
 export PROJECT_ID="code-review-ai-$(date +%s)"
 export REGION="us-central1"
+export ZONE="us-central1-a"
 export REPOSITORY_NAME="intelligent-review-system"
 
 # Generate unique identifiers for resources
@@ -114,6 +115,7 @@ export AGENT_NAME="code-review-agent-${RANDOM_SUFFIX}"
 # Set default project and region
 gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
+gcloud config set compute/zone ${ZONE}
 
 # Enable required Google Cloud APIs
 gcloud services enable sourcerepo.googleapis.com
@@ -249,7 +251,7 @@ The API enablement establishes the foundation for our intelligent code review sy
        "best_practices_enforcement"
      ],
      "model_config": {
-       "model": "gemini-2.0-flash-thinking",
+       "model": "gemini-1.5-flash",
        "temperature": 0.3,
        "max_tokens": 4096
      },
@@ -291,7 +293,7 @@ The API enablement establishes the foundation for our intelligent code review sy
        });
        
        this.model = this.vertexAI.getGenerativeModel({
-         model: 'gemini-2.0-flash-thinking'
+         model: 'gemini-1.5-flash'
        });
      }
    
@@ -396,7 +398,7 @@ The API enablement establishes the foundation for our intelligent code review sy
    });
    
    const model = vertexAI.getGenerativeModel({
-     model: 'gemini-2.0-flash-thinking'
+     model: 'gemini-1.5-flash'
    });
    
    // Cloud Function to handle repository events
@@ -473,7 +475,9 @@ The API enablement establishes the foundation for our intelligent code review sy
      `;
      
      try {
-       const result = await model.generateContent(analysisPrompt);
+       const result = await model.generateContent({
+         contents: [{role: 'user', parts: [{text: analysisPrompt}]}],
+       });
        const analysis = result.response.text();
        
        console.log(`Analysis completed for ${fileData.path}`);
@@ -506,7 +510,9 @@ The API enablement establishes the foundation for our intelligent code review sy
      `;
      
      try {
-       const result = await model.generateContent(summaryPrompt);
+       const result = await model.generateContent({
+         contents: [{role: 'user', parts: [{text: summaryPrompt}]}],
+       });
        const summary = result.response.text();
        
        console.log('Pull request summary generated');
@@ -657,7 +663,7 @@ The API enablement establishes the foundation for our intelligent code review sy
    
    # Test the webhook manually
    echo "🧪 Testing webhook trigger..."
-   ./test-webhook.sh ${FUNCTION_URL}
+   ../test-webhook.sh ${FUNCTION_URL}
    
    # Wait for processing
    echo "⏳ Waiting for AI analysis to complete..."
@@ -783,17 +789,17 @@ The API enablement establishes the foundation for our intelligent code review sy
 
 ## Discussion
 
-The intelligent code review automation system demonstrates the powerful combination of Firebase Studio's agentic development capabilities with Google Cloud's AI and integration services. Firebase Studio's cloud-based environment powered by Gemini provides sophisticated AI agents that can understand code context, identify patterns, and provide meaningful feedback that goes beyond simple syntax checking. This agentic approach enables the creation of intelligent systems that can adapt to different coding styles, project requirements, and organizational standards.
+The intelligent code review automation system demonstrates the powerful combination of Firebase Studio's agentic development capabilities with Google Cloud's AI and integration services. Firebase Studio's cloud-based environment powered by Gemini provides sophisticated AI agents that can understand code context, identify patterns, and provide meaningful feedback that goes beyond simple syntax checking. This agentic approach enables the creation of intelligent systems that can adapt to different coding styles, project requirements, and organizational standards while maintaining consistency across development teams.
 
-The integration with Cloud Source Repositories and Vertex AI creates a comprehensive DevOps solution that enhances code quality without disrupting existing development workflows. By leveraging Vertex AI's advanced language models, the system can provide contextual analysis that considers not just individual lines of code but the broader architectural patterns, security implications, and performance characteristics of the entire codebase. This holistic approach to code review helps development teams maintain high standards while accelerating delivery cycles.
+The integration with Cloud Source Repositories and Vertex AI creates a comprehensive DevOps solution that enhances code quality without disrupting existing development workflows. By leveraging Vertex AI's advanced language models like Gemini 1.5 Flash, the system can provide contextual analysis that considers not just individual lines of code but the broader architectural patterns, security implications, and performance characteristics of the entire codebase. This holistic approach to code review helps development teams maintain high standards while accelerating delivery cycles through automated, consistent feedback.
 
-The serverless architecture using Cloud Functions ensures that the review system scales automatically with development activity, providing cost-effective operation that responds to demand without requiring infrastructure management. The webhook-based integration enables real-time feedback that supports continuous integration practices, while the AI-powered analysis provides consistent, objective evaluation that complements human code review processes. This automation reduces the burden on senior developers while ensuring that junior team members receive educational feedback that helps them improve their coding practices.
+The serverless architecture using Cloud Functions ensures that the review system scales automatically with development activity, providing cost-effective operation that responds to demand without requiring infrastructure management. The webhook-based integration enables real-time feedback that supports continuous integration practices, while the AI-powered analysis provides consistent, objective evaluation that complements human code review processes. This automation reduces the burden on senior developers while ensuring that junior team members receive educational feedback that helps them improve their coding practices and understand best practices.
 
-The system's ability to identify security vulnerabilities, performance bottlenecks, and maintainability issues provides significant business value by catching problems early in the development cycle when they are less expensive to fix. The integration of multiple Google Cloud services demonstrates the platform's strength in providing cohesive solutions that leverage AI capabilities across the development lifecycle.
+The system's ability to identify security vulnerabilities, performance bottlenecks, and maintainability issues provides significant business value by catching problems early in the development cycle when they are less expensive to fix. The integration of multiple Google Cloud services demonstrates the platform's strength in providing cohesive solutions that leverage AI capabilities across the development lifecycle, following Google Cloud best practices and the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
 
-> **Tip**: Regularly update the AI agent prompts and analysis patterns based on feedback from development teams and evolving coding standards. Firebase Studio's agentic environment enables rapid iteration and refinement of review capabilities.
+> **Tip**: Regularly update the AI agent prompts and analysis patterns based on feedback from development teams and evolving coding standards. Firebase Studio's agentic environment enables rapid iteration and refinement of review capabilities through its cloud-based development interface.
 
-For production deployment, consider implementing additional features such as customizable review rules, integration with existing code review tools, and detailed analytics on code quality trends. The [Firebase Studio documentation](https://firebase.google.com/docs/studio) provides guidance on advanced agent development, while the [Cloud Source Repositories documentation](https://cloud.google.com/source-repositories/docs) covers enterprise integration patterns. The [Vertex AI documentation](https://cloud.google.com/vertex-ai/docs) offers insights into optimizing AI model performance for code analysis tasks. The [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) provides best practices for building scalable, secure DevOps solutions. Consider reviewing the [Cloud Functions documentation](https://cloud.google.com/functions/docs) for guidance on optimizing serverless performance and cost management.
+For production deployment, consider implementing additional features such as customizable review rules, integration with existing code review tools, and detailed analytics on code quality trends. The [Firebase Studio documentation](https://firebase.google.com/docs/studio) provides guidance on advanced agent development and workspace customization, while the [Cloud Source Repositories documentation](https://cloud.google.com/source-repositories/docs) covers enterprise integration patterns and security configurations. The [Vertex AI documentation](https://cloud.google.com/vertex-ai/docs) offers insights into optimizing AI model performance for code analysis tasks and managing costs. The [Cloud Functions documentation](https://cloud.google.com/functions/docs) provides guidance on optimizing serverless performance, monitoring, and cost management for production workloads.
 
 ## Challenge
 
@@ -807,8 +813,13 @@ Extend this intelligent code review automation system with these advanced capabi
 
 4. **Advanced Analytics Dashboard**: Build a comprehensive analytics system using BigQuery and Looker Studio to track code quality metrics, review effectiveness, developer improvement trends, and technical debt accumulation across projects and teams.
 
-5. **Collaborative AI Training**: Implement feedback loops that allow development teams to rate and improve AI analysis quality, using Cloud Vertex AI's custom training capabilities to fine-tune models based on organization-specific code patterns and review preferences.
+5. **Collaborative AI Training**: Implement feedback loops that allow development teams to rate and improve AI analysis quality, using Vertex AI's custom training capabilities to fine-tune models based on organization-specific code patterns and review preferences.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

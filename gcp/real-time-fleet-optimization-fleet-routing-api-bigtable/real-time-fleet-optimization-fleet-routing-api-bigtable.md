@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Cloud Fleet Routing API, Cloud Bigtable, Pub/Sub, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: fleet optimization, real-time analytics, logistics, vehicle routing, traffic data
 recipe-generator-version: 1.3
@@ -83,7 +83,7 @@ graph TB
 4. Knowledge of Python for Cloud Functions development
 5. Estimated cost: $50-100 for running this recipe (includes Bigtable cluster, Pub/Sub messages, and API calls)
 
-> **Note**: Cloud Fleet Routing API requires enabling the Optimization AI API and may have usage quotas. Review current pricing at cloud.google.com/optimization/pricing.
+> **Note**: Cloud Fleet Routing API requires enabling the Optimization AI API and may have usage quotas. Review current pricing at [cloud.google.com/optimization/pricing](https://cloud.google.com/optimization/pricing).
 
 ## Preparation
 
@@ -108,11 +108,11 @@ gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
 
 # Enable required APIs for fleet optimization platform
-gcloud services enable optimization.googleapis.com
-gcloud services enable bigtable.googleapis.com
-gcloud services enable pubsub.googleapis.com
-gcloud services enable cloudfunctions.googleapis.com
-gcloud services enable cloudresourcemanager.googleapis.com
+gcloud services enable optimization.googleapis.com \
+    bigtable.googleapis.com \
+    pubsub.googleapis.com \
+    cloudfunctions.googleapis.com \
+    cloudresourcemanager.googleapis.com
 
 # Create Pub/Sub topic for real-time fleet events
 gcloud pubsub topics create ${PUBSUB_TOPIC}
@@ -171,6 +171,12 @@ echo "✅ Pub/Sub topic: ${PUBSUB_TOPIC}"
    cbt -project=${PROJECT_ID} -instance=${BIGTABLE_INSTANCE} \
        setgcpolicy ${BIGTABLE_TABLE} traffic_speed maxage=30d
    
+   cbt -project=${PROJECT_ID} -instance=${BIGTABLE_INSTANCE} \
+       setgcpolicy ${BIGTABLE_TABLE} traffic_volume maxage=30d
+   
+   cbt -project=${PROJECT_ID} -instance=${BIGTABLE_INSTANCE} \
+       setgcpolicy ${BIGTABLE_TABLE} road_conditions maxage=30d
+   
    echo "✅ Bigtable table schema created successfully"
    ```
 
@@ -193,8 +199,9 @@ from google.cloud import bigtable
 from google.cloud import optimization
 import logging
 from datetime import datetime
+import base64
 
-def process_fleet_event(event, context):
+def process_fleet_event(cloud_event):
     """Process real-time fleet events and update traffic data."""
     
     # Initialize Bigtable client
@@ -203,21 +210,22 @@ def process_fleet_event(event, context):
     table = instance.table(os.environ['BIGTABLE_TABLE'])
     
     # Parse incoming Pub/Sub message
-    pubsub_message = json.loads(event['data'].decode('utf-8'))
+    pubsub_message_data = base64.b64decode(cloud_event.data['message']['data'])
+    pubsub_message = json.loads(pubsub_message_data.decode('utf-8'))
     
     # Extract traffic event data
     road_segment = pubsub_message.get('road_segment')
     traffic_speed = pubsub_message.get('traffic_speed')
     timestamp = pubsub_message.get('timestamp', datetime.now().isoformat())
     
-    # Create row key with reverse timestamp for efficient queries
+    # Create row key with timestamp for efficient queries
     row_key = f"{road_segment}#{timestamp}"
     
     # Write traffic data to Bigtable
     row = table.direct_row(row_key)
-    row.set_cell('traffic_speed', 'current', traffic_speed)
+    row.set_cell('traffic_speed', 'current', str(traffic_speed))
     row.set_cell('traffic_volume', 'vehicles_per_hour', 
-                 pubsub_message.get('volume', 0))
+                 str(pubsub_message.get('volume', 0)))
     row.commit()
     
     # Trigger route optimization if significant traffic change
@@ -234,14 +242,16 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-google-cloud-bigtable==2.23.1
-google-cloud-optimization==1.8.0
-google-cloud-pubsub==2.20.1
+google-cloud-bigtable==2.24.0
+google-cloud-optimization==1.11.2
+google-cloud-pubsub==2.23.1
+functions-framework==3.5.0
 EOF
    
-   # Deploy the Cloud Function
+   # Deploy the Cloud Function with updated runtime
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --gen2 \
+       --runtime python312 \
        --trigger-topic ${PUBSUB_TOPIC} \
        --source . \
        --entry-point process_fleet_event \
@@ -254,7 +264,7 @@ EOF
    echo "✅ Cloud Function deployed for real-time processing"
    ```
 
-   The Cloud Function is now deployed and ready to process real-time traffic events. It automatically updates Bigtable with current traffic conditions and triggers route optimization when significant changes occur. The serverless architecture provides automatic scaling and cost-effective processing of fleet events without infrastructure management overhead.
+   The Cloud Function is now deployed using the latest Python 3.12 runtime and Generation 2 functions for improved performance. It automatically updates Bigtable with current traffic conditions and triggers route optimization when significant changes occur. The serverless architecture provides automatic scaling and cost-effective processing of fleet events without infrastructure management overhead.
 
 4. **Create Fleet Routing Optimization Service**:
 
@@ -300,7 +310,7 @@ class FleetOptimizer:
             for row in rows:
                 if 'traffic_speed' in row.cells:
                     speed_cell = row.cells['traffic_speed']['current'][0]
-                    speeds.append(float(speed_cell.value))
+                    speeds.append(float(speed_cell.value.decode('utf-8')))
             
             traffic_data[segment] = {
                 'average_speed': sum(speeds) / len(speeds) if speeds else 50.0,
@@ -511,6 +521,9 @@ if __name__ == "__main__":
     simulate_traffic_events()
 EOF
    
+   # Install required Python packages
+   pip3 install google-cloud-pubsub
+   
    # Run traffic simulation
    python3 simulate_traffic.py
    
@@ -532,7 +545,7 @@ EOF
    cat > main.py << 'EOF'
 import json
 import os
-from flask import Flask, render_template_string
+from flask import Flask
 from google.cloud import bigtable
 from google.cloud import functions_framework
 import logging
@@ -693,15 +706,16 @@ EOF
    
    # Create requirements for dashboard
    cat > requirements.txt << 'EOF'
-google-cloud-bigtable==2.23.1
-google-cloud-functions==1.14.0
-flask==2.3.3
+google-cloud-bigtable==2.24.0
+functions-framework==3.5.0
+flask==3.0.0
 jinja2==3.1.2
 EOF
    
-   # Deploy dashboard function
+   # Deploy dashboard function with updated runtime
    gcloud functions deploy fleet-dashboard-${RANDOM_SUFFIX} \
-       --runtime python39 \
+       --gen2 \
+       --runtime python312 \
        --trigger-http \
        --allow-unauthenticated \
        --source . \
@@ -711,7 +725,10 @@ EOF
        --set-env-vars GCP_PROJECT=${PROJECT_ID},BIGTABLE_INSTANCE=${BIGTABLE_INSTANCE},BIGTABLE_TABLE=${BIGTABLE_TABLE}
    
    # Get dashboard URL
-   DASHBOARD_URL=$(gcloud functions describe fleet-dashboard-${RANDOM_SUFFIX} --format="value(httpsTrigger.url)")
+   DASHBOARD_URL=$(gcloud functions describe fleet-dashboard-${RANDOM_SUFFIX} \
+       --gen2 \
+       --region=${REGION} \
+       --format="value(serviceConfig.uri)")
    
    cd ..
    
@@ -741,10 +758,13 @@ EOF
    ```bash
    # Publish test message to verify Cloud Function processing
    gcloud pubsub topics publish ${PUBSUB_TOPIC} \
-       --message='{"road_segment":"test_segment","traffic_speed":25,"volume":200,"timestamp":"2025-01-12T10:00:00Z"}'
+       --message='{"road_segment":"test_segment","traffic_speed":25,"volume":200,"timestamp":"2025-07-23T10:00:00Z"}'
    
    # Check Cloud Function logs
-   gcloud functions logs read ${FUNCTION_NAME} --limit=10
+   gcloud functions logs read ${FUNCTION_NAME} \
+       --gen2 \
+       --region=${REGION} \
+       --limit=10
    ```
 
    Expected output: Function logs should show successful message processing and Bigtable updates.
@@ -757,6 +777,9 @@ EOF
    export PROJECT_ID=${PROJECT_ID}
    export BIGTABLE_INSTANCE=${BIGTABLE_INSTANCE}
    export BIGTABLE_TABLE=${BIGTABLE_TABLE}
+   
+   # Install required packages
+   pip3 install google-cloud-optimization google-cloud-bigtable
    
    python3 optimize_routes.py
    ```
@@ -781,10 +804,16 @@ EOF
 
    ```bash
    # Delete optimization function
-   gcloud functions delete ${FUNCTION_NAME} --quiet
+   gcloud functions delete ${FUNCTION_NAME} \
+       --gen2 \
+       --region=${REGION} \
+       --quiet
    
    # Delete dashboard function
-   gcloud functions delete fleet-dashboard-${RANDOM_SUFFIX} --quiet
+   gcloud functions delete fleet-dashboard-${RANDOM_SUFFIX} \
+       --gen2 \
+       --region=${REGION} \
+       --quiet
    
    echo "✅ Cloud Functions deleted"
    ```
@@ -824,7 +853,7 @@ This fleet optimization solution demonstrates the power of combining Google Clou
 
 The integration with Cloud Fleet Routing API leverages Google's advanced optimization algorithms, originally developed for Google Maps, to solve complex vehicle routing problems at scale. This API can handle thousands of vehicles and shipments simultaneously, considering multiple constraints including time windows, vehicle capacities, driver schedules, and traffic conditions. The solution automatically adapts to real-time changes through Pub/Sub event processing, enabling dynamic route adjustments that improve delivery efficiency and customer satisfaction.
 
-The serverless architecture using Cloud Functions and Pub/Sub provides automatic scaling and cost optimization. During peak traffic periods, the system automatically scales to process increased message volume, while scaling down during quiet periods to minimize costs. This event-driven design ensures that route optimizations are triggered only when significant traffic changes occur, balancing responsiveness with computational efficiency. The combination creates a resilient, scalable logistics platform that can grow with business demands while maintaining operational excellence.
+The serverless architecture using Cloud Functions Generation 2 and Pub/Sub provides automatic scaling and cost optimization. During peak traffic periods, the system automatically scales to process increased message volume, while scaling down during quiet periods to minimize costs. This event-driven design ensures that route optimizations are triggered only when significant traffic changes occur, balancing responsiveness with computational efficiency. The combination creates a resilient, scalable logistics platform that can grow with business demands while maintaining operational excellence.
 
 > **Tip**: Monitor Bigtable performance metrics and adjust node count based on query patterns. Consider implementing data archival strategies for historical traffic data older than 30 days to optimize storage costs while maintaining recent patterns for accurate route optimization.
 
@@ -846,4 +875,9 @@ Extend this fleet optimization solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,440 @@
+# Infrastructure Manager configuration for API Schema Generation with Gemini Code Assist and Cloud Build
+# This configuration deploys the complete infrastructure needed for automated API documentation pipeline
+# Generated for recipe: api-schema-generation-gemini-build
+
+# Define variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Google Cloud zone for resources"
+    default: "us-central1-a"
+  
+  bucket_prefix:
+    type: string
+    description: "Prefix for Cloud Storage bucket name"
+    default: "api-schemas"
+  
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+
+# Configure required Google Cloud APIs
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/${var.project_id}
+      serviceName: cloudbuild.googleapis.com
+    
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/${var.project_id}
+      serviceName: storage.googleapis.com
+    
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/${var.project_id}
+      serviceName: cloudfunctions.googleapis.com
+    
+  - name: enable-artifact-registry-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/${var.project_id}
+      serviceName: artifactregistry.googleapis.com
+
+  # Create Cloud Storage bucket for API schemas and build artifacts
+  - name: api-schemas-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      project: ${var.project_id}
+      name: ${var.bucket_prefix}-${var.environment}-$(ref.random-suffix.hex)
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              matchesStorageClass: ["STANDARD"]
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        purpose: api-schema-storage
+        environment: ${var.environment}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Generate random suffix for unique resource names
+  - name: random-suffix
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: ${var.project_id}
+    metadata:
+      runtimePolicy:
+        - CREATE
+    outputs:
+      hex: $(ref.random-suffix.projectNumber | string | slice(0,6))
+
+  # Create service account for Cloud Functions
+  - name: schema-generator-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: schema-generator-sa-${var.environment}
+      serviceAccount:
+        displayName: "Schema Generator Service Account"
+        description: "Service account for API schema generation Cloud Functions"
+      parent: projects/${var.project_id}
+
+  # Grant necessary IAM roles to service account
+  - name: schema-generator-sa-storage-admin
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.schema-generator-sa.email)
+    metadata:
+      dependsOn:
+        - schema-generator-sa
+
+  - name: schema-generator-sa-logging
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/logging.logWriter
+            members:
+              - serviceAccount:$(ref.schema-generator-sa.email)
+    metadata:
+      dependsOn:
+        - schema-generator-sa
+
+  # Create Artifact Registry repository for function source code
+  - name: function-repo
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      repositoryId: api-schema-functions-${var.environment}
+      repository:
+        format: DOCKER
+        description: "Repository for API schema generation functions"
+        labels:
+          purpose: function-storage
+          environment: ${var.environment}
+    metadata:
+      dependsOn:
+        - enable-artifact-registry-api
+
+  # Deploy Cloud Function for schema generation
+  - name: schema-generator-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/schema-generator-${var.environment}
+        description: "Generate OpenAPI schemas from source code using AI analysis"
+        sourceArchiveUrl: gs://$(ref.api-schemas-bucket.name)/function-source.zip
+        httpsTrigger: {}
+        runtime: python312
+        entryPoint: generate_schema
+        timeout: 120s
+        availableMemoryMb: 512
+        maxInstances: 10
+        serviceAccountEmail: $(ref.schema-generator-sa.email)
+        environmentVariables:
+          BUCKET_NAME: $(ref.api-schemas-bucket.name)
+          PROJECT_ID: ${var.project_id}
+          ENVIRONMENT: ${var.environment}
+        labels:
+          function-type: schema-generator
+          environment: ${var.environment}
+          managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - api-schemas-bucket
+        - schema-generator-sa
+
+  # Deploy Cloud Function for schema validation
+  - name: schema-validator-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/schema-validator-${var.environment}
+        description: "Validate OpenAPI schema compliance and best practices"
+        sourceArchiveUrl: gs://$(ref.api-schemas-bucket.name)/validator-source.zip
+        httpsTrigger: {}
+        runtime: python312
+        entryPoint: validate_schema
+        timeout: 60s
+        availableMemoryMb: 512
+        serviceAccountEmail: $(ref.schema-generator-sa.email)
+        environmentVariables:
+          PROJECT_ID: ${var.project_id}
+          ENVIRONMENT: ${var.environment}
+        labels:
+          function-type: schema-validator
+          environment: ${var.environment}
+          managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - api-schemas-bucket
+        - schema-generator-sa
+
+  # Create service account for Cloud Build
+  - name: cloudbuild-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: cloudbuild-sa-${var.environment}
+      serviceAccount:
+        displayName: "Cloud Build Service Account"
+        description: "Service account for API schema generation Cloud Build pipelines"
+      parent: projects/${var.project_id}
+
+  # Grant Cloud Build service account necessary permissions
+  - name: cloudbuild-sa-storage-admin
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/storage.admin
+            members:
+              - serviceAccount:$(ref.cloudbuild-sa.email)
+    metadata:
+      dependsOn:
+        - cloudbuild-sa
+
+  - name: cloudbuild-sa-functions-invoker
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - serviceAccount:$(ref.cloudbuild-sa.email)
+    metadata:
+      dependsOn:
+        - cloudbuild-sa
+
+  - name: cloudbuild-sa-logging
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/logging.logWriter
+            members:
+              - serviceAccount:$(ref.cloudbuild-sa.email)
+    metadata:
+      dependsOn:
+        - cloudbuild-sa
+
+  # Create Cloud Build trigger for automated schema generation
+  - name: api-schema-build-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      parent: projects/${var.project_id}
+      trigger:
+        name: api-schema-generation-pipeline-${var.environment}
+        description: "Automated API Schema Generation Pipeline with AI Analysis"
+        disabled: false
+        substitutions:
+          _BUCKET_NAME: $(ref.api-schemas-bucket.name)
+          _FUNCTION_URL: $(ref.schema-generator-function.httpsTrigger.url)
+          _VALIDATOR_URL: $(ref.schema-validator-function.httpsTrigger.url)
+          _ENVIRONMENT: ${var.environment}
+        serviceAccount: projects/${var.project_id}/serviceAccounts/$(ref.cloudbuild-sa.email)
+        # Manual trigger configuration - can be updated to include repository triggers
+        github:
+          owner: "your-github-username"
+          name: "api-schema-project"
+          push:
+            branch: "^(main|master|develop)$"
+        filename: "cloudbuild.yaml"
+        includedFiles:
+          - "**/*.py"
+          - "**/*.js"
+          - "**/*.java"
+          - "cloudbuild.yaml"
+        tags:
+          - api-schema-generation
+          - automated-docs
+          - ${var.environment}
+    metadata:
+      dependsOn:
+        - enable-apis
+        - schema-generator-function
+        - schema-validator-function
+        - cloudbuild-sa
+
+  # Create Cloud Monitoring notification channel for build alerts
+  - name: email-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/${var.project_id}
+      notificationChannel:
+        type: email
+        displayName: "API Schema Pipeline Alerts - ${var.environment}"
+        description: "Email notifications for API schema generation pipeline"
+        labels:
+          email_address: "alerts@example.com"
+        enabled: true
+
+  # Create alerting policy for build failures
+  - name: build-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${var.project_id}
+      alertPolicy:
+        displayName: "API Schema Build Failures - ${var.environment}"
+        documentation:
+          content: "Alert when API schema generation builds fail"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "Build failure rate"
+            conditionThreshold:
+              filter: resource.type="build" AND metric.type="cloudbuild.googleapis.com/build/count"
+              comparison: COMPARISON_GT
+              thresholdValue: 0.1
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+        notificationChannels:
+          - $(ref.email-notification-channel.name)
+        enabled: true
+    metadata:
+      dependsOn:
+        - email-notification-channel
+
+  # Create Cloud Storage bucket for build logs (optional)
+  - name: build-logs-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      project: ${var.project_id}
+      name: api-schema-build-logs-${var.environment}-$(ref.random-suffix.hex)
+      location: ${var.region}
+      storageClass: STANDARD
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 7
+      labels:
+        purpose: build-logs
+        environment: ${var.environment}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+# Define outputs for easy access to created resources
+outputs:
+  - name: bucket_name
+    value: $(ref.api-schemas-bucket.name)
+    description: "Name of the Cloud Storage bucket for API schemas"
+  
+  - name: schema_generator_function_url
+    value: $(ref.schema-generator-function.httpsTrigger.url)
+    description: "URL of the schema generator Cloud Function"
+  
+  - name: schema_validator_function_url
+    value: $(ref.schema-validator-function.httpsTrigger.url)
+    description: "URL of the schema validator Cloud Function"
+  
+  - name: build_trigger_id
+    value: $(ref.api-schema-build-trigger.id)
+    description: "ID of the Cloud Build trigger"
+  
+  - name: schema_generator_service_account
+    value: $(ref.schema-generator-sa.email)
+    description: "Email of the schema generator service account"
+  
+  - name: cloudbuild_service_account
+    value: $(ref.cloudbuild-sa.email)
+    description: "Email of the Cloud Build service account"
+  
+  - name: artifact_registry_repo
+    value: $(ref.function-repo.name)
+    description: "Name of the Artifact Registry repository"
+  
+  - name: build_logs_bucket
+    value: $(ref.build-logs-bucket.name)
+    description: "Name of the build logs storage bucket"
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Infrastructure for API Schema Generation with Gemini Code Assist and Cloud Build"
+  author: "Infrastructure Manager Generator"
+  tags:
+    - api-documentation
+    - automation
+    - ci-cd
+    - schema-generation
+    - openapi
+    - gemini-code-assist
+    - cloud-build
+  
+  # Resource dependencies and deployment order
+  deployment_order:
+    1: ["enable-apis", "enable-storage-api", "enable-functions-api", "enable-artifact-registry-api"]
+    2: ["random-suffix", "schema-generator-sa", "cloudbuild-sa"]
+    3: ["api-schemas-bucket", "build-logs-bucket", "function-repo"]
+    4: ["schema-generator-sa-storage-admin", "schema-generator-sa-logging", "cloudbuild-sa-storage-admin", "cloudbuild-sa-functions-invoker", "cloudbuild-sa-logging"]
+    5: ["schema-generator-function", "schema-validator-function"]
+    6: ["api-schema-build-trigger", "email-notification-channel"]
+    7: ["build-failure-alert"]
+
+  # Estimated costs (monthly, in USD)
+  cost_estimate:
+    cloud_functions: "$5-15 (based on execution frequency)"
+    cloud_storage: "$1-5 (schema artifacts and logs)"
+    cloud_build: "$0-20 (based on build frequency)"
+    monitoring: "$0-5 (alerting and notifications)"
+    total_estimated: "$6-45 per month"
+
+  # Security considerations
+  security_notes:
+    - "Service accounts follow principle of least privilege"
+    - "IAM roles are scoped to minimum required permissions"
+    - "Cloud Storage buckets use uniform bucket-level access"
+    - "Functions run with dedicated service accounts"
+    - "Build triggers include file filtering for security"
+
+  # Compliance and best practices
+  compliance:
+    - "Follows Google Cloud security best practices"
+    - "Implements proper resource labeling"
+    - "Uses latest runtime versions (Python 3.12)"
+    - "Includes comprehensive monitoring and alerting"
+    - "Implements lifecycle policies for cost optimization"

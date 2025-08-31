@@ -6,10 +6,10 @@ difficulty: 100
 subject: aws
 services: CloudWatch, SNS
 estimated-time: 30 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: monitoring, cloudwatch, alarms, notifications, beginner
 recipe-generator-version: 1.3
@@ -212,7 +212,8 @@ echo "SNS Topic: $SNS_TOPIC_NAME"
 
    ```bash
    # List SNS topics to confirm creation
-   aws sns list-topics --query "Topics[?contains(TopicArn, '$SNS_TOPIC_NAME')]"
+   aws sns list-topics \
+       --query "Topics[?contains(TopicArn, '$SNS_TOPIC_NAME')]"
    
    # Check subscription status
    aws sns list-subscriptions-by-topic \
@@ -322,4 +323,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

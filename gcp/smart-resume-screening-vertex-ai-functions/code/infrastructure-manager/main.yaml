@@ -1,0 +1,499 @@
+# Google Cloud Infrastructure Manager Configuration
+# Smart Resume Screening with Vertex AI and Cloud Functions
+# 
+# This configuration deploys a complete AI-powered resume screening system
+# including Cloud Storage, Cloud Functions, Firestore, and required APIs
+
+metadata:
+  labels:
+    purpose: "resume-screening"
+    component: "ai-ml"
+    environment: "development"
+  annotations:
+    description: "Infrastructure for smart resume screening with Vertex AI"
+    version: "1.0"
+
+# Input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    description: "GCP Project ID where resources will be created"
+    type: string
+    required: true
+  
+  region:
+    description: "GCP region for resource deployment"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: "contains(['us-central1', 'us-east1', 'us-west1', 'europe-west1'], var.region)"
+      error_message: "Region must be one of: us-central1, us-east1, us-west1, europe-west1"
+  
+  # Resource naming
+  resource_prefix:
+    description: "Prefix for all resource names to ensure uniqueness"
+    type: string
+    default: "resume-screening"
+    validation:
+      condition: "length(var.resource_prefix) <= 20"
+      error_message: "Resource prefix must be 20 characters or less"
+  
+  # Storage configuration
+  bucket_location:
+    description: "Location for Cloud Storage bucket"
+    type: string
+    default: "US"
+  
+  bucket_storage_class:
+    description: "Storage class for the resume bucket"
+    type: string
+    default: "STANDARD"
+    validation:
+      condition: "contains(['STANDARD', 'NEARLINE', 'COLDLINE'], var.bucket_storage_class)"
+      error_message: "Storage class must be STANDARD, NEARLINE, or COLDLINE"
+  
+  # Function configuration
+  function_memory:
+    description: "Memory allocation for Cloud Function (MB)"
+    type: number
+    default: 512
+    validation:
+      condition: "var.function_memory >= 128 && var.function_memory <= 8192"
+      error_message: "Function memory must be between 128 and 8192 MB"
+  
+  function_timeout:
+    description: "Timeout for Cloud Function execution (seconds)"
+    type: number
+    default: 300
+    validation:
+      condition: "var.function_timeout >= 60 && var.function_timeout <= 540"
+      error_message: "Function timeout must be between 60 and 540 seconds"
+  
+  # Firestore configuration
+  firestore_location:
+    description: "Location for Firestore database"
+    type: string
+    default: "us-central"
+
+# Required APIs and services
+resources:
+  # Enable required Google Cloud APIs
+  enable_cloudfunctions_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  enable_storage_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  enable_firestore_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/firestore.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  enable_aiplatform_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/aiplatform.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  enable_cloudbuild_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  enable_language_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/language.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Cloud Storage bucket for resume uploads
+  resume_storage_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.resource_prefix}-resumes-${generateRandomString(6)}
+      project: ${var.project_id}
+      location: ${var.bucket_location}
+      storageClass: ${var.bucket_storage_class}
+      # Enable uniform bucket-level access for better security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Lifecycle management to control costs
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90  # Delete resumes after 90 days
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30  # Move to nearline after 30 days
+      # Versioning for data protection
+      versioning:
+        enabled: true
+      # Logging for audit purposes
+      logging:
+        logBucket: ${var.resource_prefix}-audit-logs-${generateRandomString(6)}
+        logObjectPrefix: "access-logs/"
+    metadata:
+      dependsOn:
+        - enable_storage_api
+      labels:
+        component: "storage"
+        purpose: "resume-uploads"
+  
+  # Audit logs bucket for Storage access logging
+  audit_logs_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.resource_prefix}-audit-logs-${generateRandomString(6)}
+      project: ${var.project_id}
+      location: ${var.bucket_location}
+      storageClass: COLDLINE  # Cheaper storage for logs
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete audit logs after 1 year
+    metadata:
+      dependsOn:
+        - enable_storage_api
+      labels:
+        component: "logging"
+        purpose: "audit-trail"
+
+  # Firestore database for candidate data storage
+  firestore_database:
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/${var.project_id}
+      databaseId: "(default)"
+      type: FIRESTORE_NATIVE
+      locationId: ${var.firestore_location}
+      # Point-in-time recovery for data protection
+      pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+      # Delete protection to prevent accidental deletion
+      deleteProtectionState: DELETE_PROTECTION_ENABLED
+      # Encryption at rest using Google-managed keys
+      cmekConfig: {}
+    metadata:
+      dependsOn:
+        - enable_firestore_api
+      labels:
+        component: "database"
+        purpose: "candidate-storage"
+
+  # Service account for Cloud Function
+  function_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ${var.resource_prefix}-function-sa
+      serviceAccount:
+        displayName: "Resume Processing Function Service Account"
+        description: "Service account for the resume processing Cloud Function"
+      parent: projects/${var.project_id}
+    metadata:
+      labels:
+        component: "security"
+        purpose: "function-identity"
+
+  # IAM binding for Storage access
+  storage_iam_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/storage.objectViewer
+      member: serviceAccount:${function_service_account.email}
+    metadata:
+      dependsOn:
+        - function_service_account
+        - resume_storage_bucket
+
+  # IAM binding for Firestore access
+  firestore_iam_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/datastore.user
+      member: serviceAccount:${function_service_account.email}
+    metadata:
+      dependsOn:
+        - function_service_account
+        - firestore_database
+
+  # IAM binding for Natural Language API access
+  language_iam_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/ml.developer
+      member: serviceAccount:${function_service_account.email}
+    metadata:
+      dependsOn:
+        - function_service_account
+
+  # Cloud Function source code storage bucket
+  function_source_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.resource_prefix}-function-source-${generateRandomString(6)}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      # Uniform bucket-level access for security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Lifecycle to clean up old source versions
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              numNewerVersions: 5  # Keep only 5 latest versions
+    metadata:
+      dependsOn:
+        - enable_storage_api
+      labels:
+        component: "deployment"
+        purpose: "function-source"
+
+  # Cloud Function source code zip file
+  function_source_zip:
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: ${function_source_bucket.name}
+      name: function-source.zip
+      # Base64 encoded zip file containing the function source
+      # This would typically be uploaded separately or generated via Cloud Build
+      contentType: application/zip
+      metadata:
+        description: "Resume processing function source code"
+    metadata:
+      dependsOn:
+        - function_source_bucket
+      labels:
+        component: "deployment"
+        purpose: "source-artifact"
+
+  # Cloud Function for resume processing
+  resume_processing_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: ${var.resource_prefix}-process-resume
+        description: "Function to process uploaded resumes using Vertex AI"
+        # Event trigger for Storage object creation
+        eventTrigger:
+          eventType: google.storage.object.finalize
+          resource: projects/_/buckets/${resume_storage_bucket.name}
+          failurePolicy:
+            retry: {}
+        # Function configuration
+        runtime: python311
+        entryPoint: process_resume
+        timeout: ${var.function_timeout}s
+        availableMemoryMb: ${var.function_memory}
+        maxInstances: 100  # Limit concurrent executions
+        # Source code location
+        sourceArchiveUrl: gs://${function_source_bucket.name}/function-source.zip
+        # Service account for execution
+        serviceAccountEmail: ${function_service_account.email}
+        # Environment variables
+        environmentVariables:
+          PROJECT_ID: ${var.project_id}
+          BUCKET_NAME: ${resume_storage_bucket.name}
+          REGION: ${var.region}
+        # VPC connector for secure networking (optional)
+        # vpcConnector: projects/${var.project_id}/locations/${var.region}/connectors/resume-connector
+        # Ingress settings for security
+        ingressSettings: ALLOW_INTERNAL_ONLY
+        # Labels for organization
+        labels:
+          component: "processing"
+          purpose: "resume-analysis"
+          environment: "development"
+    metadata:
+      dependsOn:
+        - enable_cloudfunctions_api
+        - enable_cloudbuild_api
+        - function_service_account
+        - resume_storage_bucket
+        - function_source_zip
+        - storage_iam_binding
+        - firestore_iam_binding
+        - language_iam_binding
+
+  # Cloud Monitoring alert policy for function errors
+  function_error_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${var.project_id}
+      alertPolicy:
+        displayName: "Resume Function Error Rate Alert"
+        documentation:
+          content: "Alert when resume processing function error rate exceeds threshold"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Function Error Rate"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.labels.function_name="${resume_processing_function.name}"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.1  # 10% error rate
+              duration: 300s  # 5 minutes
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.labels.function_name
+        # Notification channels would be configured separately
+        enabled: true
+        alertStrategy:
+          autoClose: 86400s  # Auto-close after 24 hours
+    metadata:
+      dependsOn:
+        - resume_processing_function
+      labels:
+        component: "monitoring"
+        purpose: "error-alerting"
+
+  # Cloud Logging sink for function logs
+  function_log_sink:
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/${var.project_id}
+      sink:
+        name: ${var.resource_prefix}-function-logs
+        description: "Export function logs to BigQuery for analysis"
+        destination: bigquery.googleapis.com/projects/${var.project_id}/datasets/resume_function_logs
+        filter: 'resource.type="cloud_function" AND resource.labels.function_name="${resume_processing_function.name}"'
+        # Include children logs
+        includeChildren: true
+    metadata:
+      dependsOn:
+        - resume_processing_function
+      labels:
+        component: "logging"
+        purpose: "log-export"
+
+# Output values for verification and integration
+outputs:
+  # Storage bucket information
+  resume_bucket_name:
+    description: "Name of the Cloud Storage bucket for resume uploads"
+    value: ${resume_storage_bucket.name}
+  
+  resume_bucket_url:
+    description: "URL of the Cloud Storage bucket for resume uploads"
+    value: gs://${resume_storage_bucket.name}
+  
+  # Function information
+  function_name:
+    description: "Name of the resume processing Cloud Function"
+    value: ${resume_processing_function.name}
+  
+  function_url:
+    description: "HTTP trigger URL for the Cloud Function (if applicable)"
+    value: ${resume_processing_function.httpsTrigger.url}
+  
+  function_service_account:
+    description: "Service account email used by the Cloud Function"
+    value: ${function_service_account.email}
+  
+  # Database information
+  firestore_database_name:
+    description: "Name of the Firestore database"
+    value: ${firestore_database.name}
+  
+  # Project information
+  project_id:
+    description: "GCP Project ID where resources were created"
+    value: ${var.project_id}
+  
+  region:
+    description: "GCP region where resources were deployed"
+    value: ${var.region}
+  
+  # Security information
+  bucket_iam_members:
+    description: "IAM members with access to the storage bucket"
+    value:
+      - ${function_service_account.email}
+  
+  # Monitoring information
+  alert_policy_name:
+    description: "Name of the error monitoring alert policy"
+    value: ${function_error_alert.name}
+  
+  log_sink_name:
+    description: "Name of the Cloud Logging sink"
+    value: ${function_log_sink.name}
+
+# Deployment configuration
+deployment:
+  # Preview mode for testing changes
+  preview: false
+  
+  # Deployment labels
+  labels:
+    managed-by: "infrastructure-manager"
+    project: "resume-screening"
+    version: "1.0"
+  
+  # Rollback configuration
+  rollbackEnabled: true
+  
+  # Resource cleanup policy
+  deletePolicy: DELETE
+  
+  # Deployment timeout
+  timeoutMinutes: 30
+
+# Import existing resources (if any)
+imports: []
+
+# Template metadata for Infrastructure Manager
+templateMetadata:
+  title: "Smart Resume Screening Infrastructure"
+  description: "Complete infrastructure for AI-powered resume screening system"
+  documentationUrl: "https://cloud.google.com/docs/terraform"
+  version: "1.0.0"
+  author: "Cloud Recipe Generator"
+  license: "MIT"
+  
+  # Template requirements
+  requirements:
+    gcp:
+      minVersion: "2024.1.0"
+    
+  # Template categories
+  categories:
+    - "AI/ML"
+    - "Serverless"
+    - "Document Processing"
+    - "Storage"
+  
+  # Estimated costs (monthly, USD)
+  estimatedCosts:
+    development: "$10-50"
+    production: "$100-500"
+    notes: "Costs depend on resume volume and processing frequency"

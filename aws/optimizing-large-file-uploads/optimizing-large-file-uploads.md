@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: s3,cloudwatch
 estimated-time: 45 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: s3,multipart-upload,large-files,performance-optimization,file-transfer
 recipe-generator-version: 1.3
@@ -93,11 +93,17 @@ export BUCKET_NAME="multipart-upload-demo-${RANDOM_SUFFIX}"
 export TEST_FILE_NAME="large-test-file.bin"
 export TEST_FILE_SIZE="1073741824"  # 1GB in bytes
 
-# Create S3 bucket for testing
-aws s3api create-bucket \
-    --bucket $BUCKET_NAME \
-    --region $AWS_REGION \
-    --create-bucket-configuration LocationConstraint=$AWS_REGION
+# Create S3 bucket for testing (handle regions correctly)
+if [ "$AWS_REGION" = "us-east-1" ]; then
+    aws s3api create-bucket \
+        --bucket $BUCKET_NAME \
+        --region $AWS_REGION
+else
+    aws s3api create-bucket \
+        --bucket $BUCKET_NAME \
+        --region $AWS_REGION \
+        --create-bucket-configuration LocationConstraint=$AWS_REGION
+fi
 
 echo "✅ Created S3 bucket: $BUCKET_NAME"
 
@@ -440,30 +446,37 @@ echo "✅ Created 1GB test file: $TEST_FILE_NAME"
 
 ## Discussion
 
-Multipart upload is essential for large file transfers in S3, providing significant advantages over single-part uploads. The key benefits include improved throughput through parallel uploads, quick recovery from network issues by only retrying failed parts, and the ability to pause and resume uploads. When implementing multipart uploads, consider that part sizes between 100MB and 500MB typically provide optimal performance, balancing between parallel efficiency and API call overhead.
+Multipart upload is essential for large file transfers in S3, providing significant advantages over single-part uploads as outlined in the [AWS S3 Multipart Upload documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html). The key benefits include improved throughput through parallel uploads, quick recovery from network issues by only retrying failed parts, and the ability to pause and resume uploads. When implementing multipart uploads, AWS recommends using this approach for objects that are 100MB or larger, with part sizes between 100MB and 500MB typically providing optimal performance, balancing between parallel efficiency and API call overhead.
 
-The parallel upload strategy demonstrated in this recipe can dramatically reduce upload times for large files. By uploading multiple parts simultaneously, you can maximize bandwidth utilization and reduce overall transfer time. However, it's crucial to implement proper error handling and retry logic, as network interruptions are common with large file transfers. The AWS CLI automatically handles many of these scenarios, but understanding the underlying mechanics helps optimize performance.
+The parallel upload strategy demonstrated in this recipe can dramatically reduce upload times for large files by maximizing bandwidth utilization. By uploading multiple parts simultaneously, you can achieve near-linear performance improvements based on available bandwidth. However, it's crucial to implement proper error handling and retry logic, as network interruptions are common with large file transfers. This recipe follows the AWS Well-Architected Framework's Performance Efficiency pillar by optimizing resource usage and monitoring performance through CloudWatch.
 
-Cost optimization is another important consideration. Incomplete multipart uploads continue to incur storage charges until they're either completed or aborted. Implementing lifecycle policies to automatically clean up incomplete uploads after a reasonable timeframe (typically 7 days) prevents unexpected storage costs. Additionally, monitoring upload progress and performance through CloudWatch provides valuable insights for optimizing your upload strategies.
+Cost optimization is another important consideration that aligns with the AWS Well-Architected Framework's Cost Optimization pillar. Incomplete multipart uploads continue to incur storage charges until they're either completed or aborted. Implementing lifecycle policies to automatically clean up incomplete uploads after a reasonable timeframe (typically 7 days) prevents unexpected storage costs. The [S3 Lifecycle Management documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html) provides comprehensive guidance on automated cleanup strategies. Additionally, monitoring upload progress and performance through CloudWatch provides valuable insights for optimizing your upload strategies and detecting anomalies early.
 
 > **Warning**: Always implement proper error handling and retry logic in production applications, as network interruptions can cause individual part uploads to fail even when overall connectivity remains stable.
 
-> **Tip**: For applications requiring maximum upload performance, consider using S3 Transfer Acceleration, which can improve upload speeds by up to 500% for users geographically distant from the S3 bucket region.
+> **Tip**: For applications requiring maximum upload performance, consider using S3 Transfer Acceleration, which can improve upload speeds by up to 500% for users geographically distant from the S3 bucket region. See the [Transfer Acceleration documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/transfer-acceleration.html) for implementation details.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Implement intelligent part sizing** - Create a function that automatically calculates optimal part sizes based on file size and available bandwidth, adjusting between 5MB and 5GB per part.
+1. **Implement intelligent part sizing** - Create a function that automatically calculates optimal part sizes based on file size and available bandwidth, adjusting between 5MB and 5GB per part according to AWS limits.
 
-2. **Add progress tracking and resumption** - Build a system that tracks upload progress in a local database and can resume interrupted uploads from the last successful part.
+2. **Add progress tracking and resumption** - Build a system that tracks upload progress in a local database and can resume interrupted uploads from the last successful part, following AWS best practices for stateful applications.
 
-3. **Implement bandwidth throttling** - Add configurable bandwidth limits to prevent uploads from consuming all available network capacity during business hours.
+3. **Implement bandwidth throttling** - Add configurable bandwidth limits to prevent uploads from consuming all available network capacity during business hours, with integration to AWS Systems Manager Parameter Store for dynamic configuration.
 
-4. **Create upload queue management** - Develop a queuing system that manages multiple concurrent file uploads with priority handling and resource allocation.
+4. **Create upload queue management** - Develop a queuing system using Amazon SQS that manages multiple concurrent file uploads with priority handling and resource allocation based on file size and business requirements.
 
-5. **Add advanced error handling** - Implement exponential backoff retry logic with circuit breaker patterns for handling various failure scenarios including network timeouts and service throttling.
+5. **Add advanced error handling** - Implement exponential backoff retry logic with circuit breaker patterns for handling various failure scenarios including network timeouts and service throttling, incorporating AWS SDK retry mechanisms.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

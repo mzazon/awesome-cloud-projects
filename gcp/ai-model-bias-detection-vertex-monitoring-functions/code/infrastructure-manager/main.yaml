@@ -1,0 +1,414 @@
+# Infrastructure Manager Configuration for AI Model Bias Detection
+# This configuration deploys Vertex AI Model Monitoring, Cloud Functions, 
+# Cloud Scheduler, and supporting services for comprehensive bias detection
+
+# Input variables for customization
+inputs:
+  - name: project_id
+    type: string
+    description: "Google Cloud Project ID"
+    
+  - name: region
+    type: string
+    description: "GCP region for deployments"
+    default: "us-central1"
+    
+  - name: random_suffix
+    type: string
+    description: "Random suffix for unique resource naming"
+    default: "abcd12"
+    
+  - name: bucket_name_prefix
+    type: string
+    description: "Prefix for Cloud Storage bucket name"
+    default: "bias-detection-reports"
+    
+  - name: enable_monitoring
+    type: bool
+    description: "Enable advanced monitoring and logging"
+    default: true
+
+# Template configuration for GCP Infrastructure Manager
+template:
+  # Cloud Storage bucket for bias detection reports and artifacts
+  storage_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: $(ref.storage_bucket.name)
+    properties:
+      name: ${bucket_name_prefix}-${random_suffix}
+      location: ${region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365
+              matchesStorageClass:
+                - STANDARD
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              matchesStorageClass:
+                - STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      logging:
+        logBucket: ${project_id}_logs
+        logObjectPrefix: bias-detection-audit/
+    metadata:
+      dependsOn:
+        - logging_bucket
+
+  # Separate bucket for audit logs
+  logging_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${project_id}_logs
+      location: ${region}
+      storageClass: COLDLINE
+      uniformBucketLevelAccess:
+        enabled: true
+
+  # Pub/Sub topic for model monitoring alerts
+  monitoring_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${project_id}/topics/model-monitoring-alerts
+      labels:
+        environment: bias-detection
+        component: messaging
+
+  # Pub/Sub subscription for bias detection processing
+  bias_detection_subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/${project_id}/subscriptions/bias-detection-sub
+      topic: $(ref.monitoring_topic.name)
+      ackDeadlineSeconds: 300
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.dead_letter_topic.name)
+        maxDeliveryAttempts: 5
+    metadata:
+      dependsOn:
+        - monitoring_topic
+        - dead_letter_topic
+
+  # Dead letter topic for failed message processing
+  dead_letter_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${project_id}/topics/bias-detection-dead-letter
+      labels:
+        environment: bias-detection
+        component: dead-letter
+
+  # IAM service account for Cloud Functions
+  function_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: bias-detection-functions
+      displayName: "Bias Detection Cloud Functions Service Account"
+      description: "Service account for bias detection Cloud Functions with least privilege access"
+
+  # IAM binding for Cloud Function service account - Storage Admin
+  storage_iam_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+
+  # IAM binding for Cloud Function service account - Pub/Sub Publisher
+  pubsub_publisher_iam_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+
+  # IAM binding for Cloud Function service account - Logging Writer
+  logging_writer_iam_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+
+  # IAM binding for Cloud Function service account - AI Platform User
+  aiplatform_user_iam_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+
+  # Cloud Function for bias detection processing
+  bias_detection_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${project_id}/locations/${region}
+      function: bias-detection-processor
+      description: "Cloud Function for processing model monitoring alerts and detecting bias"
+      sourceArchiveUrl: gs://${bucket_name_prefix}-${random_suffix}/functions/bias-detector.zip
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: projects/${project_id}/topics/model-monitoring-alerts
+        failurePolicy:
+          retry: {}
+      runtime: python311
+      timeout: 300s
+      availableMemoryMb: 512
+      serviceAccountEmail: $(ref.function_service_account.email)
+      environmentVariables:
+        BUCKET_NAME: ${bucket_name_prefix}-${random_suffix}
+        PROJECT_ID: ${project_id}
+        REGION: ${region}
+        LOG_LEVEL: INFO
+      labels:
+        environment: bias-detection
+        component: processor
+        function-type: event-driven
+    metadata:
+      dependsOn:
+        - storage_bucket
+        - monitoring_topic
+        - function_service_account
+        - storage_iam_binding
+
+  # Cloud Function for alert processing
+  alert_processing_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${project_id}/locations/${region}
+      function: bias-alert-handler
+      description: "Cloud Function for processing and routing bias alerts based on severity"
+      sourceArchiveUrl: gs://${bucket_name_prefix}-${random_suffix}/functions/alert-processor.zip
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      runtime: python311
+      timeout: 120s
+      availableMemoryMb: 256
+      serviceAccountEmail: $(ref.function_service_account.email)
+      environmentVariables:
+        PROJECT_ID: ${project_id}
+        REGION: ${region}
+        LOG_LEVEL: INFO
+      labels:
+        environment: bias-detection
+        component: alert-handler
+        function-type: http-triggered
+    metadata:
+      dependsOn:
+        - function_service_account
+        - logging_writer_iam_binding
+
+  # Cloud Function for scheduled bias audits
+  audit_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${project_id}/locations/${region}
+      function: bias-report-generator
+      description: "Cloud Function for generating comprehensive bias audit reports"
+      sourceArchiveUrl: gs://${bucket_name_prefix}-${random_suffix}/functions/audit-scheduler.zip
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      runtime: python311
+      timeout: 600s
+      availableMemoryMb: 512
+      serviceAccountEmail: $(ref.function_service_account.email)
+      environmentVariables:
+        BUCKET_NAME: ${bucket_name_prefix}-${random_suffix}
+        PROJECT_ID: ${project_id}
+        REGION: ${region}
+        LOG_LEVEL: INFO
+      labels:
+        environment: bias-detection
+        component: audit-generator
+        function-type: scheduled
+    metadata:
+      dependsOn:
+        - storage_bucket
+        - function_service_account
+        - storage_iam_binding
+
+  # Cloud Scheduler job for regular bias audits
+  bias_audit_scheduler:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/${project_id}/locations/${region}/jobs/bias-audit-scheduler
+      description: "Scheduled job for weekly comprehensive bias audits"
+      schedule: "0 9 * * 1"  # Every Monday at 9:00 AM
+      timeZone: "America/New_York"
+      httpTarget:
+        uri: $(ref.audit_function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {
+            "audit_type": "scheduled",
+            "trigger": "weekly"
+          }
+        oidcToken:
+          serviceAccountEmail: $(ref.function_service_account.email)
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 60s
+        maxDoublings: 3
+    metadata:
+      dependsOn:
+        - audit_function
+        - function_service_account
+
+  # Cloud Monitoring notification channel for critical alerts
+  notification_channel:
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      type: email
+      displayName: "Bias Detection Alerts"
+      description: "Email notifications for critical bias detection alerts"
+      labels:
+        email_address: admin@example.com  # Replace with actual email
+      userLabels:
+        environment: bias-detection
+        severity: critical
+      enabled: true
+
+  # Cloud Monitoring alert policy for bias violations
+  bias_alert_policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "High Bias Score Alert"
+      documentation:
+        content: "Alert triggered when bias scores exceed acceptable thresholds"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "High bias score condition"
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" AND metric.type="logging.googleapis.com/user/bias_score"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.15
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.labels.function_name
+      alertStrategy:
+        autoClose: 86400s  # 24 hours
+      combiner: OR
+      enabled: true
+      notificationChannels:
+        - $(ref.notification_channel.name)
+    metadata:
+      dependsOn:
+        - notification_channel
+        - bias_detection_function
+
+  # Log sink for bias detection events to BigQuery (optional)
+  bias_log_sink:
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: bias-detection-events
+      description: "Export bias detection logs to BigQuery for analysis"
+      destination: bigquery.googleapis.com/projects/${project_id}/datasets/bias_detection_logs
+      filter: |
+        resource.type="cloud_function"
+        AND (jsonPayload.message:"BIAS_ANALYSIS" OR jsonPayload.message:"COMPLIANCE_EVENT")
+      uniqueWriterIdentity: true
+    metadata:
+      dependsOn:
+        - bias_detection_function
+        - alert_processing_function
+
+  # BigQuery dataset for bias detection logs (optional)
+  bias_logs_dataset:
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: bias_detection_logs
+      description: "Dataset for storing bias detection and compliance events"
+      location: ${region}
+      defaultTableExpirationMs: 31536000000  # 1 year
+      labels:
+        environment: bias-detection
+        component: analytics
+        data-type: compliance-logs
+      access:
+        - role: OWNER
+          userByEmail: $(ref.bias_log_sink.writerIdentity)
+        - role: READER
+          specialGroup: projectReaders
+
+# Outputs for verification and integration
+outputs:
+  - name: storage_bucket_name
+    description: "Name of the Cloud Storage bucket for bias detection reports"
+    value: $(ref.storage_bucket.name)
+    
+  - name: monitoring_topic_name
+    description: "Full name of the Pub/Sub topic for model monitoring alerts"
+    value: $(ref.monitoring_topic.name)
+    
+  - name: bias_detection_function_name
+    description: "Name of the bias detection Cloud Function"
+    value: $(ref.bias_detection_function.name)
+    
+  - name: alert_function_url
+    description: "HTTPS URL of the alert processing function"
+    value: $(ref.alert_processing_function.httpsTrigger.url)
+    
+  - name: audit_function_url
+    description: "HTTPS URL of the audit function"
+    value: $(ref.audit_function.httpsTrigger.url)
+    
+  - name: scheduler_job_name
+    description: "Name of the Cloud Scheduler job for bias audits"
+    value: $(ref.bias_audit_scheduler.name)
+    
+  - name: service_account_email
+    description: "Email of the service account used by Cloud Functions"
+    value: $(ref.function_service_account.email)
+    
+  - name: bigquery_dataset_id
+    description: "BigQuery dataset ID for bias detection logs"
+    value: $(ref.bias_logs_dataset.datasetReference.datasetId)
+
+# Metadata for deployment tracking
+metadata:
+  version: "1.0"
+  recipe: "ai-model-bias-detection-vertex-monitoring-functions"
+  description: "Infrastructure for AI model bias detection using Vertex AI monitoring and Cloud Functions"
+  tags:
+    - vertex-ai
+    - model-monitoring
+    - bias-detection
+    - responsible-ai
+    - cloud-functions
+    - automation
+  estimated_cost_monthly: "$10-50"
+  maintenance_level: "medium"
+  compliance_ready: true

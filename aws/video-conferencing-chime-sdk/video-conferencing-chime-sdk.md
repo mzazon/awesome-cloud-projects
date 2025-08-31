@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: chime-sdk, lambda, api-gateway, dynamodb
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: video-conferencing, chime-sdk, real-time-communication, webrtc, serverless
 recipe-generator-version: 1.3
@@ -17,14 +17,13 @@ recipe-generator-version: 1.3
 
 # Custom Video Conferencing with Amazon Chime SDK
 
-
 ## Problem
 
 Modern businesses need custom video conferencing solutions that can be seamlessly integrated into their existing applications, branding, and workflows. Traditional video conferencing platforms offer limited customization options, lack programmatic control, and don't provide the flexibility to build domain-specific features like custom analytics, compliance recording, or specialized collaboration tools. Companies struggle to create differentiated communication experiences that align with their specific business requirements and user interface standards.
 
 ## Solution
 
-Amazon Chime SDK provides a comprehensive set of APIs and client libraries to build custom video conferencing applications with full control over the user experience. This solution demonstrates how to create a scalable video conferencing platform using Chime SDK for real-time audio/video communications, Lambda for backend logic, API Gateway for RESTful endpoints, and S3 for storing meeting recordings and artifacts. The architecture supports custom branding, advanced meeting features, and seamless integration with existing business applications.
+Amazon Chime SDK provides a comprehensive set of APIs and client libraries to build custom video conferencing applications with full control over the user experience. This solution demonstrates how to create a scalable video conferencing platform using Chime SDK for real-time audio/video communications, Lambda for backend logic, API Gateway for RESTful endpoints, and DynamoDB for meeting metadata storage. The architecture supports custom branding, advanced meeting features, and seamless integration with existing business applications.
 
 ## Architecture Diagram
 
@@ -203,7 +202,6 @@ echo "✅ Foundation resources created successfully"
                    "chime:GetAttendee",
                    "chime:ListAttendees",
                    "chime:BatchCreateAttendee",
-                   "chime:BatchDeleteAttendee",
                    "chime:StartMeetingTranscription",
                    "chime:StopMeetingTranscription"
                ],
@@ -248,7 +246,7 @@ echo "✅ Foundation resources created successfully"
 
    The IAM role is now configured with all necessary permissions for Chime SDK operations, DynamoDB access, and S3 storage. This security foundation enables Lambda functions to interact with AWS services using temporary, rotatable credentials rather than permanent access keys.
 
-> **Warning**: Always follow the principle of least privilege when creating IAM policies. Grant only the minimum permissions required for your application to function, and regularly audit permissions to ensure they remain appropriate.
+> **Warning**: Always follow the principle of least privilege when creating IAM policies. Grant only the minimum permissions required for your application to function, and regularly audit permissions to ensure they remain appropriate. See the [AWS IAM best practices guide](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html) for comprehensive security guidance.
 
 2. **Create Meeting Management Lambda Function**:
 
@@ -257,15 +255,17 @@ echo "✅ Foundation resources created successfully"
    ```bash
    # Create meeting management Lambda code
    cat > meeting-handler.js << 'EOF'
-   const AWS = require('aws-sdk');
-   const { v4: uuidv4 } = require('uuid');
+   const { ChimeSDKMeetingsClient, CreateMeetingCommand, GetMeetingCommand, DeleteMeetingCommand } = require("@aws-sdk/client-chime-sdk-meetings");
+   const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+   const { DynamoDBDocumentClient, PutCommand, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
+   const { randomUUID } = require('crypto');
    
-   const chime = new AWS.ChimeSDKMeetings({
-       region: process.env.AWS_REGION,
-       endpoint: `https://meetings-chime.${process.env.AWS_REGION}.amazonaws.com`
+   const chimeClient = new ChimeSDKMeetingsClient({
+       region: process.env.AWS_REGION
    });
    
-   const dynamodb = new AWS.DynamoDB.DocumentClient();
+   const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION });
+   const docClient = DynamoDBDocumentClient.from(dynamoClient);
    
    exports.handler = async (event) => {
        const { httpMethod, path, body } = event;
@@ -308,8 +308,8 @@ echo "✅ Foundation resources created successfully"
        const { externalMeetingId, mediaRegion, meetingHostId } = requestBody;
        
        const meetingRequest = {
-           ClientRequestToken: uuidv4(),
-           ExternalMeetingId: externalMeetingId || uuidv4(),
+           ClientRequestToken: randomUUID(),
+           ExternalMeetingId: externalMeetingId || randomUUID(),
            MediaRegion: mediaRegion || process.env.AWS_REGION,
            MeetingHostId: meetingHostId,
            NotificationsConfiguration: {
@@ -328,10 +328,11 @@ echo "✅ Foundation resources created successfully"
            }
        };
        
-       const meeting = await chime.createMeeting(meetingRequest).promise();
+       const command = new CreateMeetingCommand(meetingRequest);
+       const meeting = await chimeClient.send(command);
        
        // Store meeting metadata in DynamoDB
-       await dynamodb.put({
+       const putCommand = new PutCommand({
            TableName: process.env.TABLE_NAME,
            Item: {
                MeetingId: meeting.Meeting.MeetingId,
@@ -340,7 +341,9 @@ echo "✅ Foundation resources created successfully"
                MediaRegion: meeting.Meeting.MediaRegion,
                Status: 'ACTIVE'
            }
-       }).promise();
+       });
+       
+       await docClient.send(putCommand);
        
        return {
            statusCode: 201,
@@ -355,7 +358,8 @@ echo "✅ Foundation resources created successfully"
    }
    
    async function getMeeting(meetingId) {
-       const meeting = await chime.getMeeting({ MeetingId: meetingId }).promise();
+       const command = new GetMeetingCommand({ MeetingId: meetingId });
+       const meeting = await chimeClient.send(command);
        
        return {
            statusCode: 200,
@@ -370,10 +374,11 @@ echo "✅ Foundation resources created successfully"
    }
    
    async function deleteMeeting(meetingId) {
-       await chime.deleteMeeting({ MeetingId: meetingId }).promise();
+       const command = new DeleteMeetingCommand({ MeetingId: meetingId });
+       await chimeClient.send(command);
        
        // Update meeting status in DynamoDB
-       await dynamodb.update({
+       const updateCommand = new UpdateCommand({
            TableName: process.env.TABLE_NAME,
            Key: { MeetingId: meetingId },
            UpdateExpression: 'SET #status = :status, UpdatedAt = :updatedAt',
@@ -384,7 +389,9 @@ echo "✅ Foundation resources created successfully"
                ':status': 'DELETED',
                ':updatedAt': new Date().toISOString()
            }
-       }).promise();
+       });
+       
+       await docClient.send(updateCommand);
        
        return {
            statusCode: 204,
@@ -397,13 +404,13 @@ echo "✅ Foundation resources created successfully"
    
    # Create deployment package
    npm init -y
-   npm install aws-sdk uuid
+   npm install @aws-sdk/client-chime-sdk-meetings @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
    zip -r meeting-handler.zip meeting-handler.js node_modules/ package.json
    
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-meeting-handler \
-       --runtime nodejs18.x \
+       --runtime nodejs20.x \
        --role ${LAMBDA_ROLE_ARN} \
        --handler meeting-handler.handler \
        --zip-file fileb://meeting-handler.zip \
@@ -416,7 +423,7 @@ echo "✅ Foundation resources created successfully"
    echo "✅ Meeting management Lambda created"
    ```
 
-   The meeting management Lambda is now deployed and ready to handle video conference requests. This serverless function automatically scales to accommodate varying meeting loads and provides the core API endpoints for creating and managing Chime SDK meetings.
+   The meeting management Lambda is now deployed with the latest AWS SDK v3 for optimal performance and uses the Amazon Chime SDK Meetings namespace for enhanced regional support. This serverless function automatically scales to accommodate varying meeting loads and provides the core API endpoints for creating and managing Chime SDK meetings.
 
 3. **Create Attendee Management Lambda Function**:
 
@@ -425,12 +432,11 @@ echo "✅ Foundation resources created successfully"
    ```bash
    # Create attendee management Lambda code
    cat > attendee-handler.js << 'EOF'
-   const AWS = require('aws-sdk');
-   const { v4: uuidv4 } = require('uuid');
+   const { ChimeSDKMeetingsClient, CreateAttendeeCommand, GetAttendeeCommand, DeleteAttendeeCommand } = require("@aws-sdk/client-chime-sdk-meetings");
+   const { randomUUID } = require('crypto');
    
-   const chime = new AWS.ChimeSDKMeetings({
-       region: process.env.AWS_REGION,
-       endpoint: `https://meetings-chime.${process.env.AWS_REGION}.amazonaws.com`
+   const chimeClient = new ChimeSDKMeetingsClient({
+       region: process.env.AWS_REGION
    });
    
    exports.handler = async (event) => {
@@ -480,7 +486,7 @@ echo "✅ Foundation resources created successfully"
        
        const attendeeRequest = {
            MeetingId: meetingId,
-           ExternalUserId: externalUserId || uuidv4(),
+           ExternalUserId: externalUserId || randomUUID(),
            Capabilities: capabilities || {
                Audio: 'SendReceive',
                Video: 'SendReceive',
@@ -488,7 +494,8 @@ echo "✅ Foundation resources created successfully"
            }
        };
        
-       const attendee = await chime.createAttendee(attendeeRequest).promise();
+       const command = new CreateAttendeeCommand(attendeeRequest);
+       const attendee = await chimeClient.send(command);
        
        return {
            statusCode: 201,
@@ -503,10 +510,12 @@ echo "✅ Foundation resources created successfully"
    }
    
    async function getAttendee(meetingId, attendeeId) {
-       const attendee = await chime.getAttendee({
+       const command = new GetAttendeeCommand({
            MeetingId: meetingId,
            AttendeeId: attendeeId
-       }).promise();
+       });
+       
+       const attendee = await chimeClient.send(command);
        
        return {
            statusCode: 200,
@@ -521,10 +530,12 @@ echo "✅ Foundation resources created successfully"
    }
    
    async function deleteAttendee(meetingId, attendeeId) {
-       await chime.deleteAttendee({
+       const command = new DeleteAttendeeCommand({
            MeetingId: meetingId,
            AttendeeId: attendeeId
-       }).promise();
+       });
+       
+       await chimeClient.send(command);
        
        return {
            statusCode: 204,
@@ -541,7 +552,7 @@ echo "✅ Foundation resources created successfully"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-attendee-handler \
-       --runtime nodejs18.x \
+       --runtime nodejs20.x \
        --role ${LAMBDA_ROLE_ARN} \
        --handler attendee-handler.handler \
        --zip-file fileb://attendee-handler.zip \
@@ -550,7 +561,7 @@ echo "✅ Foundation resources created successfully"
    echo "✅ Attendee management Lambda created"
    ```
 
-   The attendee management system is now operational, providing secure participant onboarding and access control. This function ensures each meeting participant receives appropriate permissions and secure access credentials for the video conference.
+   The attendee management system is now operational using AWS SDK v3, providing secure participant onboarding and access control. This function ensures each meeting participant receives appropriate permissions and secure access credentials for the video conference.
 
 4. **Create API Gateway REST API**:
 
@@ -793,7 +804,7 @@ echo "✅ Foundation resources created successfully"
            "build": "echo 'Build complete'"
        },
        "dependencies": {
-           "amazon-chime-sdk-js": "^3.17.0"
+           "amazon-chime-sdk-js": "^3.27.0"
        },
        "devDependencies": {
            "http-server": "^14.1.1"
@@ -923,7 +934,7 @@ echo "✅ Foundation resources created successfully"
    echo "✅ Web client created"
    ```
 
-   The web client structure is now established with all necessary dependencies for Chime SDK integration. This foundation enables rapid development of custom video conferencing user interfaces with full control over branding and user experience.
+   The web client structure is now established with the latest Chime SDK version and all necessary dependencies for Chime SDK integration. This foundation enables rapid development of custom video conferencing user interfaces with full control over branding and user experience.
 
 10. **Create JavaScript Application Logic**:
 
@@ -1197,7 +1208,7 @@ echo "✅ Foundation resources created successfully"
     echo "✅ JavaScript application created with API endpoint: ${API_ENDPOINT}"
     ```
 
-    The complete video conferencing application is now ready for testing. This client-side implementation provides all essential functionality including meeting creation, participant management, and real-time audio/video communication through the Chime SDK.
+    The complete video conferencing application is now ready for testing with the latest Chime SDK JavaScript client library. This client-side implementation provides all essential functionality including meeting creation, participant management, and real-time audio/video communication through the Chime SDK.
 
 ## Validation & Testing
 
@@ -1343,32 +1354,39 @@ echo "✅ Foundation resources created successfully"
 
 ## Discussion
 
-The Amazon Chime SDK provides a powerful platform for building custom video conferencing solutions with full control over the user experience. This implementation demonstrates several key architectural patterns and best practices for production-ready video conferencing applications.
+The Amazon Chime SDK provides a powerful platform for building custom video conferencing solutions with full control over the user experience. This implementation demonstrates several key architectural patterns and best practices for production-ready video conferencing applications using the latest AWS SDK v3 and Chime SDK Meetings namespace.
 
-**Real-time Media Architecture**: The Chime SDK uses a media service group architecture where all audio and video streams are processed through AWS-managed infrastructure. This eliminates the complexity of peer-to-peer WebRTC connections and provides consistent quality regardless of network conditions. The media placement URLs returned by the CreateMeeting API direct clients to the optimal regional endpoints for their geographic location.
+**Real-time Media Architecture**: The Chime SDK uses a media service group architecture where all audio and video streams are processed through AWS-managed infrastructure. This eliminates the complexity of peer-to-peer WebRTC connections and provides consistent quality regardless of network conditions. The media placement URLs returned by the CreateMeeting API direct clients to the optimal regional endpoints for their geographic location, with enhanced support for multiple regions through the dedicated Chime SDK Meetings namespace.
 
-**Scalable Backend Design**: The serverless architecture using Lambda functions provides automatic scaling for meeting management operations. API Gateway handles authentication, rate limiting, and request routing, while DynamoDB stores meeting metadata for analytics and compliance. The event-driven design using SNS notifications enables real-time monitoring and can trigger automated workflows like recording processing or participant notifications.
+**Scalable Backend Design**: The serverless architecture using Lambda functions with AWS SDK v3 provides automatic scaling for meeting management operations with improved performance and reduced memory footprint. API Gateway handles authentication, rate limiting, and request routing, while DynamoDB stores meeting metadata for analytics and compliance. The event-driven design using SNS notifications enables real-time monitoring and can trigger automated workflows like recording processing or participant notifications.
 
-**Client-Side Integration**: The JavaScript client demonstrates how to integrate the Chime SDK with custom user interfaces. The SDK provides comprehensive APIs for device management, audio/video controls, and screen sharing. The observer pattern used for event handling enables responsive UI updates as meeting state changes occur.
+**Client-Side Integration**: The JavaScript client demonstrates how to integrate the latest Chime SDK with custom user interfaces. The SDK provides comprehensive APIs for device management, audio/video controls, screen sharing, and enhanced features like echo reduction and attendee capabilities. The observer pattern used for event handling enables responsive UI updates as meeting state changes occur.
 
-**Security Considerations**: Production implementations should include proper authentication using Amazon Cognito or custom JWT tokens, implement meeting access controls, and consider encrypting sensitive meeting data. The current implementation uses open API endpoints for demonstration purposes but should be secured with appropriate authorization mechanisms.
+**Security Considerations**: Production implementations should include proper authentication using Amazon Cognito or custom JWT tokens, implement meeting access controls, and consider encrypting sensitive meeting data. The current implementation uses open API endpoints for demonstration purposes but should be secured with appropriate authorization mechanisms. Follow the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) security pillar for comprehensive guidance.
 
-> **Tip**: Use CloudWatch Logs Insights to monitor meeting quality metrics and identify connectivity issues. The Chime SDK emits detailed telemetry data that can help optimize the user experience.
+> **Tip**: Use CloudWatch Logs Insights to monitor meeting quality metrics and identify connectivity issues. The Chime SDK emits detailed telemetry data that can help optimize the user experience. Monitor the migration guidance from the legacy Chime namespace to the dedicated [Chime SDK Meetings namespace](https://docs.aws.amazon.com/chime-sdk/latest/dg/meeting-namespace-migration.html) for access to the latest features and multi-region support.
 
 ## Challenge
 
 Extend this video conferencing solution with these advanced features:
 
-1. **Real-time Messaging Integration**: Implement Amazon Chime SDK messaging to add chat functionality, file sharing, and meeting annotations alongside video calls.
+1. **Real-time Messaging Integration**: Implement Amazon Chime SDK messaging to add chat functionality, file sharing, and meeting annotations alongside video calls using the latest messaging APIs.
 
-2. **Meeting Recording and Playback**: Add server-side recording capabilities using Amazon Chime SDK media pipelines and S3 for storage, with automated transcription using Amazon Transcribe.
+2. **Meeting Recording and Playback**: Add server-side recording capabilities using Amazon Chime SDK media pipelines with multi-region support and S3 for storage, with automated transcription using Amazon Transcribe.
 
-3. **Advanced Analytics Dashboard**: Build a comprehensive analytics system using Amazon QuickSight to track meeting metrics, participant engagement, and quality statistics.
+3. **Advanced Analytics Dashboard**: Build a comprehensive analytics system using Amazon QuickSight to track meeting metrics, participant engagement, and quality statistics leveraging the enhanced telemetry from the Chime SDK Meetings namespace.
 
-4. **Multi-region Deployment**: Implement global deployment with automatic region selection based on participant locations, using Route 53 for DNS-based routing.
+4. **Multi-region Deployment**: Implement global deployment with automatic region selection based on participant locations, using Route 53 for DNS-based routing and leveraging the multi-region capabilities of the Chime SDK Meetings namespace.
 
-5. **AI-Powered Features**: Integrate Amazon Bedrock for real-time meeting summarization, sentiment analysis, and automated action item extraction from meeting transcripts.
+5. **AI-Powered Features**: Integrate Amazon Bedrock for real-time meeting summarization, sentiment analysis, and automated action item extraction from meeting transcripts using the enhanced transcription features.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

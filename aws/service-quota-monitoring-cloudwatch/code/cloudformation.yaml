@@ -1,0 +1,468 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Service Quota Monitoring with CloudWatch Alarms - Implements automated 
+  service quota monitoring using AWS Service Quotas, CloudWatch alarms, and 
+  SNS notifications to proactively track quota utilization and alert teams 
+  before limits are reached.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - SNSTopicName
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - QuotaThresholdPercentage
+          - AlarmEvaluationPeriods
+          - AlarmDatapointsToAlarm
+      - Label:
+          default: "Service Quota Selection"
+        Parameters:
+          - MonitorEC2Instances
+          - MonitorVPCQuota
+          - MonitorLambdaConcurrency
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+    ParameterLabels:
+      NotificationEmail:
+        default: "Email address for quota alerts"
+      SNSTopicName:
+        default: "SNS Topic name for notifications"
+      QuotaThresholdPercentage:
+        default: "Quota utilization threshold percentage"
+      AlarmEvaluationPeriods:
+        default: "Number of evaluation periods for alarms"
+      AlarmDatapointsToAlarm:
+        default: "Number of datapoints to trigger alarm"
+      MonitorEC2Instances:
+        default: "Monitor EC2 running instances quota"
+      MonitorVPCQuota:
+        default: "Monitor VPC quota"
+      MonitorLambdaConcurrency:
+        default: "Monitor Lambda concurrent executions quota"
+      ResourcePrefix:
+        default: "Prefix for resource names"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive service quota notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+    Default: ""
+
+  SNSTopicName:
+    Type: String
+    Description: Name for the SNS topic that will send quota notifications
+    Default: service-quota-alerts
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9-_]*[a-zA-Z0-9]$
+    ConstraintDescription: >
+      Must contain only alphanumeric characters, hyphens, and underscores. 
+      Cannot start or end with a hyphen or underscore.
+    MinLength: 1
+    MaxLength: 256
+
+  QuotaThresholdPercentage:
+    Type: Number
+    Description: Percentage threshold for quota utilization alarms
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  AlarmEvaluationPeriods:
+    Type: Number
+    Description: Number of periods over which data is compared to threshold
+    Default: 1
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  AlarmDatapointsToAlarm:
+    Type: Number
+    Description: Number of datapoints within evaluation periods that must be breaching to trigger alarm
+    Default: 1
+    MinValue: 1
+    ConstraintDescription: Must be at least 1
+
+  MonitorEC2Instances:
+    Type: String
+    Description: Enable monitoring for EC2 running instances quota
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  MonitorVPCQuota:
+    Type: String
+    Description: Enable monitoring for VPC quota
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  MonitorLambdaConcurrency:
+    Type: String
+    Description: Enable monitoring for Lambda concurrent executions quota
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  ResourcePrefix:
+    Type: String
+    Description: Prefix to add to all resource names for identification
+    Default: quota-monitor
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$
+    ConstraintDescription: >
+      Must contain only alphanumeric characters and hyphens. 
+      Cannot start or end with a hyphen.
+    MinLength: 1
+    MaxLength: 32
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  # Determine if email subscription should be created
+  CreateEmailSubscription: !Not [!Equals [!Ref NotificationEmail, ""]]
+  
+  # Individual service monitoring conditions
+  EnableEC2Monitoring: !Equals [!Ref MonitorEC2Instances, "true"]
+  EnableVPCMonitoring: !Equals [!Ref MonitorVPCQuota, "true"]
+  EnableLambdaMonitoring: !Equals [!Ref MonitorLambdaConcurrency, "true"]
+  
+  # Composite condition to determine if any monitoring is enabled
+  AnyMonitoringEnabled: !Or
+    - !Condition EnableEC2Monitoring
+    - !Condition EnableVPCMonitoring
+    - !Condition EnableLambdaMonitoring
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # -------------------------------------------------------------------------
+  # SNS Topic for Quota Notifications
+  # -------------------------------------------------------------------------
+  ServiceQuotaAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-${SNSTopicName}"
+      DisplayName: !Sub "${ResourcePrefix} Service Quota Alerts"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-service-quota-alerts"
+        - Key: Purpose
+          Value: Service Quota Monitoring
+        - Key: Component
+          Value: Notification
+        - Key: Environment
+          Value: Production
+        - Key: CreatedBy
+          Value: !Ref AWS::StackName
+
+  # -------------------------------------------------------------------------
+  # SNS Topic Policy for CloudWatch Alarms
+  # -------------------------------------------------------------------------
+  ServiceQuotaAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ServiceQuotaAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: ServiceQuotaAlertsTopicPolicy
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - SNS:Publish
+            Resource: !Ref ServiceQuotaAlertsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # -------------------------------------------------------------------------
+  # Email Subscription (Conditional)
+  # -------------------------------------------------------------------------
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailSubscription
+    Properties:
+      TopicArn: !Ref ServiceQuotaAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Alarm for EC2 Running Instances Quota
+  # -------------------------------------------------------------------------
+  EC2RunningInstancesQuotaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableEC2Monitoring
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-EC2-Running-Instances-Quota-Alert"
+      AlarmDescription: !Sub >
+        Alerts when EC2 running instances exceed ${QuotaThresholdPercentage}% of quota.
+        This alarm monitors the ServiceQuotaUtilization metric for EC2 running instances
+        to provide early warning before hitting service limits.
+      MetricName: ServiceQuotaUtilization
+      Namespace: AWS/ServiceQuotas
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      DatapointsToAlarm: !Ref AlarmDatapointsToAlarm
+      Threshold: !Ref QuotaThresholdPercentage
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ServiceQuotaAlertsTopic
+      OKActions:
+        - !Ref ServiceQuotaAlertsTopic
+      Dimensions:
+        - Name: ServiceCode
+          Value: ec2
+        - Name: QuotaCode
+          Value: L-1216C47A  # Running On-Demand All Standard instances
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-ec2-quota-alarm"
+        - Key: Service
+          Value: EC2
+        - Key: QuotaType
+          Value: RunningInstances
+        - Key: Component
+          Value: Monitoring
+        - Key: CreatedBy
+          Value: !Ref AWS::StackName
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Alarm for VPC Quota
+  # -------------------------------------------------------------------------
+  VPCQuotaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableVPCMonitoring
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-VPC-Quota-Alert"
+      AlarmDescription: !Sub >
+        Alerts when VPC count exceeds ${QuotaThresholdPercentage}% of quota.
+        This alarm monitors the ServiceQuotaUtilization metric for VPCs
+        to prevent network deployment failures.
+      MetricName: ServiceQuotaUtilization
+      Namespace: AWS/ServiceQuotas
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      DatapointsToAlarm: !Ref AlarmDatapointsToAlarm
+      Threshold: !Ref QuotaThresholdPercentage
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ServiceQuotaAlertsTopic
+      OKActions:
+        - !Ref ServiceQuotaAlertsTopic
+      Dimensions:
+        - Name: ServiceCode
+          Value: vpc
+        - Name: QuotaCode
+          Value: L-F678F1CE  # VPCs per Region
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-vpc-quota-alarm"
+        - Key: Service
+          Value: VPC
+        - Key: QuotaType
+          Value: VPCCount
+        - Key: Component
+          Value: Monitoring
+        - Key: CreatedBy
+          Value: !Ref AWS::StackName
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Alarm for Lambda Concurrent Executions Quota
+  # -------------------------------------------------------------------------
+  LambdaConcurrentExecutionsQuotaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableLambdaMonitoring
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-Lambda-Concurrent-Executions-Quota-Alert"
+      AlarmDescription: !Sub >
+        Alerts when Lambda concurrent executions exceed ${QuotaThresholdPercentage}% of quota.
+        This alarm monitors the ServiceQuotaUtilization metric for Lambda concurrent
+        executions to prevent function throttling.
+      MetricName: ServiceQuotaUtilization
+      Namespace: AWS/ServiceQuotas
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      DatapointsToAlarm: !Ref AlarmDatapointsToAlarm
+      Threshold: !Ref QuotaThresholdPercentage
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ServiceQuotaAlertsTopic
+      OKActions:
+        - !Ref ServiceQuotaAlertsTopic
+      Dimensions:
+        - Name: ServiceCode
+          Value: lambda
+        - Name: QuotaCode
+          Value: L-B99A9384  # Concurrent executions
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-lambda-quota-alarm"
+        - Key: Service
+          Value: Lambda
+        - Key: QuotaType
+          Value: ConcurrentExecutions
+        - Key: Component
+          Value: Monitoring
+        - Key: CreatedBy
+          Value: !Ref AWS::StackName
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # -------------------------------------------------------------------------
+  # SNS Topic Information
+  # -------------------------------------------------------------------------
+  SNSTopicArn:
+    Description: ARN of the SNS topic for service quota alerts
+    Value: !Ref ServiceQuotaAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicArn"
+
+  SNSTopicName:
+    Description: Name of the SNS topic for service quota alerts
+    Value: !GetAtt ServiceQuotaAlertsTopic.TopicName
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicName"
+
+  # -------------------------------------------------------------------------
+  # Email Subscription Information
+  # -------------------------------------------------------------------------
+  EmailSubscriptionArn:
+    Condition: CreateEmailSubscription
+    Description: ARN of the email subscription (pending confirmation)
+    Value: !Ref EmailSubscription
+    Export:
+      Name: !Sub "${AWS::StackName}-EmailSubscriptionArn"
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Alarm Information
+  # -------------------------------------------------------------------------
+  EC2QuotaAlarmName:
+    Condition: EnableEC2Monitoring
+    Description: Name of the CloudWatch alarm monitoring EC2 instance quota
+    Value: !Ref EC2RunningInstancesQuotaAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-EC2QuotaAlarmName"
+
+  VPCQuotaAlarmName:
+    Condition: EnableVPCMonitoring
+    Description: Name of the CloudWatch alarm monitoring VPC quota
+    Value: !Ref VPCQuotaAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-VPCQuotaAlarmName"
+
+  LambdaQuotaAlarmName:
+    Condition: EnableLambdaMonitoring
+    Description: Name of the CloudWatch alarm monitoring Lambda concurrent executions quota
+    Value: !Ref LambdaConcurrentExecutionsQuotaAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaQuotaAlarmName"
+
+  # -------------------------------------------------------------------------
+  # Configuration Information
+  # -------------------------------------------------------------------------
+  QuotaThreshold:
+    Description: Configured quota utilization threshold percentage
+    Value: !Ref QuotaThresholdPercentage
+    Export:
+      Name: !Sub "${AWS::StackName}-QuotaThreshold"
+
+  MonitoringConfiguration:
+    Description: Summary of monitoring configuration
+    Value: !Sub
+      - "EC2: ${EC2Status}, VPC: ${VPCStatus}, Lambda: ${LambdaStatus}, Threshold: ${QuotaThresholdPercentage}%"
+      - EC2Status: !If [EnableEC2Monitoring, "Enabled", "Disabled"]
+        VPCStatus: !If [EnableVPCMonitoring, "Enabled", "Disabled"]
+        LambdaStatus: !If [EnableLambdaMonitoring, "Enabled", "Disabled"]
+
+  # -------------------------------------------------------------------------
+  # Stack Information
+  # -------------------------------------------------------------------------
+  StackName:
+    Description: Name of this CloudFormation stack
+    Value: !Ref AWS::StackName
+
+  Region:
+    Description: AWS region where the stack is deployed
+    Value: !Ref AWS::Region
+
+  DeploymentTimestamp:
+    Description: Timestamp when the stack was deployed
+    Value: !Sub "${AWS::StackName}-${AWS::AccountId}-${AWS::Region}"
+
+  # -------------------------------------------------------------------------
+  # Next Steps Information
+  # -------------------------------------------------------------------------
+  NextSteps:
+    Description: Instructions for completing the setup
+    Value: !If
+      - CreateEmailSubscription
+      - !Sub |
+        1. Check email ${NotificationEmail} for SNS subscription confirmation
+        2. Click the confirmation link to activate notifications
+        3. Test alarms using AWS CLI: aws cloudwatch set-alarm-state --alarm-name ${ResourcePrefix}-EC2-Running-Instances-Quota-Alert --state-value ALARM --state-reason "Testing"
+        4. Monitor quota utilization in CloudWatch console under AWS/ServiceQuotas namespace
+      - |
+        1. Add email subscription manually: aws sns subscribe --topic-arn [SNS_TOPIC_ARN] --protocol email --notification-endpoint your-email@example.com
+        2. Confirm subscription via email
+        3. Test alarms using AWS CLI set-alarm-state command
+        4. Monitor quota utilization in CloudWatch console under AWS/ServiceQuotas namespace
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this monitoring solution
+    Value: !Sub
+      - "$${EstimatedCost} USD (${AlarmCount} CloudWatch alarms × $0.10 + SNS notifications)"
+      - EstimatedCost: !If
+          - AnyMonitoringEnabled
+          - !Sub
+            - "${Cost}"
+            - Cost: !If
+                - EnableEC2Monitoring
+                - !If
+                  - EnableVPCMonitoring
+                  - !If [EnableLambdaMonitoring, "0.30-2.00", "0.20-1.50"]
+                  - !If [EnableLambdaMonitoring, "0.20-1.50", "0.10-1.00"]
+                - !If
+                  - EnableVPCMonitoring
+                  - !If [EnableLambdaMonitoring, "0.20-1.50", "0.10-1.00"]
+                  - !If [EnableLambdaMonitoring, "0.10-1.00", "0.00-0.50"]
+          - "0.00"
+        AlarmCount: !If
+          - AnyMonitoringEnabled
+          - !Sub
+            - "${Count}"
+            - Count: !If
+                - EnableEC2Monitoring
+                - !If
+                  - EnableVPCMonitoring
+                  - !If [EnableLambdaMonitoring, "3", "2"]
+                  - !If [EnableLambdaMonitoring, "2", "1"]
+                - !If
+                  - EnableVPCMonitoring
+                  - !If [EnableLambdaMonitoring, "2", "1"]
+                  - !If [EnableLambdaMonitoring, "1", "0"]
+          - "0"

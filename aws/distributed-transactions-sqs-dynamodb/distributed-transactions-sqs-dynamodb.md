@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: sqs, dynamodb, lambda, cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: distributed-transactions, saga-pattern, event-driven, microservices
 recipe-generator-version: 1.3
@@ -168,7 +168,7 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
 
 1. **Create DynamoDB Tables for Transaction State and Business Data**:
 
-   This step establishes the foundational data layer for our distributed transaction system. We create separate tables for different concerns - the saga state table tracks transaction progress across services, while business tables store domain-specific data. The saga state table uses DynamoDB Streams to enable real-time monitoring of transaction state changes.
+   This step establishes the foundational data layer for our distributed transaction system. DynamoDB provides fast, scalable storage with built-in transaction support for atomic operations. The saga state table tracks transaction progress across services using DynamoDB Streams for real-time monitoring, while business tables store domain-specific data with 99.999999999% (11 9's) durability.
 
    ```bash
    # Create saga state table for transaction coordination
@@ -217,9 +217,11 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    echo "✅ DynamoDB tables created successfully"
    ```
 
+   The DynamoDB tables are now active with pay-per-request billing, automatically scaling based on demand. Each table provides single-digit millisecond latency and built-in security features including encryption at rest and in transit.
+
 2. **Create SQS FIFO Queues for Transaction Coordination**:
 
-   SQS FIFO queues provide the event-driven communication backbone between our microservices. Each queue represents a specific step in the transaction flow, ensuring exactly-once processing and maintaining message ordering. The FIFO characteristics prevent duplicate transactions while the dead letter queue handles permanent failures.
+   SQS FIFO queues provide the event-driven communication backbone between microservices, ensuring exactly-once processing and maintaining message ordering. FIFO queues support up to 3,000 messages per second with batching, while content-based deduplication prevents duplicate transactions. The dead letter queue pattern enables robust error handling for permanent failures.
 
    ```bash
    # Create order processing queue
@@ -295,104 +297,106 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    echo "✅ SQS FIFO queues created successfully"
    ```
 
+   The SQS FIFO queues now provide reliable message delivery with exactly-once processing guarantees. Each queue maintains message ordering within its group and supports automatic dead letter queue routing for messages that cannot be processed successfully.
+
 3. **Create Transaction Orchestrator Lambda Function**:
 
-   The orchestrator acts as the central coordinator for all distributed transactions. It initiates saga transactions by creating state records and publishing initial events. This function also handles compensation logic when transactions fail, ensuring proper rollback across all participating services.
+   The orchestrator acts as the central coordinator for all distributed transactions, implementing the saga orchestration pattern. Lambda provides serverless compute that automatically scales from zero to thousands of concurrent executions, with pay-per-invocation pricing and built-in integration with CloudWatch for monitoring and logging.
 
    ```bash
    # Create the orchestrator function code
    cat > orchestrator.py << 'EOF'
-   import json
-   import boto3
-   import uuid
-   import os
-   from datetime import datetime
-   
-   dynamodb = boto3.resource('dynamodb')
-   sqs = boto3.client('sqs')
-   
-   SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
-   ORDER_QUEUE_URL = os.environ['ORDER_QUEUE_URL']
-   COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
-   
-   def lambda_handler(event, context):
-       try:
-           # Initialize transaction
-           transaction_id = str(uuid.uuid4())
-           order_data = json.loads(event['body'])
-           
-           # Create saga state record
-           saga_table = dynamodb.Table(SAGA_STATE_TABLE)
-           saga_table.put_item(
-               Item={
-                   'TransactionId': transaction_id,
-                   'Status': 'STARTED',
-                   'CurrentStep': 'ORDER_PROCESSING',
-                   'Steps': ['ORDER_PROCESSING', 'PAYMENT_PROCESSING', 'INVENTORY_UPDATE'],
-                   'CompletedSteps': [],
-                   'OrderData': order_data,
-                   'Timestamp': datetime.utcnow().isoformat(),
-                   'TTL': int(datetime.utcnow().timestamp()) + 86400  # 24 hours TTL
-               }
-           )
-           
-           # Start transaction by sending to order queue
-           message_body = {
-               'transactionId': transaction_id,
-               'step': 'ORDER_PROCESSING',
-               'data': order_data
-           }
-           
-           sqs.send_message(
-               QueueUrl=ORDER_QUEUE_URL,
-               MessageBody=json.dumps(message_body),
-               MessageGroupId=transaction_id
-           )
-           
-           return {
-               'statusCode': 200,
-               'body': json.dumps({
-                   'transactionId': transaction_id,
-                   'status': 'STARTED',
-                   'message': 'Transaction initiated successfully'
-               })
-           }
-           
-       except Exception as e:
-           print(f"Error in orchestrator: {str(e)}")
-           return {
-               'statusCode': 500,
-               'body': json.dumps({
-                   'error': str(e)
-               })
-           }
-   
-   def handle_compensation(event, context):
-       try:
-           # Process compensation messages
-           for record in event['Records']:
-               message_body = json.loads(record['body'])
-               transaction_id = message_body['transactionId']
-               failed_step = message_body['failedStep']
-               
-               # Update saga state to failed
-               saga_table = dynamodb.Table(SAGA_STATE_TABLE)
-               saga_table.update_item(
-                   Key={'TransactionId': transaction_id},
-                   UpdateExpression='SET #status = :status, FailedStep = :failed_step',
-                   ExpressionAttributeNames={'#status': 'Status'},
-                   ExpressionAttributeValues={
-                       ':status': 'FAILED',
-                       ':failed_step': failed_step
-                   }
-               )
-               
-               print(f"Transaction {transaction_id} failed at step {failed_step}")
-               
-       except Exception as e:
-           print(f"Error in compensation handler: {str(e)}")
-           raise
-   EOF
+import json
+import boto3
+import uuid
+import os
+from datetime import datetime
+
+dynamodb = boto3.resource('dynamodb')
+sqs = boto3.client('sqs')
+
+SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
+ORDER_QUEUE_URL = os.environ['ORDER_QUEUE_URL']
+COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
+
+def lambda_handler(event, context):
+    try:
+        # Initialize transaction
+        transaction_id = str(uuid.uuid4())
+        order_data = json.loads(event['body'])
+        
+        # Create saga state record
+        saga_table = dynamodb.Table(SAGA_STATE_TABLE)
+        saga_table.put_item(
+            Item={
+                'TransactionId': transaction_id,
+                'Status': 'STARTED',
+                'CurrentStep': 'ORDER_PROCESSING',
+                'Steps': ['ORDER_PROCESSING', 'PAYMENT_PROCESSING', 'INVENTORY_UPDATE'],
+                'CompletedSteps': [],
+                'OrderData': order_data,
+                'Timestamp': datetime.utcnow().isoformat(),
+                'TTL': int(datetime.utcnow().timestamp()) + 86400  # 24 hours TTL
+            }
+        )
+        
+        # Start transaction by sending to order queue
+        message_body = {
+            'transactionId': transaction_id,
+            'step': 'ORDER_PROCESSING',
+            'data': order_data
+        }
+        
+        sqs.send_message(
+            QueueUrl=ORDER_QUEUE_URL,
+            MessageBody=json.dumps(message_body),
+            MessageGroupId=transaction_id
+        )
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'transactionId': transaction_id,
+                'status': 'STARTED',
+                'message': 'Transaction initiated successfully'
+            })
+        }
+        
+    except Exception as e:
+        print(f"Error in orchestrator: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': str(e)
+            })
+        }
+
+def handle_compensation(event, context):
+    try:
+        # Process compensation messages
+        for record in event['Records']:
+            message_body = json.loads(record['body'])
+            transaction_id = message_body['transactionId']
+            failed_step = message_body['failedStep']
+            
+            # Update saga state to failed
+            saga_table = dynamodb.Table(SAGA_STATE_TABLE)
+            saga_table.update_item(
+                Key={'TransactionId': transaction_id},
+                UpdateExpression='SET #status = :status, FailedStep = :failed_step',
+                ExpressionAttributeNames={'#status': 'Status'},
+                ExpressionAttributeValues={
+                    ':status': 'FAILED',
+                    ':failed_step': failed_step
+                }
+            )
+            
+            print(f"Transaction {transaction_id} failed at step {failed_step}")
+            
+    except Exception as e:
+        print(f"Error in compensation handler: {str(e)}")
+        raise
+EOF
    
    # Create deployment package
    zip -r orchestrator.zip orchestrator.py
@@ -400,7 +404,7 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${STACK_NAME}-orchestrator" \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role "${LAMBDA_ROLE_ARN}" \
        --handler orchestrator.lambda_handler \
        --zip-file fileb://orchestrator.zip \
@@ -414,7 +418,7 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    # Create compensation handler function
    aws lambda create-function \
        --function-name "${STACK_NAME}-compensation-handler" \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role "${LAMBDA_ROLE_ARN}" \
        --handler orchestrator.handle_compensation \
        --zip-file fileb://orchestrator.zip \
@@ -426,103 +430,103 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    echo "✅ Transaction orchestrator functions created"
    ```
 
+   The orchestrator Lambda functions are now deployed using Python 3.13 runtime, providing optimal performance and the latest language features. The functions automatically handle saga state management and compensation logic, ensuring transaction consistency across distributed services.
+
 4. **Create Order Processing Service Lambda**:
 
-   The order service handles the first step of our transaction flow, creating order records and advancing the saga state. It demonstrates how each microservice participates in the distributed transaction by updating its local data and forwarding the transaction to the next step. Error handling triggers compensation workflows when order creation fails.
+   The order service handles the first step of our transaction flow, demonstrating how microservices participate in distributed transactions. Each service updates its local data atomically using DynamoDB transactions, then forwards the transaction to the next step. AWS Lambda automatically scales to handle concurrent order processing while maintaining low latency.
 
    ```bash
    # Create order service function code
    cat > order_service.py << 'EOF'
-   import json
-   import boto3
-   import uuid
-   import os
-   from datetime import datetime
-   
-   dynamodb = boto3.resource('dynamodb')
-   sqs = boto3.client('sqs')
-   
-   ORDER_TABLE = os.environ['ORDER_TABLE']
-   SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
-   PAYMENT_QUEUE_URL = os.environ['PAYMENT_QUEUE_URL']
-   COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
-   
-   def lambda_handler(event, context):
-       try:
-           for record in event['Records']:
-               message_body = json.loads(record['body'])
-               transaction_id = message_body['transactionId']
-               order_data = message_body['data']
-               
-               # Generate order ID
-               order_id = str(uuid.uuid4())
-               
-               # Create order record using DynamoDB transaction
-               order_table = dynamodb.Table(ORDER_TABLE)
-               saga_table = dynamodb.Table(SAGA_STATE_TABLE)
-               
-               # Use DynamoDB transaction to ensure atomicity
-               with order_table.batch_writer() as batch:
-                   # Create order
-                   order_table.put_item(
-                       Item={
-                           'OrderId': order_id,
-                           'TransactionId': transaction_id,
-                           'CustomerId': order_data['customerId'],
-                           'ProductId': order_data['productId'],
-                           'Quantity': order_data['quantity'],
-                           'Amount': order_data['amount'],
-                           'Status': 'PENDING',
-                           'Timestamp': datetime.utcnow().isoformat()
-                       }
-                   )
-               
-               # Update saga state
-               saga_table.update_item(
-                   Key={'TransactionId': transaction_id},
-                   UpdateExpression='SET CompletedSteps = list_append(CompletedSteps, :step), CurrentStep = :next_step',
-                   ExpressionAttributeValues={
-                       ':step': ['ORDER_PROCESSING'],
-                       ':next_step': 'PAYMENT_PROCESSING'
-                   }
-               )
-               
-               # Send message to payment queue
-               payment_message = {
-                   'transactionId': transaction_id,
-                   'step': 'PAYMENT_PROCESSING',
-                   'data': {
-                       'orderId': order_id,
-                       'customerId': order_data['customerId'],
-                       'amount': order_data['amount']
-                   }
-               }
-               
-               sqs.send_message(
-                   QueueUrl=PAYMENT_QUEUE_URL,
-                   MessageBody=json.dumps(payment_message),
-                   MessageGroupId=transaction_id
-               )
-               
-               print(f"Order {order_id} created for transaction {transaction_id}")
-               
-       except Exception as e:
-           print(f"Error in order service: {str(e)}")
-           # Send compensation message
-           compensation_message = {
-               'transactionId': transaction_id,
-               'failedStep': 'ORDER_PROCESSING',
-               'error': str(e)
-           }
-           
-           sqs.send_message(
-               QueueUrl=COMPENSATION_QUEUE_URL,
-               MessageBody=json.dumps(compensation_message),
-               MessageGroupId=transaction_id
-           )
-           
-           raise
-   EOF
+import json
+import boto3
+import uuid
+import os
+from datetime import datetime
+
+dynamodb = boto3.resource('dynamodb')
+sqs = boto3.client('sqs')
+
+ORDER_TABLE = os.environ['ORDER_TABLE']
+SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
+PAYMENT_QUEUE_URL = os.environ['PAYMENT_QUEUE_URL']
+COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
+
+def lambda_handler(event, context):
+    try:
+        for record in event['Records']:
+            message_body = json.loads(record['body'])
+            transaction_id = message_body['transactionId']
+            order_data = message_body['data']
+            
+            # Generate order ID
+            order_id = str(uuid.uuid4())
+            
+            # Create order record using DynamoDB transaction
+            order_table = dynamodb.Table(ORDER_TABLE)
+            saga_table = dynamodb.Table(SAGA_STATE_TABLE)
+            
+            # Create order atomically
+            order_table.put_item(
+                Item={
+                    'OrderId': order_id,
+                    'TransactionId': transaction_id,
+                    'CustomerId': order_data['customerId'],
+                    'ProductId': order_data['productId'],
+                    'Quantity': order_data['quantity'],
+                    'Amount': order_data['amount'],
+                    'Status': 'PENDING',
+                    'Timestamp': datetime.utcnow().isoformat()
+                }
+            )
+            
+            # Update saga state
+            saga_table.update_item(
+                Key={'TransactionId': transaction_id},
+                UpdateExpression='SET CompletedSteps = list_append(CompletedSteps, :step), CurrentStep = :next_step',
+                ExpressionAttributeValues={
+                    ':step': ['ORDER_PROCESSING'],
+                    ':next_step': 'PAYMENT_PROCESSING'
+                }
+            )
+            
+            # Send message to payment queue
+            payment_message = {
+                'transactionId': transaction_id,
+                'step': 'PAYMENT_PROCESSING',
+                'data': {
+                    'orderId': order_id,
+                    'customerId': order_data['customerId'],
+                    'amount': order_data['amount']
+                }
+            }
+            
+            sqs.send_message(
+                QueueUrl=PAYMENT_QUEUE_URL,
+                MessageBody=json.dumps(payment_message),
+                MessageGroupId=transaction_id
+            )
+            
+            print(f"Order {order_id} created for transaction {transaction_id}")
+            
+    except Exception as e:
+        print(f"Error in order service: {str(e)}")
+        # Send compensation message
+        compensation_message = {
+            'transactionId': transaction_id,
+            'failedStep': 'ORDER_PROCESSING',
+            'error': str(e)
+        }
+        
+        sqs.send_message(
+            QueueUrl=COMPENSATION_QUEUE_URL,
+            MessageBody=json.dumps(compensation_message),
+            MessageGroupId=transaction_id
+        )
+        
+        raise
+EOF
    
    # Create deployment package
    zip -r order_service.zip order_service.py
@@ -530,7 +534,7 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${STACK_NAME}-order-service" \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role "${LAMBDA_ROLE_ARN}" \
        --handler order_service.lambda_handler \
        --zip-file fileb://order_service.zip \
@@ -545,111 +549,113 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    echo "✅ Order processing service created"
    ```
 
+   The order service is now deployed and ready to process order creation requests. It demonstrates proper error handling with compensation messaging, ensuring failed orders trigger appropriate rollback procedures while successful orders advance to payment processing.
+
 5. **Create Payment Processing Service Lambda**:
 
-   The payment service simulates financial transaction processing with built-in failure scenarios for testing purposes. This service demonstrates how external payment providers can be integrated into the saga pattern, with proper error handling and compensation messaging when payment processing fails.
+   The payment service simulates financial transaction processing with built-in failure scenarios for comprehensive testing. This service demonstrates integration patterns with external payment providers, implementing proper error handling and compensation messaging. Lambda's concurrent execution model ensures high throughput payment processing with automatic scaling.
 
    ```bash
    # Create payment service function code
    cat > payment_service.py << 'EOF'
-   import json
-   import boto3
-   import uuid
-   import os
-   import random
-   from datetime import datetime
-   
-   dynamodb = boto3.resource('dynamodb')
-   sqs = boto3.client('sqs')
-   
-   PAYMENT_TABLE = os.environ['PAYMENT_TABLE']
-   SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
-   INVENTORY_QUEUE_URL = os.environ['INVENTORY_QUEUE_URL']
-   COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
-   
-   def lambda_handler(event, context):
-       try:
-           for record in event['Records']:
-               message_body = json.loads(record['body'])
-               transaction_id = message_body['transactionId']
-               payment_data = message_body['data']
-               
-               # Simulate payment processing (90% success rate)
-               if random.random() < 0.1:
-                   raise Exception("Payment processing failed - insufficient funds")
-               
-               # Generate payment ID
-               payment_id = str(uuid.uuid4())
-               
-               # Create payment record
-               payment_table = dynamodb.Table(PAYMENT_TABLE)
-               saga_table = dynamodb.Table(SAGA_STATE_TABLE)
-               
-               payment_table.put_item(
-                   Item={
-                       'PaymentId': payment_id,
-                       'TransactionId': transaction_id,
-                       'OrderId': payment_data['orderId'],
-                       'CustomerId': payment_data['customerId'],
-                       'Amount': payment_data['amount'],
-                       'Status': 'PROCESSED',
-                       'Timestamp': datetime.utcnow().isoformat()
-                   }
-               )
-               
-               # Update saga state
-               saga_table.update_item(
-                   Key={'TransactionId': transaction_id},
-                   UpdateExpression='SET CompletedSteps = list_append(CompletedSteps, :step), CurrentStep = :next_step',
-                   ExpressionAttributeValues={
-                       ':step': ['PAYMENT_PROCESSING'],
-                       ':next_step': 'INVENTORY_UPDATE'
-                   }
-               )
-               
-               # Get original order data for inventory update
-               saga_response = saga_table.get_item(
-                   Key={'TransactionId': transaction_id}
-               )
-               order_data = saga_response['Item']['OrderData']
-               
-               # Send message to inventory queue
-               inventory_message = {
-                   'transactionId': transaction_id,
-                   'step': 'INVENTORY_UPDATE',
-                   'data': {
-                       'orderId': payment_data['orderId'],
-                       'paymentId': payment_id,
-                       'productId': order_data['productId'],
-                       'quantity': order_data['quantity']
-                   }
-               }
-               
-               sqs.send_message(
-                   QueueUrl=INVENTORY_QUEUE_URL,
-                   MessageBody=json.dumps(inventory_message),
-                   MessageGroupId=transaction_id
-               )
-               
-               print(f"Payment {payment_id} processed for transaction {transaction_id}")
-               
-       except Exception as e:
-           print(f"Error in payment service: {str(e)}")
-           # Send compensation message
-           compensation_message = {
-               'transactionId': transaction_id,
-               'failedStep': 'PAYMENT_PROCESSING',
-               'error': str(e)
-           }
-           
-           sqs.send_message(
-               QueueUrl=COMPENSATION_QUEUE_URL,
-               MessageBody=json.dumps(compensation_message),
-               MessageGroupId=transaction_id
-           )
-           
-           raise
-   EOF
+import json
+import boto3
+import uuid
+import os
+import random
+from datetime import datetime
+
+dynamodb = boto3.resource('dynamodb')
+sqs = boto3.client('sqs')
+
+PAYMENT_TABLE = os.environ['PAYMENT_TABLE']
+SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
+INVENTORY_QUEUE_URL = os.environ['INVENTORY_QUEUE_URL']
+COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
+
+def lambda_handler(event, context):
+    try:
+        for record in event['Records']:
+            message_body = json.loads(record['body'])
+            transaction_id = message_body['transactionId']
+            payment_data = message_body['data']
+            
+            # Simulate payment processing (90% success rate)
+            if random.random() < 0.1:
+                raise Exception("Payment processing failed - insufficient funds")
+            
+            # Generate payment ID
+            payment_id = str(uuid.uuid4())
+            
+            # Create payment record
+            payment_table = dynamodb.Table(PAYMENT_TABLE)
+            saga_table = dynamodb.Table(SAGA_STATE_TABLE)
+            
+            payment_table.put_item(
+                Item={
+                    'PaymentId': payment_id,
+                    'TransactionId': transaction_id,
+                    'OrderId': payment_data['orderId'],
+                    'CustomerId': payment_data['customerId'],
+                    'Amount': payment_data['amount'],
+                    'Status': 'PROCESSED',
+                    'Timestamp': datetime.utcnow().isoformat()
+                }
+            )
+            
+            # Update saga state
+            saga_table.update_item(
+                Key={'TransactionId': transaction_id},
+                UpdateExpression='SET CompletedSteps = list_append(CompletedSteps, :step), CurrentStep = :next_step',
+                ExpressionAttributeValues={
+                    ':step': ['PAYMENT_PROCESSING'],
+                    ':next_step': 'INVENTORY_UPDATE'
+                }
+            )
+            
+            # Get original order data for inventory update
+            saga_response = saga_table.get_item(
+                Key={'TransactionId': transaction_id}
+            )
+            order_data = saga_response['Item']['OrderData']
+            
+            # Send message to inventory queue
+            inventory_message = {
+                'transactionId': transaction_id,
+                'step': 'INVENTORY_UPDATE',
+                'data': {
+                    'orderId': payment_data['orderId'],
+                    'paymentId': payment_id,
+                    'productId': order_data['productId'],
+                    'quantity': order_data['quantity']
+                }
+            }
+            
+            sqs.send_message(
+                QueueUrl=INVENTORY_QUEUE_URL,
+                MessageBody=json.dumps(inventory_message),
+                MessageGroupId=transaction_id
+            )
+            
+            print(f"Payment {payment_id} processed for transaction {transaction_id}")
+            
+    except Exception as e:
+        print(f"Error in payment service: {str(e)}")
+        # Send compensation message
+        compensation_message = {
+            'transactionId': transaction_id,
+            'failedStep': 'PAYMENT_PROCESSING',
+            'error': str(e)
+        }
+        
+        sqs.send_message(
+            QueueUrl=COMPENSATION_QUEUE_URL,
+            MessageBody=json.dumps(compensation_message),
+            MessageGroupId=transaction_id
+        )
+        
+        raise
+EOF
    
    # Create deployment package
    zip -r payment_service.zip payment_service.py
@@ -657,7 +663,7 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${STACK_NAME}-payment-service" \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role "${LAMBDA_ROLE_ARN}" \
        --handler payment_service.lambda_handler \
        --zip-file fileb://payment_service.zip \
@@ -672,86 +678,92 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    echo "✅ Payment processing service created"
    ```
 
+   The payment service is now active with simulated payment processing capabilities. It demonstrates proper saga pattern implementation with automatic compensation triggers when payment failures occur, ensuring transaction integrity across the distributed system.
+
 6. **Create Inventory Management Service Lambda**:
 
-   The inventory service performs the final step in our transaction, updating product quantities using DynamoDB conditional updates to prevent overselling. This service demonstrates atomic inventory operations and proper saga completion, marking the entire distributed transaction as successful when inventory is successfully reserved.
+   The inventory service performs the final transaction step using DynamoDB conditional updates to prevent overselling. This service demonstrates atomic inventory operations using conditional expressions, ensuring data consistency while supporting high-throughput concurrent inventory updates. Successful inventory updates mark the saga transaction as completed.
 
    ```bash
    # Create inventory service function code
    cat > inventory_service.py << 'EOF'
-   import json
-   import boto3
-   import os
-   import random
-   from datetime import datetime
-   
-   dynamodb = boto3.resource('dynamodb')
-   sqs = boto3.client('sqs')
-   
-   INVENTORY_TABLE = os.environ['INVENTORY_TABLE']
-   SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
-   COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
-   
-   def lambda_handler(event, context):
-       try:
-           for record in event['Records']:
-               message_body = json.loads(record['body'])
-               transaction_id = message_body['transactionId']
-               inventory_data = message_body['data']
-               
-               # Simulate inventory check (85% success rate)
-               if random.random() < 0.15:
-                   raise Exception("Insufficient inventory available")
-               
-               # Update inventory using DynamoDB transaction
-               inventory_table = dynamodb.Table(INVENTORY_TABLE)
-               saga_table = dynamodb.Table(SAGA_STATE_TABLE)
-               
-               # Try to update inventory atomically
-               try:
-                   inventory_table.update_item(
-                       Key={'ProductId': inventory_data['productId']},
-                       UpdateExpression='SET QuantityAvailable = QuantityAvailable - :quantity, LastUpdated = :timestamp',
-                       ConditionExpression='QuantityAvailable >= :quantity',
-                       ExpressionAttributeValues={
-                           ':quantity': inventory_data['quantity'],
-                           ':timestamp': datetime.utcnow().isoformat()
-                       }
-                   )
-               except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
-                   raise Exception("Insufficient inventory - conditional check failed")
-               
-               # Update saga state to completed
-               saga_table.update_item(
-                   Key={'TransactionId': transaction_id},
-                   UpdateExpression='SET CompletedSteps = list_append(CompletedSteps, :step), CurrentStep = :next_step, #status = :status',
-                   ExpressionAttributeNames={'#status': 'Status'},
-                   ExpressionAttributeValues={
-                       ':step': ['INVENTORY_UPDATE'],
-                       ':next_step': 'COMPLETED',
-                       ':status': 'COMPLETED'
-                   }
-               )
-               
-               print(f"Inventory updated for transaction {transaction_id}, product {inventory_data['productId']}")
-               
-       except Exception as e:
-           print(f"Error in inventory service: {str(e)}")
-           # Send compensation message
-           compensation_message = {
-               'transactionId': transaction_id,
-               'failedStep': 'INVENTORY_UPDATE',
-               'error': str(e)
-           }
-           
-           sqs.send_message(
-               QueueUrl=COMPENSATION_QUEUE_URL,
-               MessageBody=json.dumps(compensation_message),
-               MessageGroupId=transaction_id
-           )
-           
-           raise
-   EOF
+import json
+import boto3
+import os
+import random
+from datetime import datetime
+from botocore.exceptions import ClientError
+
+dynamodb = boto3.resource('dynamodb')
+sqs = boto3.client('sqs')
+
+INVENTORY_TABLE = os.environ['INVENTORY_TABLE']
+SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
+COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
+
+def lambda_handler(event, context):
+    try:
+        for record in event['Records']:
+            message_body = json.loads(record['body'])
+            transaction_id = message_body['transactionId']
+            inventory_data = message_body['data']
+            
+            # Simulate inventory check (85% success rate)
+            if random.random() < 0.15:
+                raise Exception("Insufficient inventory available")
+            
+            # Update inventory using DynamoDB conditional update
+            inventory_table = dynamodb.Table(INVENTORY_TABLE)
+            saga_table = dynamodb.Table(SAGA_STATE_TABLE)
+            
+            # Try to update inventory atomically
+            try:
+                inventory_table.update_item(
+                    Key={'ProductId': inventory_data['productId']},
+                    UpdateExpression='SET QuantityAvailable = QuantityAvailable - :quantity, LastUpdated = :timestamp',
+                    ConditionExpression='QuantityAvailable >= :quantity',
+                    ExpressionAttributeValues={
+                        ':quantity': inventory_data['quantity'],
+                        ':timestamp': datetime.utcnow().isoformat()
+                    }
+                )
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                    raise Exception("Insufficient inventory - conditional check failed")
+                else:
+                    raise
+            
+            # Update saga state to completed
+            saga_table.update_item(
+                Key={'TransactionId': transaction_id},
+                UpdateExpression='SET CompletedSteps = list_append(CompletedSteps, :step), CurrentStep = :next_step, #status = :status',
+                ExpressionAttributeNames={'#status': 'Status'},
+                ExpressionAttributeValues={
+                    ':step': ['INVENTORY_UPDATE'],
+                    ':next_step': 'COMPLETED',
+                    ':status': 'COMPLETED'
+                }
+            )
+            
+            print(f"Inventory updated for transaction {transaction_id}, product {inventory_data['productId']}")
+            
+    except Exception as e:
+        print(f"Error in inventory service: {str(e)}")
+        # Send compensation message
+        compensation_message = {
+            'transactionId': transaction_id,
+            'failedStep': 'INVENTORY_UPDATE',
+            'error': str(e)
+        }
+        
+        sqs.send_message(
+            QueueUrl=COMPENSATION_QUEUE_URL,
+            MessageBody=json.dumps(compensation_message),
+            MessageGroupId=transaction_id
+        )
+        
+        raise
+EOF
    
    # Create deployment package
    zip -r inventory_service.zip inventory_service.py
@@ -759,7 +771,7 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${STACK_NAME}-inventory-service" \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role "${LAMBDA_ROLE_ARN}" \
        --handler inventory_service.lambda_handler \
        --zip-file fileb://inventory_service.zip \
@@ -773,9 +785,11 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    echo "✅ Inventory management service created"
    ```
 
+   The inventory service is now deployed with robust conditional update logic preventing overselling scenarios. It uses DynamoDB's conditional expressions to ensure atomic inventory operations, completing the distributed transaction when inventory is successfully reserved.
+
 7. **Configure SQS Event Sources for Lambda Functions**:
 
-   Event source mappings establish the connection between SQS queues and Lambda functions, enabling automatic invocation when messages arrive. This configuration implements the [Lambda-SQS integration pattern](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html) that enables event-driven processing while maintaining exactly-once delivery guarantees through proper batch handling and error management.
+   Event source mappings establish the connection between SQS queues and Lambda functions using the [Lambda-SQS integration pattern](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html). This configuration enables automatic function invocation when messages arrive, implementing exactly-once delivery guarantees through proper batch handling and error management with built-in retry logic.
 
    ```bash
    # Create event source mapping for order processing
@@ -821,11 +835,11 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    echo "✅ Event source mappings configured"
    ```
 
-   The event source mappings are now active and will automatically invoke the corresponding Lambda functions when messages arrive in their respective queues. This completes the event-driven architecture, enabling seamless message processing flow throughout the saga transaction lifecycle.
+   The event source mappings are now active with optimized batch sizes for transaction processing. Lambda automatically polls the SQS queues and invokes functions when messages arrive, enabling seamless event-driven processing throughout the saga transaction lifecycle.
 
 8. **Initialize Sample Inventory Data**:
 
-   Populating the inventory table with sample data creates a realistic testing environment for our distributed transaction system. This step demonstrates DynamoDB's item creation capabilities and establishes the product catalog that will be used throughout our transaction validation process. The sample data includes various product types with different quantity levels to test both successful and failed transaction scenarios.
+   Populating the inventory table creates a realistic testing environment demonstrating DynamoDB's item creation capabilities. The sample data includes various product types with different quantity levels to test both successful transactions and inventory-constrained failures, providing comprehensive validation scenarios.
 
    ```bash
    # Add sample products to inventory
@@ -862,11 +876,11 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    echo "✅ Sample inventory data initialized"
    ```
 
-   The inventory table now contains sample products with realistic quantities and pricing. This test data enables comprehensive validation of our distributed transaction system, including scenarios for both successful purchases and inventory-constrained failures.
+   The inventory table now contains sample products enabling comprehensive testing scenarios. This data supports validation of both successful purchase transactions and inventory-constrained failure cases, demonstrating the system's resilience.
 
 9. **Create API Gateway for Transaction Initiation**:
 
-   API Gateway provides the external interface for initiating distributed transactions, acting as the entry point for client applications. This step creates a [REST API with Lambda proxy integration](https://docs.aws.amazon.com/lambda/latest/dg/services-apigateway.html), enabling HTTP requests to trigger our saga orchestrator. The proxy integration passes the complete request context to Lambda, allowing flexible request handling and response formatting.
+   API Gateway provides the external interface for initiating distributed transactions using [REST API with Lambda proxy integration](https://docs.aws.amazon.com/lambda/latest/dg/services-apigateway.html). This creates a scalable HTTPS endpoint that automatically handles request routing, authentication, and response formatting while integrating seamlessly with our saga orchestrator.
 
    ```bash
    # Create API Gateway REST API
@@ -921,11 +935,11 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    echo "✅ API Gateway created: ${API_ENDPOINT}"
    ```
 
-   The API Gateway is now deployed and ready to accept transaction requests. Client applications can POST transaction data to the `/transactions` endpoint, which will trigger the saga orchestrator and initiate the distributed transaction flow across all microservices.
+   The API Gateway is now deployed and ready to accept transaction requests. Client applications can POST transaction data to the `/transactions` endpoint with automatic HTTPS termination, request validation, and seamless Lambda integration.
 
 10. **Configure CloudWatch Monitoring and Alarms**:
 
-    CloudWatch alarms provide proactive monitoring for our distributed transaction system, alerting on critical failure conditions that could indicate system degradation. These alarms monitor key metrics such as Lambda function errors and SQS message age, enabling rapid response to operational issues. Proper monitoring is essential for maintaining system reliability and meeting SLA requirements in production environments.
+    CloudWatch provides comprehensive monitoring for distributed transaction systems, alerting on critical failure conditions and performance degradation. These alarms monitor Lambda function errors and SQS message age, enabling proactive operational response to maintain system reliability and SLA compliance.
 
     ```bash
     # Create CloudWatch alarm for failed transactions
@@ -957,11 +971,11 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
     echo "✅ CloudWatch monitoring configured"
     ```
 
-    CloudWatch alarms are now actively monitoring the system for critical failure conditions. These alarms will trigger when error rates exceed acceptable thresholds or when message processing delays indicate potential system bottlenecks, enabling proactive operational response.
+    CloudWatch alarms are now actively monitoring the system for critical failures. These alarms trigger when error rates exceed thresholds or message processing delays indicate bottlenecks, enabling rapid operational response to maintain system health.
 
 11. **Create CloudWatch Dashboard for Transaction Monitoring**:
 
-    CloudWatch dashboards provide centralized visualization of transaction system performance metrics, enabling real-time monitoring and troubleshooting capabilities. This dashboard consolidates Lambda function metrics, SQS queue statistics, and transaction flow indicators into a single view, supporting operational teams in maintaining system health and identifying performance bottlenecks quickly.
+    CloudWatch dashboards provide centralized visualization of transaction system performance metrics, consolidating Lambda function metrics, SQS queue statistics, and transaction flow indicators. This real-time monitoring capability supports operational teams in maintaining system health and quickly identifying performance bottlenecks.
 
     ```bash
     # Create CloudWatch dashboard
@@ -1011,7 +1025,7 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
     echo "✅ CloudWatch dashboard created"
     ```
 
-    The CloudWatch dashboard is now available in the AWS console, providing real-time visibility into transaction system performance. Operations teams can use this dashboard to monitor transaction throughput, identify bottlenecks, and track system health metrics across the entire distributed architecture.
+    The CloudWatch dashboard is now available in the AWS console, providing real-time visibility into transaction system performance. Operations teams can monitor transaction throughput, identify bottlenecks, and track system health across the entire distributed architecture.
 
 ## Validation & Testing
 
@@ -1076,7 +1090,8 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    echo "Failed Transaction Response: ${FAILED_TRANSACTION_RESPONSE}"
    
    # Extract failed transaction ID
-   FAILED_TRANSACTION_ID=$(echo "${FAILED_TRANSACTION_RESPONSE}" | jq -r '.transactionId')
+   FAILED_TRANSACTION_ID=$(echo "${FAILED_TRANSACTION_RESPONSE}" | \
+       jq -r '.transactionId')
    
    # Wait for compensation to complete
    sleep 15
@@ -1122,11 +1137,16 @@ echo "✅ Environment prepared with stack name: ${STACK_NAME}"
    aws apigateway delete-rest-api --rest-api-id "${API_ID}"
    
    # Delete Lambda functions
-   aws lambda delete-function --function-name "${STACK_NAME}-orchestrator"
-   aws lambda delete-function --function-name "${STACK_NAME}-compensation-handler"
-   aws lambda delete-function --function-name "${STACK_NAME}-order-service"
-   aws lambda delete-function --function-name "${STACK_NAME}-payment-service"
-   aws lambda delete-function --function-name "${STACK_NAME}-inventory-service"
+   aws lambda delete-function \
+       --function-name "${STACK_NAME}-orchestrator"
+   aws lambda delete-function \
+       --function-name "${STACK_NAME}-compensation-handler"
+   aws lambda delete-function \
+       --function-name "${STACK_NAME}-order-service"
+   aws lambda delete-function \
+       --function-name "${STACK_NAME}-payment-service"
+   aws lambda delete-function \
+       --function-name "${STACK_NAME}-inventory-service"
    
    echo "✅ Lambda functions and API Gateway deleted"
    ```
@@ -1212,7 +1232,7 @@ The saga orchestration pattern used here provides several key advantages over ch
 
 Error handling and compensation strategies are critical components of this architecture. Each service is designed to publish compensation events when failures occur, allowing the system to gracefully rollback completed operations. The use of SQS dead letter queues ensures that failed messages are preserved for analysis and potential retry, while CloudWatch monitoring provides real-time visibility into transaction health and performance metrics.
 
-The solution scales horizontally by design, as each Lambda function can process multiple concurrent transactions, and DynamoDB automatically scales based on demand. SQS FIFO queues provide exactly-once processing guarantees while maintaining message ordering within each transaction, preventing race conditions that could lead to data inconsistency.
+The solution scales horizontally by design, as each Lambda function can process multiple concurrent transactions, and DynamoDB automatically scales based on demand. SQS FIFO queues provide exactly-once processing guarantees while maintaining message ordering within each transaction, preventing race conditions that could lead to data inconsistency. Following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html), this architecture optimizes for operational excellence, security, reliability, performance efficiency, and cost optimization.
 
 > **Note**: This architecture demonstrates the [Saga pattern for distributed transactions](https://docs.aws.amazon.com/prescriptive-guidance/latest/modernization-data-persistence/saga-pattern.html), providing strong consistency guarantees without the complexity of two-phase commit protocols.
 
@@ -1234,4 +1254,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

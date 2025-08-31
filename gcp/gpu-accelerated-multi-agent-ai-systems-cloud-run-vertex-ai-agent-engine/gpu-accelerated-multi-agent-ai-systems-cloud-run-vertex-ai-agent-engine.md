@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Cloud Run, Vertex AI Agent Engine, Cloud Memorystore, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: gpu, multi-agent, ai, serverless, orchestration, real-time
 recipe-generator-version: 1.3
@@ -95,7 +95,7 @@ graph TB
 5. Understanding of multi-agent systems, GPU workloads, and distributed computing concepts
 6. Estimated cost: $50-150 per day for GPU instances, Memorystore cluster, and monitoring (varies by usage)
 
-> **Note**: This recipe uses GPU-enabled Cloud Run instances which require specific quotas and incur higher costs than standard serverless computing.
+> **Note**: This recipe uses GPU-enabled Cloud Run instances which require specific quotas and incur higher costs than standard serverless computing. NVIDIA L4 GPUs require minimum 4 CPU and 16 GiB memory allocation.
 
 ## Preparation
 
@@ -107,7 +107,6 @@ export ZONE="us-central1-a"
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
-export CLUSTER_NAME="agent-cluster-${RANDOM_SUFFIX}"
 export MASTER_AGENT_NAME="master-agent-${RANDOM_SUFFIX}"
 export VISION_AGENT_NAME="vision-agent-${RANDOM_SUFFIX}"
 export LANGUAGE_AGENT_NAME="language-agent-${RANDOM_SUFFIX}"
@@ -122,13 +121,13 @@ gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
 
 # Enable required APIs
-gcloud services enable run.googleapis.com
-gcloud services enable aiplatform.googleapis.com
-gcloud services enable redis.googleapis.com
-gcloud services enable monitoring.googleapis.com
-gcloud services enable pubsub.googleapis.com
-gcloud services enable cloudbuild.googleapis.com
-gcloud services enable artifactregistry.googleapis.com
+gcloud services enable run.googleapis.com \
+    aiplatform.googleapis.com \
+    redis.googleapis.com \
+    monitoring.googleapis.com \
+    pubsub.googleapis.com \
+    cloudbuild.googleapis.com \
+    artifactregistry.googleapis.com
 
 # Create Artifact Registry repository for agent images
 gcloud artifacts repositories create agent-images \
@@ -155,12 +154,14 @@ echo "✅ APIs enabled and Artifact Registry created"
        --tier=basic \
        --enable-auth
 
-   # Wait for Redis instance to be ready
-   gcloud redis instances describe ${REDIS_INSTANCE} \
+   # Wait for Redis instance to be ready and get connection details
+   echo "Waiting for Redis instance to be ready..."
+   while [[ $(gcloud redis instances describe ${REDIS_INSTANCE} \
        --region=${REGION} \
-       --format="value(state)"
+       --format="value(state)") != "READY" ]]; do
+     sleep 10
+   done
 
-   # Get Redis connection details
    export REDIS_HOST=$(gcloud redis instances describe ${REDIS_INSTANCE} \
        --region=${REGION} \
        --format="value(host)")
@@ -289,12 +290,12 @@ if __name__ == "__main__":
 EOF
 
    # Build and push container image
-   gcloud builds submit --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/vision-agent:latest
+   gcloud builds submit \
+       --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/vision-agent:latest
 
    # Deploy vision agent with GPU to Cloud Run
    gcloud run deploy ${VISION_AGENT_NAME} \
        --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/vision-agent:latest \
-       --platform=managed \
        --region=${REGION} \
        --gpu=1 \
        --gpu-type=nvidia-l4 \
@@ -408,12 +409,12 @@ if __name__ == "__main__":
 EOF
 
    # Build and push container image
-   gcloud builds submit --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/language-agent:latest
+   gcloud builds submit \
+       --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/language-agent:latest
 
    # Deploy language agent with GPU to Cloud Run
    gcloud run deploy ${LANGUAGE_AGENT_NAME} \
        --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/language-agent:latest \
-       --platform=managed \
        --region=${REGION} \
        --gpu=1 \
        --gpu-type=nvidia-l4 \
@@ -532,11 +533,11 @@ if __name__ == "__main__":
 EOF
 
    # Build and deploy reasoning agent
-   gcloud builds submit --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/reasoning-agent:latest
+   gcloud builds submit \
+       --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/reasoning-agent:latest
 
    gcloud run deploy ${REASONING_AGENT_NAME} \
        --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/reasoning-agent:latest \
-       --platform=managed \
        --region=${REGION} \
        --gpu=1 \
        --gpu-type=nvidia-l4 \
@@ -562,7 +563,7 @@ EOF
    mkdir -p master-agent
    cd master-agent
 
-   # Create master agent using Vertex AI Agent Engine
+   # Create orchestration agent for Vertex AI Agent Engine
    cat > agent_orchestrator.py << 'EOF'
 import vertexai
 from vertexai.generative_models import GenerativeModel
@@ -722,10 +723,11 @@ requests==2.31.0
 vertexai==1.38.0
 EOF
 
-   # Deploy to Vertex AI Agent Engine
+   # Create deployment script for Vertex AI Agent Engine
    cat > deploy_agent.py << 'EOF'
 from vertexai.preview import reasoning_engines
 import vertexai
+import os
 
 # Initialize Vertex AI
 PROJECT_ID = os.getenv('PROJECT_ID')
@@ -754,7 +756,7 @@ reasoning_engine = reasoning_engines.ReasoningEngine.create(
 print(f"Reasoning Engine created: {reasoning_engine.resource_name}")
 EOF
 
-   # Package and deploy
+   # Deploy to Vertex AI Agent Engine
    python3 deploy_agent.py
    
    cd ..
@@ -867,11 +869,11 @@ if __name__ == "__main__":
 EOF
 
    # Build and deploy tool agent (no GPU required)
-   gcloud builds submit --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/tool-agent:latest
+   gcloud builds submit \
+       --tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/tool-agent:latest
 
    gcloud run deploy ${TOOL_AGENT_NAME} \
        --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/agent-images/tool-agent:latest \
-       --platform=managed \
        --region=${REGION} \
        --memory=2Gi \
        --cpu=1 \
@@ -957,7 +959,7 @@ EOF
 
    ```bash
    # Check Cloud Run services status
-   gcloud run services list --platform=managed --region=${REGION}
+   gcloud run services list --region=${REGION}
 
    # Verify Redis instance
    gcloud redis instances describe ${REDIS_INSTANCE} \
@@ -975,13 +977,13 @@ EOF
    ```bash
    # Get service URLs
    VISION_URL=$(gcloud run services describe ${VISION_AGENT_NAME} \
-       --platform=managed --region=${REGION} \
+       --region=${REGION} \
        --format="value(status.url)")
    LANGUAGE_URL=$(gcloud run services describe ${LANGUAGE_AGENT_NAME} \
-       --platform=managed --region=${REGION} \
+       --region=${REGION} \
        --format="value(status.url)")
    REASONING_URL=$(gcloud run services describe ${REASONING_AGENT_NAME} \
-       --platform=managed --region=${REGION} \
+       --region=${REGION} \
        --format="value(status.url)")
 
    # Test vision agent health
@@ -1055,16 +1057,16 @@ EOF
    ```bash
    # Delete all Cloud Run services
    gcloud run services delete ${VISION_AGENT_NAME} \
-       --platform=managed --region=${REGION} --quiet
+       --region=${REGION} --quiet
 
    gcloud run services delete ${LANGUAGE_AGENT_NAME} \
-       --platform=managed --region=${REGION} --quiet
+       --region=${REGION} --quiet
 
    gcloud run services delete ${REASONING_AGENT_NAME} \
-       --platform=managed --region=${REGION} --quiet
+       --region=${REGION} --quiet
 
    gcloud run services delete ${TOOL_AGENT_NAME} \
-       --platform=managed --region=${REGION} --quiet
+       --region=${REGION} --quiet
 
    echo "✅ Cloud Run services deleted"
    ```
@@ -1119,30 +1121,35 @@ EOF
 
 ## Discussion
 
-This multi-agent AI system architecture leverages Google Cloud's serverless GPU capabilities to create a highly scalable and cost-effective solution for complex AI workloads. The combination of Cloud Run with NVIDIA L4 GPUs provides on-demand scaling with significant performance benefits for compute-intensive tasks like computer vision and language model inference. According to [Google Cloud's GPU documentation](https://cloud.google.com/run/docs/configuring/services/gpu), L4 GPUs offer 24GB of VRAM and can start instances in approximately 5 seconds, making them ideal for real-time AI applications.
+This multi-agent AI system architecture leverages Google Cloud's serverless GPU capabilities to create a highly scalable and cost-effective solution for complex AI workloads. The combination of Cloud Run with NVIDIA L4 GPUs provides on-demand scaling with significant performance benefits for compute-intensive tasks like computer vision and language model inference. According to [Google Cloud's GPU documentation](https://cloud.google.com/run/docs/configuring/services/gpu), L4 GPUs offer 24GB of VRAM and can start instances in approximately 5 seconds, making them ideal for real-time AI applications that require high memory bandwidth and parallel processing capabilities.
 
-Vertex AI Agent Engine serves as the intelligent orchestration layer, managing task distribution and agent coordination through its fully managed runtime environment. The [Agent Engine documentation](https://cloud.google.com/vertex-ai/generative-ai/docs/agent-engine/overview) highlights its support for various frameworks including LangChain, CrewAI, and custom implementations, providing flexibility in agent development while ensuring production-ready scalability. The integrated context management with Sessions and Memory Bank enables sophisticated multi-turn conversations and personalized agent interactions.
+Vertex AI Agent Engine serves as the intelligent orchestration layer, managing task distribution and agent coordination through its fully managed runtime environment. The [Agent Engine documentation](https://cloud.google.com/vertex-ai/generative-ai/docs/agent-engine/overview) highlights its support for various frameworks including LangChain, CrewAI, and custom implementations, providing flexibility in agent development while ensuring production-ready scalability. The integrated context management with Sessions and Memory Bank enables sophisticated multi-turn conversations and personalized agent interactions across distributed systems.
 
-The Redis-based state management architecture ensures low-latency communication between agents while maintaining consistency across distributed processing tasks. Cloud Memorystore provides enterprise-grade reliability with automatic failover and monitoring capabilities. The Pub/Sub integration enables asynchronous task processing, allowing agents to work independently while coordinating through message queues. This decoupled architecture supports horizontal scaling and fault tolerance, essential for production AI systems.
+The Redis-based state management architecture ensures low-latency communication between agents while maintaining consistency across distributed processing tasks. Cloud Memorystore provides enterprise-grade reliability with automatic failover and monitoring capabilities. The Pub/Sub integration enables asynchronous task processing, allowing agents to work independently while coordinating through message queues. This decoupled architecture supports horizontal scaling and fault tolerance, essential for production AI systems that must handle variable workloads and maintain high availability.
 
-> **Tip**: Monitor GPU utilization closely through Cloud Monitoring to optimize cost efficiency. Cloud Run's ability to scale to zero when idle significantly reduces costs compared to always-on GPU instances.
+> **Tip**: Monitor GPU utilization closely through Cloud Monitoring to optimize cost efficiency. Cloud Run's ability to scale to zero when idle significantly reduces costs compared to always-on GPU instances, especially for workloads with intermittent processing requirements.
 
-The monitoring and observability setup provides comprehensive insights into system performance, including GPU utilization, response times, and cost tracking. Google Cloud's [Well-Architected Framework](https://cloud.google.com/architecture/framework) principles are embedded throughout the solution, ensuring operational excellence, security, reliability, performance efficiency, and cost optimization. The integration with Cloud Trace and Cloud Logging enables detailed debugging and performance analysis across the entire multi-agent workflow.
+The monitoring and observability setup provides comprehensive insights into system performance, including GPU utilization, response times, and cost tracking. Google Cloud's [Well-Architected Framework](https://cloud.google.com/architecture/framework) principles are embedded throughout the solution, ensuring operational excellence, security, reliability, performance efficiency, and cost optimization. The integration with Cloud Trace and Cloud Logging enables detailed debugging and performance analysis across the entire multi-agent workflow, facilitating rapid troubleshooting and performance optimization.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Dynamic Agent Scaling**: Implement intelligent auto-scaling based on queue depth and GPU utilization metrics, using Cloud Functions to trigger scaling decisions and adjust min/max instances dynamically based on workload patterns.
+1. **Dynamic Agent Scaling**: Implement intelligent auto-scaling based on queue depth and GPU utilization metrics, using Cloud Functions to trigger scaling decisions and adjust min/max instances dynamically based on workload patterns and cost optimization targets.
 
-2. **Advanced Agent Specialization**: Create domain-specific agents for healthcare, finance, or manufacturing use cases, incorporating industry-specific models and compliance requirements while maintaining the same orchestration framework.
+2. **Advanced Agent Specialization**: Create domain-specific agents for healthcare, finance, or manufacturing use cases, incorporating industry-specific models and compliance requirements while maintaining the same orchestration framework and leveraging specialized model repositories.
 
-3. **Cross-Region Deployment**: Deploy the multi-agent system across multiple Google Cloud regions with intelligent load balancing and data locality optimization, ensuring low-latency responses for global users.
+3. **Cross-Region Deployment**: Deploy the multi-agent system across multiple Google Cloud regions with intelligent load balancing and data locality optimization, ensuring low-latency responses for global users while maintaining data sovereignty requirements.
 
-4. **Hybrid CPU/GPU Optimization**: Implement intelligent workload routing that automatically determines whether tasks require GPU acceleration or can be processed efficiently on CPU-only instances, optimizing cost and performance.
+4. **Hybrid CPU/GPU Optimization**: Implement intelligent workload routing that automatically determines whether tasks require GPU acceleration or can be processed efficiently on CPU-only instances, optimizing cost and performance through real-time resource allocation decisions.
 
-5. **Advanced Evaluation Pipeline**: Integrate [Gen AI Evaluation service](https://cloud.google.com/vertex-ai/generative-ai/docs/agent-engine/evaluate) with automated A/B testing of different agent configurations and performance optimization based on real-world usage patterns.
+5. **Advanced Evaluation Pipeline**: Integrate [Gen AI Evaluation service](https://cloud.google.com/vertex-ai/generative-ai/docs/agent-engine/evaluate) with automated A/B testing of different agent configurations and performance optimization based on real-world usage patterns and quality metrics.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

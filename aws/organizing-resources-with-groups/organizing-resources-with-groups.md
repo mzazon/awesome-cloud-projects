@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: Resource Groups, Systems Manager, CloudWatch, SNS
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: resource-groups, automation, monitoring, cost-tracking, organization
 recipe-generator-version: 1.3
@@ -140,7 +140,7 @@ echo "✅ AWS environment configured with SNS topic: ${SNS_TOPIC_ARN}"
 
 2. **Configure Systems Manager for Automated Management**:
 
-   Systems Manager Automation provides runbooks that can execute maintenance tasks across resource groups automatically. This enables consistent policy enforcement and operational procedures across your entire resource collection without manual intervention.
+   Systems Manager Automation provides runbooks that can execute maintenance tasks across resource groups automatically. This enables consistent policy enforcement and operational procedures across your entire resource collection without manual intervention following AWS Well-Architected operational excellence principles.
 
    ```bash
    # Create IAM role for Systems Manager automation
@@ -199,7 +199,7 @@ echo "✅ AWS environment configured with SNS topic: ${SNS_TOPIC_ARN}"
 
 3. **Set Up CloudWatch Monitoring and Dashboards**:
 
-   CloudWatch provides comprehensive monitoring capabilities for resource groups, enabling you to track performance metrics, resource utilization, and costs in real-time. This visibility is crucial for maintaining operational excellence and cost optimization.
+   CloudWatch provides comprehensive monitoring capabilities for resource groups, enabling you to track performance metrics, resource utilization, and costs in real-time. This visibility is crucial for maintaining operational excellence and cost optimization following AWS Well-Architected performance efficiency principles.
 
    ```bash
    # Create CloudWatch dashboard for resource group monitoring
@@ -264,7 +264,7 @@ echo "✅ AWS environment configured with SNS topic: ${SNS_TOPIC_ARN}"
 
 4. **Configure Cost Tracking and Budget Alerts**:
 
-   Cost tracking through Resource Groups and CloudWatch enables precise budget monitoring and cost optimization. AWS Budgets provides early warning for budget overruns and helps identify cost optimization opportunities through integration with resource tags.
+   Cost tracking through Resource Groups and CloudWatch enables precise budget monitoring and cost optimization. AWS Budgets provides early warning for budget overruns and helps identify cost optimization opportunities through integration with resource tags, supporting AWS Well-Architected cost optimization principles.
 
    ```bash
    # Create budget for resource group monitoring
@@ -300,14 +300,12 @@ echo "✅ AWS environment configured with SNS topic: ${SNS_TOPIC_ARN}"
            }
        ]'
    
-   # Create cost anomaly detection for the resource group
-   aws ce create-anomaly-detector \
-       --anomaly-detector '{
-           "DetectorName": "ResourceGroupAnomalyDetector-'${RANDOM_SUFFIX}'",
+   # Create cost anomaly monitor for the resource group
+   aws ce create-anomaly-monitor \
+       --anomaly-monitor '{
+           "MonitorName": "ResourceGroupAnomalyMonitor-'${RANDOM_SUFFIX}'",
            "MonitorType": "DIMENSIONAL",
-           "DimensionKey": "SERVICE",
-           "MatchOptions": ["EQUALS"],
-           "MonitorSpecification": "{\"TagKey\":\"Environment\",\"TagValues\":[\"production\"]}"
+           "MonitorSpecification": "{\"Dimension\":\"SERVICE\",\"Key\":\"SERVICE\",\"Values\":[\"Amazon Elastic Compute Cloud - Compute\"]}"
        }'
    
    echo "✅ Cost tracking and budget alerts configured"
@@ -317,7 +315,7 @@ echo "✅ AWS environment configured with SNS topic: ${SNS_TOPIC_ARN}"
 
 5. **Create SNS Notification System**:
 
-   SNS provides multi-channel notifications for resource group events, ensuring that critical alerts reach the right people through their preferred communication channels. This system enables rapid response to operational issues.
+   SNS provides multi-channel notifications for resource group events, ensuring that critical alerts reach the right people through their preferred communication channels. This system enables rapid response to operational issues following AWS Well-Architected reliability principles.
 
    ```bash
    # Subscribe email to SNS topic for notifications
@@ -355,7 +353,7 @@ echo "✅ AWS environment configured with SNS topic: ${SNS_TOPIC_ARN}"
 
 6. **Implement Automated Resource Tagging**:
 
-   Automated tagging ensures consistent resource organization and enables effective resource group management. This step creates a systematic approach to resource discovery and categorization using EventBridge to trigger tagging workflows.
+   Automated tagging ensures consistent resource organization and enables effective resource group management. This step creates a systematic approach to resource discovery and categorization using EventBridge to trigger tagging workflows, supporting AWS Well-Architected operational excellence principles.
 
    ```bash
    # Create Systems Manager document for automated tagging
@@ -517,12 +515,12 @@ echo "✅ AWS environment configured with SNS topic: ${SNS_TOPIC_ARN}"
        --account-id ${AWS_ACCOUNT_ID} \
        --budget-name "ResourceGroup-Budget-${RANDOM_SUFFIX}"
    
-   # Delete cost anomaly detector
-   DETECTOR_ARN=$(aws ce get-anomaly-detectors \
-       --query 'AnomalyDetectors[?DetectorName==`ResourceGroupAnomalyDetector-'${RANDOM_SUFFIX}'`].AnomalyDetectorArn' --output text)
+   # Delete cost anomaly monitor
+   MONITOR_ARN=$(aws ce get-anomaly-monitors \
+       --query 'AnomalyMonitors[?MonitorName==`ResourceGroupAnomalyMonitor-'${RANDOM_SUFFIX}'`].MonitorArn' --output text)
    
-   aws ce delete-anomaly-detector \
-       --anomaly-detector-arn ${DETECTOR_ARN}
+   aws ce delete-anomaly-monitor \
+       --monitor-arn ${MONITOR_ARN}
    
    echo "✅ Cost monitoring resources deleted"
    ```
@@ -557,15 +555,15 @@ echo "✅ AWS environment configured with SNS topic: ${SNS_TOPIC_ARN}"
 
 ## Discussion
 
-AWS Resource Groups provide a powerful foundation for organizing and managing cloud resources at scale. This solution demonstrates how to leverage Resource Groups alongside Systems Manager, CloudWatch, and SNS to create a comprehensive resource management system that automates common operational tasks while providing proactive monitoring and alerting capabilities.
+AWS Resource Groups provide a powerful foundation for organizing and managing cloud resources at scale. This solution demonstrates how to leverage Resource Groups alongside Systems Manager, CloudWatch, and SNS to create a comprehensive resource management system that automates common operational tasks while providing proactive monitoring and alerting capabilities following AWS Well-Architected Framework principles.
 
 The tag-based approach to resource organization offers several advantages over traditional management methods. Tags provide a flexible, cross-service metadata system that enables logical grouping regardless of the underlying AWS service. This approach scales naturally as your infrastructure grows and allows for multiple overlapping organizational schemes (by environment, application, team, or cost center). The [AWS Resource Groups documentation](https://docs.aws.amazon.com/ARG/latest/userguide/resource-groups.html) provides comprehensive guidance on advanced querying and organizational strategies.
 
 Systems Manager Automation extends the value of Resource Groups by enabling consistent operational procedures across grouped resources. The automation framework supports complex workflows that can span multiple AWS services, ensuring that maintenance tasks, security updates, and compliance checks are applied uniformly. This approach reduces operational overhead while improving consistency and reducing the risk of human error. The [AWS Systems Manager Automation documentation](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-automation.html) offers detailed guidance on creating sophisticated automation workflows.
 
-CloudWatch integration provides essential visibility into resource performance and costs, enabling data-driven decision making for resource optimization. The combination of metrics, alarms, and dashboards creates a comprehensive monitoring solution that can detect issues before they impact users. The [CloudWatch documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html) explains advanced monitoring patterns and optimization strategies for large-scale deployments.
+CloudWatch integration provides essential visibility into resource performance and costs, enabling data-driven decision making for resource optimization. The combination of metrics, alarms, and dashboards creates a comprehensive monitoring solution that can detect issues before they impact users. The [CloudWatch documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html) explains advanced monitoring patterns and optimization strategies for large-scale deployments. This solution follows the AWS Well-Architected cost optimization pillar by providing visibility into resource utilization and costs.
 
-> **Tip**: Use AWS Config Rules with Resource Groups to ensure compliance and automatically remediate configuration drift across your organized resources. This adds another layer of automation to your resource management strategy.
+> **Tip**: Use AWS Config Rules with Resource Groups to ensure compliance and automatically remediate configuration drift across your organized resources. This adds another layer of automation to your resource management strategy following the AWS Well-Architected security pillar.
 
 ## Challenge
 
@@ -583,4 +581,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

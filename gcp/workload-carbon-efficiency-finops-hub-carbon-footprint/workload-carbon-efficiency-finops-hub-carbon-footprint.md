@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: FinOps Hub, Cloud Carbon Footprint, Cloud Monitoring, Recommender
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: finops, sustainability, carbon-footprint, cost-optimization, monitoring
 recipe-generator-version: 1.3
@@ -128,7 +128,7 @@ echo "✅ Billing Account ID: ${BILLING_ACCOUNT_ID}"
    # Grant necessary IAM roles for billing and carbon footprint access
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:carbon-efficiency-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
-       --role="roles/billing.carbonViewer"
+       --role="roles/billing.viewer"
    
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:carbon-efficiency-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
@@ -159,7 +159,6 @@ import json
 import logging
 import os
 from google.cloud import monitoring_v3
-from google.cloud import billing_budgets_v1
 from google.cloud import recommender_v1
 from datetime import datetime, timedelta
 import functions_framework
@@ -243,17 +242,16 @@ EOF
    
    # Create requirements file for function dependencies
    cat > requirements.txt << 'EOF'
-google-cloud-monitoring==2.15.1
-google-cloud-billing-budgets==1.12.0
-google-cloud-recommender==2.11.1
-functions-framework==3.4.0
+google-cloud-monitoring==2.21.0
+google-cloud-recommender==2.13.0
+functions-framework==3.8.0
 EOF
    
    # Deploy the carbon efficiency correlation function
    gcloud functions deploy carbon-efficiency-correlator \
        --source . \
        --entry-point correlate_carbon_efficiency \
-       --runtime python39 \
+       --runtime python311 \
        --trigger-http \
        --allow-unauthenticated \
        --memory 512MB \
@@ -408,7 +406,7 @@ EOF
 }
 EOF
    
-   gcloud alpha monitoring policies create \
+   gcloud monitoring policies create \
        --policy-from-file=efficiency-alert-policy.json
    
    echo "✅ Carbon efficiency dashboard and alerts configured successfully"
@@ -585,7 +583,10 @@ EOF
    # Execute the metrics creation script
    python3 gemini-metrics-script.py
    
-   # Create log sink for FinOps Hub insights
+   # Create BigQuery dataset for FinOps Hub insights
+   bq mk --dataset ${PROJECT_ID}:carbon_efficiency
+   
+   # Create log sink for FinOps Hub insights  
    gcloud logging sinks create finops-hub-insights \
        bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/carbon_efficiency \
        --log-filter='resource.type="global" AND jsonPayload.source="finops-hub"'
@@ -748,17 +749,17 @@ EOF
    
    # Create requirements for optimization function
    cat > requirements.txt << 'EOF'
-google-cloud-compute==1.14.1
-google-cloud-monitoring==2.15.1
-google-cloud-recommender==2.11.1
-functions-framework==3.4.0
+google-cloud-compute==1.19.2
+google-cloud-monitoring==2.21.0
+google-cloud-recommender==2.13.0
+functions-framework==3.8.0
 EOF
    
    # Deploy optimization automation function
    gcloud functions deploy carbon-efficiency-optimizer \
        --source . \
        --entry-point optimize_carbon_efficiency \
-       --runtime python39 \
+       --runtime python311 \
        --trigger-topic carbon-optimization \
        --memory 1024MB \
        --timeout 540s \
@@ -787,11 +788,12 @@ EOF
    echo "Navigate to: https://console.cloud.google.com/carbon"
    echo "Confirm carbon emissions data is visible for your billing account"
    
-   # Test service account permissions
-   gcloud auth activate-service-account \
-       carbon-efficiency-sa@${PROJECT_ID}.iam.gserviceaccount.com \
-       --key-file=<(gcloud iam service-accounts keys create /dev/stdout \
-           --iam-account=carbon-efficiency-sa@${PROJECT_ID}.iam.gserviceaccount.com)
+   # Test service account permissions by listing recommendations
+   gcloud recommender recommendations list \
+       --project=${PROJECT_ID} \
+       --recommender=google.compute.instance.MachineTypeRecommender \
+       --location=global \
+       --impersonate-service-account="carbon-efficiency-sa@${PROJECT_ID}.iam.gserviceaccount.com"
    
    echo "✅ FinOps Hub and Carbon Footprint access verified"
    ```
@@ -828,7 +830,7 @@ EOF
        --format="table(displayName,name)"
    
    # Check alert policies
-   gcloud alpha monitoring policies list \
+   gcloud monitoring policies list \
        --format="table(displayName,enabled,combiner)"
    
    # Verify workflow execution
@@ -869,8 +871,8 @@ EOF
 
    ```bash
    # Delete alert policies
-   for policy in $(gcloud alpha monitoring policies list --format="value(name)" --filter="displayName:Carbon Efficiency"); do
-       gcloud alpha monitoring policies delete ${policy} --quiet
+   for policy in $(gcloud monitoring policies list --format="value(name)" --filter="displayName:Carbon Efficiency"); do
+       gcloud monitoring policies delete ${policy} --quiet
    done
    
    # Delete dashboards
@@ -893,12 +895,15 @@ EOF
    gcloud pubsub topics delete carbon-optimization \
        --quiet
    
+   # Delete BigQuery dataset
+   bq rm -r -f ${PROJECT_ID}:carbon_efficiency
+   
    # Delete service account
    gcloud iam service-accounts delete \
        carbon-efficiency-sa@${PROJECT_ID}.iam.gserviceaccount.com \
        --quiet
    
-   echo "✅ Scheduler, Pub/Sub, and IAM resources cleaned up"
+   echo "✅ Scheduler, Pub/Sub, BigQuery, and IAM resources cleaned up"
    ```
 
 4. **Clean Up Local Files and Environment Variables**:
@@ -929,7 +934,7 @@ The correlation between FinOps Hub utilization insights and carbon emissions dat
 > **Tip**: FinOps Hub 2.0's Gemini integration can identify optimization opportunities worth 15-30% cost reduction while simultaneously reducing carbon footprint by similar percentages. Review recommendations weekly to maintain optimal efficiency levels.
 
 **Documentation Sources:**
-- [Google Cloud FinOps Hub Documentation](https://cloud.google.com/billing/docs/finops-hub)
+- [Google Cloud FinOps Hub Documentation](https://cloud.google.com/billing/docs/how-to/finops-hub)
 - [Cloud Carbon Footprint Service Guide](https://cloud.google.com/carbon-footprint/docs)
 - [Google Cloud Sustainability Best Practices](https://cloud.google.com/sustainability/docs)
 - [Active Assist Recommender Documentation](https://cloud.google.com/recommender/docs)
@@ -951,4 +956,9 @@ Extend this carbon efficiency solution by implementing these advanced enhancemen
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

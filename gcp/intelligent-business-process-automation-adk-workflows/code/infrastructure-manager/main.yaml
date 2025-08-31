@@ -1,0 +1,675 @@
+# Infrastructure Manager configuration for Intelligent Business Process Automation
+# This configuration deploys the complete infrastructure for an AI-powered business
+# process automation system using ADK, Workflows, Cloud SQL, and Cloud Functions
+#
+# Components deployed:
+# - Cloud SQL PostgreSQL database for process state management
+# - Cloud Functions for approval processing, notifications, and AI agent
+# - Cloud Workflows for intelligent process orchestration
+# - IAM roles and service accounts for secure inter-service communication
+# - VPC Connector for secure Cloud SQL connectivity
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: Blueprint
+metadata:
+  name: business-process-automation
+  annotations:
+    config.kubernetes.io/local-config: "true"
+
+deploymentSpec:
+  # Project and location configuration
+  project: ${PROJECT_ID}
+  location: ${REGION}
+
+  # Define input variables for customization
+  variables:
+    project_id:
+      type: string
+      description: "Google Cloud Project ID"
+      defaultValue: ${PROJECT_ID}
+    
+    region:
+      type: string
+      description: "Google Cloud region for resource deployment"
+      defaultValue: "us-central1"
+    
+    zone:
+      type: string
+      description: "Google Cloud zone for zonal resources"
+      defaultValue: "us-central1-a"
+    
+    db_instance_name:
+      type: string
+      description: "Cloud SQL instance name"
+      defaultValue: "business-process-db"
+    
+    random_suffix:
+      type: string
+      description: "Random suffix for unique resource naming"
+      defaultValue: ${random_id.suffix.hex}
+    
+    db_tier:
+      type: string
+      description: "Cloud SQL database tier"
+      defaultValue: "db-f1-micro"
+    
+    function_memory:
+      type: string
+      description: "Memory allocation for Cloud Functions"
+      defaultValue: "256Mi"
+    
+    function_timeout:
+      type: string
+      description: "Timeout for Cloud Functions"
+      defaultValue: "60s"
+
+  # Resource definitions
+  resources:
+    # Generate random suffix for unique naming
+    - name: suffix
+      type: gcp-types/v1:random_id
+      properties:
+        byte_length: 3
+
+    # Enable required APIs
+    - name: enable-apis
+      type: gcp-types/serviceusage-v1:serviceusage.projects.services
+      properties:
+        parent: projects/${PROJECT_ID}
+        consumerId: projects/${PROJECT_ID}
+        services:
+          - aiplatform.googleapis.com
+          - workflows.googleapis.com
+          - sqladmin.googleapis.com
+          - cloudfunctions.googleapis.com
+          - cloudbuild.googleapis.com
+          - eventarc.googleapis.com
+          - artifactregistry.googleapis.com
+          - run.googleapis.com
+          - logging.googleapis.com
+          - vpcaccess.googleapis.com
+
+    # Service account for Cloud Functions with proper IAM
+    - name: function-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        parent: projects/${PROJECT_ID}
+        accountId: bpa-functions-sa-${random_id.suffix.hex}
+        serviceAccount:
+          displayName: "Business Process Automation Functions Service Account"
+          description: "Service account for Cloud Functions in BPA system"
+      dependsOn:
+        - enable-apis
+
+    # IAM bindings for function service account
+    - name: function-sa-cloudsql-client
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: ${PROJECT_ID}
+        policy:
+          bindings:
+            - role: roles/cloudsql.client
+              members:
+                - serviceAccount:bpa-functions-sa-${random_id.suffix.hex}@${PROJECT_ID}.iam.gserviceaccount.com
+      dependsOn:
+        - function-service-account
+
+    - name: function-sa-logging-writer
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: ${PROJECT_ID}
+        policy:
+          bindings:
+            - role: roles/logging.logWriter
+              members:
+                - serviceAccount:bpa-functions-sa-${random_id.suffix.hex}@${PROJECT_ID}.iam.gserviceaccount.com
+      dependsOn:
+        - function-service-account
+
+    # VPC Connector for secure Cloud SQL access
+    - name: vpc-connector
+      type: gcp-types/vpcaccess-v1:projects.locations.connectors
+      properties:
+        parent: projects/${PROJECT_ID}/locations/${REGION}
+        connectorId: bpa-vpc-connector-${random_id.suffix.hex}
+        connector:
+          network: default
+          ipCidrRange: "10.8.0.0/28"
+          minThroughput: 200
+          maxThroughput: 300
+      dependsOn:
+        - enable-apis
+
+    # Cloud SQL PostgreSQL instance for process state management
+    - name: cloudsql-instance
+      type: gcp-types/sqladmin-v1:instances
+      properties:
+        instanceId: ${db_instance_name}-${random_id.suffix.hex}
+        project: ${PROJECT_ID}
+        body:
+          name: ${db_instance_name}-${random_id.suffix.hex}
+          databaseVersion: POSTGRES_15
+          region: ${REGION}
+          settings:
+            tier: ${db_tier}
+            backupConfiguration:
+              enabled: true
+              startTime: "03:00"
+              pointInTimeRecoveryEnabled: true
+            storageAutoResize: true
+            storageAutoResizeLimit: 100
+            ipConfiguration:
+              ipv4Enabled: true
+              requireSsl: false
+              authorizedNetworks: []
+            locationPreference:
+              zone: ${ZONE}
+            databaseFlags:
+              - name: "log_checkpoints"
+                value: "on"
+              - name: "log_connections"
+                value: "on"
+              - name: "log_disconnections"
+                value: "on"
+            deletionProtectionEnabled: false
+      dependsOn:
+        - enable-apis
+
+    # Database user for application access
+    - name: db-user-password
+      type: gcp-types/v1:random_password
+      properties:
+        length: 32
+        special: true
+
+    - name: cloudsql-user
+      type: gcp-types/sqladmin-v1:users
+      properties:
+        project: ${PROJECT_ID}
+        instance: ${cloudsql-instance.name}
+        name: postgres
+        password: ${random_password.db-user-password.result}
+      dependsOn:
+        - cloudsql-instance
+        - db-user-password
+
+    # Application database
+    - name: business-database
+      type: gcp-types/sqladmin-v1:databases
+      properties:
+        project: ${PROJECT_ID}
+        instance: ${cloudsql-instance.name}
+        name: business_processes
+        charset: UTF8
+        collation: en_US.UTF8
+      dependsOn:
+        - cloudsql-instance
+
+    # Cloud Function for process approval
+    - name: approval-function-source
+      type: gcp-types/storage-v1:bucket
+      properties:
+        name: bpa-approval-source-${random_id.suffix.hex}
+        location: ${REGION}
+        project: ${PROJECT_ID}
+      dependsOn:
+        - enable-apis
+
+    - name: approval-function
+      type: gcp-types/cloudfunctions-v2:projects.locations.functions
+      properties:
+        parent: projects/${PROJECT_ID}/locations/${REGION}
+        functionId: process-approval-${random_id.suffix.hex}
+        function:
+          buildConfig:
+            runtime: python311
+            entryPoint: approve_process
+            source:
+              storageSource:
+                bucket: bpa-approval-source-${random_id.suffix.hex}
+                object: approval-function.zip
+          serviceConfig:
+            maxInstanceCount: 100
+            availableMemory: ${function_memory}
+            timeoutSeconds: 60
+            environmentVariables:
+              DB_PASSWORD: ${random_password.db-user-password.result}
+              PROJECT_ID: ${PROJECT_ID}
+              REGION: ${REGION}
+              DB_INSTANCE: ${cloudsql-instance.name}
+            serviceAccountEmail: bpa-functions-sa-${random_id.suffix.hex}@${PROJECT_ID}.iam.gserviceaccount.com
+            vpcConnector: projects/${PROJECT_ID}/locations/${REGION}/connectors/bpa-vpc-connector-${random_id.suffix.hex}
+            vpcConnectorEgressSettings: ALL_TRAFFIC
+      dependsOn:
+        - cloudsql-instance
+        - function-service-account
+        - vpc-connector
+        - approval-function-source
+
+    # Cloud Function for notifications
+    - name: notification-function-source
+      type: gcp-types/storage-v1:bucket
+      properties:
+        name: bpa-notification-source-${random_id.suffix.hex}
+        location: ${REGION}
+        project: ${PROJECT_ID}
+      dependsOn:
+        - enable-apis
+
+    - name: notification-function
+      type: gcp-types/cloudfunctions-v2:projects.locations.functions
+      properties:
+        parent: projects/${PROJECT_ID}/locations/${REGION}
+        functionId: process-notification-${random_id.suffix.hex}
+        function:
+          buildConfig:
+            runtime: python311
+            entryPoint: send_notification
+            source:
+              storageSource:
+                bucket: bpa-notification-source-${random_id.suffix.hex}
+                object: notification-function.zip
+          serviceConfig:
+            maxInstanceCount: 100
+            availableMemory: ${function_memory}
+            timeoutSeconds: 60
+            environmentVariables:
+              DB_PASSWORD: ${random_password.db-user-password.result}
+              PROJECT_ID: ${PROJECT_ID}
+              REGION: ${REGION}
+              DB_INSTANCE: ${cloudsql-instance.name}
+            serviceAccountEmail: bpa-functions-sa-${random_id.suffix.hex}@${PROJECT_ID}.iam.gserviceaccount.com
+            vpcConnector: projects/${PROJECT_ID}/locations/${REGION}/connectors/bpa-vpc-connector-${random_id.suffix.hex}
+            vpcConnectorEgressSettings: ALL_TRAFFIC
+      dependsOn:
+        - cloudsql-instance
+        - function-service-account
+        - vpc-connector
+        - notification-function-source
+
+    # Cloud Function for AI agent (ADK simulation)
+    - name: agent-function-source
+      type: gcp-types/storage-v1:bucket
+      properties:
+        name: bpa-agent-source-${random_id.suffix.hex}
+        location: ${REGION}
+        project: ${PROJECT_ID}
+      dependsOn:
+        - enable-apis
+
+    - name: agent-function
+      type: gcp-types/cloudfunctions-v2:projects.locations.functions
+      properties:
+        parent: projects/${PROJECT_ID}/locations/${REGION}
+        functionId: bpa-agent-${random_id.suffix.hex}
+        function:
+          buildConfig:
+            runtime: python311
+            entryPoint: process_natural_language
+            source:
+              storageSource:
+                bucket: bpa-agent-source-${random_id.suffix.hex}
+                object: agent-function.zip
+          serviceConfig:
+            maxInstanceCount: 100
+            availableMemory: 512Mi
+            timeoutSeconds: 60
+            environmentVariables:
+              DB_PASSWORD: ${random_password.db-user-password.result}
+              PROJECT_ID: ${PROJECT_ID}
+              REGION: ${REGION}
+              DB_INSTANCE: ${cloudsql-instance.name}
+            serviceAccountEmail: bpa-functions-sa-${random_id.suffix.hex}@${PROJECT_ID}.iam.gserviceaccount.com
+            vpcConnector: projects/${PROJECT_ID}/locations/${REGION}/connectors/bpa-vpc-connector-${random_id.suffix.hex}
+            vpcConnectorEgressSettings: ALL_TRAFFIC
+      dependsOn:
+        - cloudsql-instance
+        - function-service-account
+        - vpc-connector
+        - agent-function-source
+
+    # Service account for Workflows
+    - name: workflows-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        parent: projects/${PROJECT_ID}
+        accountId: bpa-workflows-sa-${random_id.suffix.hex}
+        serviceAccount:
+          displayName: "Business Process Automation Workflows Service Account"
+          description: "Service account for Cloud Workflows in BPA system"
+      dependsOn:
+        - enable-apis
+
+    # IAM bindings for Workflows service account
+    - name: workflows-sa-functions-invoker
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: ${PROJECT_ID}
+        policy:
+          bindings:
+            - role: roles/cloudfunctions.invoker
+              members:
+                - serviceAccount:bpa-workflows-sa-${random_id.suffix.hex}@${PROJECT_ID}.iam.gserviceaccount.com
+      dependsOn:
+        - workflows-service-account
+
+    - name: workflows-sa-logging-writer
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: ${PROJECT_ID}
+        policy:
+          bindings:
+            - role: roles/logging.logWriter
+              members:
+                - serviceAccount:bpa-workflows-sa-${random_id.suffix.hex}@${PROJECT_ID}.iam.gserviceaccount.com
+      dependsOn:
+        - workflows-service-account
+
+    # Cloud Workflows for intelligent process orchestration
+    - name: business-process-workflow
+      type: gcp-types/workflows-v1:projects.locations.workflows
+      properties:
+        parent: projects/${PROJECT_ID}/locations/${REGION}
+        workflowId: business-process-workflow-${random_id.suffix.hex}
+        workflow:
+          name: business-process-workflow-${random_id.suffix.hex}
+          description: "Intelligent business process automation workflow"
+          serviceAccount: bpa-workflows-sa-${random_id.suffix.hex}@${PROJECT_ID}.iam.gserviceaccount.com
+          sourceContents: |
+            main:
+              params: [input]
+              steps:
+                - init:
+                    assign:
+                      - request_id: ${input.request_id}
+                      - process_type: ${input.process_type}
+                      - requester_email: ${input.requester_email}
+                      - request_data: ${input.request_data}
+                      - priority: ${default(input.priority, 3)}
+                      - approval_url: "${approval-function.serviceConfig.uri}"
+                      - notification_url: "${notification-function.serviceConfig.uri}"
+                      
+                - log_start:
+                    call: sys.log
+                    args:
+                      text: ${"Starting process automation for request: " + request_id}
+                      severity: INFO
+                      
+                - analyze_request:
+                    call: classify_process_type
+                    args:
+                      process_type: ${process_type}
+                      priority: ${priority}
+                    result: classification
+                    
+                - route_process:
+                    switch:
+                      - condition: ${classification.requires_approval}
+                        steps:
+                          - request_approval:
+                              call: http.post
+                              args:
+                                url: ${approval_url}
+                                body:
+                                  request_id: ${request_id}
+                                  decision: ${"approve" if classification.auto_approve else "pending"}
+                                  approver_email: ${classification.approver_email}
+                                  comments: "Auto-approved based on business rules"
+                              result: approval_result
+                              
+                          - notify_stakeholders:
+                              call: http.post
+                              args:
+                                url: ${notification_url}
+                                body:
+                                  request_id: ${request_id}
+                                  type: "approval_requested"
+                                  recipient_email: ${classification.approver_email}
+                              result: notification_result
+                              
+                      - condition: ${classification.auto_process}
+                        steps:
+                          - auto_process:
+                              call: sys.log
+                              args:
+                                text: ${"Auto-processing request: " + request_id}
+                                severity: INFO
+                                
+                          - complete_auto_process:
+                              call: http.post
+                              args:
+                                url: ${approval_url}
+                                body:
+                                  request_id: ${request_id}
+                                  decision: "approve"
+                                  approver_email: "system@automation"
+                                  comments: "Auto-approved based on business rules"
+                              result: auto_approval
+                              
+                - final_notification:
+                    call: http.post
+                    args:
+                      url: ${notification_url}
+                      body:
+                        request_id: ${request_id}
+                        type: "process_completed"
+                        recipient_email: ${requester_email}
+                    result: final_notify
+                    
+                - return_result:
+                    return:
+                      status: "completed"
+                      request_id: ${request_id}
+                      classification: ${classification}
+
+            classify_process_type:
+              params: [process_type, priority]
+              steps:
+                - determine_routing:
+                    switch:
+                      - condition: ${process_type == "expense_approval"}
+                        assign:
+                          - requires_approval: true
+                          - auto_approve: ${priority <= 2}
+                          - approver_email: "finance@company.com"
+                          - auto_process: false
+                      - condition: ${process_type == "leave_request"}
+                        assign:
+                          - requires_approval: true
+                          - auto_approve: false
+                          - approver_email: "hr@company.com"
+                          - auto_process: false
+                      - condition: ${process_type == "access_request"}
+                        assign:
+                          - requires_approval: true
+                          - auto_approve: ${priority >= 4}
+                          - approver_email: "security@company.com"
+                          - auto_process: false
+                      - condition: true
+                        assign:
+                          - requires_approval: false
+                          - auto_approve: false
+                          - approver_email: ""
+                          - auto_process: true
+                          
+                - return_classification:
+                    return:
+                      requires_approval: ${requires_approval}
+                      auto_approve: ${auto_approve}
+                      approver_email: ${approver_email}
+                      auto_process: ${auto_process}
+      dependsOn:
+        - approval-function
+        - notification-function
+        - workflows-service-account
+        - workflows-sa-functions-invoker
+
+    # Cloud Monitoring notification channel for system alerts
+    - name: monitoring-notification-channel
+      type: gcp-types/monitoring-v1:projects.notificationChannels
+      properties:
+        parent: projects/${PROJECT_ID}
+        body:
+          type: email
+          displayName: "BPA System Alerts"
+          description: "Email notifications for Business Process Automation system alerts"
+          labels:
+            email_address: "admin@company.com"
+          enabled: true
+      dependsOn:
+        - enable-apis
+
+    # Alerting policy for Cloud SQL instance
+    - name: cloudsql-alert-policy
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        parent: projects/${PROJECT_ID}
+        body:
+          displayName: "Cloud SQL Instance Down"
+          documentation:
+            content: "Alert when Cloud SQL instance is not available"
+            mimeType: text/markdown
+          conditions:
+            - displayName: "Cloud SQL Instance State"
+              conditionThreshold:
+                filter: 'resource.type="cloudsql_database" AND metric.type="cloudsql.googleapis.com/database/up"'
+                comparison: COMPARISON_EQUAL
+                thresholdValue: 0
+                duration: 300s
+                aggregations:
+                  - alignmentPeriod: 60s
+                    perSeriesAligner: ALIGN_MEAN
+                    crossSeriesReducer: REDUCE_MEAN
+                    groupByFields:
+                      - resource.label.database_id
+          alertStrategy:
+            autoClose: 86400s
+          enabled: true
+          notificationChannels:
+            - ${monitoring-notification-channel.name}
+      dependsOn:
+        - cloudsql-instance
+        - monitoring-notification-channel
+
+    # Alerting policy for Cloud Functions errors
+    - name: functions-error-alert-policy
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        parent: projects/${PROJECT_ID}
+        body:
+          displayName: "Cloud Functions Error Rate"
+          documentation:
+            content: "Alert when Cloud Functions error rate exceeds threshold"
+            mimeType: text/markdown
+          conditions:
+            - displayName: "Function Error Rate"
+              conditionThreshold:
+                filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/execution_count" AND metric.label.status!="ok"'
+                comparison: COMPARISON_GREATER_THAN
+                thresholdValue: 5
+                duration: 300s
+                aggregations:
+                  - alignmentPeriod: 60s
+                    perSeriesAligner: ALIGN_RATE
+                    crossSeriesReducer: REDUCE_SUM
+                    groupByFields:
+                      - resource.label.function_name
+          alertStrategy:
+            autoClose: 86400s
+          enabled: true
+          notificationChannels:
+            - ${monitoring-notification-channel.name}
+      dependsOn:
+        - approval-function
+        - notification-function
+        - agent-function
+        - monitoring-notification-channel
+
+  # Output values for verification and integration
+  outputs:
+    - name: cloudsql_instance_name
+      value: ${cloudsql-instance.name}
+      description: "Cloud SQL instance name for database connections"
+
+    - name: cloudsql_connection_name
+      value: ${PROJECT_ID}:${REGION}:${cloudsql-instance.name}
+      description: "Cloud SQL connection name for application configuration"
+
+    - name: database_password
+      value: ${random_password.db-user-password.result}
+      description: "Database password for application connections"
+      sensitive: true
+
+    - name: approval_function_url
+      value: ${approval-function.serviceConfig.uri}
+      description: "URL for the approval processing function"
+
+    - name: notification_function_url
+      value: ${notification-function.serviceConfig.uri}
+      description: "URL for the notification function"
+
+    - name: agent_function_url
+      value: ${agent-function.serviceConfig.uri}
+      description: "URL for the AI agent function"
+
+    - name: workflow_name
+      value: ${business-process-workflow.name}
+      description: "Name of the deployed workflow for process orchestration"
+
+    - name: function_service_account
+      value: bpa-functions-sa-${random_id.suffix.hex}@${PROJECT_ID}.iam.gserviceaccount.com
+      description: "Service account used by Cloud Functions"
+
+    - name: workflows_service_account
+      value: bpa-workflows-sa-${random_id.suffix.hex}@${PROJECT_ID}.iam.gserviceaccount.com
+      description: "Service account used by Cloud Workflows"
+
+    - name: vpc_connector_name
+      value: projects/${PROJECT_ID}/locations/${REGION}/connectors/bpa-vpc-connector-${random_id.suffix.hex}
+      description: "VPC Connector for secure Cloud SQL access"
+
+    - name: random_suffix
+      value: ${random_id.suffix.hex}
+      description: "Random suffix used for resource naming"
+
+# Security and compliance configurations
+compliance:
+  # Enable audit logging for all resources
+  auditConfig:
+    auditLogConfigs:
+      - logType: ADMIN_READ
+      - logType: DATA_READ
+      - logType: DATA_WRITE
+
+  # Security policies
+  securityPolicies:
+    - name: "encryption-at-rest"
+      description: "All data must be encrypted at rest"
+      enforcement: true
+    
+    - name: "least-privilege-access"
+      description: "All service accounts use minimal required permissions"
+      enforcement: true
+    
+    - name: "network-security"
+      description: "All inter-service communication uses private networking"
+      enforcement: true
+
+# Cost optimization settings
+costOptimization:
+  # Auto-scaling configurations
+  autoScaling:
+    enabled: true
+    minInstances: 0
+    maxInstances: 100
+  
+  # Resource lifecycle management
+  lifecycle:
+    deleteProtection: false
+    backupRetention: 7
+  
+  # Cost monitoring
+  budgetAlerts:
+    enabled: true
+    threshold: 100
+    currency: USD

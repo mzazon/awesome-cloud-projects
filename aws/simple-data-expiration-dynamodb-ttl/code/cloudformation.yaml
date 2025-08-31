@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Data Expiration Automation with DynamoDB TTL
+  
+  This template creates a DynamoDB table with Time-To-Live (TTL) enabled for automated
+  data lifecycle management. The solution provides cost-effective cleanup of time-sensitive
+  data such as session information, temporary preferences, or cache entries without
+  consuming write capacity units.
+  
+  Features:
+  - DynamoDB table with composite primary key (user_id, session_id)
+  - TTL enabled for automatic item expiration
+  - On-demand billing for cost optimization
+  - CloudWatch monitoring integration
+  - Sample items with various TTL configurations
+
+Parameters:
+  TableName:
+    Type: String
+    Description: Name for the DynamoDB table (will have random suffix appended)
+    Default: session-data
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: Table name must contain only alphanumeric characters and hyphens
+
+  TTLAttributeName:
+    Type: String
+    Description: Name of the TTL attribute that stores expiration timestamps
+    Default: expires_at
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z_][a-zA-Z0-9_]*$'
+    ConstraintDescription: TTL attribute name must start with a letter or underscore, followed by letters, numbers, or underscores
+
+  BillingMode:
+    Type: String
+    Description: Billing mode for the DynamoDB table
+    Default: ON_DEMAND
+    AllowedValues:
+      - ON_DEMAND
+      - PROVISIONED
+    ConstraintDescription: Must be either ON_DEMAND or PROVISIONED
+
+  ReadCapacityUnits:
+    Type: Number
+    Description: Read capacity units (only used if BillingMode is PROVISIONED)
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+
+  WriteCapacityUnits:
+    Type: Number
+    Description: Write capacity units (only used if BillingMode is PROVISIONED)
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+
+  EnablePointInTimeRecovery:
+    Type: String
+    Description: Enable Point-in-Time Recovery for the table
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  Environment:
+    Type: String
+    Description: Environment name for resource tagging
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+
+Conditions:
+  # Condition to determine if provisioned billing mode is selected
+  IsProvisionedBilling: !Equals [!Ref BillingMode, PROVISIONED]
+  
+  # Condition to enable Point-in-Time Recovery
+  EnablePITR: !Equals [!Ref EnablePointInTimeRecovery, 'true']
+  
+  # Condition for production environment (enables additional monitoring)
+  IsProduction: !Equals [!Ref Environment, production]
+
+Resources:
+  # DynamoDB Table with TTL Configuration
+  SessionDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${TableName}-${AWS::StackName}'
+      
+      # Table Schema Configuration
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: session_id
+          AttributeType: S
+      
+      # Composite Primary Key (Partition Key + Sort Key)
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH      # Partition Key
+        - AttributeName: session_id
+          KeyType: RANGE     # Sort Key
+      
+      # Billing Configuration
+      BillingMode: !Ref BillingMode
+      ProvisionedThroughput: !If
+        - IsProvisionedBilling
+        - ReadCapacityUnits: !Ref ReadCapacityUnits
+          WriteCapacityUnits: !Ref WriteCapacityUnits
+        - !Ref AWS::NoValue
+      
+      # Time-To-Live Configuration
+      TimeToLiveSpecification:
+        AttributeName: !Ref TTLAttributeName
+        Enabled: true
+      
+      # Point-in-Time Recovery
+      PointInTimeRecoverySpecification: !If
+        - EnablePITR
+        - PointInTimeRecoveryEnabled: true
+        - !Ref AWS::NoValue
+      
+      # Server-Side Encryption (always enabled for security)
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: alias/aws/dynamodb  # Use AWS managed key
+      
+      # Resource Tags
+      Tags:
+        - Key: Name
+          Value: !Sub '${TableName}-${AWS::StackName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Session Data Management with TTL
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: TTLEnabled
+          Value: 'true'
+        - Key: DataLifecycle
+          Value: Automated
+
+  # CloudWatch Log Group for TTL Monitoring (if needed for custom applications)
+  TTLMonitoringLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsProduction
+    Properties:
+      LogGroupName: !Sub '/aws/dynamodb/ttl/${TableName}-${AWS::StackName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub 'TTL-Monitoring-${TableName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: TTL Operations Monitoring
+
+  # CloudWatch Dashboard for TTL Metrics (Production Only)
+  TTLDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: IsProduction
+    Properties:
+      DashboardName: !Sub 'DynamoDB-TTL-${TableName}-${AWS::StackName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "TimeToLiveDeletedItemCount", "TableName", "${SessionDataTable}" ],
+                  [ ".", "ItemCount", ".", "." ],
+                  [ ".", "TableSizeBytes", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "TTL Deletion Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${SessionDataTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Capacity Consumption",
+                "period": 300,
+                "stat": "Sum"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarm for High TTL Deletion Rate (Production Only)
+  HighTTLDeletionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub 'DynamoDB-HighTTLDeletions-${TableName}-${AWS::StackName}'
+      AlarmDescription: 'Monitors for unusually high TTL deletion rates'
+      MetricName: TimeToLiveDeletedItemCount
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 900  # 15 minutes
+      EvaluationPeriods: 2
+      Threshold: 1000  # Adjust based on expected deletion volume
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref SessionDataTable
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub 'TTL-High-Deletions-${TableName}'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  # Table Information
+  TableName:
+    Description: Name of the DynamoDB table with TTL enabled
+    Value: !Ref SessionDataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+
+  TableArn:
+    Description: ARN of the DynamoDB table
+    Value: !GetAtt SessionDataTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TableArn'
+
+  # TTL Configuration
+  TTLAttributeName:
+    Description: Name of the TTL attribute for automatic expiration
+    Value: !Ref TTLAttributeName
+    Export:
+      Name: !Sub '${AWS::StackName}-TTLAttribute'
+
+  # Access Information
+  RegionName:
+    Description: AWS Region where the table was created
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  # Sample Commands for Testing
+  PutItemCommand:
+    Description: Sample AWS CLI command to insert an item with TTL
+    Value: !Sub |
+      aws dynamodb put-item --table-name ${SessionDataTable} --item '{
+        "user_id": {"S": "sample_user"},
+        "session_id": {"S": "sample_session"},
+        "login_time": {"S": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"},
+        "${TTLAttributeName}": {"N": "'$(($(date +%s) + 3600))'"}
+      }'
+
+  ScanActiveItemsCommand:
+    Description: Sample AWS CLI command to scan only non-expired items
+    Value: !Sub |
+      aws dynamodb scan --table-name ${SessionDataTable} --filter-expression "#ttl > :current_time" --expression-attribute-names '{"#ttl": "${TTLAttributeName}"}' --expression-attribute-values '{":current_time": {"N": "'$(date +%s)'"}}' --output table
+
+  # Monitoring Information
+  CloudWatchMetricsURL:
+    Description: URL to CloudWatch metrics for the DynamoDB table
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#metricsV2:graph=~();search=${SessionDataTable};namespace=AWS/DynamoDB'
+
+  DashboardURL:
+    Condition: IsProduction
+    Description: URL to the CloudWatch dashboard for TTL monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${TTLDashboard}'
+
+  # Cost Optimization Notes
+  CostOptimizationTips:
+    Description: Tips for optimizing costs with TTL-enabled DynamoDB
+    Value: |
+      1. Use ON_DEMAND billing for variable workloads
+      2. Set appropriate TTL values to balance data retention with storage costs
+      3. Monitor TimeToLiveDeletedItemCount metric to verify TTL effectiveness
+      4. Consider shorter TTL periods for frequently accessed data patterns
+      5. TTL deletions do not consume write capacity units
+
+  # Security Information
+  EncryptionInfo:
+    Description: Encryption configuration for the table
+    Value: Server-side encryption enabled with AWS managed KMS key (alias/aws/dynamodb)
+
+Metadata:
+  # Template Metadata
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Table Configuration"
+        Parameters:
+          - TableName
+          - TTLAttributeName
+          - BillingMode
+      - Label:
+          default: "Capacity Settings (Provisioned Mode Only)"
+        Parameters:
+          - ReadCapacityUnits
+          - WriteCapacityUnits
+      - Label:
+          default: "Additional Features"
+        Parameters:
+          - EnablePointInTimeRecovery
+          - Environment
+    
+    ParameterLabels:
+      TableName:
+        default: "DynamoDB Table Name"
+      TTLAttributeName:
+        default: "TTL Attribute Name"
+      BillingMode:
+        default: "Billing Mode"
+      ReadCapacityUnits:
+        default: "Read Capacity Units"
+      WriteCapacityUnits:
+        default: "Write Capacity Units"
+      EnablePointInTimeRecovery:
+        default: "Enable Point-in-Time Recovery"
+      Environment:
+        default: "Environment"
+
+  # Template Author and Version Information
+  AWS::CloudFormation::Designer:
+    Description: "DynamoDB TTL Data Expiration Solution"
+    Version: "1.1"
+    Author: "AWS CloudFormation Recipe Generator"
+    CreatedDate: "2025-01-27"
+    
+  # Recipe Metadata
+  Recipe:
+    ID: "d7f8e9a0"
+    Title: "Data Expiration Automation with DynamoDB TTL"
+    Category: "database"
+    Difficulty: 100
+    EstimatedTime: "25 minutes"
+    Services: "DynamoDB"
+    Tags: "dynamodb, ttl, data-lifecycle, cost-optimization, automation"

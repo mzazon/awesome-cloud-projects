@@ -6,16 +6,16 @@ difficulty: 300
 subject: aws
 services: iot-core, lambda, dynamodb, iam
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, device-provisioning, certificates, security, device-auth
 recipe-generator-version: 1.3
 ---
 
-# IoT Device Provisioning and Certificate Management
+# IoT Device Provisioning and Certificate Management with AWS IoT Core
 
 ## Problem
 
@@ -82,7 +82,7 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of X.509 certificates and PKI concepts
 4. Knowledge of IoT device authentication and MQTT protocol
-5. Python 3.8+ for Lambda function development
+5. Python 3.9+ for Lambda function development
 6. Estimated cost: $10-20 per month for device registry and certificate operations
 
 > **Note**: This recipe implements production-ready device provisioning with security best practices including device validation, certificate lifecycle management, and audit logging.
@@ -161,6 +161,7 @@ echo "✅ IAM role created for IoT provisioning"
 import json
 import boto3
 import logging
+import os
 from datetime import datetime, timezone
 
 # Configure logging
@@ -197,7 +198,12 @@ def lambda_handler(event, context):
             return create_response(False, f"Invalid device type: {device_type}")
         
         # Check if device is already registered
-        table = dynamodb.Table('device-registry-xxxxx')  # Will be replaced during deployment
+        table_name = os.environ.get('DEVICE_REGISTRY_TABLE')
+        if not table_name:
+            logger.error("DEVICE_REGISTRY_TABLE environment variable not set")
+            return create_response(False, "Configuration error")
+            
+        table = dynamodb.Table(table_name)
         
         try:
             response = table.get_item(Key={'serialNumber': serial_number})
@@ -355,14 +361,6 @@ EOF
        --memory-size 256 \
        --environment Variables="{DEVICE_REGISTRY_TABLE=${DEVICE_REGISTRY_TABLE}}" \
        --tags Project=IoTProvisioning
-   
-   # Update table name in Lambda function
-   sed -i "s/device-registry-xxxxx/${DEVICE_REGISTRY_TABLE}/g" device-provisioning-hook/lambda_function.py
-   cd device-provisioning-hook && zip -r ../device-provisioning-hook.zip . && cd ..
-   
-   aws lambda update-function-code \
-       --function-name $HOOK_FUNCTION_NAME \
-       --zip-file fileb://device-provisioning-hook.zip
    
    echo "✅ Lambda function deployed with permissions"
    ```
@@ -546,29 +544,92 @@ EOF
        --role-name $IOT_ROLE_NAME \
        --policy-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${IOT_ROLE_NAME}-policy"
    
-   # Create provisioning template
-   cat > /tmp/provisioning-template.json << EOF
+   # Create provisioning template body
+   cat > /tmp/provisioning-template-body.json << 'EOF'
    {
-       "templateName": "${TEMPLATE_NAME}",
-       "description": "Template for automated device provisioning with validation",
-       "templateBody": "{\"Parameters\":{\"SerialNumber\":{\"Type\":\"String\"},\"DeviceType\":{\"Type\":\"String\"},\"FirmwareVersion\":{\"Type\":\"String\"},\"Manufacturer\":{\"Type\":\"String\"},\"Location\":{\"Type\":\"String\"},\"AWS::IoT::Certificate::Id\":{\"Type\":\"String\"},\"AWS::IoT::Certificate::Arn\":{\"Type\":\"String\"}},\"Resources\":{\"thing\":{\"Type\":\"AWS::IoT::Thing\",\"Properties\":{\"ThingName\":{\"Ref\":\"ThingName\"},\"AttributePayload\":{\"serialNumber\":{\"Ref\":\"SerialNumber\"},\"deviceType\":{\"Ref\":\"DeviceType\"},\"firmwareVersion\":{\"Ref\":\"FirmwareVersion\"},\"manufacturer\":{\"Ref\":\"Manufacturer\"},\"location\":{\"Ref\":\"DeviceLocation\"},\"provisioningTime\":{\"Ref\":\"ProvisioningTime\"}},\"ThingTypeName\":\"IoTDevice\"}},\"certificate\":{\"Type\":\"AWS::IoT::Certificate\",\"Properties\":{\"CertificateId\":{\"Ref\":\"AWS::IoT::Certificate::Id\"},\"Status\":\"Active\"}},\"policy\":{\"Type\":\"AWS::IoT::Policy\",\"Properties\":{\"PolicyName\":{\"Fn::Sub\":\"\${DeviceType}Policy\"}}},\"thingGroup\":{\"Type\":\"AWS::IoT::ThingGroup\",\"Properties\":{\"ThingGroupName\":{\"Ref\":\"ThingGroupName\"}}}}}",
-       "enabled": true,
-       "provisioningRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IOT_ROLE_NAME}",
-       "preProvisioningHook": {
-           "targetArn": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${HOOK_FUNCTION_NAME}",
-           "payloadVersion": "2020-04-01"
-       },
-       "tags": [
-           {
-               "Key": "Project",
-               "Value": "IoTProvisioning"
+       "Parameters": {
+           "SerialNumber": {
+               "Type": "String"
+           },
+           "DeviceType": {
+               "Type": "String"
+           },
+           "FirmwareVersion": {
+               "Type": "String"
+           },
+           "Manufacturer": {
+               "Type": "String"
+           },
+           "Location": {
+               "Type": "String"
+           },
+           "AWS::IoT::Certificate::Id": {
+               "Type": "String"
+           },
+           "AWS::IoT::Certificate::Arn": {
+               "Type": "String"
            }
-       ]
+       },
+       "Resources": {
+           "thing": {
+               "Type": "AWS::IoT::Thing",
+               "Properties": {
+                   "ThingName": {
+                       "Ref": "ThingName"
+                   },
+                   "AttributePayload": {
+                       "serialNumber": {
+                           "Ref": "SerialNumber"
+                       },
+                       "deviceType": {
+                           "Ref": "DeviceType"
+                       },
+                       "firmwareVersion": {
+                           "Ref": "FirmwareVersion"
+                       },
+                       "manufacturer": {
+                           "Ref": "Manufacturer"
+                       },
+                       "location": {
+                           "Ref": "DeviceLocation"
+                       },
+                       "provisioningTime": {
+                           "Ref": "ProvisioningTime"
+                       }
+                   },
+                   "ThingTypeName": "IoTDevice"
+               }
+           },
+           "certificate": {
+               "Type": "AWS::IoT::Certificate",
+               "Properties": {
+                   "CertificateId": {
+                       "Ref": "AWS::IoT::Certificate::Id"
+                   },
+                   "Status": "Active"
+               }
+           },
+           "policy": {
+               "Type": "AWS::IoT::Policy",
+               "Properties": {
+                   "PolicyName": {
+                       "Fn::Sub": "${DeviceType}Policy"
+                   }
+               }
+           }
+       }
    }
    EOF
    
+   # Create provisioning template
    aws iot create-provisioning-template \
-       --cli-input-json file:///tmp/provisioning-template.json
+       --template-name $TEMPLATE_NAME \
+       --description "Template for automated device provisioning with validation" \
+       --template-body file:///tmp/provisioning-template-body.json \
+       --enabled \
+       --provisioning-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IOT_ROLE_NAME}" \
+       --pre-provisioning-hook targetArn="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${HOOK_FUNCTION_NAME}",payloadVersion=2020-04-01 \
+       --tags Key=Project,Value=IoTProvisioning
    
    echo "✅ Provisioning template created with pre-provisioning hook"
    ```
@@ -606,19 +667,17 @@ EOF
            {
                "Effect": "Allow",
                "Action": [
-                   "iot:Publish"
+                   "iot:Publish",
+                   "iot:Receive"
                ],
                "Resource": "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:topic/\$aws/provisioning-templates/${TEMPLATE_NAME}/provision/*"
            },
            {
                "Effect": "Allow",
                "Action": [
-                   "iot:Subscribe",
-                   "iot:Receive"
+                   "iot:Subscribe"
                ],
-               "Resource": [
-                   "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:topicfilter/\$aws/provisioning-templates/${TEMPLATE_NAME}/provision/*"
-               ]
+               "Resource": "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:topicfilter/\$aws/provisioning-templates/${TEMPLATE_NAME}/provision/*"
            }
        ]
    }
@@ -756,8 +815,7 @@ EOF
        --period 300 \
        --threshold 5 \
        --comparison-operator "GreaterThanThreshold" \
-       --evaluation-periods 1 \
-       --alarm-actions "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:provisioning-alerts"
+       --evaluation-periods 1
    
    # Create IoT rule to log provisioning events
    aws iot create-topic-rule \
@@ -801,21 +859,11 @@ EOF
 2. **Test Device Provisioning with Simulated Device**:
 
    ```bash
-   # Simulate device provisioning request
-   cat > /tmp/device-provision-request.json << 'EOF'
-   {
-       "SerialNumber": "SN123456789",
-       "DeviceType": "temperature-sensor",
-       "FirmwareVersion": "v1.2.3",
-       "Manufacturer": "AcmeIoT",
-       "Location": "Factory-Floor-A"
-   }
-   EOF
-   
-   # Test provisioning using AWS IoT Device SDK simulation
-   python3 << 'EOF'
+   # Test provisioning using Lambda function simulation
+   python3 << EOF
 import boto3
 import json
+import os
 
 # Simulate provisioning by directly calling the hook function
 lambda_client = boto3.client('lambda')
@@ -990,22 +1038,24 @@ EOF
    rm -f claim-cert-output.json device-provisioning-hook.zip shadow-init-function.zip
    rm -rf device-provisioning-hook
    rm -f /tmp/iot-* /tmp/lambda-* /tmp/claim-* /tmp/provisioning-*
-   rm -f /tmp/device-provision-request.json /tmp/shadow-init-function.py
+   rm -f /tmp/shadow-init-function.py
    
    echo "✅ All resources cleaned up"
    ```
 
 ## Discussion
 
-AWS IoT Core's fleet provisioning capabilities address the critical challenge of securely onboarding IoT devices at scale while maintaining strict security controls and compliance requirements. The pre-provisioning hook mechanism provides a powerful validation layer that can verify device authenticity, check against device registries, and implement business-specific authorization logic before certificates are issued. This approach significantly reduces the risk of unauthorized devices gaining access to IoT infrastructure.
+AWS IoT Core's fleet provisioning capabilities address the critical challenge of securely onboarding IoT devices at scale while maintaining strict security controls and compliance requirements. The pre-provisioning hook mechanism provides a powerful validation layer that can verify device authenticity, check against device registries, and implement business-specific authorization logic before certificates are issued. This approach significantly reduces the risk of unauthorized devices gaining access to IoT infrastructure while following AWS Well-Architected Framework principles for operational excellence and security.
 
-The use of claim certificates for device manufacturing provides a secure bootstrap mechanism where devices can be pre-loaded with minimal credentials that only allow them to request their unique operational certificates. This eliminates the need to embed long-term secrets in devices while ensuring that only authenticated devices can complete the provisioning process. The template-based approach enables different provisioning flows for different device types, allowing fine-grained control over permissions and configurations.
+The use of claim certificates for device manufacturing provides a secure bootstrap mechanism where devices can be pre-loaded with minimal credentials that only allow them to request their unique operational certificates. This eliminates the need to embed long-term secrets in devices while ensuring that only authenticated devices can complete the provisioning process. The template-based approach enables different provisioning flows for different device types, allowing fine-grained control over permissions and configurations based on device requirements.
 
-Device registry integration through DynamoDB provides comprehensive device lifecycle management capabilities, enabling tracking of device status, firmware versions, and provisioning history. This centralized registry supports compliance requirements and enables advanced device management features like firmware update targeting, device health monitoring, and security incident response. The combination with device shadows provides immediate configuration management capabilities for newly provisioned devices.
+Device registry integration through DynamoDB provides comprehensive device lifecycle management capabilities, enabling tracking of device status, firmware versions, and provisioning history. This centralized registry supports compliance requirements and enables advanced device management features like firmware update targeting, device health monitoring, and security incident response. The combination with device shadows provides immediate configuration management capabilities for newly provisioned devices, ensuring they are ready for production use immediately after provisioning.
 
-The monitoring and audit capabilities implemented through CloudWatch and IoT Rules Engine provide complete visibility into the provisioning process, enabling detection of anomalous provisioning patterns, failed attempts, and potential security threats. This observability is crucial for maintaining the security posture of large-scale IoT deployments and meeting regulatory compliance requirements.
+The monitoring and audit capabilities implemented through CloudWatch and IoT Rules Engine provide complete visibility into the provisioning process, enabling detection of anomalous provisioning patterns, failed attempts, and potential security threats. This observability is crucial for maintaining the security posture of large-scale IoT deployments and meeting regulatory compliance requirements through detailed audit trails and automated alerting.
 
-For comprehensive implementation guidance, refer to the [AWS IoT Device Provisioning Guide](https://docs.aws.amazon.com/iot/latest/developerguide/provision-wo-cert.html) and [IoT Security Best Practices](https://docs.aws.amazon.com/iot/latest/developerguide/security-best-practices.html).
+For comprehensive implementation guidance, refer to the [AWS IoT Device Provisioning Guide](https://docs.aws.amazon.com/iot/latest/developerguide/provision-wo-cert.html) and [AWS IoT Security Best Practices](https://docs.aws.amazon.com/iot/latest/developerguide/security-best-practices.html).
+
+> **Note**: This configuration follows AWS Well-Architected Framework security and operational excellence principles. Regularly review and update provisioning policies to maintain compliance with your organization's security requirements.
 
 ## Challenge
 
@@ -1015,12 +1065,19 @@ Extend this solution by implementing these enhancements:
 
 2. **Advanced Device Validation**: Implement hardware security module (HSM) integration for cryptographic device authentication and secure boot verification during provisioning.
 
-3. **Bulk Provisioning APIs**: Create REST APIs for manufacturing systems to perform bulk device provisioning with batch validation and progress tracking capabilities.
+3. **Bulk Provisioning APIs**: Create REST APIs using API Gateway and Lambda for manufacturing systems to perform bulk device provisioning with batch validation and progress tracking capabilities.
 
-4. **Certificate Lifecycle Management**: Implement automated certificate rotation, renewal tracking, and revocation workflows with device notification mechanisms.
+4. **Certificate Lifecycle Management**: Implement automated certificate rotation, renewal tracking, and revocation workflows with device notification mechanisms using AWS IoT Device Management Jobs.
 
-5. **Zero-Touch Provisioning**: Integrate with device manufacturing processes to enable completely automated provisioning without manual intervention, including quality assurance workflows.
+5. **Zero-Touch Provisioning**: Integrate with device manufacturing processes to enable completely automated provisioning without manual intervention, including quality assurance workflows and factory floor integration.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

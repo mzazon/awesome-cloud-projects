@@ -4,12 +4,12 @@ id: a7f4b2e8
 category: compute
 difficulty: 200
 subject: gcp
-services: Cloud Memorystore, Firebase Authentication, Cloud Functions, Cloud Secret Manager
+services: Cloud Memorystore, Firebase Authentication, Cloud Functions, Secret Manager
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: session-management, redis, firebase-auth, cloud-functions, security
 recipe-generator-version: 1.3
@@ -73,8 +73,8 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and appropriate permissions for Cloud Memorystore, Cloud Functions, and Secret Manager
-2. Google Cloud CLI v2 installed and configured (or Cloud Shell access)
-3. Firebase project with Authentication enabled
+2. Google Cloud CLI installed and configured (or Cloud Shell access)
+3. Firebase CLI installed (`npm install -g firebase-tools`)
 4. Basic knowledge of Redis, session management, and serverless functions
 5. Node.js 18+ for local development and testing
 6. Estimated cost: $25-50/month for Redis instance, minimal cost for Cloud Functions and Secret Manager
@@ -108,6 +108,9 @@ gcloud services enable secretmanager.googleapis.com
 gcloud services enable firebase.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable monitoring.googleapis.com
+
+# Authenticate Firebase CLI
+firebase login
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Region set to: ${REGION}"
@@ -171,13 +174,18 @@ echo "✅ Required APIs enabled"
    Firebase Authentication provides a comprehensive identity platform that handles user sign-in, registration, and session management across web and mobile applications. The integration with Google Cloud services enables seamless user experience while maintaining security standards and compliance requirements.
 
    ```bash
-   # Initialize Firebase in the current project
-   firebase projects:addfirebase ${PROJECT_ID} 2>/dev/null || echo "Firebase already initialized"
+   # Initialize Firebase project if not already done
+   firebase projects:addfirebase ${PROJECT_ID} 2>/dev/null || \
+       echo "Firebase already initialized for project"
    
-   # Enable Authentication providers (Email/Password and Google Sign-In)
-   gcloud alpha firebase auth providers configs create \
-       --provider-id=password \
-       --project=${PROJECT_ID} 2>/dev/null || echo "Email/Password provider already enabled"
+   # Create Firebase project configuration
+   cat > firebase.json << EOF
+   {
+     "functions": {
+       "runtime": "nodejs18"
+     }
+   }
+   EOF
    
    # Configure Firebase Auth settings for session management
    cat > firebase-auth-config.json << EOF
@@ -218,8 +226,8 @@ echo "✅ Required APIs enabled"
      "main": "index.js",
      "dependencies": {
        "redis": "^4.6.0",
-       "firebase-admin": "^11.11.0",
-       "express": "^4.18.0",
+       "firebase-admin": "^12.0.0",
+       "@google-cloud/functions-framework": "^3.3.0",
        "@google-cloud/secret-manager": "^5.0.0",
        "@google-cloud/logging": "^10.0.0"
      }
@@ -369,6 +377,7 @@ echo "✅ Required APIs enabled"
      "main": "index.js",
      "dependencies": {
        "redis": "^4.6.0",
+       "@google-cloud/functions-framework": "^3.3.0",
        "@google-cloud/secret-manager": "^5.0.0",
        "@google-cloud/logging": "^10.0.0"
      }
@@ -386,7 +395,7 @@ echo "✅ Required APIs enabled"
    const logging = new Logging();
    const log = logging.log('session-cleanup');
    
-   functions.cloudEvent('sessionCleanup', async (cloudEvent) => {
+   functions.http('sessionCleanup', async (req, res) => {
      try {
        // Get Redis connection from Secret Manager
        const [version] = await secretClient.accessSecretVersion({
@@ -425,14 +434,19 @@ echo "✅ Required APIs enabled"
        });
        
        await client.disconnect();
+       res.json({ 
+         success: true, 
+         cleanedSessions: cleanedCount, 
+         activeSessions: activeCount 
+       });
      } catch (error) {
        await log.error({ message: 'Cleanup failed', error: error.message });
-       throw error;
+       res.status(500).json({ error: 'Cleanup failed' });
      }
    });
    EOF
    
-   # Deploy cleanup function with Cloud Scheduler trigger
+   # Deploy cleanup function
    gcloud functions deploy session-cleanup-${RANDOM_SUFFIX} \
        --gen2 \
        --runtime=nodejs18 \
@@ -482,20 +496,6 @@ echo "✅ Required APIs enabled"
    Comprehensive monitoring provides visibility into session management performance, Redis health, and user behavior patterns. Cloud Monitoring and Cloud Logging enable proactive system management and troubleshooting capabilities.
 
    ```bash
-   # Create custom metrics for session analytics
-   cat > monitoring-config.yaml << EOF
-   displayName: "Session Management Dashboard"
-   gridLayout:
-     widgets:
-     - title: "Active Sessions"
-       xyChart:
-         dataSets:
-         - targetAxis: "Y1"
-           plotType: "LINE"
-           timeSeriesFilter:
-             filter: 'resource.type="cloud_function"'
-   EOF
-   
    # Create alerting policy for Redis memory usage
    gcloud alpha monitoring policies create \
        --policy-from-file=<(cat << 'EOF'
@@ -518,6 +518,11 @@ echo "✅ Required APIs enabled"
    }
    EOF
    )
+   
+   # Create log-based metric for session operations
+   gcloud logging metrics create session_operations_count \
+       --description="Count of session operations" \
+       --log-filter='resource.type="cloud_function" AND jsonPayload.message:"Session"'
    
    echo "✅ Monitoring and alerting configured for session management system"
    ```
@@ -548,17 +553,15 @@ echo "✅ Required APIs enabled"
 2. **Test Session Management Function**:
 
    ```bash
-   # Test session creation with mock Firebase token (for demonstration)
-   curl -X POST ${FUNCTION_URL} \
-       -H "Content-Type: application/json" \
-       -d '{
-         "action": "create",
-         "token": "mock-firebase-token",
-         "sessionData": {"device": "web", "location": "test"}
-       }'
+   # Note: This test requires a valid Firebase ID token
+   # In a real implementation, obtain token from Firebase Auth SDK
+   echo "To test the session function, use a valid Firebase ID token:"
+   echo "curl -X POST ${FUNCTION_URL} \\"
+   echo "    -H \"Content-Type: application/json\" \\"
+   echo "    -d '{\"action\": \"create\", \"token\": \"VALID_FIREBASE_TOKEN\", \"sessionData\": {\"device\": \"web\"}}'"
    ```
 
-   Expected output: Function should return session creation confirmation with session ID.
+   Expected output: Function should return session creation confirmation with session ID when using a valid Firebase token.
 
 3. **Verify Secret Manager Integration**:
 
@@ -578,9 +581,13 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # Manually trigger cleanup function
-   gcloud functions call session-cleanup-${RANDOM_SUFFIX} \
+   CLEANUP_FUNCTION_URL=$(gcloud functions describe session-cleanup-${RANDOM_SUFFIX} \
        --region=${REGION} \
-       --data='{"trigger":"manual"}'
+       --format="value(serviceConfig.uri)")
+   
+   curl -X POST ${CLEANUP_FUNCTION_URL} \
+       -H "Content-Type: application/json" \
+       -d '{"trigger":"manual"}'
    
    # Check cleanup logs
    gcloud functions logs read session-cleanup-${RANDOM_SUFFIX} \
@@ -644,7 +651,7 @@ echo "✅ Required APIs enabled"
    ```bash
    # Remove function directories
    cd .. && rm -rf session-function cleanup-function
-   rm -f firebase-auth-config.json monitoring-config.yaml
+   rm -f firebase-auth-config.json firebase.json
    
    echo "✅ Local files cleaned up"
    ```
@@ -677,4 +684,9 @@ Extend this session management solution with these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

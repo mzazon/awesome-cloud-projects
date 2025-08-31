@@ -4,12 +4,12 @@ id: f8a3d2c7
 category: devops
 difficulty: 200
 subject: aws
-services: CloudShell, Systems Manager, Lambda, CloudWatch
+services: CloudShell, Systems Manager, Lambda, EventBridge
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: automation, powershell, cloudshell, infrastructure, devops, scheduled-tasks, monitoring
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Organizations struggle with manual infrastructure management tasks that consume 
 
 ## Solution
 
-Build serverless automation workflows using AWS CloudShell PowerShell scripts integrated with Systems Manager Automation, Lambda functions, and CloudWatch monitoring. This approach leverages CloudShell's pre-configured PowerShell environment to create, test, and deploy infrastructure automation scripts that can run on schedules, respond to events, and provide centralized monitoring without requiring local tooling or infrastructure provisioning.
+Build serverless automation workflows using AWS CloudShell PowerShell scripts integrated with Systems Manager Automation, Lambda functions, and EventBridge scheduling. This approach leverages CloudShell's pre-configured PowerShell environment to create, test, and deploy infrastructure automation scripts that can run on schedules, respond to events, and provide centralized monitoring without requiring local tooling or infrastructure provisioning.
 
 ## Architecture Diagram
 
@@ -37,6 +37,7 @@ graph TB
     subgraph "Automation Layer"
         SSM[Systems Manager<br/>Automation Documents]
         LAMBDA[Lambda Functions<br/>Scheduled Execution]
+        EB[EventBridge<br/>Scheduler]
     end
     
     subgraph "Monitoring & Alerting"
@@ -55,6 +56,7 @@ graph TB
     USER --> CS
     CS --> SSM
     CS --> LAMBDA
+    EB --> LAMBDA
     SSM --> EC2
     SSM --> S3
     SSM --> RDS
@@ -67,12 +69,13 @@ graph TB
     style CS fill:#FF9900
     style SSM fill:#3F8624
     style LAMBDA fill:#FF9900
+    style EB fill:#3F8624
     style CW fill:#3F8624
 ```
 
 ## Prerequisites
 
-1. AWS account with CloudShell access and permissions for EC2, Systems Manager, Lambda, CloudWatch, and IAM
+1. AWS account with CloudShell access and permissions for EC2, Systems Manager, Lambda, EventBridge, CloudWatch, and IAM
 2. Basic PowerShell knowledge and familiarity with AWS CLI
 3. Understanding of AWS automation concepts and JSON/YAML configuration
 4. Existing EC2 instances or other AWS resources for testing automation scripts
@@ -160,7 +163,7 @@ echo "✅ AWS environment configured with role: ${AUTOMATION_ROLE_ARN}"
 
    PowerShell's object-oriented nature and AWS Tools integration enables sophisticated infrastructure analysis and reporting. This script demonstrates automated resource discovery, health assessment, and structured reporting that can be easily extended for custom business requirements.
 
-   ```powershell
+   ```bash
    # Create PowerShell script for infrastructure health checks
    cat > ~/infrastructure-health-check.ps1 << 'EOF'
    param(
@@ -181,9 +184,15 @@ echo "✅ AWS environment configured with role: ${AUTOMATION_ROLE_ARN}"
        
        Write-Host $logEntry
        # Send to CloudWatch Logs
-       Write-CWLLogEvent -LogGroupName $LogGroup -LogStreamName "health-check-$(Get-Date -Format 'yyyy-MM-dd')" -LogEvent @{
-           Message = $logEntry
-           Timestamp = [DateTimeOffset]::UtcNow
+       try {
+           Write-CWLLogEvent -LogGroupName $LogGroup \
+               -LogStreamName "health-check-$(Get-Date -Format 'yyyy-MM-dd')" \
+               -LogEvent @{
+                   Message = $logEntry
+                   Timestamp = [DateTimeOffset]::UtcNow
+               }
+       } catch {
+           Write-Host "Warning: Could not write to CloudWatch Logs: $($_.Exception.Message)"
        }
    }
    
@@ -219,18 +228,22 @@ echo "✅ AWS environment configured with role: ${AUTOMATION_ROLE_ARN}"
        $complianceReport = @()
        
        foreach ($bucket in $buckets) {
-           $encryption = Get-S3BucketEncryption -BucketName $bucket.BucketName -ErrorAction SilentlyContinue
-           $versioning = Get-S3BucketVersioning -BucketName $bucket.BucketName
-           $logging = Get-S3BucketLogging -BucketName $bucket.BucketName
-           
-           $complianceStatus = @{
-               BucketName = $bucket.BucketName
-               CreationDate = $bucket.CreationDate
-               EncryptionEnabled = $null -ne $encryption
-               VersioningEnabled = $versioning.Status -eq "Enabled"
-               LoggingEnabled = $null -ne $logging.LoggingEnabled
+           try {
+               $encryption = Get-S3BucketEncryption -BucketName $bucket.BucketName -ErrorAction SilentlyContinue
+               $versioning = Get-S3BucketVersioning -BucketName $bucket.BucketName
+               $logging = Get-S3BucketLogging -BucketName $bucket.BucketName
+               
+               $complianceStatus = @{
+                   BucketName = $bucket.BucketName
+                   CreationDate = $bucket.CreationDate
+                   EncryptionEnabled = $null -ne $encryption
+                   VersioningEnabled = $versioning.Status -eq "Enabled"
+                   LoggingEnabled = $null -ne $logging.LoggingEnabled
+               }
+               $complianceReport += $complianceStatus
+           } catch {
+               Write-AutomationLog "Error assessing bucket $($bucket.BucketName): $($_.Exception.Message)" "ERROR"
            }
-           $complianceReport += $complianceStatus
        }
        
        Write-AutomationLog "Assessed $($complianceReport.Count) S3 buckets"
@@ -343,7 +356,7 @@ EOF
 
 4. **Create Lambda Function for Scheduled Execution**:
 
-   Lambda provides serverless execution for automation workflows with automatic scaling, built-in monitoring, and event-driven triggers. This approach eliminates infrastructure management while providing reliable, cost-effective scheduled operations that can respond to CloudWatch events or API Gateway requests.
+   Lambda provides serverless execution for automation workflows with automatic scaling, built-in monitoring, and event-driven triggers. This approach eliminates infrastructure management while providing reliable, cost-effective scheduled operations that can respond to EventBridge events or API Gateway requests.
 
    ```bash
    # Create Lambda function code for automation orchestration
@@ -429,7 +442,7 @@ EOF
    
    aws lambda create-function \
        --function-name "InfrastructureAutomation-${RANDOM_SUFFIX}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "${AUTOMATION_ROLE_ARN}" \
        --handler lambda-automation.lambda_handler \
        --zip-file fileb://lambda-automation.zip \
@@ -462,7 +475,7 @@ EOF
    # Add Lambda as target for the rule
    aws events put-targets \
        --rule "InfrastructureHealthSchedule-${RANDOM_SUFFIX}" \
-       --targets "Id"="1","Arn"="${LAMBDA_ARN}"
+       --targets '[{"Id":"1","Arn":"'${LAMBDA_ARN}'"}]'
    
    # Grant EventBridge permission to invoke Lambda
    aws lambda add-permission \
@@ -483,7 +496,9 @@ EOF
 
    ```bash
    # Create SNS topic for notifications
-   aws sns create-topic --name automation-alerts
+   SNS_TOPIC_ARN=$(aws sns create-topic \
+       --name automation-alerts-${RANDOM_SUFFIX} \
+       --query TopicArn --output text)
    
    # Create CloudWatch alarm for automation failures
    aws cloudwatch put-metric-alarm \
@@ -496,7 +511,7 @@ EOF
        --threshold 1 \
        --comparison-operator GreaterThanOrEqualToThreshold \
        --evaluation-periods 1 \
-       --alarm-actions "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:automation-alerts"
+       --alarm-actions "${SNS_TOPIC_ARN}"
    
    # Create CloudWatch dashboard for automation monitoring
    cat > ~/dashboard-config.json << EOF
@@ -526,7 +541,7 @@ EOF
                "width": 24,
                "height": 6,
                "properties": {
-                   "query": "SOURCE '/aws/automation/infrastructure-health'\n| fields @timestamp, level, message\n| sort @timestamp desc\n| limit 100",
+                   "query": "SOURCE '/aws/automation/infrastructure-health'\\n| fields @timestamp, level, message\\n| sort @timestamp desc\\n| limit 100",
                    "region": "${AWS_REGION}",
                    "title": "Automation Logs"
                }
@@ -686,6 +701,12 @@ EOF
    aws cloudwatch delete-alarms \
        --alarm-names "InfrastructureAutomationErrors-${RANDOM_SUFFIX}"
    
+   # Delete SNS topic
+   aws sns delete-topic \
+       --topic-arn "$(aws sns list-topics \
+           --query "Topics[?contains(TopicArn, 'automation-alerts-${RANDOM_SUFFIX}')].TopicArn" \
+           --output text)"
+   
    # Delete log group (optional - contains valuable historical data)
    aws logs delete-log-group \
        --log-group-name "/aws/automation/infrastructure-health"
@@ -722,9 +743,9 @@ This solution demonstrates the power of combining AWS CloudShell's pre-configure
 
 The integration with Systems Manager Automation provides enterprise features like role-based execution, audit trails, and approval workflows that aren't available with standalone scripts. PowerShell's object-oriented nature and rich AWS Tools integration enable sophisticated resource analysis and reporting capabilities that would require significant development effort in other scripting languages. The automation documents can be shared across teams and AWS accounts, promoting standardization and reducing operational overhead.
 
-Lambda's event-driven execution model ensures automations run reliably on schedule while providing automatic scaling and built-in monitoring. The combination with CloudWatch provides comprehensive observability into automation performance, enabling data-driven optimization and proactive issue resolution. This approach follows [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles by implementing automated operations, comprehensive monitoring, and cost-effective serverless execution.
+Lambda's event-driven execution model ensures automations run reliably on schedule while providing automatic scaling and built-in monitoring. The combination with EventBridge provides flexible scheduling capabilities that support complex business requirements. This approach follows [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles by implementing automated operations, comprehensive monitoring, and cost-effective serverless execution.
 
-The solution's modular design allows easy extension for additional resource types, compliance checks, and business-specific requirements. Organizations can build upon this foundation to create comprehensive infrastructure automation platforms that reduce manual overhead, improve consistency, and enhance security posture across their AWS environments.
+The solution's modular design allows easy extension for additional resource types, compliance checks, and business-specific requirements. Organizations can build upon this foundation to create comprehensive infrastructure automation platforms that reduce manual overhead, improve consistency, and enhance security posture across their AWS environments. For detailed guidance on PowerShell scripting best practices, refer to the [AWS Tools for PowerShell User Guide](https://docs.aws.amazon.com/powershell/latest/userguide/).
 
 > **Tip**: Store PowerShell scripts in CloudShell's persistent storage and use Git integration to maintain version control and collaborate with team members across automation development.
 
@@ -744,4 +765,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

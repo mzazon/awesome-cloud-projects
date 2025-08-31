@@ -1,15 +1,15 @@
 ---
 title: Creating Contact Forms with SES and Lambda
-id: a1b2c3d4
+id: a53f6d46
 category: serverless
 difficulty: 100
 subject: aws
 services: SES, Lambda, API Gateway
 estimated-time: 60 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: serverless, contact-form, email, beginners, web-development
 recipe-generator-version: 1.3
@@ -327,7 +327,7 @@ echo "✅ Resource suffix: ${RANDOM_SUFFIX}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
@@ -589,6 +589,7 @@ The solution's scalability characteristics make it suitable for everything from 
 - [API Gateway CORS Configuration](https://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-cors.html)
 - [SES Identity Management](https://docs.aws.amazon.com/ses/latest/dg/creating-identities.html)
 - [AWS Lambda Best Practices](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html)
+- [Lambda Runtime Support Policy](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html)
 
 ## Challenge
 
@@ -602,4 +603,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

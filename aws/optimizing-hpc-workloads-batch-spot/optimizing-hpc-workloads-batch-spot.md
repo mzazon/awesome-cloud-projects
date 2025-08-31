@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AWS Batch, EC2 Spot Instances, CloudWatch, S3
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: hpc, batch-computing, spot-instances, cost-optimization, fault-tolerance
 recipe-generator-version: 1.3
@@ -76,7 +76,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for Batch, EC2, S3, CloudWatch, and EFS
+1. AWS account with appropriate permissions for Batch, EC2, S3, CloudWatch, EFS, and IAM
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of containerization and Docker concepts
 4. Familiarity with HPC workload characteristics and checkpoint/restart concepts
@@ -222,7 +222,7 @@ echo "✅ Environment prepared successfully"
 
 3. **Create Spot-Optimized Compute Environment**:
 
-   The compute environment defines how AWS Batch manages the underlying EC2 infrastructure using Spot instances with fault-tolerant configuration. This setup uses the SPOT_CAPACITY_OPTIMIZED allocation strategy to select instances from the deepest capacity pools, minimizing interruption risk while maximizing cost savings across multiple instance families.
+   The compute environment defines how AWS Batch manages the underlying EC2 infrastructure using Spot instances with fault-tolerant configuration. This setup uses the SPOT_PRICE_CAPACITY_OPTIMIZED allocation strategy to select instances from the deepest capacity pools while considering price, minimizing interruption risk while maximizing cost savings across multiple instance families.
 
    ```bash
    # Create security group for Batch compute instances
@@ -246,7 +246,7 @@ echo "✅ Environment prepared successfully"
        --state ENABLED \
        --compute-resources '{
            "type": "EC2",
-           "allocationStrategy": "SPOT_CAPACITY_OPTIMIZED",
+           "allocationStrategy": "SPOT_PRICE_CAPACITY_OPTIMIZED",
            "minvCpus": 0,
            "maxvCpus": 1000,
            "desiredvCpus": 0,
@@ -264,7 +264,7 @@ echo "✅ Environment prepared successfully"
    echo "✅ Spot-optimized compute environment created"
    ```
 
-   The compute environment is now configured with intelligent Spot instance selection across multiple instance types and availability zones. This diversification strategy, combined with the 80% bid percentage, provides excellent cost optimization while maintaining high availability through AWS's capacity optimization algorithms.
+   The compute environment is now configured with intelligent Spot instance selection across multiple instance types and availability zones. This diversification strategy, combined with the 80% bid percentage and price-capacity optimized allocation, provides excellent cost optimization while maintaining high availability through AWS's advanced capacity optimization algorithms.
 
 4. **Create Job Queue with Priority Configuration**:
 
@@ -572,7 +572,7 @@ echo "✅ Environment prepared successfully"
 
 Building cost-optimized HPC pipelines with AWS Batch and Spot instances represents a paradigm shift from traditional fixed-capacity clusters to elastic, pay-per-use computing resources. This architecture enables research organizations to access enterprise-grade computational resources while achieving dramatic cost reductions through intelligent use of excess AWS capacity. The combination of Spot instances with AWS Batch's managed infrastructure provides automatic scaling, fault tolerance, and simplified job management that rivals dedicated HPC clusters at a fraction of the cost. For comprehensive guidance on Spot instance best practices, review the [AWS Batch User Guide](https://docs.aws.amazon.com/batch/latest/userguide/what-is-batch.html) and [EC2 Spot Instance documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-best-practices.html).
 
-The SPOT_CAPACITY_OPTIMIZED allocation strategy employed in this solution leverages AWS's real-time capacity analytics to select instance types from the deepest Spot capacity pools, significantly reducing interruption rates compared to price-based strategies. Research conducted by AWS demonstrates that this approach can reduce Spot interruptions by up to 80% while maintaining the same cost savings. The retry mechanism with intelligent failure detection ensures that legitimate infrastructure interruptions don't impact computational progress, while application-level failures are properly identified and handled. For detailed implementation patterns, consult the [AWS Batch Best Practices Guide](https://docs.aws.amazon.com/batch/latest/userguide/best-practices-general.html) and [Well-Architected HPC Framework](https://docs.aws.amazon.com/wellarchitected/latest/high-performance-computing-lens/welcome.html).
+The SPOT_PRICE_CAPACITY_OPTIMIZED allocation strategy employed in this solution leverages AWS's real-time capacity analytics to select instance types from the deepest Spot capacity pools while considering both price and capacity optimization, significantly reducing interruption rates compared to price-only strategies. According to AWS documentation, this approach provides the optimal balance between cost savings and interruption resilience. The retry mechanism with intelligent failure detection ensures that legitimate infrastructure interruptions don't impact computational progress, while application-level failures are properly identified and handled. For detailed implementation patterns, consult the [AWS Batch Best Practices Guide](https://docs.aws.amazon.com/batch/latest/userguide/best-practices-general.html) and [Well-Architected HPC Framework](https://docs.aws.amazon.com/wellarchitected/latest/high-performance-computing-lens/welcome.html).
 
 From a cost optimization perspective, this architecture typically achieves 70-90% cost reduction compared to equivalent on-demand capacity, with the exact savings depending on workload characteristics and Spot market conditions. The automatic scaling capabilities ensure that compute resources are only provisioned when jobs are actively running, eliminating idle capacity costs that plague traditional HPC clusters. CloudWatch monitoring provides granular visibility into actual versus projected costs, enabling data-driven optimization of instance type selection and job scheduling strategies. Organizations can further optimize costs by implementing checkpoint/restart mechanisms for long-running jobs and using mixed instance types to maximize capacity availability across multiple Spot pools. The integration with Amazon EFS provides shared storage capabilities essential for distributed HPC workloads while maintaining cost efficiency through pay-per-use pricing.
 
@@ -594,4 +594,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

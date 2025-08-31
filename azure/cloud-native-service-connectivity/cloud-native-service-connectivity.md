@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Application Gateway for Containers, Service Connector, Azure Workload Identity, Azure Kubernetes Service
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: kubernetes, networking, microservices, load-balancing, passwordless-authentication, service-mesh, cloud-native
 recipe-generator-version: 1.3
@@ -63,10 +63,11 @@ graph TB
         KEYVAULT[Azure Key Vault]
     end
     
-    CLIENT-->AGC
+    CLIENT-->|"HTTP Traffic"|AGC
     AGC-->FRONTEND
     AGC-->BACKEND
-    FRONTEND-->GATEWAY
+    FRONTEND-->|"Gateway API"|GATEWAY
+    GATEWAY-->|"Route Traffic"|HTTPROUTE
     HTTPROUTE-->APP1
     HTTPROUTE-->APP2
     HTTPROUTE-->APP3
@@ -100,12 +101,12 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-cloud-native-connectivity"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
+export RESOURCE_GROUP="rg-recipe-${RANDOM_SUFFIX}"
 export CLUSTER_NAME="aks-connectivity-${RANDOM_SUFFIX}"
 export AGC_NAME="agc-connectivity-${RANDOM_SUFFIX}"
 export STORAGE_ACCOUNT="storage${RANDOM_SUFFIX}"
@@ -121,14 +122,18 @@ az group create \
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
+# Register required Azure resource providers
+az provider register --namespace Microsoft.ServiceLinker
+az provider register --namespace Microsoft.KubernetesConfiguration
+
 # Enable required Azure feature flags
 az feature register --namespace Microsoft.ContainerService --name AKS-ExtensionManager
 az feature register --namespace Microsoft.ContainerService --name AKS-Dapr
-az feature register --namespace Microsoft.ContainerService --name EnableWorkloadIdentityPreview
 
 # Install required Azure CLI extensions
 az extension add --name serviceconnector-passwordless --upgrade
 az extension add --name alb --upgrade
+az extension add --name k8s-extension --upgrade
 
 echo "✅ Azure CLI extensions and features configured"
 ```
@@ -168,6 +173,9 @@ echo "✅ Azure CLI extensions and features configured"
        --query "oidcIssuerProfile.issuerUrl" \
        --output tsv)
    
+   # Wait for cluster to be fully ready
+   sleep 60
+   
    echo "✅ AKS cluster created with workload identity enabled"
    echo "OIDC Issuer: ${OIDC_ISSUER}"
    ```
@@ -185,22 +193,27 @@ echo "✅ Azure CLI extensions and features configured"
        --name ${CLUSTER_NAME} \
        --addons application-gateway-for-containers
    
+   # Wait for addon installation to complete
+   sleep 30
+   
    # Verify the installation
    kubectl get pods -n azure-alb-system
    
    # Create Application Gateway for Containers resource
-   az network application-gateway for-containers create \
+   az network alb create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${AGC_NAME} \
-       --location ${LOCATION} \
-       --frontend-configurations '[{
-           "name": "frontend-config",
-           "port": 80,
-           "protocol": "Http"
-       }]'
+       --location ${LOCATION}
+   
+   # Create frontend configuration
+   az network alb frontend create \
+       --resource-group ${RESOURCE_GROUP} \
+       --alb-name ${AGC_NAME} \
+       --frontend-name "frontend-config" \
+       --location ${LOCATION}
    
    # Get the Application Gateway for Containers resource ID
-   export AGC_ID=$(az network application-gateway for-containers show \
+   export AGC_ID=$(az network alb show \
        --resource-group ${RESOURCE_GROUP} \
        --name ${AGC_NAME} \
        --query id \
@@ -588,41 +601,44 @@ echo "✅ Azure CLI extensions and features configured"
 
 8. **Create Service Connector connections for passwordless authentication**:
 
-   Service Connector automates the configuration of secure connections between AKS applications and Azure services. It configures authentication, injects connection information, and manages the integration between services using managed identities.
+   Service Connector automates the configuration of secure connections between AKS applications and Azure services. It configures authentication, injects connection information, and manages the integration between services using managed identities. For AKS clusters, Service Connector creates the necessary Kubernetes secrets and configures environment variables to enable passwordless authentication.
 
    ```bash
    # Create Service Connector for Azure Storage
-   az containerapp connection create storage-blob \
+   az aks connection create storage-blob \
        --resource-group ${RESOURCE_GROUP} \
-       --name storage-connection \
+       --name ${CLUSTER_NAME} \
+       --connection storage-connection \
        --target-resource-group ${RESOURCE_GROUP} \
        --account ${STORAGE_ACCOUNT} \
-       --system-identity \
+       --user-identity client-id=${USER_ASSIGNED_CLIENT_ID} \
        --client-type dotnet
    
    # Create Service Connector for Azure SQL Database
-   az containerapp connection create sql \
+   az aks connection create sql \
        --resource-group ${RESOURCE_GROUP} \
-       --name sql-connection \
+       --name ${CLUSTER_NAME} \
+       --connection sql-connection \
        --target-resource-group ${RESOURCE_GROUP} \
        --server ${SQL_SERVER} \
        --database application-db \
-       --system-identity \
+       --user-identity client-id=${USER_ASSIGNED_CLIENT_ID} \
        --client-type dotnet
    
    # Create Service Connector for Azure Key Vault
-   az containerapp connection create keyvault \
+   az aks connection create keyvault \
        --resource-group ${RESOURCE_GROUP} \
-       --name keyvault-connection \
+       --name ${CLUSTER_NAME} \
+       --connection keyvault-connection \
        --target-resource-group ${RESOURCE_GROUP} \
        --vault ${KEY_VAULT} \
-       --system-identity \
+       --user-identity client-id=${USER_ASSIGNED_CLIENT_ID} \
        --client-type dotnet
    
    echo "✅ Service Connector connections created for passwordless authentication"
    ```
 
-   Service Connector has established secure, passwordless connections between the applications and Azure services. The connections are configured to use managed identities, eliminating the need for connection strings or stored credentials.
+   Service Connector has established secure, passwordless connections between the applications and Azure services. The connections are configured to use the user-assigned managed identity, eliminating the need for connection strings or stored credentials. The connection information is injected into the AKS cluster as Kubernetes secrets and environment variables.
 
 ## Validation & Testing
 
@@ -630,7 +646,7 @@ echo "✅ Azure CLI extensions and features configured"
 
    ```bash
    # Check Application Gateway for Containers status
-   az network application-gateway for-containers show \
+   az network alb show \
        --resource-group ${RESOURCE_GROUP} \
        --name ${AGC_NAME} \
        --query '{name:name,provisioningState:provisioningState,location:location}' \
@@ -665,8 +681,8 @@ echo "✅ Azure CLI extensions and features configured"
    kubectl get pods -n cloud-native-app
    
    # Test internal service connectivity
-   kubectl exec -it deployment/frontend-app -n cloud-native-app -- curl http://api-service:8080/
-   kubectl exec -it deployment/api-service -n cloud-native-app -- curl http://data-service:8080/
+   kubectl exec -it deployment/frontend-app -n cloud-native-app -- /bin/sh -c "curl -s -o /dev/null -w '%{http_code}' http://api-service:8080/ || echo 'Service not ready yet'"
+   kubectl exec -it deployment/api-service -n cloud-native-app -- /bin/sh -c "curl -s -o /dev/null -w '%{http_code}' http://data-service:8080/ || echo 'Service not ready yet'"
    ```
 
    Expected output: All pods should be in "Running" state and services should respond to connectivity tests.
@@ -678,13 +694,25 @@ echo "✅ Azure CLI extensions and features configured"
    export GATEWAY_IP=$(kubectl get gateway cloud-native-gateway -n cloud-native-app -o jsonpath='{.status.addresses[0].value}')
    
    # Test frontend application access
-   curl -H "Host: frontend.example.com" http://${GATEWAY_IP}/
+   curl -s -o /dev/null -w "%{http_code}" http://${GATEWAY_IP}/ || echo "Gateway not ready yet"
    
    # Test API service access
-   curl -H "Host: api.example.com" http://${GATEWAY_IP}/api/
+   curl -s -o /dev/null -w "%{http_code}" http://${GATEWAY_IP}/api/ || echo "API route not ready yet"
    ```
 
    Expected output: HTTP responses from the applications routed through Application Gateway for Containers.
+
+5. **Verify Service Connector connections**:
+
+   ```bash
+   # List Service Connector connections
+   az aks connection list \
+       --resource-group ${RESOURCE_GROUP} \
+       --name ${CLUSTER_NAME} \
+       --output table
+   ```
+
+   Expected output: List of connections showing "Succeeded" provisioning state.
 
 ## Cleanup
 
@@ -692,19 +720,22 @@ echo "✅ Azure CLI extensions and features configured"
 
    ```bash
    # Delete Service Connector connections
-   az containerapp connection delete \
+   az aks connection delete \
        --resource-group ${RESOURCE_GROUP} \
-       --name storage-connection \
+       --name ${CLUSTER_NAME} \
+       --connection storage-connection \
        --yes
    
-   az containerapp connection delete \
+   az aks connection delete \
        --resource-group ${RESOURCE_GROUP} \
-       --name sql-connection \
+       --name ${CLUSTER_NAME} \
+       --connection sql-connection \
        --yes
    
-   az containerapp connection delete \
+   az aks connection delete \
        --resource-group ${RESOURCE_GROUP} \
-       --name keyvault-connection \
+       --name ${CLUSTER_NAME} \
+       --connection keyvault-connection \
        --yes
    
    echo "✅ Service Connector connections deleted"
@@ -734,15 +765,15 @@ echo "✅ Azure CLI extensions and features configured"
 
 ## Discussion
 
-Azure Application Gateway for Containers represents a significant evolution in cloud-native load balancing, providing native Kubernetes Gateway API support and advanced traffic management capabilities. This solution integrates seamlessly with AKS clusters, offering features like traffic splitting, mutual TLS authentication, and near real-time configuration updates. The Gateway API standardization ensures portability across different Kubernetes implementations while providing Azure-specific optimizations. For comprehensive guidance on Application Gateway for Containers, see the [official documentation](https://docs.microsoft.com/en-us/azure/application-gateway/for-containers/overview) and [Gateway API specification](https://gateway-api.sigs.k8s.io/).
+Azure Application Gateway for Containers represents a significant evolution in cloud-native load balancing, providing native Kubernetes Gateway API support and advanced traffic management capabilities. This solution integrates seamlessly with AKS clusters, offering features like traffic splitting, mutual TLS authentication, and near real-time configuration updates. The Gateway API standardization ensures portability across different Kubernetes implementations while providing Azure-specific optimizations. For comprehensive guidance on Application Gateway for Containers, see the [official documentation](https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/overview) and [Gateway API specification](https://gateway-api.sigs.k8s.io/).
 
-Service Connector automates the complex process of establishing secure connections between applications and Azure services, eliminating the operational overhead of managing connection strings, certificates, and authentication credentials. By integrating with Azure Workload Identity, Service Connector enables passwordless authentication patterns that significantly enhance security posture while simplifying operational management. This approach follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of security and operational excellence. The passwordless authentication model reduces the attack surface and eliminates common security vulnerabilities associated with stored credentials.
+Service Connector automates the complex process of establishing secure connections between applications and Azure services, eliminating the operational overhead of managing connection strings, certificates, and authentication credentials. By integrating with Azure Workload Identity, Service Connector enables passwordless authentication patterns that significantly enhance security posture while simplifying operational management. This approach follows the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles of security and operational excellence. The passwordless authentication model reduces the attack surface and eliminates common security vulnerabilities associated with stored credentials.
 
 From an architectural perspective, this solution demonstrates modern cloud-native patterns including service mesh concepts, zero-trust networking, and identity-based security. The combination of Application Gateway for Containers and Service Connector creates a comprehensive platform for microservices communication that scales automatically and maintains security through Azure's native identity services. Organizations can leverage this pattern to build resilient, secure applications that follow industry best practices for cloud-native development.
 
-The integration of workload identity with Service Connector represents a shift toward identity-centric security models, where authentication is based on federated identities rather than shared secrets. This approach aligns with modern security practices and provides better auditability and compliance capabilities. For detailed information about workload identity patterns, review the [Azure Workload Identity documentation](https://docs.microsoft.com/en-us/azure/aks/workload-identity-overview) and [Service Connector authentication guide](https://docs.microsoft.com/en-us/azure/service-connector/how-to-manage-authentication).
+The integration of workload identity with Service Connector represents a shift toward identity-centric security models, where authentication is based on federated identities rather than shared secrets. This approach aligns with modern security practices and provides better auditability and compliance capabilities. For detailed information about workload identity patterns, review the [Azure Workload Identity documentation](https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview) and [Service Connector authentication guide](https://learn.microsoft.com/en-us/azure/service-connector/how-to-manage-authentication).
 
-> **Tip**: Monitor Application Gateway for Containers performance and Service Connector health using Azure Monitor and Application Insights. The [monitoring documentation](https://docs.microsoft.com/en-us/azure/application-gateway/for-containers/monitoring) provides comprehensive guidance on setting up observability for production workloads.
+> **Tip**: Monitor Application Gateway for Containers performance and Service Connector health using Azure Monitor and Application Insights. The [monitoring documentation](https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/monitoring) provides comprehensive guidance on setting up observability for production workloads.
 
 ## Challenge
 
@@ -760,4 +791,9 @@ Extend this solution by implementing these advanced cloud-native connectivity pa
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

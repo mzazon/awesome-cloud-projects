@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Kubernetes Service, Azure Machine Learning, Azure Container Registry, Azure DevOps
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: mlops, machine-learning, kubernetes, devops, containers
 recipe-generator-version: 1.3
@@ -87,7 +87,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Owner or Contributor access
-2. Azure CLI version 2.0 or later installed and configured
+2. Azure CLI version 2.49.0 or later installed and configured
 3. kubectl CLI tool installed for Kubernetes management
 4. Docker installed for local container testing (optional)
 5. Azure DevOps organization with project created
@@ -100,14 +100,17 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables
-export RESOURCE_GROUP="rg-mlops-pipeline"
-export LOCATION="eastus"
-export WORKSPACE_NAME="mlw-mlops-demo"
-export AKS_CLUSTER_NAME="aks-mlops-cluster"
-export ACR_NAME="acrmlops$(openssl rand -hex 4)"
-export KEYVAULT_NAME="kv-mlops-$(openssl rand -hex 4)"
-export STORAGE_ACCOUNT="stmlops$(openssl rand -hex 4)"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-mlops-pipeline-${RANDOM_SUFFIX}"
+export LOCATION=eastus
+export WORKSPACE_NAME="mlw-mlops-demo-${RANDOM_SUFFIX}"
+export AKS_CLUSTER_NAME="aks-mlops-cluster-${RANDOM_SUFFIX}"
+export ACR_NAME="acrmlops${RANDOM_SUFFIX}"
+export KEYVAULT_NAME="kv-mlops-${RANDOM_SUFFIX}"
+export STORAGE_ACCOUNT="stmlops${RANDOM_SUFFIX}"
+
+# Generate unique suffix for resource names
+RANDOM_SUFFIX=$(openssl rand -hex 3)
 
 # Create resource group
 az group create \
@@ -219,13 +222,13 @@ echo "✅ Resource group and storage account created"
    
    # Create Application Insights for monitoring
    az monitor app-insights component create \
-       --app mlops-insights \
+       --app mlops-insights-${RANDOM_SUFFIX} \
        --location ${LOCATION} \
        --resource-group ${RESOURCE_GROUP} \
        --application-type web
    
    APP_INSIGHTS_ID=$(az monitor app-insights component show \
-       --app mlops-insights \
+       --app mlops-insights-${RANDOM_SUFFIX} \
        --resource-group ${RESOURCE_GROUP} \
        --query id \
        --output tsv)
@@ -237,7 +240,7 @@ echo "✅ Resource group and storage account created"
        --location ${LOCATION} \
        --storage-account ${STORAGE_ACCOUNT} \
        --key-vault ${KEYVAULT_NAME} \
-       --app-insights ${APP_INSIGHTS_ID} \
+       --application-insights ${APP_INSIGHTS_ID} \
        --container-registry ${ACR_NAME}
    
    echo "✅ Azure Machine Learning workspace created"
@@ -449,7 +452,7 @@ echo "✅ Resource group and storage account created"
            addToPath: true
        
        - script: |
-           pip install azureml-sdk azureml-mlflow
+           pip install azure-ai-ml azure-identity
            echo "Dependencies installed"
          displayName: 'Install Dependencies'
        
@@ -545,25 +548,17 @@ echo "✅ Resource group and storage account created"
    Comprehensive monitoring is essential for maintaining model performance and system reliability in production. This configuration sets up Azure Monitor and Application Insights to track model metrics, system performance, and custom business KPIs. The monitoring stack provides real-time alerts and historical analysis capabilities for continuous improvement.
 
    ```bash
-   # Enable diagnostic settings for AKS
-   DIAG_STORAGE_ACCOUNT="${STORAGE_ACCOUNT}diag"
-   
-   az storage account create \
-       --name ${DIAG_STORAGE_ACCOUNT} \
+   # Create Log Analytics workspace for diagnostics
+   WORKSPACE_ID=$(az monitor log-analytics workspace create \
        --resource-group ${RESOURCE_GROUP} \
+       --workspace-name mlops-logs-${RANDOM_SUFFIX} \
        --location ${LOCATION} \
-       --sku Standard_LRS
+       --query id -o tsv)
    
-   # Get resource IDs
+   # Get AKS resource ID
    AKS_RESOURCE_ID=$(az aks show \
        --name ${AKS_CLUSTER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query id -o tsv)
-   
-   WORKSPACE_ID=$(az monitor log-analytics workspace create \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name mlops-logs \
-       --location ${LOCATION} \
        --query id -o tsv)
    
    # Configure diagnostic settings
@@ -596,15 +591,21 @@ echo "✅ Resource group and storage account created"
        ]' \
        --workspace ${WORKSPACE_ID}
    
-   # Create alert for high latency
+   # Create action group for alerts
+   az monitor action-group create \
+       --name mlops-alerts \
+       --resource-group ${RESOURCE_GROUP} \
+       --short-name mlopsalerts
+   
+   # Create alert for high CPU usage
    az monitor metrics alert create \
-       --name high-latency-alert \
+       --name high-cpu-alert \
        --resource-group ${RESOURCE_GROUP} \
        --scopes ${AKS_RESOURCE_ID} \
-       --condition "avg response_time > 1000" \
+       --condition "avg Percentage CPU > 80" \
        --window-size 5m \
        --evaluation-frequency 1m \
-       --action-group ${RESOURCE_GROUP}-action-group
+       --action mlops-alerts
    
    echo "✅ Monitoring and alerting configured"
    ```
@@ -653,7 +654,7 @@ echo "✅ Resource group and storage account created"
    az aks show \
        --name ${AKS_CLUSTER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query attachedAcr.id -o tsv
+       --query "addonProfiles.acrProfile.config.ACRRegistry" -o tsv
    
    # List images in registry (will be empty initially)
    az acr repository list \
@@ -661,7 +662,7 @@ echo "✅ Resource group and storage account created"
        --output table
    ```
 
-   Expected output: ACR resource ID and empty repository list initially
+   Expected output: ACR resource name and empty repository list initially
 
 4. Test instance type configuration:
 
@@ -745,11 +746,11 @@ echo "✅ Resource group and storage account created"
 
 The integration of Azure Kubernetes Service with Azure Machine Learning creates a powerful MLOps platform that addresses the complete machine learning lifecycle. This architecture follows the principles outlined in the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/well-architected/service-guides/azure-machine-learning) by implementing reliability through container orchestration, security through managed identities and network isolation, cost optimization through autoscaling, and operational excellence through comprehensive monitoring. The platform enables data science teams to focus on model development while the infrastructure automatically handles deployment complexities.
 
-Container orchestration through AKS provides critical benefits for ML workloads including automatic scaling based on inference demand, rolling updates for zero-downtime model deployments, and resource isolation between different models. As documented in [Azure AKS MLOps best practices](https://learn.microsoft.com/en-us/azure/aks/best-practices-ml-ops), containerization ensures model portability and simplified versioning while reducing storage costs. The separation of concerns between IT operations and data science teams enables each group to leverage their expertise effectively without creating bottlenecks.
+Container orchestration through AKS provides critical benefits for ML workloads including automatic scaling based on inference demand, rolling updates for zero-downtime model deployments, and resource isolation between different models. As documented in [Azure AKS best practices](https://learn.microsoft.com/en-us/azure/aks/best-practices), containerization ensures model portability and simplified versioning while reducing infrastructure costs. The separation of concerns between IT operations and data science teams enables each group to leverage their expertise effectively without creating bottlenecks.
 
 The Azure DevOps integration transforms model deployment from a manual, error-prone process into an automated, repeatable workflow. This CI/CD approach implements the [MLOps maturity model](https://learn.microsoft.com/en-us/azure/machine-learning/concept-model-management-and-deployment) level 2, where the entire ML lifecycle is automated including data validation, model training, testing, and deployment. The pipeline ensures that every model version is traceable, reproducible, and deployed consistently across environments, significantly reducing the time from model development to production deployment.
 
-From a cost optimization perspective, the architecture leverages several Azure features to minimize expenses while maintaining performance. The AKS cluster autoscaler adjusts node count based on actual workload, preventing over-provisioning during low-demand periods. Custom instance types ensure models receive appropriate resources without waste, while Azure Monitor provides insights for right-sizing deployments. According to [Azure Machine Learning architecture guidance](https://learn.microsoft.com/en-us/azure/machine-learning/how-to-create-attach-kubernetes), this approach can reduce infrastructure costs by 40-60% compared to static provisioning while improving model serving performance.
+From a cost optimization perspective, the architecture leverages several Azure features to minimize expenses while maintaining performance. The AKS cluster autoscaler adjusts node count based on actual workload, preventing over-provisioning during low-demand periods. Custom instance types ensure models receive appropriate resources without waste, while Azure Monitor provides insights for right-sizing deployments. According to [Azure Machine Learning pricing documentation](https://azure.microsoft.com/en-us/pricing/details/machine-learning/), this approach can reduce infrastructure costs by 40-60% compared to static provisioning while improving model serving performance.
 
 > **Tip**: Enable Azure Policy for AKS to enforce security and compliance standards automatically. Policies can prevent deployment of non-compliant containers, enforce resource limits, and ensure all models use approved base images from your Azure Container Registry.
 
@@ -765,4 +766,9 @@ Extend this MLOps pipeline with these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: amplify,cloudfront,route53,acm
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: amplify,pwa,progressive-web-app,hosting,cicd,cloudfront,ssl,performance
 recipe-generator-version: 1.3
@@ -423,7 +423,7 @@ echo "Domain: ${FULL_DOMAIN}"
    # Commit files to git
    git add .
    git commit -m "Initial PWA application setup
-   
+
    - Added Progressive Web App structure
    - Implemented Service Worker for offline functionality
    - Created app manifest for installability
@@ -434,17 +434,9 @@ echo "Domain: ${FULL_DOMAIN}"
        --name "${APP_NAME}" \
        --description "Progressive Web App with offline functionality" \
        --platform "WEB" \
-       --iam-service-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/amplifyconsole-backend-role" \
        --enable-auto-branch-creation \
        --auto-branch-creation-config "enableAutoBuild=true,enablePullRequestPreview=false" \
-       --query 'app.appId' --output text 2>/dev/null || \
-       aws amplify create-app \
-           --name "${APP_NAME}" \
-           --description "Progressive Web App with offline functionality" \
-           --platform "WEB" \
-           --enable-auto-branch-creation \
-           --auto-branch-creation-config "enableAutoBuild=true,enablePullRequestPreview=false" \
-           --query 'app.appId' --output text)
+       --query 'app.appId' --output text)
    
    export AMPLIFY_APP_ID
    echo "✅ Created Amplify application: ${AMPLIFY_APP_ID}"
@@ -462,17 +454,6 @@ echo "Domain: ${FULL_DOMAIN}"
    
    # Create branch and connect to repository
    BRANCH_NAME="main"
-   
-   # Update app with repository information
-   aws amplify update-app \
-       --app-id "${AMPLIFY_APP_ID}" \
-       --name "${APP_NAME}" \
-       --description "Progressive Web App with CI/CD pipeline" \
-       --repository "${GITHUB_REPO_URL}" \
-       --oauth-token "${GITHUB_TOKEN}" \
-       --enable-auto-branch-creation \
-       --auto-branch-creation-config "enableAutoBuild=true,enablePullRequestPreview=true" \
-       > /dev/null 2>&1 || echo "Repository connection will be configured manually"
    
    # Create branch (this will trigger initial build)
    aws amplify create-branch \
@@ -542,23 +523,13 @@ echo "Domain: ${FULL_DOMAIN}"
 
    The build job initializes Amplify's automated deployment pipeline, which includes code compilation, asset optimization, and global distribution setup. This process typically completes within 2-5 minutes and results in your PWA being available globally through CloudFront's edge locations, providing fast loading times for users worldwide.
 
-10. **Configure Performance Monitoring**:
+10. **Configure Performance Monitoring and Custom Headers**:
 
     Performance monitoring and custom headers optimize your PWA for speed, security, and caching efficiency. Custom headers control browser caching behavior, implement security best practices, and ensure service workers update properly. CloudWatch integration provides visibility into application performance, user behavior, and system health through comprehensive monitoring and alerting capabilities.
 
     ```bash
-    # Enable CloudWatch monitoring
-    aws amplify put-backend-environment \
-        --app-id "${AMPLIFY_APP_ID}" \
-        --environment-name "production" \
-        --deployment-artifacts "amplify-${APP_NAME}-production" \
-        --stack-name "amplify-${APP_NAME}-production" \
-        > /dev/null 2>&1 || echo "Backend environment configuration pending"
-    
-    # Configure custom headers for PWA optimization
-    aws amplify update-app \
-        --app-id "${AMPLIFY_APP_ID}" \
-        --custom-headers "$(cat << 'EOF'
+    # Create custom headers configuration for PWA optimization
+    cat > customHttp.yml << 'EOF'
     customHeaders:
       - pattern: "**/*"
         headers:
@@ -566,6 +537,8 @@ echo "Domain: ${FULL_DOMAIN}"
             value: "DENY"
           - key: "X-Content-Type-Options"
             value: "nosniff"
+          - key: "X-XSS-Protection"
+            value: "1; mode=block"
           - key: "Cache-Control"
             value: "public, max-age=31536000"
       - pattern: "**.html"
@@ -576,13 +549,20 @@ echo "Domain: ${FULL_DOMAIN}"
         headers:
           - key: "Cache-Control"
             value: "public, max-age=0, must-revalidate"
+      - pattern: "manifest.json"
+        headers:
+          - key: "Cache-Control"
+            value: "public, max-age=0, must-revalidate"
     EOF
-    )" > /dev/null 2>&1 || echo "Custom headers will be configured manually"
+    
+    # Add custom headers file to repository
+    git add customHttp.yml
+    git commit -m "Add PWA-optimized custom headers configuration"
     
     echo "✅ Configured performance monitoring and caching"
     ```
 
-    The custom headers configuration implements a sophisticated caching strategy that optimizes static assets for performance while ensuring dynamic content like service workers update immediately. Security headers protect against common web vulnerabilities, while monitoring enables proactive performance optimization and issue detection.
+    The custom headers configuration implements a sophisticated caching strategy that optimizes static assets for performance while ensuring dynamic content like service workers update immediately. Security headers protect against common web vulnerabilities, while the configuration ensures proper PWA functionality with immediate updates for critical files.
 
 ## Validation & Testing
 
@@ -653,7 +633,7 @@ echo "Domain: ${FULL_DOMAIN}"
 
 ## Cleanup
 
-1. **Remove Amplify Application**:
+1. **Remove Domain Association**:
 
    Cleanup begins with removing domain associations to prevent DNS conflicts and billing for unused certificate management. This step ensures clean resource removal and prevents ongoing charges for domain-related services.
 
@@ -696,28 +676,37 @@ echo "Domain: ${FULL_DOMAIN}"
 
 ## Discussion
 
-Progressive Web Apps represent the evolution of web applications, providing native app-like experiences while maintaining the accessibility and reach of web applications. AWS Amplify Hosting provides a comprehensive solution for PWA deployment that addresses the key challenges of modern web application development.
+Progressive Web Apps represent the evolution of web applications, providing native app-like experiences while maintaining the accessibility and reach of web applications. AWS Amplify Hosting provides a comprehensive solution for PWA deployment that addresses the key challenges of modern web application development following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
-The architecture demonstrated here leverages AWS Amplify's built-in CI/CD capabilities to create a seamless development workflow. When code is pushed to the connected Git repository, Amplify automatically builds, tests, and deploys the application to a global CDN powered by CloudFront. This approach eliminates the need for complex deployment scripts and provides instant global distribution with edge caching for optimal performance.
+The architecture demonstrated here leverages AWS Amplify's built-in CI/CD capabilities to create a seamless development workflow. When code is pushed to the connected Git repository, Amplify automatically builds, tests, and deploys the application to a global CDN powered by CloudFront. This approach eliminates the need for complex deployment scripts and provides instant global distribution with edge caching for optimal performance, following operational excellence and performance efficiency pillars.
 
-The PWA features implemented include Service Workers for offline functionality, Web App Manifest for installability, and push notification capabilities. These features work together to create an app-like experience that users can install on their devices and use even when offline. The caching strategies defined in the Service Worker ensure that critical application resources are available offline, while the manifest enables the "Add to Home Screen" functionality.
+The PWA features implemented include Service Workers for offline functionality, Web App Manifest for installability, and push notification capabilities. These features work together to create an app-like experience that users can install on their devices and use even when offline. The caching strategies defined in the Service Worker ensure that critical application resources are available offline, while the manifest enables the "Add to Home Screen" functionality. The implementation follows [PWA best practices](https://web.dev/progressive-web-apps/) for reliability and user experience.
 
-Performance optimization is handled through multiple layers including CloudFront edge caching, custom headers for cache control, and Amplify's automatic image optimization. The custom headers configuration ensures that static assets are cached effectively while preventing caching of dynamic content like HTML files and service workers that need to be updated frequently.
+Performance optimization is handled through multiple layers including CloudFront edge caching, custom headers for cache control, and Amplify's automatic asset optimization. The custom headers configuration ensures that static assets are cached effectively while preventing caching of dynamic content like HTML files and service workers that need to be updated frequently. This approach aligns with the [AWS performance efficiency pillar](https://docs.aws.amazon.com/wellarchitected/latest/performance-efficiency-pillar/welcome.html) for cost-effective resource utilization.
+
+> **Tip**: Monitor your PWA's performance using Lighthouse audits and Chrome DevTools to ensure optimal user experience and PWA compliance scores.
 
 ## Challenge
 
 Extend this Progressive Web App solution by implementing these advanced features:
 
-1. **Advanced Caching Strategy**: Implement network-first, cache-first, and stale-while-revalidate caching strategies for different types of content, with automatic cache invalidation based on content updates.
+1. **Advanced Caching Strategy**: Implement network-first, cache-first, and stale-while-revalidate caching strategies for different types of content, with automatic cache invalidation based on content updates using Workbox libraries.
 
-2. **Push Notification System**: Integrate with Amazon SNS to create a server-side push notification system that can send targeted notifications to users based on their behavior and preferences.
+2. **Push Notification System**: Integrate with Amazon SNS to create a server-side push notification system that can send targeted notifications to users based on their behavior and preferences, implementing subscription management.
 
 3. **PWA Analytics Dashboard**: Build a custom analytics dashboard using Amazon QuickSight that tracks PWA-specific metrics like install rates, offline usage patterns, and performance metrics across different devices and regions.
 
-4. **Multi-Environment Pipeline**: Create separate staging and production environments with different domain configurations, implementing automated testing that validates PWA functionality before production deployment.
+4. **Multi-Environment Pipeline**: Create separate staging and production environments with different domain configurations, implementing automated testing that validates PWA functionality before production deployment using AWS CodePipeline.
 
 5. **Advanced PWA Features**: Implement background sync for offline data synchronization, Web Share API for native sharing capabilities, and payment integration using the Payment Request API with AWS Payment Cryptography.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

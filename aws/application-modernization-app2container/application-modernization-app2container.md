@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: App2Container, ECS, EKS, ECR
 estimated-time: 240 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: application-modernization, containerization, app2container, migration
 recipe-generator-version: 1.3
@@ -86,7 +86,7 @@ graph TB
 1. AWS account with appropriate permissions for App2Container, ECS, EKS, ECR, and CodePipeline
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. A Linux or Windows server with running Java/.NET applications
-4. Docker Engine 17.07 or later installed on worker machine
+4. Docker Engine 18.06 or later installed on worker machine
 5. Root access (Linux) or Administrator access (Windows) on application servers
 6. Understanding of containerization concepts and AWS container services
 7. At least 20-30 GB of free disk space on worker machine
@@ -140,7 +140,7 @@ echo "✅ Preparation complete with bucket: ${S3_BUCKET_NAME}"
    curl -o AWSApp2Container-installer-linux.tar.gz \
        https://app2container-release-us-east-1.s3.us-east-1.amazonaws.com/latest/linux/AWSApp2Container-installer-linux.tar.gz
    
-   sudo tar xvf AWSApp2Container-installer-linux.tar.gz
+   tar xzf AWSApp2Container-installer-linux.tar.gz
    sudo ./install.sh
    
    # Verify installation
@@ -157,14 +157,11 @@ echo "✅ Preparation complete with bucket: ${S3_BUCKET_NAME}"
 
    ```bash
    # Initialize App2Container with interactive setup
-   sudo app2container init
-   
-   # Configure the following when prompted:
-   # - Workspace: /opt/app2container (or preferred path with 20GB+ space)
-   # - AWS Profile: default
-   # - S3 Bucket: ${S3_BUCKET_NAME}
-   # - Docker Content Trust: disable (for demo purposes)
-   # - Metrics reporting: enable
+   sudo app2container init \
+       --workspace /opt/app2container \
+       --aws-profile default \
+       --s3-bucket ${S3_BUCKET_NAME} \
+       --enable-metrics
    
    # Verify configuration
    sudo app2container config
@@ -216,7 +213,7 @@ echo "✅ Preparation complete with bucket: ${S3_BUCKET_NAME}"
    echo "✅ Application analysis completed for ${APP_ID}"
    ```
 
-   App2Container has completed a comprehensive analysis of your application, creating a detailed blueprint for containerization that includes optimal base operating system selection, required dependencies, and recommended container configurations. This analysis report serves as the authoritative reference for containerization decisions, ensuring that the resulting container image maintains full application functionality while following container security and optimization best practices as outlined in [AWS App2Container compatibility documentation](https://docs.aws.amazon.com/app2container/latest/UserGuide/compatibility-a2c.html).
+   App2Container has completed a comprehensive analysis of your application, creating a detailed blueprint for containerization that includes optimal base operating system selection, required dependencies, and recommended container configurations. This analysis report serves as the authoritative reference for containerization decisions, ensuring that the resulting container image maintains full application functionality while following container security and optimization best practices as outlined in [AWS App2Container compatibility documentation](https://docs.aws.amazon.com/app2container/latest/UserGuide/supported-applications.html).
 
 5. **Extract Application Artifacts**:
 
@@ -257,6 +254,9 @@ echo "✅ Preparation complete with bucket: ${S3_BUCKET_NAME}"
    
    # Check container status
    docker ps | grep test-${APP_ID}
+   
+   # Stop test container
+   docker stop test-${APP_ID} && docker rm test-${APP_ID}
    
    echo "✅ Application containerized successfully: ${CONTAINER_IMAGE}"
    ```
@@ -300,11 +300,16 @@ echo "✅ Preparation complete with bucket: ${S3_BUCKET_NAME}"
        --default-capacity-provider-strategy \
        capacityProvider=FARGATE,weight=1
    
-   # Deploy the containerized application to ECS
-   sudo app2container generate app-deployment \
-       --application-id ${APP_ID} \
-       --deploy-target ecs \
-       --deploy
+   # Deploy the containerized application to ECS using CloudFormation
+   aws cloudformation create-stack \
+       --stack-name app2container-deployment-${APP_ID} \
+       --template-body file://${DEPLOYMENT_DIR}/ecs-master.yml \
+       --capabilities CAPABILITY_IAM \
+       --parameters ParameterKey=ClusterName,ParameterValue=${CLUSTER_NAME}
+   
+   # Wait for deployment to complete
+   aws cloudformation wait stack-create-complete \
+       --stack-name app2container-deployment-${APP_ID}
    
    # Monitor deployment progress
    aws ecs describe-clusters --clusters ${CLUSTER_NAME}
@@ -315,7 +320,7 @@ echo "✅ Preparation complete with bucket: ${S3_BUCKET_NAME}"
    echo "✅ Application deployed to ECS cluster: ${CLUSTER_NAME}"
    ```
 
-   Your modernized application is now running on Amazon ECS, leveraging AWS Fargate's serverless compute engine for containers. This deployment provides automatic high availability across multiple Availability Zones, integrated security through AWS IAM and VPC networking, and seamless integration with other AWS services. The ECS deployment enables your application to benefit from AWS's enterprise-grade infrastructure while maintaining the flexibility to scale, update, and manage your containerized workloads using familiar AWS tools and APIs as detailed in [Amazon ECS container creation guides](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/create-container-image.html).
+   Your modernized application is now running on Amazon ECS, leveraging AWS Fargate's serverless compute engine for containers. This deployment provides automatic high availability across multiple Availability Zones, integrated security through AWS IAM and VPC networking, and seamless integration with other AWS services. The ECS deployment enables your application to benefit from AWS's enterprise-grade infrastructure while maintaining the flexibility to scale, update, and manage your containerized workloads using familiar AWS tools and APIs as detailed in [Amazon ECS developer guide](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/welcome.html).
 
 9. **Set up CI/CD Pipeline**:
 
@@ -345,15 +350,18 @@ echo "✅ Preparation complete with bucket: ${S3_BUCKET_NAME}"
    echo "✅ CI/CD pipeline deployed successfully"
    ```
 
-   Your CI/CD pipeline is now operational, providing automated deployment capabilities that enable rapid iteration and reliable releases for your modernized application. The pipeline integrates CodeCommit for source control, CodeBuild for container image creation, and CodePipeline for orchestrating the entire deployment workflow. This automation ensures consistent deployments while enabling development teams to focus on application features rather than deployment complexity, following [AWS CI/CD best practices for container applications](https://docs.aws.amazon.com/app2container/latest/UserGuide/a2c-integration_codepipeline.html).
+   Your CI/CD pipeline is now operational, providing automated deployment capabilities that enable rapid iteration and reliable releases for your modernized application. The pipeline integrates CodeCommit for source control, CodeBuild for container image creation, and CodePipeline for orchestrating the entire deployment workflow. This automation ensures consistent deployments while enabling development teams to focus on application features rather than deployment complexity, following [AWS CI/CD best practices for container applications](https://docs.aws.amazon.com/app2container/latest/UserGuide/deploy-overview.html).
 
 > **Warning**: Before deploying to production environments, conduct thorough security assessments of containerized applications and implement additional security scanning in your CI/CD pipeline to identify vulnerabilities.
 
 10. **Configure Application Load Balancer**:
 
+    Application Load Balancers provide advanced load balancing features for containerized applications, including path-based routing, health checks, and integration with AWS security services. The ALB distributes incoming application traffic across multiple targets while providing SSL termination and web application firewall capabilities.
+
     ```bash
-    # Create Application Load Balancer for the containerized application
-    export VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" \
+    # Get default VPC and subnets
+    export VPC_ID=$(aws ec2 describe-vpcs \
+        --filters "Name=isDefault,Values=true" \
         --query 'Vpcs[0].VpcId' --output text)
     
     export SUBNET_IDS=$(aws ec2 describe-subnets \
@@ -384,7 +392,8 @@ echo "✅ Preparation complete with bucket: ${S3_BUCKET_NAME}"
 
     ```bash
     # Check ECS service status
-    export SERVICE_NAME=$(aws ecs list-services --cluster ${CLUSTER_NAME} \
+    export SERVICE_NAME=$(aws ecs list-services \
+        --cluster ${CLUSTER_NAME} \
         --query 'serviceArns[0]' --output text | cut -d'/' -f2)
     
     aws ecs describe-services \
@@ -393,7 +402,8 @@ echo "✅ Preparation complete with bucket: ${S3_BUCKET_NAME}"
         --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount}'
     
     # Get task details
-    export TASK_ARN=$(aws ecs list-tasks --cluster ${CLUSTER_NAME} \
+    export TASK_ARN=$(aws ecs list-tasks \
+        --cluster ${CLUSTER_NAME} \
         --service-name ${SERVICE_NAME} \
         --query 'taskArns[0]' --output text)
     
@@ -559,18 +569,25 @@ echo "✅ Preparation complete with bucket: ${S3_BUCKET_NAME}"
    echo "✅ ECS service removed"
    ```
 
-2. **Delete CI/CD Pipeline**:
+2. **Delete CloudFormation Stacks**:
 
    ```bash
-   # Delete CodePipeline CloudFormation stack
+   # Delete deployment stack
+   aws cloudformation delete-stack \
+       --stack-name app2container-deployment-${APP_ID}
+   
+   # Delete CodePipeline stack
    aws cloudformation delete-stack \
        --stack-name app2container-pipeline-${APP_ID}
    
    # Wait for stack deletion
    aws cloudformation wait stack-delete-complete \
+       --stack-name app2container-deployment-${APP_ID}
+   
+   aws cloudformation wait stack-delete-complete \
        --stack-name app2container-pipeline-${APP_ID}
    
-   echo "✅ CI/CD pipeline removed"
+   echo "✅ CloudFormation stacks removed"
    ```
 
 3. **Remove Container Images and Repositories**:
@@ -630,30 +647,37 @@ echo "✅ Preparation complete with bucket: ${S3_BUCKET_NAME}"
 
 ## Discussion
 
-AWS App2Container revolutionizes application modernization by providing an automated, low-risk approach to containerizing legacy applications. The tool addresses key challenges organizations face when modernizing their application portfolio: dependency analysis, container image creation, and AWS deployment configuration. By automatically discovering application dependencies and generating optimized Docker containers, App2Container eliminates much of the manual work traditionally required for containerization projects.
+AWS App2Container revolutionizes application modernization by providing an automated, low-risk approach to containerizing legacy applications. The tool addresses key challenges organizations face when modernizing their application portfolio: dependency analysis, container image creation, and AWS deployment configuration. By automatically discovering application dependencies and generating optimized Docker containers, App2Container eliminates much of the manual work traditionally required for containerization projects while following the AWS Well-Architected Framework principles.
 
-The containerization process leverages Docker best practices, creating lightweight, secure container images that maintain application functionality while enabling modern deployment patterns. App2Container's integration with AWS services provides a complete modernization solution, generating CloudFormation templates, ECS task definitions, and CI/CD pipelines that follow AWS Well-Architected principles. This approach ensures that containerized applications benefit from AWS's managed services, automatic scaling, and robust monitoring capabilities.
+The containerization process leverages Docker best practices, creating lightweight, secure container images that maintain application functionality while enabling modern deployment patterns. App2Container's integration with AWS services provides a complete modernization solution, generating CloudFormation templates, ECS task definitions, and CI/CD pipelines that follow AWS Well-Architected principles. This approach ensures that containerized applications benefit from AWS's managed services, automatic scaling, and robust monitoring capabilities while maintaining the security posture required for enterprise workloads.
 
-For organizations with complex application portfolios, App2Container's worker machine capability enables centralized modernization efforts. IT teams can analyze and containerize applications across multiple servers without installing Docker or other containerization tools on production systems. The tool's support for both remote and local containerization workflows provides flexibility for different organizational constraints and security requirements.
+For organizations with complex application portfolios, App2Container's worker machine capability enables centralized modernization efforts. IT teams can analyze and containerize applications across multiple servers without installing Docker or other containerization tools on production systems. The tool's support for both remote and local containerization workflows provides flexibility for different organizational constraints and security requirements, making it suitable for both cloud-native and hybrid cloud deployment scenarios.
 
 The generated CI/CD pipelines integrate seamlessly with AWS DevOps services, enabling continuous deployment and automated testing workflows. This integration ensures that modernized applications can be maintained and updated using modern DevOps practices, reducing operational overhead and increasing deployment velocity. The combination of containerization and automated deployment pipelines provides a foundation for further modernization efforts, including microservices decomposition and cloud-native architecture adoption.
 
-> **Tip**: Use App2Container's analysis phase to identify optimization opportunities before containerization. Review the generated reports to understand application dependencies and potential security considerations. For comprehensive modernization strategies, consult the [AWS Prescriptive Guidance for Java application migration](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/migrate-on-premises-java-applications-to-aws-using-aws-app2container.html) and [cost optimization patterns](https://docs.aws.amazon.com/prescriptive-guidance/latest/optimize-costs-microsoft-workloads/app2container-main.html).
+> **Tip**: Use App2Container's analysis phase to identify optimization opportunities before containerization. Review the generated reports to understand application dependencies and potential security considerations. For comprehensive modernization strategies, consult the [AWS Prescriptive Guidance for Java application migration](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/migrate-on-premises-java-applications-to-aws-using-aws-app2container.html) and [AWS Application Migration patterns](https://docs.aws.amazon.com/app2container/latest/UserGuide/deploy-overview.html).
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Environment Deployment**: Configure App2Container to deploy containerized applications across development, staging, and production environments with environment-specific configurations and automated promotion workflows.
+1. **Multi-Environment Deployment**: Configure App2Container to deploy containerized applications across development, staging, and production environments with environment-specific configurations and automated promotion workflows using AWS CodePipeline cross-region deployments.
 
-2. **Microservices Decomposition**: Use App2Container's analysis capabilities to identify monolithic application components that can be decomposed into microservices, then containerize each service separately with appropriate service discovery and API gateway integration.
+2. **Microservices Decomposition**: Use App2Container's analysis capabilities to identify monolithic application components that can be decomposed into microservices, then containerize each service separately with appropriate service discovery using AWS App Mesh and API gateway integration.
 
-3. **Hybrid Cloud Integration**: Implement App2Container workflows that support hybrid deployments, containerizing applications for both AWS and on-premises Kubernetes clusters with shared container registries and deployment pipelines.
+3. **Hybrid Cloud Integration**: Implement App2Container workflows that support hybrid deployments, containerizing applications for both AWS and on-premises Kubernetes clusters with shared container registries and deployment pipelines using Amazon ECR Public.
 
-4. **Security Scanning Integration**: Enhance the containerization pipeline with automated security scanning using Amazon Inspector, AWS Security Hub, and third-party vulnerability scanners to ensure container images meet security compliance requirements.
+4. **Security Scanning Integration**: Enhance the containerization pipeline with automated security scanning using Amazon Inspector, AWS Security Hub, and container vulnerability assessment tools to ensure container images meet security compliance requirements.
 
-5. **Cost Optimization Automation**: Implement automated cost optimization strategies using AWS Fargate Spot, ECS capacity providers, and intelligent scaling policies based on application usage patterns identified during the App2Container analysis phase.
+5. **Cost Optimization Automation**: Implement automated cost optimization strategies using AWS Fargate Spot, ECS capacity providers, and intelligent scaling policies based on application usage patterns identified during the App2Container analysis phase with AWS Cost Explorer integration.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

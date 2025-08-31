@@ -1,0 +1,623 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template for Simple Text Processing with CloudShell and S3.
+  This template creates the necessary S3 infrastructure for a text processing
+  workflow that uses AWS CloudShell's built-in Linux tools to process files
+  stored in S3, providing a consistent cloud-based environment for data analysis.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - BucketName
+          - EnableVersioning
+          - EnableLogging
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableServerSideEncryption
+          - KMSKeyId
+          - AllowedPrincipals
+      - Label:
+          default: "Lifecycle Management"
+        Parameters:
+          - EnableIntelligentTiering
+          - TransitionToIADays
+          - DeleteObjectsDays
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - EnableEventNotifications
+          - NotificationEmail
+    ParameterLabels:
+      BucketName:
+        default: "S3 Bucket Name"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      EnableLogging:
+        default: "Enable Access Logging"
+      EnableServerSideEncryption:
+        default: "Enable Server-Side Encryption"
+      KMSKeyId:
+        default: "KMS Key ID (Optional)"
+      AllowedPrincipals:
+        default: "Allowed IAM Principals"
+      EnableIntelligentTiering:
+        default: "Enable Intelligent Tiering"
+      TransitionToIADays:
+        default: "Days to Infrequent Access"
+      DeleteObjectsDays:
+        default: "Days to Delete Objects"
+      EnableEventNotifications:
+        default: "Enable Event Notifications"
+      NotificationEmail:
+        default: "Notification Email Address"
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: |
+      Name for the S3 bucket (leave empty for auto-generated name).
+      Must be globally unique and follow S3 naming conventions.
+    Default: ""
+    AllowedPattern: ^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: |
+      Bucket name must be between 3 and 63 characters, contain only lowercase
+      letters, numbers, and hyphens, and cannot start or end with a hyphen.
+
+  EnableVersioning:
+    Type: String
+    Description: Enable S3 object versioning for data protection and recovery
+    Default: "Enabled"
+    AllowedValues:
+      - "Enabled"
+      - "Suspended"
+
+  EnableLogging:
+    Type: String
+    Description: Enable S3 access logging for audit and compliance purposes
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  EnableServerSideEncryption:
+    Type: String
+    Description: Enable server-side encryption for data at rest security
+    Default: "AES256"
+    AllowedValues:
+      - "AES256"
+      - "aws:kms"
+      - "Disabled"
+
+  KMSKeyId:
+    Type: String
+    Description: |
+      KMS Key ID for encryption (only used when encryption is set to aws:kms).
+      Leave empty to use AWS managed key.
+    Default: ""
+
+  AllowedPrincipals:
+    Type: CommaDelimitedList
+    Description: |
+      Comma-separated list of IAM principals (users/roles) allowed to access
+      the bucket. Leave empty to allow current account access only.
+    Default: ""
+
+  EnableIntelligentTiering:
+    Type: String
+    Description: Enable S3 Intelligent Tiering for automatic cost optimization
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  TransitionToIADays:
+    Type: Number
+    Description: Number of days after which objects transition to Infrequent Access
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+
+  DeleteObjectsDays:
+    Type: Number
+    Description: |
+      Number of days after which objects are permanently deleted.
+      Set to 0 to disable automatic deletion.
+    Default: 0
+    MinValue: 0
+    MaxValue: 3650
+
+  EnableEventNotifications:
+    Type: String
+    Description: Enable S3 event notifications for object create/delete operations
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for S3 event notifications (required if notifications enabled)
+    Default: ""
+    AllowedPattern: ^$|^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+Conditions:
+  # Bucket name conditions
+  CreateBucketName: !Equals [!Ref BucketName, ""]
+  
+  # Security conditions
+  UseKMSEncryption: !Equals [!Ref EnableServerSideEncryption, "aws:kms"]
+  UseCustomKMSKey: !And 
+    - !Condition UseKMSEncryption
+    - !Not [!Equals [!Ref KMSKeyId, ""]]
+  EnableEncryption: !Not [!Equals [!Ref EnableServerSideEncryption, "Disabled"]]
+  
+  # Access control conditions
+  HasAllowedPrincipals: !Not [!Equals [!Select [0, !Ref AllowedPrincipals], ""]]
+  
+  # Lifecycle conditions
+  UseIntelligentTiering: !Equals [!Ref EnableIntelligentTiering, "true"]
+  UseLifecycleTransition: !Not [!Equals [!Ref TransitionToIADays, 0]]
+  UseLifecycleExpiration: !Not [!Equals [!Ref DeleteObjectsDays, 0]]
+  HasLifecycleRules: !Or 
+    - !Condition UseIntelligentTiering
+    - !Condition UseLifecycleTransition
+    - !Condition UseLifecycleExpiration
+  
+  # Logging conditions
+  UseAccessLogging: !Equals [!Ref EnableLogging, "true"]
+  
+  # Notification conditions
+  UseNotifications: !Equals [!Ref EnableEventNotifications, "true"]
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+  CreateNotifications: !And 
+    - !Condition UseNotifications
+    - !Condition HasNotificationEmail
+
+Resources:
+  # S3 Bucket for text processing data storage
+  TextProcessingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - CreateBucketName
+        - !Sub "text-processing-${AWS::AccountId}-${AWS::Region}-${AWS::StackName}"
+        - !Ref BucketName
+      
+      # Enable versioning for data protection
+      VersioningConfiguration:
+        Status: !Ref EnableVersioning
+      
+      # Configure server-side encryption
+      BucketEncryption: !If
+        - EnableEncryption
+        - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: !Ref EnableServerSideEncryption
+                KMSMasterKeyID: !If 
+                  - UseCustomKMSKey
+                  - !Ref KMSKeyId
+                  - !Ref AWS::NoValue
+              BucketKeyEnabled: !If 
+                - UseKMSEncryption
+                - true
+                - !Ref AWS::NoValue
+        - !Ref AWS::NoValue
+      
+      # Configure access logging
+      LoggingConfiguration: !If
+        - UseAccessLogging
+        - DestinationBucketName: !Ref AccessLogsBucket
+          LogFilePrefix: "access-logs/"
+        - !Ref AWS::NoValue
+      
+      # Configure lifecycle rules for cost optimization
+      LifecycleConfiguration: !If
+        - HasLifecycleRules
+        - Rules:
+            # Intelligent Tiering rule for automatic cost optimization
+            - !If
+              - UseIntelligentTiering
+              - Id: "IntelligentTieringRule"
+                Status: Enabled
+                Filter:
+                  Prefix: ""
+                Transitions:
+                  - TransitionInDays: 0
+                    StorageClass: INTELLIGENT_TIERING
+              - !Ref AWS::NoValue
+            
+            # Standard transition rule for predictable access patterns
+            - !If
+              - UseLifecycleTransition
+              - Id: "StandardTransitionRule"
+                Status: Enabled
+                Filter:
+                  Prefix: ""
+                Transitions:
+                  - TransitionInDays: !Ref TransitionToIADays
+                    StorageClass: STANDARD_IA
+                  - TransitionInDays: !If 
+                      - UseIntelligentTiering
+                      - !Ref AWS::NoValue
+                      - 90
+                    StorageClass: !If 
+                      - UseIntelligentTiering
+                      - !Ref AWS::NoValue
+                      - GLACIER
+              - !Ref AWS::NoValue
+            
+            # Object expiration rule for data cleanup
+            - !If
+              - UseLifecycleExpiration
+              - Id: "ExpirationRule"
+                Status: Enabled
+                Filter:
+                  Prefix: ""
+                ExpirationInDays: !Ref DeleteObjectsDays
+                NoncurrentVersionExpirationInDays: !If
+                  - !Equals [!Ref EnableVersioning, "Enabled"]
+                  - !Ref DeleteObjectsDays
+                  - !Ref AWS::NoValue
+              - !Ref AWS::NoValue
+        - !Ref AWS::NoValue
+      
+      # Configure event notifications
+      NotificationConfiguration: !If
+        - CreateNotifications
+        - TopicConfigurations:
+            - Topic: !Ref NotificationTopic
+              Event: "s3:ObjectCreated:*"
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: "prefix"
+                      Value: "input/"
+            - Topic: !Ref NotificationTopic
+              Event: "s3:ObjectCreated:*"
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: "prefix"
+                      Value: "output/"
+        - !Ref AWS::NoValue
+      
+      # Apply security and compliance tags
+      Tags:
+        - Key: "Purpose"
+          Value: "TextProcessing"
+        - Key: "Environment"
+          Value: "Development"
+        - Key: "DataClassification"
+          Value: "Internal"
+        - Key: "BackupRequired"
+          Value: !If [!Equals [!Ref EnableVersioning, "Enabled"], "Yes", "No"]
+        - Key: "CostCenter"
+          Value: "DataAnalytics"
+        - Key: "CreatedBy"
+          Value: "CloudFormation"
+        - Key: "StackName"
+          Value: !Ref AWS::StackName
+
+  # Separate bucket for access logs (required for logging)
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: UseAccessLogging
+    Properties:
+      BucketName: !Sub "${TextProcessingBucket}-access-logs"
+      
+      # Access logs bucket should have minimal configuration
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      
+      # Lifecycle rule to manage log retention
+      LifecycleConfiguration:
+        Rules:
+          - Id: "LogRetentionRule"
+            Status: Enabled
+            ExpirationInDays: 90
+            Filter:
+              Prefix: ""
+      
+      Tags:
+        - Key: "Purpose"
+          Value: "AccessLogs"
+        - Key: "ParentBucket"
+          Value: !Ref TextProcessingBucket
+        - Key: "StackName"
+          Value: !Ref AWS::StackName
+
+  # SNS Topic for event notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-s3-notifications"
+      DisplayName: "S3 Text Processing Notifications"
+      
+      # Enable server-side encryption for SNS
+      KmsMasterKeyId: "alias/aws/sns"
+      
+      Tags:
+        - Key: "Purpose"
+          Value: "S3Notifications"
+        - Key: "StackName"
+          Value: !Ref AWS::StackName
+
+  # Email subscription for notifications
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotifications
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: "email"
+      Endpoint: !Ref NotificationEmail
+
+  # SNS Topic Policy to allow S3 to publish messages
+  NotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: CreateNotifications
+    Properties:
+      Topics:
+        - !Ref NotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "AllowS3Publish"
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - "SNS:Publish"
+            Resource: !Ref NotificationTopic
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnEquals:
+                "aws:SourceArn": !Sub "${TextProcessingBucket}"
+
+  # IAM Role for CloudShell users with appropriate S3 permissions
+  CloudShellTextProcessingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CloudShell-TextProcessing-${AWS::StackName}"
+      Description: "IAM role for CloudShell users to access text processing S3 bucket"
+      
+      # Trust policy for CloudShell service and specified principals
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !If
+                - HasAllowedPrincipals
+                - !Split 
+                  - ","
+                  - !Sub 
+                    - "arn:aws:iam::${AWS::AccountId}:${inner}"
+                    - inner: !Join
+                      - !Sub ":,arn:aws:iam::${AWS::AccountId}:"
+                      - !Ref AllowedPrincipals
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:RequestedRegion": !Ref AWS::Region
+      
+      # Inline policy with least privilege access to the S3 bucket
+      Policies:
+        - PolicyName: "S3TextProcessingAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # List bucket contents and get bucket location
+              - Sid: "ListBucketAccess"
+                Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:GetBucketLocation"
+                  - "s3:GetBucketVersioning"
+                Resource: 
+                  - !GetAtt TextProcessingBucket.Arn
+              
+              # Read and write objects in the bucket
+              - Sid: "ObjectAccess"
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                  - "s3:DeleteObjectVersion"
+                Resource: 
+                  - !Sub "${TextProcessingBucket.Arn}/*"
+              
+              # CloudShell basic permissions
+              - Sid: "CloudShellAccess"
+                Effect: Allow
+                Action:
+                  - "cloudshell:CreateEnvironment"
+                  - "cloudshell:CreateSession"
+                  - "cloudshell:GetEnvironmentStatus"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "aws:RequestedRegion": !Ref AWS::Region
+      
+      Tags:
+        - Key: "Purpose"
+          Value: "CloudShellTextProcessing"
+        - Key: "StackName"
+          Value: !Ref AWS::StackName
+
+  # S3 Bucket Policy for enhanced security
+  TextProcessingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TextProcessingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny insecure transport (enforce HTTPS)
+          - Sid: "DenyInsecureConnections"
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt TextProcessingBucket.Arn
+              - !Sub "${TextProcessingBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          
+          # Allow access only from the current AWS account
+          - Sid: "AllowAccountAccess"
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt TextProcessingBucket.Arn
+              - !Sub "${TextProcessingBucket.Arn}/*"
+          
+          # Additional principal access if specified
+          - !If
+            - HasAllowedPrincipals
+            - Sid: "AllowSpecifiedPrincipals"
+              Effect: Allow
+              Principal:
+                AWS: !Split 
+                  - ","
+                  - !Sub 
+                    - "arn:aws:iam::${AWS::AccountId}:${inner}"
+                    - inner: !Join
+                      - !Sub ":,arn:aws:iam::${AWS::AccountId}:"
+                      - !Ref AllowedPrincipals
+              Action:
+                - "s3:ListBucket"
+                - "s3:GetObject"
+                - "s3:PutObject"
+                - "s3:DeleteObject"
+              Resource:
+                - !GetAtt TextProcessingBucket.Arn
+                - !Sub "${TextProcessingBucket.Arn}/*"
+            - !Ref AWS::NoValue
+
+Outputs:
+  # Primary bucket information
+  BucketName:
+    Description: "Name of the S3 bucket created for text processing"
+    Value: !Ref TextProcessingBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketName"
+
+  BucketArn:
+    Description: "ARN of the S3 bucket for use in other resources"
+    Value: !GetAtt TextProcessingBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketArn"
+
+  BucketDomainName:
+    Description: "Domain name of the S3 bucket for direct access"
+    Value: !GetAtt TextProcessingBucket.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketDomainName"
+
+  BucketWebsiteURL:
+    Description: "Website URL of the S3 bucket"
+    Value: !GetAtt TextProcessingBucket.WebsiteURL
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketWebsiteURL"
+
+  # Access logging information
+  AccessLogsBucketName:
+    Condition: UseAccessLogging
+    Description: "Name of the S3 bucket used for access logging"
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-AccessLogsBucketName"
+
+  # IAM role information
+  CloudShellRoleArn:
+    Description: "ARN of the IAM role for CloudShell text processing access"
+    Value: !GetAtt CloudShellTextProcessingRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudShellRoleArn"
+
+  CloudShellRoleName:
+    Description: "Name of the IAM role for CloudShell text processing access"
+    Value: !Ref CloudShellTextProcessingRole
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudShellRoleName"
+
+  # Notification information
+  NotificationTopicArn:
+    Condition: CreateNotifications
+    Description: "ARN of the SNS topic for S3 event notifications"
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-NotificationTopicArn"
+
+  # CloudShell commands for quick start
+  CloudShellSetupCommands:
+    Description: "Commands to run in CloudShell to start using the bucket"
+    Value: !Sub |
+      # Set environment variables
+      export BUCKET_NAME="${TextProcessingBucket}"
+      export AWS_REGION="${AWS::Region}"
+      
+      # Verify bucket access
+      aws s3 ls s3://${TextProcessingBucket}/
+      
+      # Create folder structure
+      aws s3api put-object --bucket ${TextProcessingBucket} --key input/
+      aws s3api put-object --bucket ${TextProcessingBucket} --key output/
+      
+      # Test upload (create a sample file first)
+      echo "test,data,123" > sample.csv
+      aws s3 cp sample.csv s3://${TextProcessingBucket}/input/
+      
+      echo "✅ S3 bucket ready for text processing!"
+
+  # Stack information
+  StackRegion:
+    Description: "AWS Region where this stack is deployed"
+    Value: !Ref AWS::Region
+
+  StackId:
+    Description: "CloudFormation Stack ID"
+    Value: !Ref AWS::StackId
+
+  CreationTime:
+    Description: "Approximate creation time of this stack"
+    Value: !Sub "${AWS::StackName} created in ${AWS::Region}"
+
+  # Cost estimation information
+  EstimatedMonthlyCost:
+    Description: "Estimated monthly cost breakdown for this infrastructure"
+    Value: !Sub |
+      S3 Standard Storage: ~$0.023 per GB/month
+      S3 Requests: ~$0.0004 per 1K PUT requests, ~$0.0004 per 10K GET requests
+      S3 Intelligent Tiering: ${EnableIntelligentTiering} - adds ~$0.0025 per 1K objects monitored
+      SNS Notifications: ${EnableEventNotifications} - ~$0.50 per 1M requests
+      Data Transfer: First 1GB/month free, then ~$0.09 per GB
+      
+      Typical monthly cost for light usage: $1-5
+      Note: CloudShell usage is included with AWS account (subject to usage limits)
+
+  # Security and compliance information
+  SecurityFeatures:
+    Description: "Security features enabled in this deployment"
+    Value: !Sub |
+      Server-Side Encryption: ${EnableServerSideEncryption}
+      Object Versioning: ${EnableVersioning}
+      Access Logging: ${EnableLogging}
+      HTTPS Enforced: Yes (via bucket policy)
+      Least Privilege IAM: Yes
+      Account Boundary: Yes (cross-account access denied)

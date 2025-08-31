@@ -1,0 +1,938 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Simple Image Metadata Extractor with Lambda and S3
+  Creates a serverless image metadata extraction system that automatically processes 
+  uploaded images and extracts key metadata using AWS Lambda and S3 event triggers.
+  Recipe ID: a7b8c9d2
+
+# =============================================================================
+# METADATA - CloudFormation Interface Configuration
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ResourcePrefix
+      - Label:
+          default: "S3 Bucket Configuration"
+        Parameters:
+          - EnableVersioning
+          - EnableEncryption
+          - EnableAccessLogging
+      - Label:
+          default: "Lambda Function Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+          - PillowLayerArn
+      - Label:
+          default: "Monitoring & Logging Configuration"
+        Parameters:
+          - LogRetentionDays
+          - EnableCloudWatchAlarms
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+      EnableVersioning:
+        default: "Enable S3 Bucket Versioning"
+      EnableEncryption:
+        default: "Enable S3 Server-Side Encryption"
+      EnableAccessLogging:
+        default: "Enable S3 Access Logging"
+      LambdaRuntime:
+        default: "Lambda Runtime Version"
+      LambdaTimeout:
+        default: "Lambda Function Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Allocation (MB)"
+      PillowLayerArn:
+        default: "Pillow Lambda Layer ARN (Optional)"
+      LogRetentionDays:
+        default: "CloudWatch Log Retention Period"
+      EnableCloudWatchAlarms:
+        default: "Enable CloudWatch Alarms"
+
+# =============================================================================
+# PARAMETERS - Input Configuration
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name for resource tagging and naming
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, test, staging, or prod
+
+  ResourcePrefix:
+    Type: String
+    Default: image-metadata
+    Description: Prefix for all resource names to ensure uniqueness
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens (3-20 chars)
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    Description: Enable versioning on the S3 bucket for data protection and recovery
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableEncryption:
+    Type: String
+    Default: 'true'
+    Description: Enable server-side encryption on the S3 bucket using AES-256
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableAccessLogging:
+    Type: String
+    Default: 'false'
+    Description: Enable S3 access logging for audit and compliance purposes
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.12
+    Description: Python runtime version for Lambda function execution
+    AllowedValues:
+      - python3.10
+      - python3.11
+      - python3.12
+    ConstraintDescription: Must be a supported Python runtime version
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 900
+    Description: Lambda function timeout in seconds (5-900 seconds)
+    ConstraintDescription: Must be between 5 and 900 seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    Description: Lambda function memory allocation in MB (affects CPU performance)
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 3008
+    ConstraintDescription: Must be a valid Lambda memory size
+
+  PillowLayerArn:
+    Type: String
+    Default: ''
+    Description: >
+      Optional ARN of pre-deployed Pillow Lambda Layer. If empty, function will 
+      attempt to use Pillow from deployment package (not recommended for production)
+    AllowedPattern: '^(arn:aws:lambda:.*:.*:layer:.*|)$'
+    ConstraintDescription: Must be a valid Lambda Layer ARN or empty string
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: Number of days to retain CloudWatch logs (affects storage costs)
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1827
+      - 3653
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'false'
+    Description: Enable CloudWatch alarms for monitoring Lambda function health
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+# =============================================================================
+# CONDITIONS - Conditional Resource Creation
+# =============================================================================
+Conditions:
+  # S3 Configuration Conditions
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+  EnableS3Encryption: !Equals [!Ref EnableEncryption, 'true']
+  EnableS3AccessLogging: !Equals [!Ref EnableAccessLogging, 'true']
+  
+  # Environment-based Conditions
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IsNonProduction: !Not [!Equals [!Ref Environment, 'prod']]
+  
+  # Lambda Configuration Conditions
+  HasPillowLayer: !Not [!Equals [!Ref PillowLayerArn, '']]
+  
+  # Monitoring Conditions
+  EnableAlarmsCondition: !And
+    - !Equals [!Ref EnableCloudWatchAlarms, 'true']
+    - !Condition IsProduction
+
+# =============================================================================
+# RESOURCES - AWS Infrastructure Components
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # S3 BUCKET FOR IMAGE STORAGE
+  # Primary storage bucket for uploaded images with comprehensive security
+  # ---------------------------------------------------------------------------
+  ImageStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-images-${Environment}-${AWS::AccountId}'
+      # Security Configuration - Block all public access
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Versioning Configuration - Enable for data protection
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, Enabled, Suspended]
+      # Encryption Configuration - Server-side encryption
+      BucketEncryption:
+        !If
+          - EnableS3Encryption
+          - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+              BucketKeyEnabled: true
+          - !Ref AWS::NoValue
+      # Lifecycle Management - Cost optimization and cleanup
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToInfrequentAccess
+            Status: !If [IsProduction, Enabled, Disabled]
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: DeleteNoncurrentVersions
+            Status: !If [EnableS3Versioning, Enabled, Disabled]
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      # Access Logging Configuration - Optional for compliance
+      LoggingConfiguration:
+        !If
+          - EnableS3AccessLogging
+          - DestinationBucketName: !Ref AccessLogsBucket
+            LogFilePrefix: access-logs/
+          - !Ref AWS::NoValue
+      # Event Notification Configuration - Trigger Lambda on image uploads
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageMetadataExtractorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpg
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageMetadataExtractorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpeg
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageMetadataExtractorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .png
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageMetadataExtractorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .gif
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageMetadataExtractorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .webp
+      # Resource Tags - For cost tracking and management
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: SimpleImageMetadataExtractor
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: CostCenter
+          Value: Development
+        - Key: Purpose
+          Value: ImageStorage
+
+  # ---------------------------------------------------------------------------
+  # S3 BUCKET FOR ACCESS LOGS (Conditional)
+  # Separate bucket for storing S3 access logs when logging is enabled
+  # ---------------------------------------------------------------------------
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableS3AccessLogging
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-access-logs-${Environment}-${AWS::AccountId}'
+      AccessControl: LogDeliveryWrite
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAccessLogs
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: SimpleImageMetadataExtractor
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: AccessLogging
+
+  # ---------------------------------------------------------------------------
+  # IAM ROLE FOR LAMBDA FUNCTION
+  # Execution role with minimal required permissions following least privilege
+  # ---------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-lambda-execution-${Environment}'
+      Description: Execution role for image metadata extractor Lambda function
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      # AWS Managed Policy for basic Lambda execution
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      # Custom policies for specific S3 access
+      Policies:
+        - PolicyName: S3ImageBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read access to image objects
+              - Sid: GetImageObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetObjectAttributes
+                Resource: !Sub '${ImageStorageBucket}/*'
+              # List bucket contents (limited scope)
+              - Sid: ListImageBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref ImageStorageBucket
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - '*.jpg'
+                      - '*.jpeg'
+                      - '*.png'
+                      - '*.gif'
+                      - '*.webp'
+      # Resource Tags
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: SimpleImageMetadataExtractor
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: LambdaExecutionRole
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP FOR LAMBDA FUNCTION
+  # Centralized logging with configurable retention for cost management
+  # ---------------------------------------------------------------------------
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-extractor-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: SimpleImageMetadataExtractor
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: LambdaLogging
+
+  # ---------------------------------------------------------------------------
+  # LAMBDA FUNCTION FOR IMAGE METADATA EXTRACTION
+  # Core processing function with comprehensive error handling and logging
+  # ---------------------------------------------------------------------------
+  ImageMetadataExtractorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-extractor-${Environment}'
+      Description: !Sub 'Extract metadata from uploaded images - Environment: ${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      # Conditional Layer attachment
+      Layers: !If
+        - HasPillowLayer
+        - [!Ref PillowLayerArn]
+        - !Ref AWS::NoValue
+      # Environment variables for configuration
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          BUCKET_NAME: !Ref ImageStorageBucket
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+          STACK_NAME: !Ref AWS::StackName
+      # Lambda function code with comprehensive metadata extraction
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from urllib.parse import unquote_plus
+          import io
+          
+          # Try to import PIL, handle gracefully if not available
+          try:
+              from PIL import Image
+              PIL_AVAILABLE = True
+          except ImportError:
+              PIL_AVAILABLE = False
+              logging.warning("PIL/Pillow not available. Limited metadata extraction will be performed.")
+          
+          # Initialize AWS clients outside handler for connection reuse
+          s3_client = boto3.client('s3')
+          
+          # Configure logging based on environment
+          logger = logging.getLogger()
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+          
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler for S3 image upload events
+              Processes S3 event records and extracts metadata from uploaded images
+              
+              Args:
+                  event: S3 event notification containing uploaded object details
+                  context: Lambda runtime context information
+              
+              Returns:
+                  dict: Response with status code and processing results
+              """
+              try:
+                  logger.info(f"Processing {len(event.get('Records', []))} S3 event records")
+                  
+                  processed_images = []
+                  
+                  # Process each S3 event record
+                  for record_index, record in enumerate(event.get('Records', [])):
+                      try:
+                          # Extract S3 bucket and object information
+                          bucket = record['s3']['bucket']['name']
+                          key = unquote_plus(record['s3']['object']['key'])
+                          event_name = record['eventName']
+                          
+                          logger.info(f"Processing record {record_index + 1}: {event_name} for {key} in {bucket}")
+                          
+                          # Download image from S3
+                          logger.debug(f"Downloading object: s3://{bucket}/{key}")
+                          response = s3_client.get_object(Bucket=bucket, Key=key)
+                          image_content = response['Body'].read()
+                          
+                          # Extract object metadata from S3
+                          s3_metadata = {
+                              'content_type': response.get('ContentType', 'unknown'),
+                              'content_length': response.get('ContentLength', len(image_content)),
+                              'last_modified': response.get('LastModified', '').isoformat() if response.get('LastModified') else None,
+                              'etag': response.get('ETag', '').strip('"'),
+                              'server_side_encryption': response.get('ServerSideEncryption'),
+                              'metadata': response.get('Metadata', {})
+                          }
+                          
+                          # Extract comprehensive image metadata
+                          image_metadata = extract_image_metadata(image_content, key, s3_metadata)
+                          
+                          # Add processing context
+                          image_metadata.update({
+                              'processing_timestamp': context.aws_request_id,
+                              'lambda_request_id': context.aws_request_id,
+                              'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                              'function_version': context.function_version,
+                              'remaining_time_ms': context.get_remaining_time_in_millis()
+                          })
+                          
+                          processed_images.append(image_metadata)
+                          
+                          # Log successful processing
+                          logger.info(f"Successfully extracted metadata for {key}")
+                          logger.debug(f"Metadata: {json.dumps(image_metadata, indent=2, default=str)}")
+                          
+                      except Exception as record_error:
+                          logger.error(f"Error processing record {record_index + 1}: {str(record_error)}")
+                          # Continue processing other records even if one fails
+                          processed_images.append({
+                              'filename': record.get('s3', {}).get('object', {}).get('key', 'unknown'),
+                              'error': str(record_error),
+                              'processing_status': 'failed'
+                          })
+                  
+                  # Return success response with processing summary
+                  response = {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Image processing completed',
+                          'processed_count': len(processed_images),
+                          'successful_count': len([img for img in processed_images if not img.get('error')]),
+                          'failed_count': len([img for img in processed_images if img.get('error')]),
+                          'images': processed_images
+                      }, default=str)
+                  }
+                  
+                  logger.info(f"Processing completed. Total: {len(processed_images)}")
+                  return response
+                  
+              except Exception as e:
+                  logger.error(f"Critical error in lambda_handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Internal processing error',
+                          'message': str(e)
+                      })
+                  }
+          
+          def extract_image_metadata(image_content, filename, s3_metadata=None):
+              """
+              Extract comprehensive metadata from image content
+              Supports both PIL-based extraction and basic file analysis
+              
+              Args:
+                  image_content: Binary image data from S3
+                  filename: Original filename/key from S3
+                  s3_metadata: Additional metadata from S3 object
+              
+              Returns:
+                  dict: Comprehensive metadata dictionary
+              """
+              try:
+                  metadata = {
+                      'filename': filename,
+                      'file_size_bytes': len(image_content),
+                      'file_size_kb': round(len(image_content) / 1024, 2),
+                      'file_size_mb': round(len(image_content) / (1024 * 1024), 2),
+                      'processing_method': 'PIL' if PIL_AVAILABLE else 'basic',
+                      's3_metadata': s3_metadata or {}
+                  }
+                  
+                  # Enhanced metadata extraction with PIL
+                  if PIL_AVAILABLE:
+                      try:
+                          with Image.open(io.BytesIO(image_content)) as img:
+                              # Basic image properties
+                              metadata.update({
+                                  'format': img.format,
+                                  'mode': img.mode,
+                                  'size': img.size,
+                                  'width': img.width,
+                                  'height': img.height,
+                                  'aspect_ratio': round(img.width / img.height, 4) if img.height > 0 else 0,
+                                  'megapixels': round((img.width * img.height) / 1000000, 2)
+                              })
+                              
+                              # Color analysis
+                              if hasattr(img, 'getcolors'):
+                                  try:
+                                      colors = img.getcolors(maxcolors=256*256*256)
+                                      if colors:
+                                          metadata['unique_colors'] = len(colors)
+                                          metadata['dominant_color'] = colors[0][1] if colors else None
+                                  except Exception as color_error:
+                                      logger.debug(f"Color analysis failed: {color_error}")
+                              
+                              # EXIF data extraction
+                              try:
+                                  exif_dict = img.getexif()
+                                  if exif_dict:
+                                      metadata.update({
+                                          'has_exif': True,
+                                          'exif_tags_count': len(exif_dict),
+                                          'exif_data': dict(exif_dict) if len(exif_dict) < 50 else 'too_large'
+                                      })
+                                      
+                                      # Extract common EXIF tags
+                                      common_tags = {
+                                          'DateTime': 306,
+                                          'Make': 271,
+                                          'Model': 272,
+                                          'Orientation': 274,
+                                          'XResolution': 282,
+                                          'YResolution': 283,
+                                          'Software': 305
+                                      }
+                                      
+                                      for tag_name, tag_id in common_tags.items():
+                                          if tag_id in exif_dict:
+                                              metadata[f'exif_{tag_name.lower()}'] = str(exif_dict[tag_id])
+                                  else:
+                                      metadata['has_exif'] = False
+                              except Exception as exif_error:
+                                  logger.debug(f"EXIF extraction failed: {exif_error}")
+                                  metadata['has_exif'] = False
+                              
+                              # Image quality assessment
+                              try:
+                                  # Calculate compression ratio as quality indicator
+                                  uncompressed_size = img.width * img.height * len(img.getbands())
+                                  compression_ratio = len(image_content) / uncompressed_size if uncompressed_size > 0 else 0
+                                  metadata['compression_ratio'] = round(compression_ratio, 4)
+                                  
+                                  # Estimate quality based on file size vs dimensions
+                                  pixels = img.width * img.height
+                                  bytes_per_pixel = len(image_content) / pixels if pixels > 0 else 0
+                                  metadata['bytes_per_pixel'] = round(bytes_per_pixel, 4)
+                                  
+                              except Exception as quality_error:
+                                  logger.debug(f"Quality assessment failed: {quality_error}")
+                      
+                      except Exception as pil_error:
+                          logger.warning(f"PIL processing failed for {filename}: {pil_error}")
+                          metadata['pil_error'] = str(pil_error)
+                  
+                  else:
+                      # Basic metadata extraction without PIL
+                      logger.info(f"Performing basic metadata extraction for {filename}")
+                      # Attempt to determine format from filename extension
+                      file_extension = filename.lower().split('.')[-1] if '.' in filename else 'unknown'
+                      metadata.update({
+                          'format': file_extension.upper(),
+                          'format_detected_by': 'filename_extension'
+                      })
+                  
+                  # File categorization
+                  if metadata.get('file_size_mb', 0) > 10:
+                      metadata['size_category'] = 'large'
+                  elif metadata.get('file_size_mb', 0) > 1:
+                      metadata['size_category'] = 'medium'
+                  else:
+                      metadata['size_category'] = 'small'
+                  
+                  return metadata
+                  
+              except Exception as e:
+                  logger.error(f"Error extracting metadata from {filename}: {str(e)}")
+                  return {
+                      'filename': filename,
+                      'error': str(e),
+                      'file_size_bytes': len(image_content) if image_content else 0,
+                      'processing_status': 'failed'
+                  }
+      # Dead Letter Queue Configuration for failed invocations
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      # Reserved Concurrency for cost control (optional)
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      # Resource Tags
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: SimpleImageMetadataExtractor
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Runtime
+          Value: !Ref LambdaRuntime
+        - Key: Purpose
+          Value: ImageMetadataExtraction
+
+  # ---------------------------------------------------------------------------
+  # SQS DEAD LETTER QUEUE FOR FAILED LAMBDA INVOCATIONS
+  # Captures failed Lambda invocations for debugging and replay capability
+  # ---------------------------------------------------------------------------
+  LambdaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: SimpleImageMetadataExtractor
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: LambdaDeadLetterQueue
+
+  # ---------------------------------------------------------------------------
+  # LAMBDA PERMISSION FOR S3 TO INVOKE FUNCTION
+  # Grants S3 service permission to invoke Lambda function on object creation
+  # ---------------------------------------------------------------------------
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ImageMetadataExtractorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ImageStorageBucket.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS FOR MONITORING (Conditional)
+  # Production monitoring alarms for function health and performance
+  # ---------------------------------------------------------------------------
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-lambda-errors-${Environment}'
+      AlarmDescription: !Sub 'Monitors error rate for ${ResourcePrefix} Lambda function'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ImageMetadataExtractorFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-lambda-duration-${Environment}'
+      AlarmDescription: !Sub 'Monitors duration for ${ResourcePrefix} Lambda function'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ImageMetadataExtractorFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-lambda-throttles-${Environment}'
+      AlarmDescription: !Sub 'Monitors throttles for ${ResourcePrefix} Lambda function'
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ImageMetadataExtractorFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  # ---------------------------------------------------------------------------
+  # SNS TOPIC FOR ALARM NOTIFICATIONS (Conditional)
+  # Centralized notification system for CloudWatch alarms
+  # ---------------------------------------------------------------------------
+  SNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableAlarmsCondition
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-alarms-${Environment}'
+      DisplayName: !Sub 'Image Metadata Extractor Alarms - ${Environment}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: SimpleImageMetadataExtractor
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: AlarmNotifications
+
+# =============================================================================
+# OUTPUTS - Stack Output Values
+# =============================================================================
+Outputs:
+  # S3 Bucket Information
+  ImageStorageBucketName:
+    Description: Name of the S3 bucket for image storage
+    Value: !Ref ImageStorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageBucket'
+
+  ImageStorageBucketArn:
+    Description: ARN of the S3 bucket for image storage
+    Value: !GetAtt ImageStorageBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageBucketArn'
+
+  ImageStorageBucketDomainName:
+    Description: Domain name of the S3 bucket for image storage
+    Value: !GetAtt ImageStorageBucket.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageBucketDomain'
+
+  # Lambda Function Information
+  LambdaFunctionName:
+    Description: Name of the Lambda function for image metadata extraction
+    Value: !Ref ImageMetadataExtractorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function for image metadata extraction
+    Value: !GetAtt ImageMetadataExtractorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # IAM Role Information
+  LambdaRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+
+  # CloudWatch Information
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for Lambda function
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  # Dead Letter Queue Information
+  DeadLetterQueueArn:
+    Description: ARN of the SQS Dead Letter Queue for failed Lambda invocations
+    Value: !GetAtt LambdaDeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueue'
+
+  # Conditional Outputs
+  SNSAlarmTopicArn:
+    Condition: EnableAlarmsCondition
+    Description: ARN of SNS topic for CloudWatch alarm notifications
+    Value: !Ref SNSAlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSAlarmTopic'
+
+  AccessLogsBucketName:
+    Condition: EnableS3AccessLogging
+    Description: Name of the S3 bucket for access logs
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessLogsBucket'
+
+  # Helpful Commands for Testing and Monitoring
+  TestUploadCommand:
+    Description: AWS CLI command to test the solution by uploading an image
+    Value: !Sub 'aws s3 cp your-image.jpg s3://${ImageStorageBucket}/test-images/your-image.jpg'
+
+  ViewLogsCommand:
+    Description: AWS CLI command to view recent Lambda function logs
+    Value: !Sub |
+      aws logs filter-log-events \
+        --log-group-name ${LambdaLogGroup} \
+        --start-time $(date -d '1 hour ago' +%s)000 \
+        --query 'events[*].[eventId,message]' \
+        --output table
+
+  MonitoringDashboardURL:
+    Description: AWS Console URL for Lambda function monitoring
+    Value: !Sub |
+      https://${AWS::Region}.console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${ImageMetadataExtractorFunction}?tab=monitoring
+
+  # Stack Information
+  StackEnvironment:
+    Description: Environment this stack was deployed to
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  StackRegion:
+    Description: AWS Region where this stack was deployed
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  DeploymentTimestamp:
+    Description: Approximate timestamp when this stack was deployed
+    Value: !Sub '${AWS::StackName}-deployed-at-$(date +%Y%m%d-%H%M%S)'

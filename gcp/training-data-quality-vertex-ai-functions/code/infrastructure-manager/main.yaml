@@ -1,0 +1,355 @@
+# Google Cloud Infrastructure Manager Configuration
+# Training Data Quality Assessment with Vertex AI and Functions
+# 
+# This configuration deploys:
+# - Cloud Storage bucket for training data and reports
+# - Cloud Function for data quality analysis
+# - IAM service account with appropriate permissions
+# - Vertex AI API enablement
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: Blueprint
+metadata:
+  name: training-data-quality-vertex-ai-functions
+  labels:
+    category: machine-learning
+    difficulty: "200"
+    recipe-version: "1.1"
+spec:
+  title: "Training Data Quality Assessment with Vertex AI and Functions"
+  description: |
+    Automated data quality assessment system using Vertex AI's Gemini models 
+    and bias detection capabilities integrated with Cloud Functions for 
+    serverless processing. Analyzes training datasets for quality issues, 
+    bias patterns, and content validation.
+  
+  # Define input variables for customization
+  variables:
+    - name: project_id
+      description: "Google Cloud Project ID"
+      type: string
+      required: true
+    
+    - name: region
+      description: "Primary region for resources"
+      type: string
+      default: "us-central1"
+      required: false
+    
+    - name: zone
+      description: "Primary zone for resources"
+      type: string
+      default: "us-central1-a"
+      required: false
+    
+    - name: bucket_suffix
+      description: "Unique suffix for bucket naming"
+      type: string
+      required: false
+      # Generate random suffix if not provided
+      default: "{{ randomId(6) }}"
+    
+    - name: environment
+      description: "Environment tag (dev, staging, prod)"
+      type: string
+      default: "dev"
+      required: false
+    
+    - name: function_memory
+      description: "Memory allocation for Cloud Function (MB)"
+      type: integer
+      default: 1024
+      required: false
+      constraints:
+        - range: [256, 8192]
+    
+    - name: function_timeout
+      description: "Timeout for Cloud Function (seconds)"
+      type: integer
+      default: 540
+      required: false
+      constraints:
+        - range: [60, 540]
+
+  # Resource definitions
+  resources:
+    # Enable required Google Cloud APIs
+    - name: enable-apis
+      type: gcp-types/serviceusage-v1:ServiceUsage
+      properties:
+        name: projects/{{ $.variables.project_id }}/services
+        services:
+          - cloudfunctions.googleapis.com
+          - aiplatform.googleapis.com
+          - storage.googleapis.com
+          - cloudbuild.googleapis.com
+          - compute.googleapis.com
+          - logging.googleapis.com
+          - monitoring.googleapis.com
+      metadata:
+        dependsOn: []
+      options:
+        asyncOperationTimeout: 600s
+
+    # Create dedicated service account for Cloud Function
+    - name: data-quality-function-sa
+      type: gcp-types/iam-v1:ServiceAccount
+      properties:
+        accountId: data-quality-function-sa
+        displayName: "Data Quality Analysis Function Service Account"
+        description: "Service account for data quality analysis function with Vertex AI access"
+        project: {{ $.variables.project_id }}
+      metadata:
+        dependsOn:
+          - enable-apis
+
+    # Grant Vertex AI user permissions to service account
+    - name: vertex-ai-binding
+      type: gcp-types/cloudresourcemanager-v1:ProjectIamBinding
+      properties:
+        resource: {{ $.variables.project_id }}
+        role: roles/aiplatform.user
+        members:
+          - serviceAccount:{{ $.resources["data-quality-function-sa"].email }}
+      metadata:
+        dependsOn:
+          - data-quality-function-sa
+
+    # Grant Cloud Storage admin permissions to service account
+    - name: storage-admin-binding
+      type: gcp-types/cloudresourcemanager-v1:ProjectIamBinding
+      properties:
+        resource: {{ $.variables.project_id }}
+        role: roles/storage.objectAdmin
+        members:
+          - serviceAccount:{{ $.resources["data-quality-function-sa"].email }}
+      metadata:
+        dependsOn:
+          - data-quality-function-sa
+
+    # Grant Cloud Functions invoker role for HTTP trigger
+    - name: function-invoker-binding
+      type: gcp-types/cloudresourcemanager-v1:ProjectIamBinding
+      properties:
+        resource: {{ $.variables.project_id }}
+        role: roles/cloudfunctions.invoker
+        members:
+          - allUsers
+      metadata:
+        dependsOn:
+          - data-quality-function-sa
+
+    # Create Cloud Storage bucket for training data and reports
+    - name: training-data-bucket
+      type: gcp-types/storage-v1:Bucket
+      properties:
+        name: training-data-quality-{{ $.variables.bucket_suffix }}
+        project: {{ $.variables.project_id }}
+        location: {{ $.variables.region }}
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        # Enable uniform bucket-level access for security
+        iamConfiguration:
+          uniformBucketLevelAccess:
+            enabled: true
+        # Lifecycle management for cost optimization
+        lifecycle:
+          rule:
+            - condition:
+                age: 90
+                matchesStorageClass:
+                  - STANDARD
+              action:
+                type: SetStorageClass
+                storageClass: NEARLINE
+            - condition:
+                age: 365
+                matchesStorageClass:
+                  - NEARLINE
+              action:
+                type: SetStorageClass
+                storageClass: COLDLINE
+        # Labels for resource management
+        labels:
+          environment: {{ $.variables.environment }}
+          purpose: training-data-quality
+          managed-by: infrastructure-manager
+      metadata:
+        dependsOn:
+          - enable-apis
+
+    # Create bucket folders for organization
+    - name: datasets-folder
+      type: gcp-types/storage-v1:Object
+      properties:
+        bucket: {{ $.resources["training-data-bucket"].name }}
+        name: datasets/
+        contentType: application/x-directory
+      metadata:
+        dependsOn:
+          - training-data-bucket
+
+    - name: reports-folder
+      type: gcp-types/storage-v1:Object
+      properties:
+        bucket: {{ $.resources["training-data-bucket"].name }}
+        name: reports/
+        contentType: application/x-directory
+      metadata:
+        dependsOn:
+          - training-data-bucket
+
+    # Upload sample training data for testing
+    - name: sample-training-data
+      type: gcp-types/storage-v1:Object
+      properties:
+        bucket: {{ $.resources["training-data-bucket"].name }}
+        name: datasets/sample_training_data.json
+        contentType: application/json
+        # Inline sample data with intentional bias patterns
+        metadata:
+          purpose: sample-data-with-bias-patterns
+          created-by: infrastructure-manager
+        # Sample data content (base64 encoded)
+        data: |
+          WwogIHsidGV4dCI6ICJUaGUgc29mdHdhcmUgZW5naW5lZXIgY29tcGxldGVkIHRoZSBwcm9qZWN0IGVmZmljaWVudGx5IiwgImxhYmVsIjogInBvc2l0aXZlIiwgImRlbW9ncmFwaGljIjogIm1hbGUifSwKICB7InRleHQiOiAiU2hlIG1hbmFnZWQgdG8gZmluaXNoIHRoZSBjb2RpbmcgdGFzayBhZGVxdWF0ZWx5IiwgImxhYmVsIjogIm5ldXRyYWwiLCAiZGVtb2dyYXBoaWMiOiAiZmVtYWxlIn0sCiAgeyJ0ZXh0IjogIlRoZSBkZXZlbG9wZXIgc2hvd2VkIGV4Y2VwdGlvbmFsIHByb2JsZW0tc29sdmluZyBza2lsbHMiLCAibGFiZWwiOiAicG9zaXRpdmUiLCAiZGVtb2dyYXBoaWMiOiAibWFsZSJ9LAogIHsidGV4dCI6ICJUaGUgZmVtYWxlIHByb2dyYW1tZXIgaGFuZGxlZCB0aGUgYXNzaWdubWVudCByZWFzb25hYmx5IHdlbGwiLCAibGFiZWwiOiAibmV1dHJhbCIsICJkZW1vZ3JhcGhpYyI6ICJmZW1hbGUifSwKICB7InRleHQiOiAiT3V0c3RhbmRpbmcgdGVjaG5pY2FsIGxlYWRlcnNoaXAgZGVtb25zdHJhdGVkIHRocm91Z2hvdXQiLCAibGFiZWwiOiAicG9zaXRpdmUiLCAiZGVtb2dyYXBoaWMiOiAibWFsZSJ9LAogIHsidGV4dCI6ICJUaGUgY29kZSByZXZpZXcgd2FzIGNvbXBsZXRlZCBzYXRpc2ZhY3RvcmlseSIsICJsYWJlbCI6ICJuZXV0cmFsIiwgImRlbW9ncmFwaGljIjogImZlbWFsZSJ9LAogIHsidGV4dCI6ICJJbm5vdmF0aXZlIHNvbHV0aW9uIGRldmVsb3BlZCB3aXRoIGdyZWF0IGV4cGVydGlzZSIsICJsYWJlbCI6ICJwb3NpdGl2ZSIsICJkZW1vZ3JhcGhpYyI6ICJtYWxlIn0sCiAgeyJ0ZXh0IjogIlRoZSBkb2N1bWVudGF0aW9uIHdhcyBwcmVwYXJlZCBhcHByb3ByaWF0ZWx5IiwgImxhYmVsIjogIm5ldXRyYWwiLCAiZGVtb2dyYXBoaWMiOiAiZmVtYWxlIn0sCiAgeyJ0ZXh0IjogIkV4Y2VsbGVudCBkZWJ1Z2dpbmcgc2tpbGxzIHJlc29sdmVkIGNvbXBsZXggaXNzdWVzIiwgImxhYmVsIjogInBvc2l0aXZlIiwgImRlbW9ncmFwaGljIjogIm1hbGUifSwKICB7InRleHQiOiAiVGFzayBjb21wbGV0ZWQgYWNjb3JkaW5nIHRvIGJhc2ljIHJlcXVpcmVtZW50cyIsICJsYWJlbCI6ICJuZXV0cmFsIiwgImRlbW9ncmFwaGljIjogImZlbWFsZSJ9Cl0=
+      metadata:
+        dependsOn:
+          - datasets-folder
+
+    # Create Cloud Function source code archive
+    - name: function-source-archive
+      type: gcp-types/storage-v1:Object
+      properties:
+        bucket: {{ $.resources["training-data-bucket"].name }}
+        name: function-source/data-quality-function.zip
+        contentType: application/zip
+        metadata:
+          purpose: cloud-function-source-code
+          created-by: infrastructure-manager
+        # Base64 encoded ZIP file containing the function source
+        # This would contain main.py and requirements.txt from the recipe
+        data: |
+          UEsDBBQACAgIAAAAAAAAAAAAAAAAAAAAAAkAEABtYWluLnB5VVgMAOf4tGcAAAAAAAAAqAcAAGltcG9ydCBqc29uCmltcG9ydCBwYW5kYXMgYXMgcGQKaW1wb3J0IG51bXB5IGFzIG5wCmZyb20gZ29vZ2xlLmNsb3VkIGltcG9ydCBhaXBsYXRmb3JtCmZyb20gZ29vZ2xlLmNsb3VkIGltcG9ydCBzdG9yYWdlCmltcG9ydCBnb29nbGUuZ2VuYWkgYXMgZ2VuYWkKZnJvbSBza2xlYXJuLm1ldHJpY3MgaW1wb3J0IGFjY3VyYWN5X3Njb3JlCmltcG9ydCByZQpmcm9tIGNvbGxlY3Rpb25zIGltcG9ydCBDb3VudGVyLCBkZWZhdWx0ZGljdAppbXBvcnQgb3MKCmRlZiBhbmFseXplX2RhdGFfcXVhbGl0eShyZXF1ZXN0KToKICAgICIiIkNsb3VkIEZ1bmN0aW9uIHRvIGFuYWx5emUgdHJhaW5pbmcgZGF0YSBxdWFsaXR5IGFuZCBiaWFzLiIiIgogICAgCiAgICAjIEluaXRpYWxpemUgcmVxdWVzdCBkYXRhCiAgICB0cnk6CiAgICAgICAgcmVxdWVzdF9qc29uID0gcmVxdWVzdC5nZXRfanNvbigpCiAgICAgICAgaWYgbm90IHJlcXVlc3RfanNvbjoKICAgICAgICAgICAgcmV0dXJuIHsnZXJyb3InOiAnTm8gSlNPTiBwYXlsb2FkIHByb3ZpZGVkJ30sIDQwMAogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHJldHVybiB7J2Vycm9yJzogZidJbnZhbGlkIEpTT04gcGF5bG9hZDoge3N0cihlKX0nfSwgNDAwCiAgICAKICAgICMgRXh0cmFjdCBwYXJhbWV0ZXJzIHdpdGggZGVmYXVsdHMKICAgIHByb2plY3RfaWQgPSByZXF1ZXN0X2pzb24uZ2V0KCdwcm9qZWN0X2lkJykKICAgIHJlZ2lvbiA9IHJlcXVlc3RfanNvbi5nZXQoJ3JlZ2lvbicsICd1cy1jZW50cmFsMScpCiAgICBidWNrZXRfbmFtZSA9IHJlcXVlc3RfanNvbi5nZXQoJ2J1Y2tldF9uYW1lJykKICAgIGRhdGFzZXRfcGF0aCA9IHJlcXVlc3RfanNvbi5nZXQoJ2RhdGFzZXRfcGF0aCcsICdkYXRhc2V0cy9zYW1wbGVfdHJhaW5pbmdfZGF0YS5qc29uJykKICAgIAogICAgaWYgbm90IHByb2plY3RfaWQgb3Igbm90IGJ1Y2tldF9uYW1lOgogICAgICAgIHJldHVybiB7J2Vycm9yJzogJ3Byb2plY3RfaWQgYW5kIGJ1Y2tldF9uYW1lIGFyZSByZXF1aXJlZCd9LCA0MDAKICAgIAogICAgIyBJbml0aWFsaXplIFZlcnRleCBBSSB3aXRoIHByb3BlciBlcnJvciBoYW5kbGluZwogICAgdHJ5OgogICAgICAgIGFpcGxhdGZvcm0uaW5pdChwcm9qZWN0PXByb2plY3RfaWQsIGxvY2F0aW9uPXJlZ2lvbikKICAgICAgICBnZW5haS5jb25maWd1cmUocHJvamVjdD1wcm9qZWN0X2lkLCBsb2NhdGlvbj1yZWdpb24pCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgcmV0dXJuIHsnZXJyb3InOiBmJ0ZhaWxlZCB0byBpbml0aWFsaXplIFZlcnRleCBBSToge3N0cihlKX0nfSwgNTAwCiAgICAKICAgICMgTG9hZCBkYXRhc2V0IGZyb20gQ2xvdWQgU3RvcmFnZQogICAgdHJ5OgogICAgICAgIHN0b3JhZ2VfY2xpZW50ID0gc3RvcmFnZS5DbGllbnQoKQogICAgICAgIGJ1Y2tldCA9IHN0b3JhZ2VfY2xpZW50LmJ1Y2tldChidWNrZXRfbmFtZSkKICAgICAgICBibG9iID0gYnVja2V0LmJsb2IoZGF0YXNldF9wYXRoKQogICAgICAgIGRhdGFfY29udGVudCA9IGJsb2IuZG93bmxvYWRfYXNfdGV4dCgpCiAgICAgICAgZGF0YXNldCA9IGpzb24ubG9hZHMoZGF0YV9jb250ZW50KQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHJldHVybiB7J2Vycm9yJzogZidGYWlsZWQgdG8gbG9hZCBkYXRhc2V0OiB7c3RyKGUpfSd9LCA1MDAKICAgIAogICAgIyBDb252ZXJ0IHRvIERhdGFGcmFtZSBmb3IgYW5hbHlzaXMKICAgIGRmID0gcGQuRGF0YUZyYW1lKGRhdGFzZXQpCiAgICAKICAgICMgSW5pdGlhbGl6ZSByZXN1bHRzCiAgICBxdWFsaXR5X3JlcG9ydCA9IHsKICAgICAgICAnZGF0YXNldF9pbmZvJzogewogICAgICAgICAgICAndG90YWxfc2FtcGxlcyc6IGxlbihkZiksCiAgICAgICAgICAgICd1bmlxdWVfbGFiZWxzJzogZGZbJ2xhYmVsJ10udW5pcXVlKCkudG9saXN0KCksCiAgICAgICAgICAgICdkZW1vZ3JhcGhpY3MnOiBkZlsnZGVtb2dyYXBoaWMnXS51bmlxdWUoKS50b2xpc3QoKSBpZiAnZGVtb2dyYXBoaWMnIGluIGRmLmNvbHVtbnMgZWxzZSBbXQogICAgICAgIH0sCiAgICAgICAgJ2JpYXNfYW5hbHlzaXMnOiB7fSwKICAgICAgICAnY29udGVudF9xdWFsaXR5Jzoge30sCiAgICAgICAgJ3JlY29tbWVuZGF0aW9ucyc6IFtdCiAgICB9CiAgICAKICAgICMgQmlhcyBBbmFseXNpcyB1c2luZyBWZXJ0ZXggQUkgcmVjb21tZW5kZWQgbWV0cmljcwogICAgaWYgJ2RlbW9ncmFwaGljJyBpbiBkZi5jb2x1bW5zOgogICAgICAgIGJpYXNfbWV0cmljcyA9IGFuYWx5emVfZGVtb2dyYXBoaWNfYmlhcyhkZikKICAgICAgICBxdWFsaXR5X3JlcG9ydFsnYmlhc19hbmFseXNpcyddID0gYmlhc19tZXRyaWNzCiAgICAKICAgICMgQ29udGVudCBRdWFsaXR5IEFuYWx5c2lzIHVzaW5nIEdlbWluaQogICAgY29udGVudF9hbmFseXNpcyA9IGFuYWx5emVfY29udGVudF93aXRoX2dlbWluaShkZiwgcHJvamVjdF9pZCwgcmVnaW9uKQogICAgcXVhbGl0eV9yZXBvcnRbJ2NvbnRlbnRfcXVhbGl0eSddID0gY29udGVudF9hbmFseXNpcwogICAgCiAgICAjIEdlbmVyYXRlIHJlY29tbWVuZGF0aW9ucwogICAgcmVjb21tZW5kYXRpb25zID0gZ2VuZXJhdGVfcmVjb21tZW5kYXRpb25zKHF1YWxpdHlfcmVwb3J0KQogICAgcXVhbGl0eV9yZXBvcnRbJ3JlY29tbWVuZGF0aW9ucyddID0gcmVjb21tZW5kYXRpb25zCiAgICAKICAgICMgU2F2ZSByZXBvcnQgdG8gQ2xvdWQgU3RvcmFnZQogICAgdHJ5OgogICAgICAgIHJlcG9ydF9ibG9iID0gYnVja2V0LmJsb2IoZidyZXBvcnRzL3F1YWxpdHlfcmVwb3J0X3twZC5UaW1lc3RhbXAubm93KCkuc3RyZnRpbWUoIiVZJW0lZF8lSCVNJVMiKX0uanNvbicpCiAgICAgICAgcmVwb3J0X2Jsb2IudXBsb2FkX2Zyb21fc3RyaW5nKGpzb24uZHVtcHMocXVhbGl0eV9yZXBvcnQsIGluZGVudD0yKSkKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICByZXR1cm4geydlcnJvcic6IGYnRmFpbGVkIHRvIHNhdmUgcmVwb3J0OiB7c3RyKGUpfSd9LCA1MDAKICAgIAogICAgcmV0dXJuIHsKICAgICAgICAnc3RhdHVzJzogJ3N1Y2Nlc3MnLAogICAgICAgICdyZXBvcnRfbG9jYXRpb24nOiBmJ2dzOi8ve2J1Y2tldF9uYW1lfS9yZXBvcnRzL3tyZXBvcnRfYmxvYi5uYW1lfScsCiAgICAgICAgJ3N1bW1hcnknOiB7CiAgICAgICAgICAgICd0b3RhbF9zYW1wbGVzJzogcXVhbGl0eV9yZXBvcnRbJ2RhdGFzZXRfaW5mbyddWyd0b3RhbF9zYW1wbGVzJ10sCiAgICAgICAgICAgICdiaWFzX2RldGVjdGVkJzogbGVuKHF1YWxpdHlfcmVwb3J0WydiaWFzX2FuYWx5c2lzJ10pID4gMCwKICAgICAgICAgICAgJ2NvbnRlbnRfaXNzdWVzJzogbGVuKHF1YWxpdHlfcmVwb3J0Wydjb250ZW50X3F1YWxpdHknXS5nZXQoJ2lzc3VlcycsIFtdKSksCiAgICAgICAgICAgICdyZWNvbW1lbmRhdGlvbnNfY291bnQnOiBsZW4ocXVhbGl0eV9yZXBvcnRbJ3JlY29tbWVuZGF0aW9ucyddKQogICAgICAgIH0KICAgIH0KClBLAwQUAAgICAAAAAAAAAAAAAAAAAAAABQAEAByZXF1aXJlbWVudHMudHh0VVgMAOf4tGcAAAAAAAAAqAcAAGdvb2dsZS1jbG91ZC1haXBsYXRmb3JtPT0xLjEwMi4wCmdvb2dsZS1jbG91ZC1zdG9yYWdlPT0yLjE4LjAKZ29vZ2xlLWNsb3VkLWZ1bmN0aW9ucy1mcmFtZXdvcms9PTMuOC4wCnBhbmRhcz09Mi4yLjMKbnVtcHk9PTEuMjYuNApzY2lraXQtbGVhcm49PTEuNS4yCmdvb2dsZS1nZW5haT09MC4zLjAKUEsBAhQAFAAICAgAAAAAAAAAAAAAAAAACQAQAAAAAABtYWluLnB5VVgMAOf4tGcAAAAAAAAAqAcAAKgHAABQSwECFAAUAAgICAAAAAAAAAAAAAAAABQAEAAAAAAAcmVxdWlyZW1lbnRzLnR4dFVYDADn+LRnAAAAAAAAAKgHAACoBwAAUEsFBgAAAAACAAIAeAAAAE4PAAAAAA==
+      metadata:
+        dependsOn:
+          - training-data-bucket
+
+    # Deploy Cloud Function for data quality analysis
+    - name: data-quality-analyzer-function
+      type: gcp-types/cloudfunctions-v1:CloudFunction
+      properties:
+        name: projects/{{ $.variables.project_id }}/locations/{{ $.variables.region }}/functions/data-quality-analyzer
+        sourceArchiveUrl: gs://{{ $.resources["training-data-bucket"].name }}/function-source/data-quality-function.zip
+        entryPoint: analyze_data_quality
+        runtime: python312
+        httpsTrigger:
+          # Allow unauthenticated access for demonstration purposes
+          # In production, implement proper authentication
+        timeout: {{ $.variables.function_timeout }}s
+        availableMemoryMb: {{ $.variables.function_memory }}
+        serviceAccountEmail: {{ $.resources["data-quality-function-sa"].email }}
+        environmentVariables:
+          PROJECT_ID: {{ $.variables.project_id }}
+          REGION: {{ $.variables.region }}
+          ENVIRONMENT: {{ $.variables.environment }}
+        labels:
+          environment: {{ $.variables.environment }}
+          purpose: data-quality-analysis
+          managed-by: infrastructure-manager
+      metadata:
+        dependsOn:
+          - function-source-archive
+          - vertex-ai-binding
+          - storage-admin-binding
+          - function-invoker-binding
+
+    # Create Cloud Monitoring notification channel for alerting
+    - name: monitoring-notification-channel
+      type: gcp-types/monitoring-v1:NotificationChannel
+      properties:
+        type: email
+        displayName: "Data Quality Analysis Alerts"
+        description: "Email notifications for data quality analysis issues"
+        labels:
+          email_address: "alerts@example.com"  # Replace with actual email
+        enabled: true
+      metadata:
+        dependsOn:
+          - enable-apis
+
+    # Create alerting policy for function errors
+    - name: function-error-alert
+      type: gcp-types/monitoring-v1:AlertPolicy
+      properties:
+        displayName: "Data Quality Function Error Rate"
+        documentation:
+          content: "Alert when data quality analysis function error rate exceeds threshold"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "Function error rate high"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.label.function_name="data-quality-analyzer"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.1
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.label.function_name
+        notificationChannels:
+          - {{ $.resources["monitoring-notification-channel"].name }}
+        enabled: true
+      metadata:
+        dependsOn:
+          - data-quality-analyzer-function
+          - monitoring-notification-channel
+
+  # Define outputs for integration and verification
+  outputs:
+    - name: project_id
+      description: "Google Cloud Project ID"
+      value: {{ $.variables.project_id }}
+    
+    - name: region
+      description: "Primary region for resources"
+      value: {{ $.variables.region }}
+    
+    - name: bucket_name
+      description: "Cloud Storage bucket for training data and reports"
+      value: {{ $.resources["training-data-bucket"].name }}
+    
+    - name: bucket_url
+      description: "Cloud Storage bucket URL"
+      value: gs://{{ $.resources["training-data-bucket"].name }}
+    
+    - name: function_name
+      description: "Cloud Function name for data quality analysis"
+      value: data-quality-analyzer
+    
+    - name: function_url
+      description: "Cloud Function trigger URL"
+      value: {{ $.resources["data-quality-analyzer-function"].httpsTrigger.url }}
+    
+    - name: service_account_email
+      description: "Service account email for the Cloud Function"
+      value: {{ $.resources["data-quality-function-sa"].email }}
+    
+    - name: sample_data_location
+      description: "Location of sample training data for testing"
+      value: gs://{{ $.resources["training-data-bucket"].name }}/datasets/sample_training_data.json
+    
+    - name: reports_location
+      description: "Location where quality reports will be stored"
+      value: gs://{{ $.resources["training-data-bucket"].name }}/reports/
+    
+    - name: function_test_command
+      description: "Example curl command to test the function"
+      value: |
+        curl -X POST \
+          -H "Content-Type: application/json" \
+          -d '{"project_id":"{{ $.variables.project_id }}","region":"{{ $.variables.region }}","bucket_name":"{{ $.resources["training-data-bucket"].name }}","dataset_path":"datasets/sample_training_data.json"}' \
+          {{ $.resources["data-quality-analyzer-function"].httpsTrigger.url }}

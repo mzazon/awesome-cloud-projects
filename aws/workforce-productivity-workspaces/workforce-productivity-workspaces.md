@@ -1,15 +1,15 @@
 ---
 title: Virtual Desktop Infrastructure with WorkSpaces
 id: b6a9690a
-category: end-user computing
+category: end-user-computing
 difficulty: 300
 subject: aws
-services: workspaces,directory,service,vpc,ec2
+services: workspaces,ds,vpc,ec2
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-25
 passed-qa: null
 tags: workspaces,vdi,directory-service,vpc,remote-work,virtual-desktop
 recipe-generator-version: 1.3
@@ -326,28 +326,7 @@ echo "✅ Environment prepared for WorkSpaces deployment"
 
    The directory registration is complete, establishing the integration between Simple AD and WorkSpaces. This enables the creation of virtual desktops for directory users and activates features like WorkDocs for file sharing and self-service portal for users to manage their own WorkSpaces settings. The registration process also configures the necessary security policies and access controls.
 
-7. **Create directory user for WorkSpace**:
-
-   User management in Simple AD requires careful consideration of authentication and access control requirements. While Simple AD provides Microsoft Active Directory compatibility, user creation in a managed directory service follows AWS-specific patterns. For production deployments, organizations typically integrate with existing identity providers or use AWS Single Sign-On for federated access management.
-
-   ```bash
-   # Get directory IP addresses for user creation
-   DIRECTORY_IPS=$(aws ds describe-directories \
-       --directory-ids $DIRECTORY_ID \
-       --query 'DirectoryDescriptions[0].DnsIpAddrs' --output text)
-   
-   # Create user in Simple AD (using PowerShell commands via Systems Manager)
-   # Note: This requires additional setup. For demo purposes, we'll use a different approach
-   
-   # Create WorkSpace user through WorkSpaces service
-   # This will be done in the next step when creating the WorkSpace
-   
-   echo "✅ Prepared for user creation"
-   ```
-
-   The directory infrastructure is prepared for user management. In production environments, user creation would typically be handled through directory management tools or automated provisioning systems integrated with HR systems. The next step will demonstrate WorkSpace creation with a user account.
-
-8. **Create WorkSpace for user**:
+7. **Create WorkSpace for user**:
 
    AWS WorkSpaces offers various bundle configurations optimized for different use cases, from basic productivity tasks to graphics-intensive applications. Bundle selection impacts both performance and cost, making it important to match bundle types with user requirements. The WorkSpace creation process provisions a complete virtual desktop environment including operating system, applications, and user profile storage, all managed by AWS infrastructure.
 
@@ -359,7 +338,19 @@ echo "✅ Environment prepared for WorkSpaces deployment"
    
    # Create WorkSpace
    aws workspaces create-workspaces \
-       --workspaces DirectoryId=$DIRECTORY_ID,UserName=$WORKSPACE_USERNAME,BundleId=$BUNDLE_ID,UserVolumeEncryptionEnabled=true,RootVolumeEncryptionEnabled=true,WorkspaceProperties='{RunningMode=AUTO_STOP,RunningModeAutoStopTimeoutInMinutes=60,RootVolumeSizeGib=80,UserVolumeSizeGib=50,ComputeTypeName=STANDARD}'
+       --workspaces '[{
+           "DirectoryId": "'$DIRECTORY_ID'",
+           "UserName": "'$WORKSPACE_USERNAME'",
+           "BundleId": "'$BUNDLE_ID'",
+           "UserVolumeEncryptionEnabled": true,
+           "RootVolumeEncryptionEnabled": true,
+           "WorkspaceProperties": {
+               "RunningMode": "AUTO_STOP",
+               "RunningModeAutoStopTimeoutInMinutes": 60,
+               "RootVolumeSizeGib": 80,
+               "UserVolumeSizeGib": 50
+           }
+       }]'
    
    # Wait for WorkSpace to be available
    echo "Creating WorkSpace... this may take 20-30 minutes"
@@ -374,7 +365,7 @@ echo "✅ Environment prepared for WorkSpaces deployment"
 
    The WorkSpace is now provisioning with enterprise-grade security features including encryption at rest for both root and user volumes. The AUTO_STOP configuration optimizes costs by automatically stopping the WorkSpace when not in use, while the Standard bundle provides adequate performance for typical productivity applications. This configuration demonstrates cost-effective virtual desktop deployment with strong security controls.
 
-9. **Configure WorkSpace access and security**:
+8. **Configure WorkSpace access and security**:
 
    Access control for WorkSpaces requires implementing network-level security policies and user access restrictions. IP access control groups provide an additional security layer by restricting WorkSpace access to specific IP ranges, which is particularly important for organizations with compliance requirements or those operating in regulated industries. These controls complement the directory-based authentication to provide defense-in-depth security.
 
@@ -394,7 +385,7 @@ echo "✅ Environment prepared for WorkSpaces deployment"
    # Configure WorkSpace properties
    aws workspaces modify-workspace-properties \
        --workspace-id $WORKSPACE_ID \
-       --workspace-properties RunningMode=AUTO_STOP,RunningModeAutoStopTimeoutInMinutes=60
+       --workspace-properties "RunningMode=AUTO_STOP,RunningModeAutoStopTimeoutInMinutes=60"
    
    echo "✅ Configured WorkSpace security and properties"
    ```
@@ -403,32 +394,32 @@ echo "✅ Environment prepared for WorkSpaces deployment"
 
 > **Tip**: For enhanced security, configure IP access control groups with specific IP ranges that match your organization's office locations or VPN endpoints rather than allowing access from all IPs.
 
-10. **Set up CloudWatch monitoring**:
+9. **Set up CloudWatch monitoring**:
 
-    Comprehensive monitoring is essential for maintaining WorkSpaces performance and availability in production environments. CloudWatch provides detailed metrics about WorkSpace connectivity, performance, and usage patterns, enabling proactive management and troubleshooting. Monitoring data helps optimize costs, plan capacity, and ensure consistent user experience across the virtual desktop infrastructure.
+   Comprehensive monitoring is essential for maintaining WorkSpaces performance and availability in production environments. CloudWatch provides detailed metrics about WorkSpace connectivity, performance, and usage patterns, enabling proactive management and troubleshooting. Monitoring data helps optimize costs, plan capacity, and ensure consistent user experience across the virtual desktop infrastructure.
 
-    ```bash
-    # Enable CloudWatch monitoring for WorkSpaces
-    aws logs create-log-group \
-        --log-group-name /aws/workspaces/${DIRECTORY_ID}
-    
-    # Create CloudWatch alarm for WorkSpace connection failures
-    aws cloudwatch put-metric-alarm \
-        --alarm-name "WorkSpaces-Connection-Failures" \
-        --alarm-description "Monitor WorkSpace connection failures" \
-        --metric-name "ConnectionAttempt" \
-        --namespace "AWS/WorkSpaces" \
-        --statistic Sum \
-        --period 300 \
-        --threshold 5 \
-        --comparison-operator GreaterThanThreshold \
-        --evaluation-periods 2 \
-        --alarm-actions "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:workspaces-alerts"
-    
-    echo "✅ Configured CloudWatch monitoring"
-    ```
+   ```bash
+   # Enable CloudWatch monitoring for WorkSpaces
+   aws logs create-log-group \
+       --log-group-name /aws/workspaces/${DIRECTORY_ID}
+   
+   # Create CloudWatch alarm for WorkSpace connection failures
+   aws cloudwatch put-metric-alarm \
+       --alarm-name "WorkSpaces-Connection-Failures" \
+       --alarm-description "Monitor WorkSpace connection failures" \
+       --metric-name "ConnectionAttempt" \
+       --namespace "AWS/WorkSpaces" \
+       --statistic Sum \
+       --period 300 \
+       --threshold 5 \
+       --comparison-operator GreaterThanThreshold \
+       --evaluation-periods 2 \
+       --treat-missing-data notBreaching
+   
+   echo "✅ Configured CloudWatch monitoring"
+   ```
 
-    Monitoring infrastructure is now operational, providing visibility into WorkSpace performance and availability. The connection failure alarm enables proactive response to connectivity issues, while the log group captures detailed operational data for troubleshooting and optimization. This monitoring foundation supports enterprise-grade operations and SLA management.
+   Monitoring infrastructure is now operational, providing visibility into WorkSpace performance and availability. The connection failure alarm enables proactive response to connectivity issues, while the log group captures detailed operational data for troubleshooting and optimization. This monitoring foundation supports enterprise-grade operations and SLA management.
 
 ## Validation & Testing
 
@@ -483,7 +474,7 @@ echo "✅ Environment prepared for WorkSpaces deployment"
    ```bash
    # Terminate all WorkSpaces in the directory
    aws workspaces terminate-workspaces \
-       --terminate-workspace-requests WorkspaceId=$WORKSPACE_ID
+       --terminate-workspace-requests "WorkspaceId=$WORKSPACE_ID"
    
    # Wait for termination to complete
    echo "Terminating WorkSpaces... this may take 10-15 minutes"
@@ -589,6 +580,8 @@ The solution scales elastically, allowing organizations to quickly provision add
 
 For more information about WorkSpaces best practices, see the [AWS WorkSpaces Administration Guide](https://docs.aws.amazon.com/workspaces/latest/adminguide/amazon-workspaces.html) and [Best Practices for Deploying Amazon WorkSpaces](https://docs.aws.amazon.com/whitepapers/latest/best-practices-deploying-amazon-workspaces/best-practices-deploying-amazon-workspaces.html).
 
+> **Note**: This solution follows AWS Well-Architected Framework principles for operational excellence, security, reliability, performance efficiency, and cost optimization. See the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) for additional guidance.
+
 ## Challenge
 
 Extend this solution by implementing these enhancements:
@@ -605,4 +598,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

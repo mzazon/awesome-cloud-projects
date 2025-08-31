@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Apigee, Cloud Armor, Cloud Load Balancing
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: api-security, ddos-protection, geo-fencing, multi-region, waf
 recipe-generator-version: 1.3
@@ -86,7 +86,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with Owner or Editor permissions for Apigee, Cloud Armor, and Load Balancing
-2. Google Cloud CLI (gcloud) v400.0.0 or later installed and configured
+2. Google Cloud CLI (gcloud) v450.0.0 or later installed and configured
 3. Basic understanding of API gateway concepts and web application security
 4. Domain name with DNS management capabilities for SSL certificate provisioning
 5. Estimated cost: $500-1000/month for Apigee X and associated resources (varies by API traffic volume)
@@ -96,7 +96,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for consistent resource naming
+# Set environment variables for Google Cloud resources
 export PROJECT_ID=$(gcloud config get-value project)
 export REGION_US="us-central1"
 export REGION_EU="europe-west1"
@@ -165,8 +165,7 @@ echo "✅ APIs enabled for Apigee, Cloud Armor, and Load Balancing"
    gcloud apigee organizations provision \
        --runtime-type=CLOUD \
        --billing-type=PAYG \
-       --network=${NETWORK_NAME} \
-       --authorized-network=${PROJECT_ID}
+       --authorized-network=projects/${PROJECT_ID}/global/networks/${NETWORK_NAME}
    
    # Wait for organization provisioning to complete
    echo "⏳ Apigee organization provisioning initiated..."
@@ -191,7 +190,7 @@ echo "✅ APIs enabled for Apigee, Cloud Armor, and Load Balancing"
        --description="Multi-regional API security policy" \
        --type=CLOUD_ARMOR
    
-   # Add rule to block traffic from specific countries (example: blocking known malicious regions)
+   # Add rule to block traffic from specific countries (example: demonstration only)
    gcloud compute security-policies rules create 1000 \
        --security-policy=${ARMOR_POLICY_NAME} \
        --expression="origin.region_code == 'CN' || origin.region_code == 'RU'" \
@@ -211,7 +210,7 @@ echo "✅ APIs enabled for Apigee, Cloud Armor, and Load Balancing"
    # Add rule to block SQL injection attempts
    gcloud compute security-policies rules create 3000 \
        --security-policy=${ARMOR_POLICY_NAME} \
-       --expression="evaluatePreconfiguredExpr('sqli-stable')" \
+       --expression="evaluatePreconfiguredWaf('sqli-stable')" \
        --action=deny-403 \
        --description="Block SQL injection attacks"
    
@@ -228,12 +227,12 @@ echo "✅ APIs enabled for Apigee, Cloud Armor, and Load Balancing"
    # Create Apigee instance in US region
    gcloud apigee instances create us-instance \
        --location=${REGION_US} \
-       --network=${NETWORK_NAME}
+       --organization=${PROJECT_ID}
    
    # Create Apigee instance in EU region
    gcloud apigee instances create eu-instance \
        --location=${REGION_EU} \
-       --network=${NETWORK_NAME}
+       --organization=${PROJECT_ID}
    
    # Create environment groups for routing
    gcloud apigee envgroups create prod-us \
@@ -362,15 +361,15 @@ echo "✅ APIs enabled for Apigee, Cloud Armor, and Load Balancing"
    # Create API proxy (simplified for demonstration)
    echo "Creating sample API proxy configuration..."
    
-   # Create environment deployment for US
-   gcloud apigee environments attach ${PROJECT_ID} \
-       --environment=production-us \
-       --instance=us-instance
+   # Attach environment to instance for US
+   gcloud apigee environments attach production-us \
+       --instance=us-instance \
+       --organization=${PROJECT_ID}
    
-   # Create environment deployment for EU
-   gcloud apigee environments attach ${PROJECT_ID} \
-       --environment=production-eu \
-       --instance=eu-instance
+   # Attach environment to instance for EU
+   gcloud apigee environments attach production-eu \
+       --instance=eu-instance \
+       --organization=${PROJECT_ID}
    
    echo "✅ API proxy deployment configuration completed"
    echo "Deploy actual API proxies through Apigee console or API"
@@ -386,14 +385,14 @@ echo "✅ APIs enabled for Apigee, Cloud Armor, and Load Balancing"
    # Add advanced threat detection rule
    gcloud compute security-policies rules create 4000 \
        --security-policy=${ARMOR_POLICY_NAME} \
-       --expression="evaluatePreconfiguredExpr('xss-stable')" \
+       --expression="evaluatePreconfiguredWaf('xss-stable')" \
        --action=deny-403 \
        --description="Block cross-site scripting attacks"
    
-   # Add rule for bot protection
+   # Add rule for local file inclusion protection
    gcloud compute security-policies rules create 5000 \
        --security-policy=${ARMOR_POLICY_NAME} \
-       --expression="evaluatePreconfiguredExpr('lfi-stable')" \
+       --expression="evaluatePreconfiguredWaf('lfi-stable')" \
        --action=deny-403 \
        --description="Block local file inclusion attacks"
    
@@ -512,6 +511,15 @@ echo "✅ APIs enabled for Apigee, Cloud Armor, and Load Balancing"
 3. **Remove Apigee Resources**:
 
    ```bash
+   # Detach environments from instances
+   gcloud apigee environments detach production-us \
+       --instance=us-instance \
+       --organization=${PROJECT_ID} --quiet
+   
+   gcloud apigee environments detach production-eu \
+       --instance=eu-instance \
+       --organization=${PROJECT_ID} --quiet
+   
    # Delete Apigee instances (this can take 10-15 minutes)
    gcloud apigee instances delete us-instance \
        --organization=${PROJECT_ID} --quiet
@@ -524,6 +532,13 @@ echo "✅ APIs enabled for Apigee, Cloud Armor, and Load Balancing"
        --organization=${PROJECT_ID} --quiet
    
    gcloud apigee environments delete production-eu \
+       --organization=${PROJECT_ID} --quiet
+   
+   # Delete environment groups
+   gcloud apigee envgroups delete prod-us \
+       --organization=${PROJECT_ID} --quiet
+   
+   gcloud apigee envgroups delete prod-eu \
        --organization=${PROJECT_ID} --quiet
    
    # Note: Apigee organization deletion requires separate process
@@ -544,6 +559,11 @@ echo "✅ APIs enabled for Apigee, Cloud Armor, and Load Balancing"
    # Delete VPC network
    gcloud compute networks delete ${NETWORK_NAME} --quiet
    
+   # Clean up environment variables
+   unset PROJECT_ID REGION_US REGION_EU NETWORK_NAME
+   unset SUBNET_US SUBNET_EU APIGEE_ORG_NAME
+   unset ARMOR_POLICY_NAME LB_NAME DOMAIN_NAME RANDOM_SUFFIX
+   
    echo "✅ Network resources cleaned up"
    echo "Note: Monitor billing to ensure all resources are properly removed"
    ```
@@ -554,9 +574,9 @@ This comprehensive API security architecture demonstrates the power of combining
 
 The multi-regional deployment pattern ensures high availability and optimal performance for global users. By deploying Apigee instances in multiple regions and using Google Cloud's Global Load Balancer, API requests are automatically routed to the nearest healthy instance, reducing latency while maintaining consistent security policies. The global load balancer's integration with Cloud Armor means that security policies are applied at Google's edge locations worldwide, filtering malicious traffic before it consumes API gateway resources.
 
-Cloud Armor's advanced capabilities extend beyond traditional firewall rules to include machine learning-based threat detection, bot protection, and integration with Google's global threat intelligence. The preconfigured expression language enables sophisticated rule creation for detecting SQL injection, cross-site scripting, and other OWASP Top 10 vulnerabilities. Rate limiting and geographic restrictions provide additional layers of protection against abuse and compliance requirements. For organizations requiring advanced security features, this architecture provides [OWASP API Security](https://owasp.org/www-project-api-security/) compliance and supports integration with [Google Cloud Security Command Center](https://cloud.google.com/security-command-center) for centralized security monitoring.
+Cloud Armor's advanced capabilities extend beyond traditional firewall rules to include machine learning-based threat detection, bot protection, and integration with Google's global threat intelligence. The preconfigured WAF expressions enable sophisticated rule creation for detecting SQL injection, cross-site scripting, and other [OWASP Top 10](https://owasp.org/www-project-api-security/) vulnerabilities. Rate limiting and geographic restrictions provide additional layers of protection against abuse and compliance requirements. For organizations requiring advanced security features, this architecture provides comprehensive API security compliance and supports integration with [Google Cloud Security Command Center](https://cloud.google.com/security-command-center) for centralized security monitoring.
 
-The operational benefits of this architecture include centralized logging and monitoring through Cloud Logging and Cloud Monitoring, automated SSL certificate management, and seamless scaling of API capacity. Google Cloud's commitment to [infrastructure security](https://cloud.google.com/security/infrastructure) and compliance certifications ensures that this architecture meets enterprise security requirements while providing the flexibility to adapt to changing threat landscapes and business requirements.
+The operational benefits of this architecture include centralized logging and monitoring through Cloud Logging and Cloud Monitoring, automated SSL certificate management, and seamless scaling of API capacity. Google Cloud's commitment to [infrastructure security](https://cloud.google.com/security/infrastructure) and compliance certifications ensures that this architecture meets enterprise security requirements while providing the flexibility to adapt to changing threat landscapes and business requirements. This solution follows the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) principles for security, reliability, and operational excellence.
 
 > **Tip**: Enable [Cloud Armor adaptive protection](https://cloud.google.com/armor/docs/adaptive-protection-overview) for machine learning-based DDoS detection and automatic rule generation based on traffic patterns.
 
@@ -576,4 +596,9 @@ Extend this secure API gateway solution by implementing these advanced enhanceme
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

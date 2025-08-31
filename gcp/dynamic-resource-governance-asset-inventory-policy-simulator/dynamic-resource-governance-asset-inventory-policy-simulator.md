@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Asset Inventory, Policy Simulator, Cloud Functions, Cloud Pub/Sub
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: governance, compliance, automation, monitoring, policy-management
 recipe-generator-version: 1.3
@@ -167,11 +167,11 @@ echo "✅ APIs enabled for governance system"
    
    # Create requirements.txt file
    cat > requirements.txt << 'EOF'
-google-cloud-asset==3.24.0
-google-cloud-pubsub==2.18.4
-google-cloud-logging==3.8.0
-google-cloud-policy-intelligence==1.5.0
-functions-framework==3.4.0
+google-cloud-asset==3.30.0
+google-cloud-pubsub==2.23.1
+google-cloud-logging==3.11.0
+google-cloud-policy-intelligence==1.7.0
+functions-framework==3.8.0
    EOF
    
    # Create the asset analyzer function
@@ -191,7 +191,14 @@ def analyze_asset_change(cloud_event):
     """Analyze asset changes and trigger governance workflows."""
     try:
         # Decode Pub/Sub message
-        pubsub_message = base64.b64decode(cloud_event.data['message']['data']).decode('utf-8')
+        if 'data' in cloud_event and 'message' in cloud_event['data']:
+            pubsub_message = base64.b64decode(
+                cloud_event['data']['message']['data']
+            ).decode('utf-8')
+        else:
+            logger.error("Invalid cloud event format")
+            return {'status': 'error', 'message': 'Invalid event format'}
+        
         asset_data = json.loads(pubsub_message)
         
         # Extract asset information
@@ -271,10 +278,10 @@ def log_compliance_event(asset_name, asset_type, risk_level):
    
    # Create requirements.txt file
    cat > requirements.txt << 'EOF'
-google-cloud-policy-intelligence==1.5.0
-google-cloud-asset==3.24.0
-google-cloud-logging==3.8.0
-functions-framework==3.4.0
+google-cloud-policy-intelligence==1.7.0
+google-cloud-asset==3.30.0
+google-cloud-logging==3.11.0
+functions-framework==3.8.0
    EOF
    
    # Create the policy validator function
@@ -292,7 +299,10 @@ logger = logging.getLogger(__name__)
 def validate_policy_changes(request):
     """Validate policy changes using Policy Simulator."""
     try:
-        request_json = request.get_json()
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return {'status': 'error', 'message': 'No JSON body provided'}
+        
         resource_name = request_json.get('resource_name')
         proposed_policy = request_json.get('proposed_policy')
         
@@ -379,12 +389,12 @@ def assess_policy_risk(validation_results):
    
    # Create requirements.txt file
    cat > requirements.txt << 'EOF'
-google-cloud-pubsub==2.18.4
-google-cloud-logging==3.8.0
-google-cloud-monitoring==2.16.0
-google-cloud-asset==3.24.0
+google-cloud-pubsub==2.23.1
+google-cloud-logging==3.11.0
+google-cloud-monitoring==2.20.0
+google-cloud-asset==3.30.0
 requests==2.31.0
-functions-framework==3.4.0
+functions-framework==3.8.0
    EOF
    
    # Create the compliance engine function
@@ -405,7 +415,14 @@ def enforce_compliance(cloud_event):
     """Main compliance enforcement function."""
     try:
         # Decode Pub/Sub message
-        pubsub_message = base64.b64decode(cloud_event.data['message']['data']).decode('utf-8')
+        if 'data' in cloud_event and 'message' in cloud_event['data']:
+            pubsub_message = base64.b64decode(
+                cloud_event['data']['message']['data']
+            ).decode('utf-8')
+        else:
+            logger.error("Invalid cloud event format")
+            return {'status': 'error', 'message': 'Invalid event format'}
+        
         compliance_data = json.loads(pubsub_message)
         
         logger.info("Processing compliance enforcement request")
@@ -553,7 +570,8 @@ def record_compliance_metrics(asset_name, risk_level, results):
 
    ```bash
    # Check asset feed status
-   gcloud asset feeds list --format="table(name,feedOutputConfig.pubsubDestination.topic)"
+   gcloud asset feeds list \
+       --format="table(name,feedOutputConfig.pubsubDestination.topic)"
    
    # Test asset discovery
    gcloud asset search-all-resources \
@@ -681,4 +699,9 @@ Extend this governance solution by implementing these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

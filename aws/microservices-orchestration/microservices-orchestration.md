@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: eventbridge, step-functions, lambda, dynamodb
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: event-driven, microservices, serverless, orchestration, workflow
 recipe-generator-version: 1.3
 ---
 
-# Microservices Orchestration with EventBridge
-
+# Microservices Orchestration with EventBridge and Step Functions
 
 ## Problem
 
@@ -169,7 +168,7 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
    
    aws iam attach-role-policy \
        --role-name ${LAMBDA_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/Amazon-EventBridge-FullAccess
+       --policy-arn arn:aws:iam::aws:policy/AmazonEventBridgeFullAccess
    
    # Create Step Functions execution role
    aws iam create-role \
@@ -194,6 +193,9 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
    aws iam attach-role-policy \
        --role-name ${STEPFUNCTIONS_ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+   
+   # Wait for IAM roles to propagate
+   sleep 10
    
    echo "✅ IAM roles created successfully"
    ```
@@ -325,7 +327,7 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
    # Create Lambda function
    export ORDER_SERVICE_ARN=$(aws lambda create-function \
        --function-name ${PROJECT_NAME}-order-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler order-service.lambda_handler \
        --zip-file fileb://order-service.zip \
@@ -453,7 +455,7 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
    # Create Lambda function
    export PAYMENT_SERVICE_ARN=$(aws lambda create-function \
        --function-name ${PROJECT_NAME}-payment-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler payment-service.lambda_handler \
        --zip-file fileb://payment-service.zip \
@@ -575,7 +577,7 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
    # Create Lambda function
    export INVENTORY_SERVICE_ARN=$(aws lambda create-function \
        --function-name ${PROJECT_NAME}-inventory-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler inventory-service.lambda_handler \
        --zip-file fileb://inventory-service.zip \
@@ -631,7 +633,7 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
    # Create Lambda function
    export NOTIFICATION_SERVICE_ARN=$(aws lambda create-function \
        --function-name ${PROJECT_NAME}-notification-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler notification-service.lambda_handler \
        --zip-file fileb://notification-service.zip \
@@ -645,7 +647,26 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
 
    The Notification Service is now deployed and ready to handle customer notifications and system alerts. This microservice provides a foundation for implementing comprehensive customer communication strategies and can be extended to support multi-channel messaging, personalization, and delivery tracking.
 
-8. **Create Step Functions state machine for order processing workflow**:
+8. **Create CloudWatch Log Group for Step Functions**:
+
+   CloudWatch Logs provides centralized logging and monitoring for our Step Functions executions, enabling detailed troubleshooting and performance analysis. Structured logging with defined retention policies helps manage costs while maintaining adequate audit trails. This observability foundation is crucial for production microservices architectures.
+
+   ```bash
+   # Create CloudWatch Log Group for Step Functions
+   aws logs create-log-group \
+       --log-group-name /aws/stepfunctions/${PROJECT_NAME}-order-processing-${RANDOM_SUFFIX}
+   
+   # Set log retention to 14 days
+   aws logs put-retention-policy \
+       --log-group-name /aws/stepfunctions/${PROJECT_NAME}-order-processing-${RANDOM_SUFFIX} \
+       --retention-in-days 14
+   
+   echo "✅ CloudWatch Log Group created for Step Functions"
+   ```
+
+   The CloudWatch Log Group is now configured to capture detailed execution logs from our Step Functions workflows. This centralized logging enables comprehensive monitoring and troubleshooting capabilities essential for production microservices operations.
+
+9. **Create Step Functions state machine for order processing workflow**:
 
    Step Functions orchestrates our complex business workflow using visual state machines that provide built-in error handling, retry logic, and parallel execution capabilities. The Amazon States Language (ASL) defines the workflow declaratively, making it easy to understand and modify business logic. This approach separates orchestration concerns from business logic, enabling better testing and maintenance.
 
@@ -769,13 +790,12 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
    }
    EOF
    
-   # Create Step Functions state machine
+   # Create Step Functions state machine  
    export STATE_MACHINE_ARN=$(aws stepfunctions create-state-machine \
        --name ${PROJECT_NAME}-order-processing-${RANDOM_SUFFIX} \
        --definition file://order-processing-workflow.json \
        --role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/${STEPFUNCTIONS_ROLE_NAME} \
        --type STANDARD \
-       --logging-configuration level=ALL,includeExecutionData=true,destinations=[{cloudWatchLogsLogGroup=arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:/aws/stepfunctions/${PROJECT_NAME}-order-processing-${RANDOM_SUFFIX}}] \
        --query 'stateMachineArn' --output text)
    
    echo "✅ Step Functions state machine created"
@@ -803,7 +823,7 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
    aws events put-targets \
        --rule ${PROJECT_NAME}-order-created-rule-${RANDOM_SUFFIX} \
        --event-bus-name ${EVENTBUS_NAME} \
-       --targets "Id"="1","Arn"="${STATE_MACHINE_ARN}","RoleArn"="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${STEPFUNCTIONS_ROLE_NAME}"
+       --targets Id=1,Arn=${STATE_MACHINE_ARN},RoleArn=arn:aws:iam::${AWS_ACCOUNT_ID}:role/${STEPFUNCTIONS_ROLE_NAME}
    
    # Create EventBridge rule for payment events
    aws events put-rule \
@@ -819,7 +839,7 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
    aws events put-targets \
        --rule ${PROJECT_NAME}-payment-events-rule-${RANDOM_SUFFIX} \
        --event-bus-name ${EVENTBUS_NAME} \
-       --targets "Id"="1","Arn"="${NOTIFICATION_SERVICE_ARN}"
+       --targets Id=1,Arn=${NOTIFICATION_SERVICE_ARN}
    
    # Grant EventBridge permission to invoke Lambda
    aws lambda add-permission \
@@ -834,26 +854,7 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
 
    The EventBridge rules are now active and will automatically trigger Step Functions workflows when order events are published. This event-driven triggering mechanism enables real-time processing while maintaining loose coupling between event producers and consumers.
 
-10. **Create CloudWatch Log Group for Step Functions**:
-
-    CloudWatch Logs provides centralized logging and monitoring for our Step Functions executions, enabling detailed troubleshooting and performance analysis. Structured logging with defined retention policies helps manage costs while maintaining adequate audit trails. This observability foundation is crucial for production microservices architectures.
-
-    ```bash
-    # Create CloudWatch Log Group for Step Functions
-    aws logs create-log-group \
-        --log-group-name /aws/stepfunctions/${PROJECT_NAME}-order-processing-${RANDOM_SUFFIX}
-    
-    # Set log retention to 14 days
-    aws logs put-retention-policy \
-        --log-group-name /aws/stepfunctions/${PROJECT_NAME}-order-processing-${RANDOM_SUFFIX} \
-        --retention-in-days 14
-    
-    echo "✅ CloudWatch Log Group created for Step Functions"
-    ```
-
-    The CloudWatch Log Group is now configured to capture detailed execution logs from our Step Functions workflows. This centralized logging enables comprehensive monitoring and troubleshooting capabilities essential for production microservices operations.
-
-11. **Test the event-driven microservices architecture**:
+10. **Test the event-driven microservices architecture**:
 
     Testing validates that our event-driven architecture functions correctly end-to-end, from initial order creation through workflow orchestration to final completion. This integration test demonstrates how events flow through the system and validates that our microservices correctly handle business logic while maintaining data consistency.
 
@@ -886,7 +887,7 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
 
     The test order has been submitted and should trigger the complete workflow orchestration. Monitor the Step Functions console to observe real-time execution progress and verify that each microservice processes events correctly according to our business logic.
 
-12. **Set up monitoring and observability**:
+11. **Set up monitoring and observability**:
 
     Comprehensive monitoring and observability are essential for production microservices architectures, providing insights into system health, performance, and business metrics. CloudWatch dashboards aggregate metrics from multiple services, enabling proactive monitoring and rapid incident response. This observability strategy supports both operational excellence and business intelligence requirements.
 
@@ -977,9 +978,9 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
 4. **Check Lambda function logs**:
 
    ```bash
-   # View Order Service logs
+   # View Order Service logs (requires CloudWatch Logs access)
    aws logs tail /aws/lambda/${PROJECT_NAME}-order-service-${RANDOM_SUFFIX} \
-       --since 10m
+       --since 10m --follow
    ```
 
    Expected output: Log entries showing function executions and EventBridge events.
@@ -1017,12 +1018,12 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
    aws events remove-targets \
        --rule ${PROJECT_NAME}-order-created-rule-${RANDOM_SUFFIX} \
        --event-bus-name ${EVENTBUS_NAME} \
-       --ids "1"
+       --ids 1
    
    aws events remove-targets \
        --rule ${PROJECT_NAME}-payment-events-rule-${RANDOM_SUFFIX} \
        --event-bus-name ${EVENTBUS_NAME} \
-       --ids "1"
+       --ids 1
    
    # Delete rules
    aws events delete-rule \
@@ -1103,7 +1104,7 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
    
    aws iam detach-role-policy \
        --role-name ${LAMBDA_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/Amazon-EventBridge-FullAccess
+       --policy-arn arn:aws:iam::aws:policy/AmazonEventBridgeFullAccess
    
    # Delete Lambda role
    aws iam delete-role \
@@ -1142,15 +1143,15 @@ echo "DynamoDB Table: ${DYNAMODB_TABLE_NAME}"
 
 ## Discussion
 
-This recipe demonstrates the power of event-driven microservices architecture using Amazon EventBridge and AWS Step Functions. The architecture provides several key benefits over traditional tightly-coupled systems. EventBridge serves as the central nervous system, enabling microservices to communicate through events without direct knowledge of each other, promoting loose coupling and system resilience.
+This recipe demonstrates the power of event-driven microservices architecture using Amazon EventBridge and AWS Step Functions. The architecture provides several key benefits over traditional tightly-coupled systems following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html). EventBridge serves as the central nervous system, enabling microservices to communicate through events without direct knowledge of each other, promoting loose coupling and system resilience.
 
-Step Functions orchestrates complex business workflows while providing built-in error handling, retry logic, and visual monitoring. The state machine definition uses the Amazon States Language to define the workflow, making it easy to understand and modify business logic. The choice between Standard and Express workflows depends on your specific requirements - Standard workflows are ideal for long-running processes with full audit trails, while Express workflows excel in high-throughput scenarios.
+Step Functions orchestrates complex business workflows while providing built-in error handling, retry logic, and visual monitoring. The state machine definition uses the [Amazon States Language](https://docs.aws.amazon.com/step-functions/latest/dg/concepts-amazon-states-language.html) to define the workflow declaratively, making it easy to understand and modify business logic. The choice between Standard and Express workflows depends on your specific requirements - Standard workflows are ideal for long-running processes with full audit trails, while Express workflows excel in high-throughput scenarios.
 
 The implementation includes comprehensive error handling strategies, including retry policies with exponential backoff and circuit breaker patterns. Each microservice publishes events to EventBridge, allowing other services to react independently. This pattern enables horizontal scaling, fault isolation, and easier system evolution. The monitoring setup provides visibility into system health and performance through CloudWatch dashboards and Step Functions execution history.
 
 [AWS Step Functions documentation](https://docs.aws.amazon.com/step-functions/latest/dg/) provides detailed guidance on workflow patterns, while [Amazon EventBridge documentation](https://docs.aws.amazon.com/eventbridge/latest/userguide/) covers event-driven architecture best practices. For Lambda best practices, refer to the [AWS Lambda Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/). Monitor your architecture using [Amazon CloudWatch](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/) for comprehensive observability.
 
-> **Tip**: Use EventBridge schema registry to automatically discover and version your event schemas, enabling better integration testing and API evolution.
+> **Tip**: Use EventBridge schema registry to automatically discover and version your event schemas, enabling better integration testing and API evolution. See the [EventBridge Schema Registry documentation](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-schema.html) for implementation guidance.
 
 ## Challenge
 
@@ -1164,4 +1165,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

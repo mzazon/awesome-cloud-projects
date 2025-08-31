@@ -4,19 +4,18 @@ id: 3a186430
 category: compute
 difficulty: 300
 subject: aws
-services: s3,lambda,mediaconvert
+services: s3,lambda,mediaconvert,eventbridge
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: s3,lambda,mediaconvert,video-processing
 recipe-generator-version: 1.3
 ---
 
 # Building Video Processing Workflows with S3, Lambda, and MediaConvert
-
 
 ## Problem
 
@@ -45,6 +44,7 @@ graph TB
     
     subgraph "Delivery & Distribution"
         CLOUDFRONT[CloudFront Distribution]
+        OAC[Origin Access Control]
         DEVICES[Multiple Devices]
     end
     
@@ -55,24 +55,26 @@ graph TB
     MEDIACONVERT-->S3_OUTPUT
     MEDIACONVERT-->EVENTBRIDGE
     EVENTBRIDGE-->LAMBDA
-    S3_OUTPUT-->CLOUDFRONT
+    S3_OUTPUT-->OAC
+    OAC-->CLOUDFRONT
     CLOUDFRONT-->DEVICES
     
     style MEDIACONVERT fill:#FF9900
     style LAMBDA fill:#FF9900
     style S3_INPUT fill:#3F8624
     style S3_OUTPUT fill:#3F8624
+    style OAC fill:#FF9900
 ```
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for S3, Lambda, MediaConvert, and EventBridge
+1. AWS account with appropriate permissions for S3, Lambda, MediaConvert, EventBridge, CloudFront, and IAM
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic knowledge of video formats and streaming protocols
 4. Understanding of event-driven architectures
 5. Estimated cost: $5-15 for testing (depends on video processing volume)
 
-> **Note**: AWS Elemental MediaConvert is the recommended service for video processing. Amazon Elastic Transcoder is being discontinued on November 13, 2025, and new applications should use MediaConvert.
+> **Note**: AWS Elemental MediaConvert is the recommended service for video processing. Amazon Elastic Transcoder was discontinued on November 13, 2025, and all new applications should use MediaConvert for video processing workflows.
 
 > **Warning**: MediaConvert pricing is based on the duration and complexity of video processing. Monitor your usage through AWS Cost Explorer and consider implementing processing limits for cost control.
 
@@ -97,8 +99,27 @@ export MEDIACONVERT_ROLE_NAME="MediaConvertRole-${RANDOM_SUFFIX}"
 export LAMBDA_ROLE_NAME="LambdaVideoProcessorRole-${RANDOM_SUFFIX}"
 
 # Create S3 buckets for video processing
-aws s3 mb s3://${S3_SOURCE_BUCKET}
-aws s3 mb s3://${S3_OUTPUT_BUCKET}
+aws s3 mb s3://${S3_SOURCE_BUCKET} --region ${AWS_REGION}
+aws s3 mb s3://${S3_OUTPUT_BUCKET} --region ${AWS_REGION}
+
+# Enable versioning and encryption for security
+aws s3api put-bucket-versioning \
+    --bucket ${S3_SOURCE_BUCKET} \
+    --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-versioning \
+    --bucket ${S3_OUTPUT_BUCKET} \
+    --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+    --bucket ${S3_SOURCE_BUCKET} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
+aws s3api put-bucket-encryption \
+    --bucket ${S3_OUTPUT_BUCKET} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
 
 echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
 ```
@@ -107,7 +128,7 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
 
 1. **Create IAM role for MediaConvert**:
 
-   AWS Elemental MediaConvert requires an IAM service role to access your S3 buckets for reading source videos and writing processed outputs. This role operates on the principle of least privilege, providing MediaConvert with only the specific permissions needed to perform video transcoding operations. Understanding IAM roles for AWS services is fundamental to building secure, automated workflows.
+   AWS Elemental MediaConvert requires an IAM service role to access your S3 buckets for reading source videos and writing processed outputs. This role operates on the principle of least privilege, providing MediaConvert with only the specific permissions needed to perform video transcoding operations. Understanding IAM roles for AWS services is fundamental to building secure, automated workflows that follow AWS Well-Architected Framework security principles.
 
    ```bash
    # Create trust policy for MediaConvert
@@ -131,14 +152,39 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
        --role-name ${MEDIACONVERT_ROLE_NAME} \
        --assume-role-policy-document file://mediaconvert-trust-policy.json
    
-   # Attach required policies
-   aws iam attach-role-policy \
-       --role-name ${MEDIACONVERT_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+   # Create custom policy with specific bucket access
+   cat > mediaconvert-s3-policy.json << EOF
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": [
+           "s3:GetObject",
+           "s3:GetObjectVersion"
+         ],
+         "Resource": "arn:aws:s3:::${S3_SOURCE_BUCKET}/*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "s3:PutObject",
+           "s3:PutObjectAcl"
+         ],
+         "Resource": "arn:aws:s3:::${S3_OUTPUT_BUCKET}/*"
+       }
+     ]
+   }
+   EOF
+   
+   # Create and attach the policy
+   aws iam create-policy \
+       --policy-name MediaConvertS3Policy-${RANDOM_SUFFIX} \
+       --policy-document file://mediaconvert-s3-policy.json
    
    aws iam attach-role-policy \
        --role-name ${MEDIACONVERT_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/MediaConvertS3Policy-${RANDOM_SUFFIX}
    
    export MEDIACONVERT_ROLE_ARN=$(aws iam get-role \
        --role-name ${MEDIACONVERT_ROLE_NAME} \
@@ -147,11 +193,11 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
    echo "✅ Created MediaConvert role: ${MEDIACONVERT_ROLE_ARN}"
    ```
 
-   The MediaConvert service role is now established with the necessary S3 permissions. This security foundation enables MediaConvert to securely access your video files and write processed outputs without exposing your AWS credentials or granting excessive permissions.
+   The MediaConvert service role is now established with specific S3 permissions following the principle of least privilege. This security foundation enables MediaConvert to securely access your video files and write processed outputs without exposing your AWS credentials or granting excessive permissions.
 
 2. **Create IAM role for Lambda function**:
 
-   Lambda functions require an execution role to interact with other AWS services like MediaConvert and S3. This role enables the serverless orchestration of video processing workflows while maintaining security through temporary, rotatable credentials. The execution role eliminates the need to embed AWS credentials in your function code, following AWS security best practices.
+   Lambda functions require an execution role to interact with other AWS services like MediaConvert and S3. This role enables the serverless orchestration of video processing workflows while maintaining security through temporary, rotatable credentials. The execution role eliminates the need to embed AWS credentials in your function code, following AWS security best practices and IAM guidelines.
 
    ```bash
    # Create trust policy for Lambda
@@ -188,12 +234,26 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
        {
          "Effect": "Allow",
          "Action": [
-           "mediaconvert:*",
-           "s3:GetObject",
-           "s3:PutObject",
-           "iam:PassRole"
+           "mediaconvert:CreateJob",
+           "mediaconvert:GetJob",
+           "mediaconvert:ListJobs",
+           "mediaconvert:DescribeEndpoints"
          ],
          "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "s3:GetObject"
+         ],
+         "Resource": "arn:aws:s3:::${S3_SOURCE_BUCKET}/*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "iam:PassRole"
+         ],
+         "Resource": "${MEDIACONVERT_ROLE_ARN}"
        }
      ]
    }
@@ -215,7 +275,7 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
    echo "✅ Created Lambda role: ${LAMBDA_ROLE_ARN}"
    ```
 
-   The Lambda execution role is configured with permissions to orchestrate MediaConvert jobs and access S3 resources. This serverless security model enables your function to make AWS API calls on your behalf while adhering to the principle of least privilege.
+   The Lambda execution role is configured with specific permissions to orchestrate MediaConvert jobs and access S3 resources. This serverless security model enables your function to make AWS API calls on your behalf while adhering to the principle of least privilege.
 
 3. **Get MediaConvert endpoint**:
 
@@ -254,8 +314,13 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
            key = urllib.parse.unquote_plus(record['s3']['object']['key'])
            
            # Skip if not a video file
-           if not key.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.m4v')):
+           video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.m4v', '.flv', '.wmv')
+           if not key.lower().endswith(video_extensions):
+               print(f"Skipping non-video file: {key}")
                continue
+           
+           # Extract filename without extension
+           filename = key.split('.')[0].split('/')[-1]
            
            # Create job settings
            job_settings = {
@@ -287,7 +352,7 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
                                "Type": "HLS_GROUP_SETTINGS",
                                "HlsGroupSettings": {
                                    "ManifestDurationFormat": "INTEGER",
-                                   "Destination": f"s3://{os.environ['S3_OUTPUT_BUCKET']}/hls/{key.split('.')[0]}/",
+                                   "Destination": f"s3://{os.environ['S3_OUTPUT_BUCKET']}/hls/{filename}/",
                                    "TimedMetadataId3Frame": "PRIV",
                                    "CodecSpecification": "RFC_4281",
                                    "OutputSelection": "MANIFESTS_AND_SEGMENTS",
@@ -407,7 +472,10 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
                                                "GopSize": 90,
                                                "FramerateControl": "SPECIFIED",
                                                "FramerateNumerator": 30,
-                                               "FramerateDenominator": 1
+                                               "FramerateDenominator": 1,
+                                               "InterlaceMode": "PROGRESSIVE",
+                                               "NumberReferenceFrames": 3,
+                                               "Syntax": "DEFAULT"
                                            }
                                        }
                                    },
@@ -417,7 +485,9 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
                                                "Codec": "AAC",
                                                "AacSettings": {
                                                    "Bitrate": 96000,
-                                                   "SampleRate": 48000
+                                                   "SampleRate": 48000,
+                                                   "CodecProfile": "LC",
+                                                   "CodingMode": "CODING_MODE_2_0"
                                                }
                                            },
                                            "AudioSourceName": "Audio Selector 1"
@@ -431,7 +501,7 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
                                            "MoovPlacement": "PROGRESSIVE_DOWNLOAD"
                                        }
                                    },
-                                   "NameModifier": "_720p"
+                                   "NameModifier": f"_{filename}_720p"
                                }
                            ]
                        }
@@ -446,7 +516,7 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
                print(f"Created MediaConvert job: {job_id} for {key}")
                
            except Exception as e:
-               print(f"Error creating MediaConvert job: {str(e)}")
+               print(f"Error creating MediaConvert job for {key}: {str(e)}")
                raise
        
        return {
@@ -458,10 +528,10 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
    # Create deployment package
    zip lambda-function.zip lambda_function.py
    
-   # Create Lambda function
+   # Create Lambda function with updated runtime
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
@@ -471,7 +541,7 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
    echo "✅ Created Lambda function: ${LAMBDA_FUNCTION_NAME}"
    ```
 
-   The video processing Lambda function is deployed and configured with the necessary environment variables and permissions. This serverless orchestrator will automatically detect video uploads and initiate appropriate MediaConvert jobs, enabling hands-free video processing at scale.
+   The video processing Lambda function is deployed with an updated Python 3.12 runtime and configured with the necessary environment variables and permissions. This serverless orchestrator will automatically detect video uploads and initiate appropriate MediaConvert jobs, enabling hands-free video processing at scale.
 
 5. **Configure S3 event notification**:
 
@@ -486,7 +556,7 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
        --principal s3.amazonaws.com \
        --source-arn arn:aws:s3:::${S3_SOURCE_BUCKET}
    
-   # Create S3 event notification configuration
+   # Create S3 event notification configuration for multiple video formats
    cat > s3-notification.json << EOF
    {
      "LambdaConfigurations": [
@@ -531,9 +601,10 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
          "source": ["aws.mediaconvert"],
          "detail-type": ["MediaConvert Job State Change"],
          "detail": {
-           "status": ["COMPLETE"]
+           "status": ["COMPLETE", "ERROR"]
          }
-       }'
+       }' \
+       --state ENABLED
    
    # Create Lambda function for job completion handling
    cat > completion_handler.py << 'EOF'
@@ -541,22 +612,41 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
    import boto3
    
    def lambda_handler(event, context):
-       print(f"MediaConvert job completed: {json.dumps(event)}")
+       print(f"MediaConvert job status change: {json.dumps(event)}")
        
        # Extract job details
        job_id = event['detail']['jobId']
        status = event['detail']['status']
+       timestamp = event['detail']['timestamp']
        
-       # Here you can add additional processing logic:
-       # - Send notifications
-       # - Update database records
-       # - Trigger additional workflows
-       
-       print(f"Job {job_id} completed with status: {status}")
+       # Handle different job statuses
+       if status == 'COMPLETE':
+           print(f"SUCCESS: Job {job_id} completed successfully at {timestamp}")
+           
+           # Add your success logic here:
+           # - Send notifications via SNS
+           # - Update database records
+           # - Trigger additional workflows
+           # - Generate metadata or thumbnails
+           
+       elif status == 'ERROR':
+           error_message = event['detail'].get('errorMessage', 'Unknown error')
+           print(f"ERROR: Job {job_id} failed at {timestamp}: {error_message}")
+           
+           # Add your error handling logic here:
+           # - Send error notifications
+           # - Log to monitoring systems
+           # - Retry mechanisms
+           # - Alert administrators
        
        return {
            'statusCode': 200,
-           'body': json.dumps('Job completion handled successfully')
+           'body': json.dumps({
+               'message': f'Job {job_id} status {status} handled successfully',
+               'jobId': job_id,
+               'status': status,
+               'timestamp': timestamp
+           })
        }
    EOF
    
@@ -566,7 +656,7 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
    # Create completion handler Lambda function
    aws lambda create-function \
        --function-name "completion-handler-${RANDOM_SUFFIX}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler completion_handler.lambda_handler \
        --zip-file fileb://completion-handler.zip \
@@ -588,7 +678,7 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
    echo "✅ Created EventBridge rule for job completion handling"
    ```
 
-   The completion handling system is now established, creating a comprehensive event-driven workflow. When MediaConvert jobs finish processing, EventBridge will automatically trigger the completion handler, enabling post-processing workflows, notifications, and business logic execution.
+   The completion handling system is now established with enhanced error handling, creating a comprehensive event-driven workflow. When MediaConvert jobs finish processing (successfully or with errors), EventBridge will automatically trigger the completion handler, enabling post-processing workflows, notifications, and business logic execution.
 
 7. **Test the video processing workflow**:
 
@@ -596,43 +686,72 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
 
    ```bash
    # Download a sample video file for testing
-   curl -o sample-video.mp4 "https://sample-videos.com/zip/10/mp4/SampleVideo_1280x720_1mb.mp4"
+   echo "Downloading sample video file..."
+   curl -L -o sample-video.mp4 \
+       "https://sample-files.com/zip/video/mp4/SampleVideo_1280x720_1mb.mp4" \
+       || curl -L -o sample-video.mp4 \
+       "https://file-examples.com/storage/fe85d4ad06906d2cad7e7d7/2017/10/file_example_MP4_1280_10MG.mp4"
+   
+   # Verify file was downloaded
+   if [ ! -f "sample-video.mp4" ]; then
+       echo "Sample video download failed. Creating a small test file..."
+       # Create a simple test MP4 using FFmpeg if available, or download from alternate source
+       curl -L -o sample-video.mp4 \
+           "https://www.learningcontainer.com/wp-content/uploads/2020/05/sample-mp4-file.mp4"
+   fi
    
    # Upload the video to trigger processing
-   aws s3 cp sample-video.mp4 s3://${S3_SOURCE_BUCKET}/
+   aws s3 cp sample-video.mp4 s3://${S3_SOURCE_BUCKET}/test-video.mp4
    
    echo "✅ Uploaded sample video to trigger processing"
    
+   # Wait a moment for Lambda to process
+   echo "Waiting for Lambda function to process the upload..."
+   sleep 15
+   
    # Check Lambda logs to verify processing started
-   sleep 10
-   aws logs tail /aws/lambda/${LAMBDA_FUNCTION_NAME} --follow
+   echo "Checking Lambda logs for processing status..."
+   aws logs tail /aws/lambda/${LAMBDA_FUNCTION_NAME} \
+       --since 5m --format short
    ```
 
-   The video processing workflow is now actively processing your sample video. Monitor the Lambda logs to observe the MediaConvert job creation and track processing progress through the various stages of transcoding.
+   The video processing workflow is now actively processing your sample video. The logs will show the MediaConvert job creation and you can track processing progress through the various stages of transcoding.
 
-8. **Create CloudFront distribution for content delivery**:
+8. **Create CloudFront distribution with Origin Access Control**:
 
-   CloudFront provides global content delivery network (CDN) capabilities essential for streaming video content to users worldwide. By caching video segments at edge locations closer to viewers, CloudFront significantly reduces latency and improves streaming quality. This distribution layer is crucial for delivering adaptive bitrate streaming content and handling traffic spikes during popular content releases.
+   CloudFront provides global content delivery network (CDN) capabilities essential for streaming video content to users worldwide. By caching video segments at edge locations closer to viewers, CloudFront significantly reduces latency and improves streaming quality. Origin Access Control (OAC) is the modern, secure way to restrict access to S3 origins, replacing the deprecated Origin Access Identity (OAI) approach.
 
    ```bash
-   # Create CloudFront distribution for video delivery
+   # Create Origin Access Control (OAC) for secure S3 access
+   OAC_ID=$(aws cloudfront create-origin-access-control \
+       --origin-access-control-config '{
+         "Name": "video-oac-'${RANDOM_SUFFIX}'",
+         "Description": "OAC for video streaming S3 bucket",
+         "OriginAccessControlOriginType": "s3",
+         "SigningBehavior": "always",
+         "SigningProtocol": "sigv4"
+       }' \
+       --query 'OriginAccessControl.Id' --output text)
+   
+   # Create CloudFront distribution with OAC
    cat > cloudfront-distribution.json << EOF
    {
      "CallerReference": "video-distribution-${RANDOM_SUFFIX}",
      "Aliases": {
        "Quantity": 0
      },
-     "Comment": "Video streaming distribution",
+     "Comment": "Video streaming distribution with OAC",
      "Enabled": true,
      "Origins": {
        "Quantity": 1,
        "Items": [
          {
            "Id": "S3-${S3_OUTPUT_BUCKET}",
-           "DomainName": "${S3_OUTPUT_BUCKET}.s3.amazonaws.com",
+           "DomainName": "${S3_OUTPUT_BUCKET}.s3.${AWS_REGION}.amazonaws.com",
            "S3OriginConfig": {
              "OriginAccessIdentity": ""
-           }
+           },
+           "OriginAccessControlId": "${OAC_ID}"
          }
        ]
      },
@@ -641,34 +760,86 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
        "ViewerProtocolPolicy": "redirect-to-https",
        "AllowedMethods": {
          "Quantity": 2,
-         "Items": ["GET", "HEAD"]
-       },
-       "ForwardedValues": {
-         "QueryString": false,
-         "Cookies": {
-           "Forward": "none"
+         "Items": ["GET", "HEAD"],
+         "CachedMethods": {
+           "Quantity": 2,
+           "Items": ["GET", "HEAD"]
          }
        },
+       "Compress": true,
+       "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+       "OriginRequestPolicyId": "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf",
        "TrustedSigners": {
          "Enabled": false,
          "Quantity": 0
-       },
-       "MinTTL": 0
+       }
+     },
+     "CacheBehaviors": {
+       "Quantity": 1,
+       "Items": [
+         {
+           "PathPattern": "*.m3u8",
+           "TargetOriginId": "S3-${S3_OUTPUT_BUCKET}",
+           "ViewerProtocolPolicy": "redirect-to-https",
+           "AllowedMethods": {
+             "Quantity": 2,
+             "Items": ["GET", "HEAD"]
+           },
+           "Compress": false,
+           "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+           "TrustedSigners": {
+             "Enabled": false,
+             "Quantity": 0
+           }
+         }
+       ]
      },
      "PriceClass": "PriceClass_100"
    }
    EOF
    
    # Create CloudFront distribution
-   aws cloudfront create-distribution \
-       --distribution-config file://cloudfront-distribution.json \
-       --query 'Distribution.{Id:Id,DomainName:DomainName}' \
-       --output table
+   DISTRIBUTION_OUTPUT=$(aws cloudfront create-distribution \
+       --distribution-config file://cloudfront-distribution.json)
    
-   echo "✅ Created CloudFront distribution for video delivery"
+   DISTRIBUTION_ID=$(echo ${DISTRIBUTION_OUTPUT} | \
+       python3 -c "import sys, json; print(json.load(sys.stdin)['Distribution']['Id'])")
+   
+   DISTRIBUTION_DOMAIN=$(echo ${DISTRIBUTION_OUTPUT} | \
+       python3 -c "import sys, json; print(json.load(sys.stdin)['Distribution']['DomainName'])")
+   
+   # Update S3 bucket policy to allow CloudFront OAC access
+   cat > bucket-policy.json << EOF
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Sid": "AllowCloudFrontServicePrincipal",
+         "Effect": "Allow",
+         "Principal": {
+           "Service": "cloudfront.amazonaws.com"
+         },
+         "Action": "s3:GetObject",
+         "Resource": "arn:aws:s3:::${S3_OUTPUT_BUCKET}/*",
+         "Condition": {
+           "StringEquals": {
+             "AWS:SourceArn": "arn:aws:cloudfront::${AWS_ACCOUNT_ID}:distribution/${DISTRIBUTION_ID}"
+           }
+         }
+       }
+     ]
+   }
+   EOF
+   
+   aws s3api put-bucket-policy \
+       --bucket ${S3_OUTPUT_BUCKET} \
+       --policy file://bucket-policy.json
+   
+   echo "✅ Created CloudFront distribution: ${DISTRIBUTION_DOMAIN}"
+   echo "Distribution ID: ${DISTRIBUTION_ID}"
    ```
 
-   Your global content delivery infrastructure is now established. CloudFront will cache processed video content at edge locations worldwide, enabling low-latency streaming to users regardless of their geographic location.
+   Your global content delivery infrastructure is now established with modern Origin Access Control security. CloudFront will cache processed video content at edge locations worldwide while ensuring secure access to your S3 bucket, enabling low-latency streaming to users regardless of their geographic location.
 
 ## Validation & Testing
 
@@ -676,9 +847,14 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
 
    ```bash
    # List source bucket contents
+   echo "Source bucket contents:"
    aws s3 ls s3://${S3_SOURCE_BUCKET}/
    
-   # List output bucket contents (wait for processing to complete)
+   # Wait for processing to complete and list output bucket contents
+   echo "Waiting for video processing to complete..."
+   sleep 60
+   
+   echo "Output bucket contents:"
    aws s3 ls s3://${S3_OUTPUT_BUCKET}/ --recursive
    ```
 
@@ -691,16 +867,19 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
    aws mediaconvert list-jobs \
        --endpoint-url ${MEDIACONVERT_ENDPOINT} \
        --max-results 10 \
-       --query 'Jobs[*].{Id:Id,Status:Status,CreatedAt:CreatedAt}'
+       --query 'Jobs[*].{Id:Id,Status:Status,CreatedAt:CreatedAt}' \
+       --output table
    ```
 
 3. **Test video playback**:
 
    ```bash
    # Get HLS manifest URL
+   echo "HLS manifest files:"
    aws s3 ls s3://${S3_OUTPUT_BUCKET}/hls/ --recursive | grep "\.m3u8"
    
    # Test MP4 file availability
+   echo "MP4 output files:"
    aws s3 ls s3://${S3_OUTPUT_BUCKET}/mp4/ --recursive | grep "\.mp4"
    ```
 
@@ -708,10 +887,26 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
 
    ```bash
    # Check processing logs
+   echo "Video processing Lambda logs:"
    aws logs tail /aws/lambda/${LAMBDA_FUNCTION_NAME} --since 1h
    
    # Check completion handler logs
+   echo "Completion handler Lambda logs:"
    aws logs tail /aws/lambda/completion-handler-${RANDOM_SUFFIX} --since 1h
+   ```
+
+5. **Test CloudFront distribution**:
+
+   ```bash
+   # Test CloudFront access to processed video
+   echo "Testing CloudFront distribution..."
+   echo "Distribution domain: ${DISTRIBUTION_DOMAIN}"
+   echo "Note: Distribution deployment takes 15-20 minutes"
+   
+   # Check distribution status
+   aws cloudfront get-distribution \
+       --id ${DISTRIBUTION_ID} \
+       --query 'Distribution.Status'
    ```
 
 ## Cleanup
@@ -719,30 +914,30 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
 1. **Delete CloudFront distribution**:
 
    ```bash
-   # Get distribution ID
-   DISTRIBUTION_ID=$(aws cloudfront list-distributions \
-       --query "DistributionList.Items[?Comment=='Video streaming distribution'].Id" \
-       --output text)
+   # Get distribution configuration
+   DISTRIBUTION_CONFIG=$(aws cloudfront get-distribution-config \
+       --id ${DISTRIBUTION_ID})
+   
+   ETAG=$(echo ${DISTRIBUTION_CONFIG} | \
+       python3 -c "import sys, json; print(json.load(sys.stdin)['ETag'])")
    
    # Disable distribution first
-   aws cloudfront get-distribution-config \
-       --id ${DISTRIBUTION_ID} \
-       --query 'DistributionConfig' > distribution-config.json
+   echo ${DISTRIBUTION_CONFIG} | \
+       python3 -c "
+   import sys, json
+   config = json.load(sys.stdin)['DistributionConfig']
+   config['Enabled'] = False
+   print(json.dumps(config, indent=2))
+   " > distribution-config.json
    
-   # Update enabled status to false
-   sed -i 's/"Enabled": true/"Enabled": false/' distribution-config.json
-   
-   # Update distribution
-   ETAG=$(aws cloudfront get-distribution-config \
-       --id ${DISTRIBUTION_ID} \
-       --query 'ETag' --output text)
-   
+   # Update distribution to disabled
    aws cloudfront update-distribution \
        --id ${DISTRIBUTION_ID} \
        --distribution-config file://distribution-config.json \
        --if-match ${ETAG}
    
    echo "✅ Disabled CloudFront distribution (deletion requires manual completion)"
+   echo "Note: Wait for distribution to be disabled before attempting deletion"
    ```
 
 2. **Remove EventBridge rule and targets**:
@@ -794,11 +989,10 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
    # Detach and delete policies for MediaConvert role
    aws iam detach-role-policy \
        --role-name ${MEDIACONVERT_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/MediaConvertS3Policy-${RANDOM_SUFFIX}
    
-   aws iam detach-role-policy \
-       --role-name ${MEDIACONVERT_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+   aws iam delete-policy \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/MediaConvertS3Policy-${RANDOM_SUFFIX}
    
    aws iam delete-role \
        --role-name ${MEDIACONVERT_ROLE_NAME}
@@ -834,24 +1028,33 @@ echo "✅ Created S3 buckets: ${S3_SOURCE_BUCKET} and ${S3_OUTPUT_BUCKET}"
 
 ## Discussion
 
-This video processing workflow demonstrates a modern, scalable approach to automated video transcoding using AWS managed services. The architecture leverages event-driven processing to automatically handle video uploads, eliminating the need for manual intervention or polling mechanisms.
+This video processing workflow demonstrates a modern, scalable approach to automated video transcoding using AWS managed services. The architecture leverages event-driven processing to automatically handle video uploads, eliminating the need for manual intervention or polling mechanisms while following AWS Well-Architected Framework principles.
 
-AWS Elemental MediaConvert provides enterprise-grade video processing capabilities with support for a wide range of input and output formats, advanced features like adaptive bitrate streaming, and integration with other AWS services. The service handles the complexity of video processing infrastructure, allowing developers to focus on business logic rather than managing encoding resources.
+AWS Elemental MediaConvert provides enterprise-grade video processing capabilities with support for a wide range of input and output formats, advanced features like adaptive bitrate streaming, and seamless integration with other AWS services. The service handles the complexity of video processing infrastructure, allowing developers to focus on business logic rather than managing encoding resources or maintaining transcoding servers.
 
-The Lambda-based orchestration provides several advantages over traditional approaches. Functions automatically scale based on demand, process videos in parallel, and integrate seamlessly with other AWS services. The event-driven architecture ensures processing begins immediately when videos are uploaded, reducing latency and improving user experience.
+The Lambda-based orchestration provides several advantages over traditional approaches. Functions automatically scale based on demand, process videos in parallel, and integrate seamlessly with other AWS services. The event-driven architecture ensures processing begins immediately when videos are uploaded, reducing latency and improving user experience. The updated Python 3.12 runtime provides enhanced performance and security features.
 
-> **Tip**: Consider implementing additional features like progress tracking using DynamoDB, custom presets for different content types, and integration with AWS Elemental MediaLive for live streaming workflows. See the [MediaConvert Developer Guide](https://docs.aws.amazon.com/mediaconvert/latest/ug/) for advanced configuration options.
+The implementation of CloudFront with Origin Access Control (OAC) represents current AWS security best practices, replacing the deprecated Origin Access Identity (OAI) approach. This ensures secure, scalable content delivery while maintaining proper access controls to your S3 storage.
+
+> **Tip**: Consider implementing additional features like progress tracking using DynamoDB, custom presets for different content types, and integration with AWS Elemental MediaLive for live streaming workflows. For advanced configuration options, see the [MediaConvert User Guide](https://docs.aws.amazon.com/mediaconvert/latest/ug/) and the [S3 Batch Operations tutorial](https://docs.aws.amazon.com/AmazonS3/latest/userguide/tutorial-s3-batchops-lambda-mediaconvert-video.html) for batch processing scenarios.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-resolution processing**: Modify the MediaConvert job to create multiple output resolutions (480p, 720p, 1080p) for different device capabilities
-2. **Thumbnail generation**: Add thumbnail extraction at specific time intervals and store them in a separate S3 prefix
-3. **Content analysis**: Integrate Amazon Rekognition Video to detect and tag video content automatically
-4. **Cost optimization**: Implement S3 Intelligent-Tiering and Glacier transitions for processed video archives
-5. **Advanced monitoring**: Create CloudWatch dashboards with custom metrics for processing times, error rates, and cost tracking
+1. **Multi-resolution processing**: Modify the MediaConvert job to create multiple output resolutions (480p, 720p, 1080p) for different device capabilities and bandwidth conditions
+2. **Thumbnail generation**: Add thumbnail extraction at specific time intervals and store them in a separate S3 prefix for video previews and seeking functionality
+3. **Content analysis**: Integrate Amazon Rekognition Video to detect and tag video content automatically, enabling content moderation and searchability
+4. **Cost optimization**: Implement S3 Intelligent-Tiering and Glacier transitions for processed video archives, with automated lifecycle policies
+5. **Advanced monitoring**: Create CloudWatch dashboards with custom metrics for processing times, error rates, cost tracking, and quality metrics using MediaConvert job metadata
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

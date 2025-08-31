@@ -4,12 +4,12 @@ id: 284f0cc7
 category: security
 difficulty: 300
 subject: aws
-services: secrets,manager,lambda,iam,kms
+services: Secrets Manager, Lambda, IAM, KMS
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security,secrets-management,encryption,automation,lambda,iam,kms
 recipe-generator-version: 1.3
@@ -42,7 +42,7 @@ graph TB
     
     subgraph "Rotation Function"
         LAMBDA[Lambda Function]
-        TRIGGER[CloudWatch Event]
+        TRIGGER[EventBridge Schedule]
     end
     
     subgraph "Database Layer"
@@ -260,31 +260,46 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
        """
        Lambda function to handle secret rotation
        """
-       secretsmanager = boto3.client('secretsmanager')
-       
-       secret_arn = event['SecretId']
-       token = event['ClientRequestToken']
-       step = event['Step']
-       
-       logger.info(f"Rotation step: {step} for secret: {secret_arn}")
-       
-       if step == "createSecret":
-           create_secret(secretsmanager, secret_arn, token)
-       elif step == "setSecret":
-           set_secret(secretsmanager, secret_arn, token)
-       elif step == "testSecret":
-           test_secret(secretsmanager, secret_arn, token)
-       elif step == "finishSecret":
-           finish_secret(secretsmanager, secret_arn, token)
-       else:
-           logger.error(f"Invalid step parameter: {step}")
-           raise ValueError(f"Invalid step parameter: {step}")
-       
-       return {"statusCode": 200, "body": "Rotation completed successfully"}
+       try:
+           secretsmanager = boto3.client('secretsmanager')
+           
+           secret_arn = event['SecretId']
+           token = event['ClientRequestToken']
+           step = event['Step']
+           
+           logger.info(f"Rotation step: {step} for secret: {secret_arn}")
+           
+           if step == "createSecret":
+               create_secret(secretsmanager, secret_arn, token)
+           elif step == "setSecret":
+               set_secret(secretsmanager, secret_arn, token)
+           elif step == "testSecret":
+               test_secret(secretsmanager, secret_arn, token)
+           elif step == "finishSecret":
+               finish_secret(secretsmanager, secret_arn, token)
+           else:
+               logger.error(f"Invalid step parameter: {step}")
+               raise ValueError(f"Invalid step parameter: {step}")
+           
+           return {"statusCode": 200, "body": "Rotation completed successfully"}
+           
+       except Exception as e:
+           logger.error(f"Error in lambda_handler: {str(e)}")
+           raise
    
    def create_secret(secretsmanager, secret_arn, token):
        """Create a new secret version"""
        try:
+           # Check if the secret version already exists
+           try:
+               secretsmanager.get_secret_value(SecretId=secret_arn, 
+                                             VersionId=token, 
+                                             VersionStage="AWSPENDING")
+               logger.info("createSecret: Version already exists")
+               return
+           except secretsmanager.exceptions.ResourceNotFoundException:
+               pass
+           
            current_secret = secretsmanager.get_secret_value(
                SecretId=secret_arn,
                VersionStage="AWSCURRENT"
@@ -320,24 +335,33 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
    def set_secret(secretsmanager, secret_arn, token):
        """Set the secret in the service"""
        logger.info("setSecret: In a real implementation, this would update the database user password")
-       # In a real implementation, you would connect to the database
-       # and update the user's password here
+       # In a real implementation, you would:
+       # 1. Get the AWSPENDING secret version
+       # 2. Connect to the database using current credentials
+       # 3. Update the user's password to the new password
+       # 4. Handle any database-specific password policies
        
    def test_secret(secretsmanager, secret_arn, token):
        """Test the secret"""
        logger.info("testSecret: In a real implementation, this would test database connectivity")
-       # In a real implementation, you would test the database connection
-       # with the new credentials here
+       # In a real implementation, you would:
+       # 1. Get the AWSPENDING secret version
+       # 2. Attempt to connect to the database using new credentials
+       # 3. Perform a simple query to validate connectivity
+       # 4. Handle connection timeouts and authentication errors
        
    def finish_secret(secretsmanager, secret_arn, token):
        """Finish the rotation"""
        try:
-           # Move AWSCURRENT to AWSPREVIOUS
+           # Get the current version
+           current_version = get_current_version_id(secretsmanager, secret_arn)
+           
+           # Move AWSPENDING to AWSCURRENT and AWSCURRENT to AWSPREVIOUS
            secretsmanager.update_secret_version_stage(
                SecretId=secret_arn,
                VersionStage="AWSCURRENT",
                MoveToVersionId=token,
-               RemoveFromVersionId=get_current_version_id(secretsmanager, secret_arn)
+               RemoveFromVersionId=current_version
            )
            
            logger.info("finishSecret: Successfully completed rotation")
@@ -348,25 +372,30 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
    
    def get_current_version_id(secretsmanager, secret_arn):
        """Get the current version ID"""
-       versions = secretsmanager.list_secret_version_ids(SecretId=secret_arn)
-       
-       for version in versions['Versions']:
-           if 'AWSCURRENT' in version['VersionStages']:
-               return version['VersionId']
-       
-       return None
+       try:
+           versions = secretsmanager.describe_secret(SecretId=secret_arn)
+           
+           for version_id, stages in versions['VersionIdsToStages'].items():
+               if 'AWSCURRENT' in stages:
+                   return version_id
+           
+           return None
+           
+       except Exception as e:
+           logger.error(f"get_current_version_id: Error: {str(e)}")
+           raise
    EOF
    
    # Create deployment package
-   zip /tmp/rotation_lambda.zip /tmp/rotation_lambda.py
+   cd /tmp && zip rotation_lambda.zip rotation_lambda.py
    
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
        --handler rotation_lambda.lambda_handler \
-       --zip-file fileb:///tmp/rotation_lambda.zip \
+       --zip-file fileb://rotation_lambda.zip \
        --timeout 60 \
        --description "Lambda function for rotating Secrets Manager secrets"
    
@@ -460,10 +489,13 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
    logger = logging.getLogger()
    logger.setLevel(logging.INFO)
    
-   def get_secret(secret_name, region_name="us-east-1"):
+   def get_secret(secret_name, region_name=None):
        """
        Retrieve a secret from AWS Secrets Manager
        """
+       if region_name is None:
+           region_name = boto3.Session().region_name
+           
        session = boto3.session.Session()
        client = session.client(
            service_name='secretsmanager',
@@ -480,7 +512,17 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
            return secret_data
            
        except ClientError as e:
-           logger.error(f"Error retrieving secret {secret_name}: {e}")
+           error_code = e.response['Error']['Code']
+           if error_code == 'ResourceNotFoundException':
+               logger.error(f"Secret {secret_name} not found")
+           elif error_code == 'InvalidRequestException':
+               logger.error(f"Invalid request for secret {secret_name}: {e}")
+           elif error_code == 'InvalidParameterException':
+               logger.error(f"Invalid parameter for secret {secret_name}: {e}")
+           elif error_code == 'DecryptionFailure':
+               logger.error(f"Cannot decrypt secret {secret_name}: {e}")
+           else:
+               logger.error(f"Error retrieving secret {secret_name}: {e}")
            raise
        except json.JSONDecodeError as e:
            logger.error(f"Error parsing secret JSON: {e}")
@@ -502,7 +544,7 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
            database = credentials['dbname']
            
            # In a real application, you would use these credentials
-           # to connect to your database
+           # to connect to your database using a library like pymysql or psycopg2
            print(f"Connecting to database: {host}:{port}/{database}")
            print(f"Username: {username}")
            print("Password: [REDACTED]")
@@ -515,7 +557,8 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
    
    if __name__ == "__main__":
        # Example usage
-       SECRET_NAME = "demo-db-credentials-123456"
+       import os
+       SECRET_NAME = os.environ.get('SECRET_NAME', 'demo-db-credentials-123456')
        
        if connect_to_database(SECRET_NAME):
            print("✅ Database connection successful")
@@ -539,15 +582,22 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
        "widgets": [
            {
                "type": "metric",
+               "width": 12,
+               "height": 6,
                "properties": {
                    "metrics": [
                        ["AWS/SecretsManager", "RotationSucceeded", "SecretName", "${SECRET_NAME}"],
-                       ["AWS/SecretsManager", "RotationFailed", "SecretName", "${SECRET_NAME}"]
+                       [".", "RotationFailed", ".", "."]
                    ],
                    "period": 300,
                    "stat": "Sum",
                    "region": "${AWS_REGION}",
-                   "title": "Secret Rotation Status"
+                   "title": "Secret Rotation Status",
+                   "yAxis": {
+                       "left": {
+                           "min": 0
+                       }
+                   }
                }
            }
        ]
@@ -577,7 +627,7 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
 
    Monitoring and alerting are now active for your secrets management operations. The dashboard provides real-time visibility into rotation status, while alarms ensure immediate notification of any rotation failures requiring investigation.
 
-   > **Tip**: Configure additional CloudWatch Logs Insights queries to analyze secret access patterns and identify potential security anomalies. See [CloudWatch Logs Insights documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/AnalyzingLogData.html) for advanced query examples.
+   > **Tip**: Configure additional CloudWatch Logs Insights queries to analyze secret access patterns and identify potential security anomalies. See the [CloudWatch Logs Insights documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/AnalyzingLogData.html) for advanced query examples.
 
 ## Validation & Testing
 
@@ -621,13 +671,16 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
    aws secretsmanager rotate-secret \
        --secret-id ${SECRET_NAME}
    
+   # Wait for rotation to complete
+   sleep 30
+   
    # Check rotation status
    aws secretsmanager describe-secret \
        --secret-id ${SECRET_NAME} \
        --query 'VersionIdsToStages'
    ```
 
-   Expected output: Multiple versions with AWSCURRENT and AWSPENDING stages
+   Expected output: Multiple versions with AWSCURRENT and AWSPREVIOUS stages
 
 4. **Verify Lambda Function Execution**:
 
@@ -638,7 +691,8 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
    aws logs describe-log-groups \
        --log-group-name-prefix "/aws/lambda/${LAMBDA_FUNCTION_NAME}"
    
-   # Get recent log events
+   # Get recent log events (wait for log group creation)
+   sleep 10
    aws logs describe-log-streams \
        --log-group-name "/aws/lambda/${LAMBDA_FUNCTION_NAME}" \
        --order-by LastEventTime \
@@ -667,9 +721,9 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
    Proper cleanup begins with stopping rotation operations to prevent Lambda executions during resource deletion. The force-delete option bypasses the normal 7-day recovery window, immediately removing the secret and all versions to avoid ongoing charges.
 
    ```bash
-   # Cancel rotation
+   # Cancel rotation if active
    aws secretsmanager cancel-rotate-secret \
-       --secret-id ${SECRET_NAME}
+       --secret-id ${SECRET_NAME} || true
    
    # Delete secret immediately
    aws secretsmanager delete-secret \
@@ -755,26 +809,35 @@ echo "✅ Environment prepared with KMS key: ${KMS_KEY_ID}"
 
 ## Discussion
 
-AWS Secrets Manager provides a comprehensive solution for managing sensitive information throughout its lifecycle. The service automatically encrypts secrets at rest using AWS KMS and in transit using TLS 1.2, ensuring data protection meets enterprise security standards. By implementing automatic rotation, organizations can enforce security best practices without manual intervention, significantly reducing the risk of credential compromise.
+AWS Secrets Manager provides a comprehensive solution for managing sensitive information throughout its lifecycle, following AWS Well-Architected Framework security principles. The service automatically encrypts secrets at rest using AWS KMS and in transit using TLS 1.2, ensuring data protection meets enterprise security standards. By implementing automatic rotation, organizations can enforce security best practices without manual intervention, significantly reducing the risk of credential compromise while maintaining operational excellence.
 
-The Lambda-based rotation function demonstrates how to implement custom rotation logic for various services. While this example shows a simplified rotation process, production implementations should include proper database connections, error handling, and rollback mechanisms. The four-step rotation process (createSecret, setSecret, testSecret, finishSecret) ensures that applications experience no downtime during credential updates by maintaining both current and pending versions.
+The Lambda-based rotation function demonstrates how to implement custom rotation logic for various services. While this example shows a simplified rotation process, production implementations should include proper database connections, error handling, and rollback mechanisms. The four-step rotation process (createSecret, setSecret, testSecret, finishSecret) ensures that applications experience no downtime during credential updates by maintaining both current and pending versions, supporting the reliability pillar of the Well-Architected Framework.
 
-Fine-grained access control through IAM policies and resource-based policies enables secure cross-account access while maintaining the principle of least privilege. The integration with CloudWatch provides comprehensive monitoring and alerting capabilities, allowing teams to track rotation success rates and respond to failures promptly. For production environments, consider implementing additional security measures such as VPC endpoints for private connectivity and AWS CloudTrail for comprehensive audit logging. Always use structured JSON for storing multiple credential components, enable automatic rotation for all production secrets, and implement proper error handling in rotation functions to prevent credential corruption.
+Fine-grained access control through IAM policies and resource-based policies enables secure cross-account access while maintaining the principle of least privilege. The integration with CloudWatch provides comprehensive monitoring and alerting capabilities, allowing teams to track rotation success rates and respond to failures promptly. For production environments, consider implementing additional security measures such as VPC endpoints for private connectivity and AWS CloudTrail for comprehensive audit logging. Always use structured JSON for storing multiple credential components, enable automatic rotation for all production secrets, and implement proper error handling in rotation functions to prevent credential corruption. See the [AWS Secrets Manager User Guide](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html) for comprehensive best practices and implementation guidance.
+
+> **Note**: This implementation follows [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles for operational excellence, security, reliability, and cost optimization.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Region Secret Replication**: Configure automatic replication of secrets across multiple AWS regions for disaster recovery and implement cross-region failover logic in applications.
+1. **Multi-Region Secret Replication**: Configure automatic replication of secrets across multiple AWS regions for disaster recovery and implement cross-region failover logic in applications using [AWS Secrets Manager replication](https://docs.aws.amazon.com/secretsmanager/latest/userguide/create-manage-multi-region-secrets.html).
 
-2. **Database-Specific Rotation**: Implement rotation functions for specific database types (PostgreSQL, MySQL, Oracle) with proper connection testing and user management capabilities.
+2. **Database-Specific Rotation**: Implement rotation functions for specific database types (PostgreSQL, MySQL, Oracle) with proper connection testing and user management capabilities using [AWS-provided rotation templates](https://docs.aws.amazon.com/secretsmanager/latest/userguide/reference_available-rotation-templates.html).
 
-3. **Integration with Container Orchestration**: Set up secrets injection into Amazon EKS pods using the AWS Secrets and Configuration Provider (ASCP) for the Kubernetes Secrets Store CSI Driver.
+3. **Integration with Container Orchestration**: Set up secrets injection into Amazon EKS pods using the [AWS Secrets and Configuration Provider](https://docs.aws.amazon.com/eks/latest/userguide/manage-secrets.html) (ASCP) for the Kubernetes Secrets Store CSI Driver.
 
-4. **Advanced Security Controls**: Implement secrets approval workflows using AWS Step Functions, integrate with AWS Security Hub for compliance monitoring, and set up automated secret scanning using Amazon Macie.
+4. **Advanced Security Controls**: Implement secrets approval workflows using AWS Step Functions, integrate with AWS Security Hub for compliance monitoring, and set up automated secret scanning using Amazon Macie for sensitive data discovery.
 
-5. **Cost Optimization and Lifecycle Management**: Create automated policies for secret cleanup, implement tiered storage for historical secret versions, and set up cost alerts for secrets management expenses.
+5. **Cost Optimization and Lifecycle Management**: Create automated policies for secret cleanup, implement tiered storage for historical secret versions, and set up cost alerts for secrets management expenses using AWS Budgets and Cost Anomaly Detection.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

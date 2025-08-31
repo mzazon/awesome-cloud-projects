@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Dataproc, Cloud Scheduler, Cloud Storage, BigQuery
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: big-data, apache-spark, workflow-automation, batch-processing, data-analytics
 recipe-generator-version: 1.3
@@ -151,18 +151,18 @@ echo "✅ Required APIs enabled"
    ```bash
    # Create sample sales data file
    cat > sales_data.csv << 'EOF'
-   transaction_id,customer_id,product_id,product_name,category,quantity,unit_price,transaction_date,region
-   T001,C001,P001,Laptop Pro,Electronics,2,1299.99,2024-01-15,North
-   T002,C002,P002,Coffee Maker,Appliances,1,89.99,2024-01-15,South
-   T003,C003,P003,Running Shoes,Sports,1,129.99,2024-01-16,East
-   T004,C001,P004,Wireless Mouse,Electronics,3,29.99,2024-01-16,North
-   T005,C004,P005,Yoga Mat,Sports,2,49.99,2024-01-17,West
-   T006,C005,P001,Laptop Pro,Electronics,1,1299.99,2024-01-17,South
-   T007,C002,P006,Blender,Appliances,1,199.99,2024-01-18,South
-   T008,C006,P003,Running Shoes,Sports,2,129.99,2024-01-18,East
-   T009,C007,P007,Gaming Chair,Furniture,1,399.99,2024-01-19,North
-   T010,C003,P008,Desk Lamp,Furniture,1,79.99,2024-01-19,East
-   EOF
+transaction_id,customer_id,product_id,product_name,category,quantity,unit_price,transaction_date,region
+T001,C001,P001,Laptop Pro,Electronics,2,1299.99,2024-01-15,North
+T002,C002,P002,Coffee Maker,Appliances,1,89.99,2024-01-15,South
+T003,C003,P003,Running Shoes,Sports,1,129.99,2024-01-16,East
+T004,C001,P004,Wireless Mouse,Electronics,3,29.99,2024-01-16,North
+T005,C004,P005,Yoga Mat,Sports,2,49.99,2024-01-17,West
+T006,C005,P001,Laptop Pro,Electronics,1,1299.99,2024-01-17,South
+T007,C002,P006,Blender,Appliances,1,199.99,2024-01-18,South
+T008,C006,P003,Running Shoes,Sports,2,129.99,2024-01-18,East
+T009,C007,P007,Gaming Chair,Furniture,1,399.99,2024-01-19,North
+T010,C003,P008,Desk Lamp,Furniture,1,79.99,2024-01-19,East
+EOF
    
    # Upload sample data to Cloud Storage
    gsutil cp sales_data.csv gs://${BUCKET_NAME}/input/
@@ -199,62 +199,62 @@ echo "✅ Required APIs enabled"
    ```bash
    # Create PySpark script for sales analytics
    cat > spark_sales_analysis.py << 'EOF'
-   from pyspark.sql import SparkSession
-   from pyspark.sql.functions import col, sum as spark_sum, count, avg, current_timestamp
-   import sys
-   
-   def main():
-       # Initialize Spark session with BigQuery connector
-       spark = SparkSession.builder \
-           .appName("SalesAnalyticsWorkflow") \
-           .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.28.0") \
-           .getOrCreate()
-       
-       try:
-           # Read input data from Cloud Storage
-           input_path = sys.argv[1] if len(sys.argv) > 1 else "gs://*/input/sales_data.csv"
-           output_path = sys.argv[2] if len(sys.argv) > 2 else "gs://*/output/"
-           project_id = sys.argv[3] if len(sys.argv) > 3 else "default-project"
-           
-           print(f"Processing data from: {input_path}")
-           
-           # Load sales data
-           df = spark.read.option("header", "true").option("inferSchema", "true").csv(input_path)
-           
-           # Perform analytics aggregations
-           sales_summary = df.groupBy("region", "category") \
-               .agg(
-                   spark_sum(col("quantity") * col("unit_price")).alias("total_sales"),
-                   count("transaction_id").alias("transaction_count"),
-                   avg(col("quantity") * col("unit_price")).alias("avg_order_value")
-               ) \
-               .withColumn("processing_timestamp", current_timestamp())
-           
-           # Show sample results
-           print("Sales Summary Results:")
-           sales_summary.show()
-           
-           # Write results to Cloud Storage as Parquet
-           sales_summary.write.mode("overwrite").parquet(f"{output_path}/sales_summary")
-           
-           # Write results to BigQuery
-           sales_summary.write \
-               .format("bigquery") \
-               .option("table", f"{project_id}.analytics_results.sales_summary") \
-               .option("writeMethod", "overwrite") \
-               .save()
-           
-           print("✅ Processing completed successfully")
-           
-       except Exception as e:
-           print(f"❌ Error during processing: {str(e)}")
-           raise
-       finally:
-           spark.stop()
-   
-   if __name__ == "__main__":
-       main()
-   EOF
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sum as spark_sum, count, avg, current_timestamp
+import sys
+
+def main():
+    # Initialize Spark session with BigQuery connector
+    spark = SparkSession.builder \
+        .appName("SalesAnalyticsWorkflow") \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.32.2") \
+        .getOrCreate()
+    
+    try:
+        # Read input data from Cloud Storage
+        input_path = sys.argv[1] if len(sys.argv) > 1 else "gs://*/input/sales_data.csv"
+        output_path = sys.argv[2] if len(sys.argv) > 2 else "gs://*/output/"
+        project_id = sys.argv[3] if len(sys.argv) > 3 else "default-project"
+        
+        print(f"Processing data from: {input_path}")
+        
+        # Load sales data
+        df = spark.read.option("header", "true").option("inferSchema", "true").csv(input_path)
+        
+        # Perform analytics aggregations
+        sales_summary = df.groupBy("region", "category") \
+            .agg(
+                spark_sum(col("quantity") * col("unit_price")).alias("total_sales"),
+                count("transaction_id").alias("transaction_count"),
+                avg(col("quantity") * col("unit_price")).alias("avg_order_value")
+            ) \
+            .withColumn("processing_timestamp", current_timestamp())
+        
+        # Show sample results
+        print("Sales Summary Results:")
+        sales_summary.show()
+        
+        # Write results to Cloud Storage as Parquet
+        sales_summary.write.mode("overwrite").parquet(f"{output_path}/sales_summary")
+        
+        # Write results to BigQuery
+        sales_summary.write \
+            .format("bigquery") \
+            .option("table", f"{project_id}.analytics_results.sales_summary") \
+            .option("writeMethod", "overwrite") \
+            .save()
+        
+        print("✅ Processing completed successfully")
+        
+    except Exception as e:
+        print(f"❌ Error during processing: {str(e)}")
+        raise
+    finally:
+        spark.stop()
+
+if __name__ == "__main__":
+    main()
+EOF
    
    # Upload Spark script to Cloud Storage
    gsutil cp spark_sales_analysis.py gs://${STAGING_BUCKET}/scripts/
@@ -383,11 +383,11 @@ echo "✅ Required APIs enabled"
    # Check output files in Cloud Storage
    gsutil ls -r gs://${BUCKET_NAME}/output/
    
-   # Display sample processed data
-   gsutil cat gs://${BUCKET_NAME}/output/sales_summary/*.parquet | head -20
+   # Display sample processed data (first few lines)
+   gsutil cat gs://${BUCKET_NAME}/output/sales_summary/_SUCCESS
    ```
 
-   Expected output: You should see Parquet files containing processed sales summary data organized by partition.
+   Expected output: You should see Parquet files containing processed sales summary data organized by partition, along with a success marker file.
 
 3. **Verify BigQuery Results**:
 
@@ -481,7 +481,7 @@ This recipe demonstrates a production-ready approach to building automated data 
 
 **Dataproc Workflow Templates** provide significant advantages over traditional cluster management approaches. By defining reusable job configurations with ephemeral clusters, organizations can achieve better resource utilization and cost optimization. The managed cluster approach automatically handles cluster provisioning, job execution, and cleanup, reducing operational overhead while ensuring consistent execution environments. According to [Google Cloud Dataproc best practices](https://cloud.google.com/dataproc/docs/guides/dataproc-best-practices), using workflow templates with specific image versions ensures reproducible results and simplifies production deployment management.
 
-**Apache Spark Integration** within the Google Cloud ecosystem leverages native connectors for seamless data movement between services. The BigQuery Spark connector enables direct writes from Spark DataFrames to BigQuery tables, eliminating the need for intermediate storage and data format conversions. This integration pattern supports both batch and streaming analytics workloads while maintaining data consistency and performance optimization. The [Cloud Dataproc Apache Spark documentation](https://cloud.google.com/dataproc/docs/concepts/jobs/spark-jobs) provides detailed guidance on optimizing Spark configurations for different workload types.
+**Apache Spark Integration** within the Google Cloud ecosystem leverages native connectors for seamless data movement between services. The BigQuery Spark connector enables direct writes from Spark DataFrames to BigQuery tables, eliminating the need for intermediate storage and data format conversions. This integration pattern supports both batch and streaming analytics workloads while maintaining data consistency and performance optimization. The updated connector version (0.32.2) provides improved performance and compatibility with the latest Spark releases.
 
 **Cost Optimization Strategies** are built into this architecture through several mechanisms. Ephemeral clusters ensure resources are only provisioned during job execution, with automatic deletion upon completion. Auto-scaling capabilities adjust cluster size based on workload demands, optimizing compute costs while maintaining performance. The use of standard storage classes in Cloud Storage provides cost-effective data retention, while BigQuery's serverless architecture eliminates the need for pre-provisioned analytics infrastructure. Organizations can further optimize costs by implementing [Cloud Dataproc preemptible instances](https://cloud.google.com/dataproc/docs/concepts/preemptible-vms) for fault-tolerant workloads.
 
@@ -505,4 +505,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

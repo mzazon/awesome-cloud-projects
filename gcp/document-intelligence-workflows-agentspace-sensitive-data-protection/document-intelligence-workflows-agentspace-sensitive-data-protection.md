@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Agentspace, Sensitive Data Protection, Document AI, Cloud Workflows
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai-agents, document-processing, data-protection, enterprise-automation, compliance
 recipe-generator-version: 1.3
@@ -79,7 +79,7 @@ graph TB
 4. Agentspace Enterprise license and access to Google Workspace integration
 5. Estimated cost: $150-300 for 2 hours of testing (varies by document volume and processing complexity)
 
-> **Note**: This recipe requires Agentspace Enterprise access which may require contacting Google Cloud sales for enterprise licensing. Ensure your organization has appropriate data handling and compliance policies in place.
+> **Note**: This recipe requires Agentspace Enterprise access which is in public preview and may require contacting Google Cloud sales for enterprise licensing. Ensure your organization has appropriate data handling and compliance policies in place.
 
 ## Preparation
 
@@ -248,14 +248,14 @@ echo "✅ Storage buckets created for document processing pipeline"
      steps:
        - init:
            assign:
-             - project_id: ${PROJECT_ID}
-             - location: ${REGION}
-             - processor_name: "${PROCESSOR_NAME}"
-             - input_bucket: ${INPUT_BUCKET}
-             - output_bucket: ${OUTPUT_BUCKET}
-             - audit_bucket: ${AUDIT_BUCKET}
-             - dlp_template: ${DLP_TEMPLATE_ID}
-             - deidentify_template: ${DEIDENTIFY_TEMPLATE_ID}
+             - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+             - location: "us-central1"
+             - processor_name: ${input.processor_name}
+             - input_bucket: ${input.input_bucket}
+             - output_bucket: ${input.output_bucket}
+             - audit_bucket: ${input.audit_bucket}
+             - dlp_template: ${input.dlp_template}
+             - deidentify_template: ${input.deidentify_template}
              - document_path: ${input.document_path}
              - processing_start_time: ${sys.now()}
        
@@ -287,7 +287,7 @@ echo "✅ Storage buckets created for document processing pipeline"
        - scan_for_sensitive_data:
            call: http.post
            args:
-             url: "https://dlp.googleapis.com/v2/projects/${project_id}/content:inspect"
+             url: ${"https://dlp.googleapis.com/v2/projects/" + project_id + "/content:inspect"}
              auth:
                type: OAuth2
              headers:
@@ -309,7 +309,7 @@ echo "✅ Storage buckets created for document processing pipeline"
        - redact_sensitive_data:
            call: http.post
            args:
-             url: "https://dlp.googleapis.com/v2/projects/${project_id}/content:deidentify"
+             url: ${"https://dlp.googleapis.com/v2/projects/" + project_id + "/content:deidentify"}
              auth:
                type: OAuth2
              headers:
@@ -772,9 +772,18 @@ echo "✅ Storage buckets created for document processing pipeline"
    # Upload sample document to input bucket
    gsutil cp sample-document.txt gs://${INPUT_BUCKET}/sample-document.txt
    
-   # Execute document processing workflow
+   # Execute document processing workflow with proper parameter structure
    gcloud workflows run ${WORKFLOW_NAME} \
-       --data='{"document_path": "sample-document.txt", "document_content": "'$(base64 -w 0 sample-document.txt)'"}' \
+       --data='{
+         "processor_name": "'${PROCESSOR_NAME}'",
+         "input_bucket": "'${INPUT_BUCKET}'",
+         "output_bucket": "'${OUTPUT_BUCKET}'",
+         "audit_bucket": "'${AUDIT_BUCKET}'",
+         "dlp_template": "'${DLP_TEMPLATE_ID}'",
+         "deidentify_template": "'${DEIDENTIFY_TEMPLATE_ID}'",
+         "document_path": "sample-document.txt",
+         "document_content": "'$(base64 -w 0 sample-document.txt)'"
+       }' \
        --location=${REGION}
    
    # Wait for workflow completion and get execution status
@@ -947,9 +956,9 @@ The integration of Document AI with Agentspace creates a sophisticated document 
 
 The Sensitive Data Protection integration ensures comprehensive compliance with data protection regulations like GDPR, HIPAA, and CCPA by automatically detecting and protecting sensitive information across all document types. The configurable DLP templates allow organizations to customize protection policies based on their specific compliance requirements, while the automated redaction and de-identification capabilities ensure consistent application of data protection measures. The audit logging and monitoring capabilities provide complete visibility into data protection activities, enabling organizations to demonstrate compliance and track security events.
 
-Cloud Workflows serves as the orchestration backbone that coordinates all document processing activities, ensuring proper sequencing of operations, error handling, and scalability. The workflow-based approach enables organizations to easily modify processing logic, add new processing steps, and integrate additional services without disrupting existing operations. This flexibility is crucial for enterprise environments where document processing requirements evolve frequently and integration with existing systems is essential.
+Cloud Workflows serves as the orchestration backbone that coordinates all document processing activities, ensuring proper sequencing of operations, error handling, and scalability. The workflow-based approach enables organizations to easily modify processing logic, add new processing steps, and integrate additional services without disrupting existing operations. This flexibility is crucial for enterprise environments where document processing requirements evolve frequently and integration with existing systems is essential. See [Google Cloud Workflows documentation](https://cloud.google.com/workflows/docs) for more information on advanced orchestration patterns.
 
-> **Note**: For production deployments, consider implementing additional security measures such as VPC Service Controls, customer-managed encryption keys (CMEK), and integration with enterprise identity providers. Regularly review and update DLP detection rules to ensure comprehensive coverage of emerging sensitive data types and compliance requirements.
+> **Note**: For production deployments, consider implementing additional security measures such as VPC Service Controls, customer-managed encryption keys (CMEK), and integration with enterprise identity providers. Regularly review and update DLP detection rules to ensure comprehensive coverage of emerging sensitive data types and compliance requirements. Agentspace is currently in public preview - monitor the [Google Cloud release notes](https://cloud.google.com/agentspace/docs/release-notes) for updates on general availability.
 
 ## Challenge
 
@@ -967,4 +976,9 @@ Extend this intelligent document processing solution by implementing these advan
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

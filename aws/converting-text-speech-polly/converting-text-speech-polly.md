@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: polly, s3, lambda, iam
 estimated-time: 60 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: text-to-speech, audio-processing, accessibility, neural-voices
 recipe-generator-version: 1.3
@@ -298,7 +298,7 @@ echo "✅ Environment prepared successfully"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -340,13 +340,14 @@ echo "✅ Environment prepared successfully"
 
 6. **Implement Streaming Text-to-Speech**:
 
+   Real-time audio streaming enables immediate playback of synthesized speech, crucial for interactive applications and conversational interfaces. This approach minimizes latency between text input and audio output, providing seamless user experiences in chatbots, voice assistants, and accessibility tools.
+
    ```bash
    # Create streaming synthesis example
    cat > streaming_example.py << 'EOF'
    import boto3
    import json
    import io
-   import pygame
    
    def stream_polly_audio(text, voice_id='Joanna'):
        polly = boto3.client('polly')
@@ -377,6 +378,8 @@ echo "✅ Environment prepared successfully"
    
    echo "✅ Streaming example created"
    ```
+
+   This streaming implementation provides the foundation for real-time audio applications, enabling developers to integrate immediate speech synthesis into their applications with minimal development overhead.
 
 7. **Set Up Long-Form Content Processing**:
 
@@ -623,28 +626,35 @@ echo "✅ Environment prepared successfully"
 
 ## Discussion
 
-Amazon Polly revolutionizes text-to-speech applications by providing high-quality, natural-sounding voices through advanced neural network technology. The service offers multiple voice engines including standard, neural, long-form, and generative voices, each optimized for different use cases. Neural voices provide the most natural-sounding speech for general applications, while long-form voices excel at longer content like audiobooks and training materials. The generative voices offer the most human-like and emotionally expressive speech for conversational applications.
+Amazon Polly revolutionizes text-to-speech applications by providing high-quality, natural-sounding voices through advanced neural network technology. The service offers multiple voice engines including standard, neural, long-form, and generative voices, each optimized for different use cases. Neural voices provide the most natural-sounding speech for general applications, while long-form voices excel at longer content like audiobooks and training materials. The generative voices offer the most human-like and emotionally expressive speech for conversational applications, following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles for performance and cost optimization.
 
-The SSML (Speech Synthesis Markup Language) capabilities enable fine-grained control over speech characteristics including pronunciation, emphasis, pauses, and speaking rate. This level of control makes it possible to create professional-quality audio content that rivals human narration. The custom lexicon feature allows organizations to define specific pronunciations for technical terms, brand names, and domain-specific vocabulary, ensuring consistent and accurate speech output.
+The SSML (Speech Synthesis Markup Language) capabilities enable fine-grained control over speech characteristics including pronunciation, emphasis, pauses, and speaking rate. This level of control makes it possible to create professional-quality audio content that rivals human narration. The custom lexicon feature allows organizations to define specific pronunciations for technical terms, brand names, and domain-specific vocabulary, ensuring consistent and accurate speech output across all applications.
 
-The integration with other AWS services creates powerful automation possibilities. Lambda functions can process text content from various sources, apply appropriate voice settings, and store the resulting audio files in S3 for distribution. This serverless approach scales automatically and only charges for actual usage, making it cost-effective for both small applications and enterprise-scale deployments. The speech marks feature enables sophisticated applications like lip-sync animations and real-time visual feedback during speech playback.
+The integration with other AWS services creates powerful automation possibilities. Lambda functions can process text content from various sources, apply appropriate voice settings, and store the resulting audio files in S3 for distribution. This serverless approach scales automatically and only charges for actual usage, making it cost-effective for both small applications and enterprise-scale deployments. The speech marks feature enables sophisticated applications like lip-sync animations and real-time visual feedback during speech playback, as detailed in the [Amazon Polly documentation](https://docs.aws.amazon.com/polly/latest/dg/speechmarks.html).
 
-> **Tip**: Use neural voices for customer-facing applications and long-form voices for content longer than a few paragraphs. Consider implementing caching strategies to avoid re-synthesizing the same content multiple times.
+> **Tip**: Use neural voices for customer-facing applications and long-form voices for content longer than a few paragraphs. Consider implementing caching strategies to avoid re-synthesizing the same content multiple times, following [AWS cost optimization best practices](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html).
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Language Content Detection**: Build a system that automatically detects text language and selects appropriate voices, handling mixed-language content seamlessly.
+1. **Multi-Language Content Detection**: Build a system that automatically detects text language and selects appropriate voices, handling mixed-language content seamlessly using Amazon Comprehend for language detection.
 
-2. **Real-Time Voice Cloning**: Implement voice cloning capabilities using Amazon Polly's generative voices to create custom brand voices for consistent audio branding.
+2. **Real-Time Voice Cloning**: Implement voice cloning capabilities using Amazon Polly's generative voices to create custom brand voices for consistent audio branding across all customer touchpoints.
 
-3. **Interactive Voice Response (IVR) System**: Create a complete IVR system that combines Polly with Amazon Lex for natural language understanding and dynamic speech generation.
+3. **Interactive Voice Response (IVR) System**: Create a complete IVR system that combines Polly with Amazon Lex for natural language understanding and dynamic speech generation in customer service applications.
 
-4. **Podcast Generation Pipeline**: Build an automated pipeline that converts blog posts or articles into podcast episodes with intro/outro music, chapter markers, and RSS feed generation.
+4. **Podcast Generation Pipeline**: Build an automated pipeline that converts blog posts or articles into podcast episodes with intro/outro music, chapter markers, and RSS feed generation using Step Functions for orchestration.
 
-5. **Accessibility Integration**: Develop a web browser extension that automatically converts web page content to speech with customizable voice settings and reading speed controls.
+5. **Accessibility Integration**: Develop a web browser extension that automatically converts web page content to speech with customizable voice settings and reading speed controls for visually impaired users.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

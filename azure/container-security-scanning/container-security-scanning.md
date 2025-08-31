@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Container Registry, Microsoft Defender for Cloud, Azure Policy, Azure DevOps
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers, security, vulnerability-scanning, compliance, devsecops
 recipe-generator-version: 1.3
@@ -78,12 +78,13 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for resource deployment
+# Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-container-security-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export ACR_NAME="acrsecurity${RANDOM_SUFFIX}"
 export AKS_NAME="aks-security-${RANDOM_SUFFIX}"
 export WORKSPACE_NAME="law-security-${RANDOM_SUFFIX}"
+export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for globally unique resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -92,7 +93,7 @@ RANDOM_SUFFIX=$(openssl rand -hex 3)
 az group create \
     --name ${RESOURCE_GROUP} \
     --location ${LOCATION} \
-    --tags purpose=security environment=demo
+    --tags purpose=recipe environment=demo
 
 # Create Log Analytics workspace for monitoring
 WORKSPACE_ID=$(az monitor log-analytics workspace create \
@@ -193,7 +194,7 @@ echo "✅ Resource group and workspace created successfully"
        --name "require-vuln-resolution" \
        --display-name "Container images must have vulnerabilities resolved" \
        --policy "/providers/Microsoft.Authorization/policyDefinitions/090c7b07-b4ed-4561-ad20-e9075f3ccaff" \
-       --scope "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}" \
+       --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}" \
        --params '{"effect": {"value": "AuditIfNotExists"}}'
    
    # Assign policy to disable anonymous pull
@@ -203,28 +204,6 @@ echo "✅ Resource group and workspace created successfully"
        --policy "/providers/Microsoft.Authorization/policyDefinitions/9f2dea28-e834-476c-99c5-3507b4728395" \
        --scope ${ACR_ID} \
        --params '{"effect": {"value": "Deny"}}'
-   
-   # Create custom policy for image signing requirement
-   POLICY_RULE=$(cat <<EOF
-   {
-     "if": {
-       "allOf": [
-         {
-           "field": "type",
-           "equals": "Microsoft.ContainerRegistry/registries/images"
-         },
-         {
-           "field": "Microsoft.ContainerRegistry/registries/images/signed",
-           "notEquals": "true"
-         }
-       ]
-     },
-     "then": {
-       "effect": "deny"
-     }
-   }
-   EOF
-   )
    
    echo "✅ Compliance policies configured and assigned"
    ```
@@ -318,25 +297,20 @@ echo "✅ Resource group and workspace created successfully"
    A comprehensive security dashboard provides visibility into container vulnerabilities, compliance status, and security trends across your container infrastructure. This centralized monitoring enables security teams to prioritize remediation efforts and track security posture improvements over time.
 
    ```bash
-   # Create Log Analytics query for vulnerability tracking
-   QUERY=$(cat <<EOF
-   ContainerRegistryRepositoryEvents
-   | where OperationName == "PushImage"
-   | join kind=leftouter (
-       SecurityRecommendation
-       | where RecommendationDisplayName contains "vulnerabilities"
-   ) on \$left.CorrelationId == \$right.AssessedResourceId
-   | project TimeGenerated, Repository, Tag, VulnerabilityCount, Severity
-   | order by TimeGenerated desc
-   EOF
-   )
+   # Create Log Analytics workspace query pack
+   az monitor log-analytics query-pack create \
+       --resource-group ${RESOURCE_GROUP} \
+       --query-pack-name "container-security-queries" \
+       --location ${LOCATION}
    
-   # Save query for dashboard
+   # Create Log Analytics query for vulnerability tracking
+   QUERY_ID=$(uuidgen)
    az monitor log-analytics query-pack query create \
        --resource-group ${RESOURCE_GROUP} \
        --query-pack-name "container-security-queries" \
-       --body "${QUERY}" \
-       --display-name "Container Vulnerability Trends"
+       --name ${QUERY_ID} \
+       --display-name "Container Vulnerability Trends" \
+       --body "ContainerRegistryRepositoryEvents | where OperationName == \"PushImage\" | join kind=leftouter (SecurityRecommendation | where RecommendationDisplayName contains \"vulnerabilities\") on \$left.CorrelationId == \$right.AssessedResourceId | project TimeGenerated, Repository, Tag, VulnerabilityCount, Severity | order by TimeGenerated desc"
    
    # Create alert for critical vulnerabilities
    az monitor metrics alert create \
@@ -412,7 +386,7 @@ echo "✅ Resource group and workspace created successfully"
    # Remove policy assignments
    az policy assignment delete \
        --name "require-vuln-resolution" \
-       --scope "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}"
+       --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}"
    
    az policy assignment delete \
        --name "disable-anonymous-pull" \
@@ -474,4 +448,9 @@ Extend this security solution with these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

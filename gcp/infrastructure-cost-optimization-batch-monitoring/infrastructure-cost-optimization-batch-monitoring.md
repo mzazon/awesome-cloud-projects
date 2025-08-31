@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Batch, Cloud Monitoring, Cloud Functions, Compute Engine
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-optimization, automation, monitoring, batch-processing, infrastructure
 recipe-generator-version: 1.3
@@ -44,6 +44,7 @@ graph TB
         CF[Cloud Functions]
         CR[Cloud Run]
         PS[Pub/Sub]
+        SCHED[Cloud Scheduler]
     end
     
     subgraph "Target Resources"
@@ -61,6 +62,8 @@ graph TB
     CR-->CE
     CR-->GKE
     CR-->GCS
+    SCHED-->CF
+    SCHED-->CB
     
     CB-->CL
     CF-->CL
@@ -109,6 +112,8 @@ gcloud services enable storage.googleapis.com
 gcloud services enable compute.googleapis.com
 gcloud services enable pubsub.googleapis.com
 gcloud services enable run.googleapis.com
+gcloud services enable cloudscheduler.googleapis.com
+gcloud services enable logging.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled for cost optimization automation"
@@ -197,7 +202,7 @@ echo "✅ APIs enabled for cost optimization automation"
                  "commands": [
                    "/bin/bash",
                    "-c",
-                   "echo 'Starting infrastructure cost analysis...' && gcloud compute instances list --format=json > /tmp/instances.json && gsutil cp /tmp/instances.json gs://${BUCKET_NAME}/analysis/instances-$(date +%Y%m%d-%H%M%S).json"
+                   "echo 'Starting infrastructure cost analysis...' && gcloud auth activate-service-account --key-file=\$GOOGLE_APPLICATION_CREDENTIALS && gcloud compute instances list --format=json > /tmp/instances.json && gsutil cp /tmp/instances.json gs://\${BUCKET_NAME}/analysis/instances-\$(date +%Y%m%d-%H%M%S).json"
                  ]
                }
              }
@@ -222,7 +227,7 @@ echo "✅ APIs enabled for cost optimization automation"
          {
            "policy": {
              "machineType": "e2-standard-2",
-             "provisioningModel": "PREEMPTIBLE"
+             "provisioningModel": "SPOT"
            }
          }
        ]
@@ -236,7 +241,7 @@ echo "✅ APIs enabled for cost optimization automation"
    echo "✅ Batch job definition created for infrastructure analysis"
    ```
 
-   The batch job configuration uses preemptible instances for cost-effective parallel processing of infrastructure data. This managed approach automatically handles job scheduling, retry logic, and resource provisioning while integrating with Cloud Logging for comprehensive monitoring and debugging capabilities.
+   The batch job configuration uses Spot instances for cost-effective parallel processing of infrastructure data. This managed approach automatically handles job scheduling, retry logic, and resource provisioning while integrating with Cloud Logging for comprehensive monitoring and debugging capabilities.
 
 4. **Deploy Cloud Function for Automated Optimization Actions**:
 
@@ -256,6 +261,7 @@ from google.cloud import monitoring_v3
 from google.cloud import bigquery
 import functions_framework
 import os
+from datetime import datetime
 
 @functions_framework.http
 def optimize_infrastructure(request):
@@ -276,12 +282,13 @@ def optimize_infrastructure(request):
         recommendations = generate_recommendations(instances)
         
         # Log recommendations to BigQuery
-        log_recommendations(bq_client, recommendations)
+        log_recommendations(bq_client, recommendations, project_id)
         
         return {
             'status': 'success',
             'processed_instances': len(instances),
-            'recommendations': len(recommendations)
+            'recommendations': len(recommendations),
+            'timestamp': datetime.now().isoformat()
         }, 200
         
     except Exception as e:
@@ -290,44 +297,82 @@ def optimize_infrastructure(request):
 
 def list_underutilized_instances(compute_client, project_id):
     """Identify instances with low utilization."""
-    # Implementation would connect to monitoring data
-    # This is a simplified example
-    return []
+    try:
+        request = compute_v1.AggregatedListInstancesRequest(project=project_id)
+        page_result = compute_client.aggregated_list(request=request)
+        instances = []
+        
+        for zone, response in page_result:
+            if response.instances:
+                for instance in response.instances:
+                    instances.append({
+                        'name': instance.name,
+                        'zone': zone.split('/')[-1],
+                        'machine_type': instance.machine_type.split('/')[-1],
+                        'status': instance.status
+                    })
+        return instances
+    except Exception as e:
+        logging.error(f"Error listing instances: {str(e)}")
+        return []
 
 def generate_recommendations(instances):
     """Generate cost optimization recommendations."""
     recommendations = []
     for instance in instances:
-        recommendations.append({
-            'resource_id': instance.get('name'),
-            'action': 'resize',
-            'estimated_savings': 50.0
-        })
+        if instance.get('status') == 'RUNNING':
+            recommendations.append({
+                'resource_id': instance.get('name'),
+                'action': 'analyze_utilization',
+                'estimated_savings': 25.0,
+                'machine_type': instance.get('machine_type')
+            })
     return recommendations
 
-def log_recommendations(bq_client, recommendations):
+def log_recommendations(bq_client, recommendations, project_id):
     """Log recommendations to BigQuery for tracking."""
-    # Implementation would insert data into BigQuery
-    pass
-   EOF
+    try:
+        dataset_name = os.environ.get('DATASET_NAME', 'cost_analytics')
+        table_id = f"{project_id}.{dataset_name}.optimization_actions"
+        
+        rows_to_insert = []
+        for rec in recommendations:
+            rows_to_insert.append({
+                'timestamp': datetime.now().isoformat(),
+                'resource_id': rec['resource_id'],
+                'action_type': rec['action'],
+                'estimated_savings': rec['estimated_savings'],
+                'status': 'generated'
+            })
+        
+        if rows_to_insert:
+            table = bq_client.get_table(table_id)
+            errors = bq_client.insert_rows_json(table, rows_to_insert)
+            if errors:
+                logging.error(f"BigQuery insert errors: {errors}")
+            else:
+                logging.info(f"Inserted {len(rows_to_insert)} recommendations to BigQuery")
+    except Exception as e:
+        logging.error(f"Error logging to BigQuery: {str(e)}")
+EOF
    
    # Create requirements.txt
    cat > requirements.txt << EOF
-   google-cloud-compute>=1.15.0
-   google-cloud-monitoring>=2.15.0
-   google-cloud-bigquery>=3.11.0
-   functions-framework>=3.4.0
+   google-cloud-compute>=1.19.0
+   google-cloud-monitoring>=2.21.0
+   google-cloud-bigquery>=3.25.0
+   functions-framework>=3.7.0
    EOF
    
    # Deploy the Cloud Function
    gcloud functions deploy cost-optimizer \
        --gen2 \
-       --runtime=python311 \
+       --runtime=python312 \
        --region=${REGION} \
        --source=. \
        --entry-point=optimize_infrastructure \
        --trigger=http \
-       --set-env-vars PROJECT_ID=${PROJECT_ID} \
+       --set-env-vars PROJECT_ID=${PROJECT_ID},DATASET_NAME=${DATASET_NAME} \
        --allow-unauthenticated
    
    cd ..
@@ -365,15 +410,15 @@ def log_recommendations(bq_client, recommendations):
    Cloud Monitoring provides comprehensive observability for tracking resource utilization, cost trends, and optimization effectiveness across your Google Cloud infrastructure. Setting up alerting policies enables proactive cost management by triggering automated optimization actions when resources exceed utilization thresholds or cost budgets.
 
    ```bash
-   # Create monitoring alert policy for high resource costs
+   # Create monitoring alert policy for low resource utilization
    cat > alert-policy.json << EOF
    {
-     "displayName": "High Infrastructure Costs Alert",
+     "displayName": "Low CPU Utilization Alert",
      "conditions": [
        {
          "displayName": "CPU utilization below 10%",
          "conditionThreshold": {
-           "filter": "resource.type=\"gce_instance\"",
+           "filter": "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/cpu/utilization\"",
            "comparison": "COMPARISON_LESS_THAN",
            "thresholdValue": 0.1,
            "duration": "300s",
@@ -392,7 +437,8 @@ def log_recommendations(bq_client, recommendations):
    EOF
    
    # Create the alerting policy
-   gcloud alpha monitoring policies create --policy-from-file=alert-policy.json
+   gcloud alpha monitoring policies create \
+       --policy-from-file=alert-policy.json
    
    echo "✅ Cloud Monitoring alerting policies configured"
    ```
@@ -438,21 +484,28 @@ def log_recommendations(bq_client, recommendations):
    Cloud Scheduler enables regular execution of cost optimization workflows, ensuring continuous monitoring and optimization of your infrastructure without manual intervention. This scheduling system triggers batch analysis jobs, processes recommendations, and implements approved optimization actions on a configurable cadence that aligns with business requirements.
 
    ```bash
+   # Get the Cloud Function trigger URL
+   FUNCTION_URL=$(gcloud functions describe cost-optimizer \
+       --region=${REGION} \
+       --format="value(serviceConfig.uri)")
+   
    # Create Cloud Scheduler job for regular cost optimization
    gcloud scheduler jobs create http cost-optimization-schedule \
        --location=${REGION} \
        --schedule="0 2 * * *" \
-       --uri="https://${REGION}-${PROJECT_ID}.cloudfunctions.net/cost-optimizer" \
+       --uri="${FUNCTION_URL}" \
        --http-method=GET \
        --description="Daily infrastructure cost optimization analysis"
    
-   # Create scheduler for weekly batch analysis
-   gcloud scheduler jobs create http weekly-batch-analysis \
-       --location=${REGION} \
-       --schedule="0 3 * * 0" \
-       --uri="https://batch.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/jobs" \
-       --http-method=POST \
-       --description="Weekly comprehensive infrastructure analysis"
+   # Create IAM service account for batch job scheduling
+   gcloud iam service-accounts create batch-scheduler \
+       --description="Service account for batch job scheduling" \
+       --display-name="Batch Scheduler"
+   
+   # Grant necessary permissions to the service account
+   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:batch-scheduler@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/batch.jobsEditor"
    
    echo "✅ Automated optimization scheduler configured"
    ```
@@ -470,7 +523,7 @@ def log_recommendations(bq_client, recommendations):
        --format="table(status.state,status.statusEvents[].description)"
    
    # View batch job logs
-   gcloud logging read "resource.type=batch_job AND resource.labels.job_uid=${BATCH_JOB_NAME}" \
+   gcloud logging read "resource.type=batch_job AND resource.labels.job_id=${BATCH_JOB_NAME}" \
        --limit=10 \
        --format="value(textPayload)"
    ```
@@ -530,10 +583,6 @@ def log_recommendations(bq_client, recommendations):
        --location=${REGION} \
        --quiet
    
-   gcloud scheduler jobs delete weekly-batch-analysis \
-       --location=${REGION} \
-       --quiet
-   
    echo "✅ Cloud Scheduler jobs deleted"
    ```
 
@@ -583,25 +632,33 @@ def log_recommendations(bq_client, recommendations):
    echo "✅ Storage and analytics resources deleted"
    ```
 
-5. **Remove Monitoring Resources**:
+5. **Remove Monitoring and IAM Resources**:
 
    ```bash
-   # List and delete alerting policies (manual cleanup required)
-   gcloud alpha monitoring policies list \
-       --filter="displayName:'High Infrastructure Costs Alert'" \
-       --format="value(name)"
+   # List and delete alerting policies
+   POLICY_NAME=$(gcloud alpha monitoring policies list \
+       --filter="displayName:'Low CPU Utilization Alert'" \
+       --format="value(name)")
    
-   echo "✅ Cleanup completed - verify monitoring policies manually"
-   echo "Note: Some monitoring resources may require manual deletion through the console"
+   if [ ! -z "${POLICY_NAME}" ]; then
+       gcloud alpha monitoring policies delete ${POLICY_NAME} --quiet
+   fi
+   
+   # Delete service account
+   gcloud iam service-accounts delete \
+       batch-scheduler@${PROJECT_ID}.iam.gserviceaccount.com \
+       --quiet
+   
+   echo "✅ Cleanup completed - monitoring policies and IAM resources removed"
    ```
 
 ## Discussion
 
 This cost optimization automation system demonstrates the power of combining Google Cloud's managed services to create intelligent, scalable infrastructure management solutions. Cloud Batch provides the computational foundation for analyzing large-scale infrastructure data, while Cloud Monitoring offers real-time visibility into resource utilization patterns that drive optimization decisions. The serverless nature of Cloud Functions ensures optimization logic executes efficiently without infrastructure overhead, and Pub/Sub enables reliable event-driven coordination between system components.
 
-The architecture follows Google Cloud's [cost optimization best practices](https://cloud.google.com/architecture/framework/cost-optimization) by implementing automated monitoring, rightsizing recommendations, and scheduled optimization workflows. By leveraging preemptible instances in batch jobs and serverless functions for processing, the system minimizes its own operational costs while maximizing savings across the broader infrastructure portfolio. The integration with BigQuery enables sophisticated analytics and machine learning capabilities that can identify complex optimization patterns and predict future cost trends.
+The architecture follows Google Cloud's [cost optimization best practices](https://cloud.google.com/architecture/framework/cost-optimization) by implementing automated monitoring, rightsizing recommendations, and scheduled optimization workflows. By leveraging Spot instances in batch jobs and serverless functions for processing, the system minimizes its own operational costs while maximizing savings across the broader infrastructure portfolio. The integration with BigQuery enables sophisticated analytics and machine learning capabilities that can identify complex optimization patterns and predict future cost trends.
 
-This automated approach significantly reduces the manual effort required for infrastructure cost management while improving optimization accuracy and consistency. The system scales automatically to handle enterprise environments with thousands of resources, providing centralized visibility and control over cost optimization initiatives. Organizations can customize the optimization algorithms, adjust monitoring thresholds, and integrate with existing workflows through the flexible, API-driven architecture.
+This automated approach significantly reduces the manual effort required for infrastructure cost management while improving optimization accuracy and consistency. The system scales automatically to handle enterprise environments with thousands of resources, providing centralized visibility and control over cost optimization initiatives. Organizations can customize the optimization algorithms, adjust monitoring thresholds, and integrate with existing workflows through the flexible, API-driven architecture that follows [Google Cloud's Well-Architected Framework](https://cloud.google.com/architecture/framework).
 
 The integration with Google Cloud's [billing and cost management tools](https://cloud.google.com/billing/docs) provides comprehensive cost visibility and control, while the event-driven architecture ensures rapid response to changing infrastructure conditions. This proactive approach to cost optimization helps organizations maintain optimal resource utilization while meeting performance and availability requirements, ultimately enabling more predictable cloud spending and improved operational efficiency.
 
@@ -623,4 +680,9 @@ Extend this cost optimization solution by implementing these advanced capabiliti
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

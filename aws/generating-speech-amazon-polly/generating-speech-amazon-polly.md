@@ -6,17 +6,16 @@ difficulty: 200
 subject: aws
 services: polly, s3
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: text-to-speech, accessibility, voice-applications, ssml, neural-voices
 recipe-generator-version: 1.3
 ---
 
 # Generating Speech with Amazon Polly
-
 
 ## Problem
 
@@ -75,7 +74,7 @@ graph TB
 4. Text content for speech synthesis testing
 5. Estimated cost: $0.50-$2.00 for testing (pay per character synthesized)
 
-> **Note**: Amazon Polly charges $4.00 per 1 million characters for standard voices and $16.00 per 1 million characters for neural voices. First 5 million characters per month are free for 12 months.
+> **Note**: Amazon Polly charges $4.00 per 1 million characters for standard voices and $16.00 per 1 million characters for neural voices. Free tier includes 5 million characters per month for standard voices and 1 million characters per month for neural voices for the first 12 months.
 
 ## Preparation
 
@@ -115,7 +114,7 @@ echo "✅ Created sample text file: ${SAMPLE_TEXT_FILE}"
 
 1. **Explore Available Voices and Languages**:
 
-   Understanding Polly's voice portfolio is essential for building effective voice applications. Amazon Polly offers over 90 voices across 30+ languages, with two distinct synthesis engines: standard (concatenative) and neural (deep learning-based). The voice selection directly impacts user experience, as neural voices provide 50% higher naturalness scores in listener studies and support advanced prosody features.
+   Understanding Polly's voice portfolio is essential for building effective voice applications. Amazon Polly offers over 90 voices across 30+ languages, with multiple synthesis engines: standard (concatenative), neural (deep learning-based), generative (most human-like), and long-form (optimized for longer content). The voice selection directly impacts user experience, as neural voices provide significantly higher naturalness scores in listener studies and support advanced prosody features.
 
    ```bash
    # List all available voices
@@ -132,11 +131,11 @@ echo "✅ Created sample text file: ${SAMPLE_TEXT_FILE}"
    echo "✅ Retrieved available voices and their capabilities"
    ```
 
-   This inventory reveals the full spectrum of voice options available for your applications. Neural voices like Joanna, Matthew, and Amy provide superior quality for customer-facing applications, while standard voices offer cost-effective solutions for internal tools and high-volume use cases.
+   This inventory reveals the full spectrum of voice options available for your applications. Neural voices like Joanna, Matthew, and Amy provide superior quality for customer-facing applications, while standard voices offer cost-effective solutions for internal tools and high-volume use cases. The newest generative voices deliver the most human-like, emotionally engaged conversational experiences.
 
 2. **Generate Basic Text-to-Speech Audio**:
 
-   Text synthesis forms the foundation of voice-enabled applications, converting written content into audio streams that enhance accessibility and user engagement. Amazon Polly's synchronous synthesis API provides real-time speech generation with sub-second latency, making it ideal for interactive applications like chatbots, navigation systems, and voice assistants. The choice between standard and neural engines affects both quality and cost.
+   Text synthesis forms the foundation of voice-enabled applications, converting written content into audio streams that enhance accessibility and user engagement. Amazon Polly's synchronous synthesis API provides real-time speech generation with sub-second latency, making it ideal for interactive applications like chatbots, navigation systems, and voice assistants. The choice between standard and neural engines affects both quality and cost significantly.
 
    ```bash
    # Synthesize speech using standard voice
@@ -160,7 +159,7 @@ echo "✅ Created sample text file: ${SAMPLE_TEXT_FILE}"
    echo "✅ Generated MP3 audio with neural voice"
    ```
 
-   The generated audio files demonstrate the quality difference between synthesis engines. Neural voices produce more natural-sounding speech with better intonation, breathing patterns, and emotional expression, while standard voices provide consistent, clear output at lower cost. This comparison helps inform voice selection decisions for different application contexts.
+   The generated audio files demonstrate the quality difference between synthesis engines. Neural voices produce more natural-sounding speech with better intonation, breathing patterns, and emotional expression, while standard voices provide consistent, clear output at lower cost. This comparison helps inform voice selection decisions for different application contexts following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) cost optimization principles.
 
 3. **Create SSML-Enhanced Speech Synthesis**:
 
@@ -275,7 +274,7 @@ echo "✅ Created sample text file: ${SAMPLE_TEXT_FILE}"
 
 6. **Monitor and Retrieve Batch Synthesis Results**:
 
-   Batch synthesis monitoring demonstrates asynchronous processing patterns essential for scalable voice applications. The task lifecycle includes queued, in_progress, completed, and failed states, with typical processing times of 1-5 minutes depending on content length and queue depth. This monitoring approach enables applications to implement robust workflow orchestration while providing users with progress updates and error handling.
+   Batch synthesis monitoring demonstrates asynchronous processing patterns essential for scalable voice applications. The task lifecycle includes scheduled, in_progress, completed, and failed states, with typical processing times of 1-5 minutes depending on content length and queue depth. This monitoring approach enables applications to implement robust workflow orchestration while providing users with progress updates and error handling.
 
    ```bash
    # Check task status
@@ -494,15 +493,15 @@ echo "✅ Created sample text file: ${SAMPLE_TEXT_FILE}"
 
 ## Discussion
 
-Amazon Polly provides a comprehensive text-to-speech solution that addresses the key challenges of building voice-enabled applications. The service offers significant advantages over traditional TTS solutions through its pay-per-use model, extensive voice portfolio, and seamless AWS integration. The neural voice engine delivers remarkably natural speech quality that closely mimics human intonation and rhythm patterns.
+Amazon Polly provides a comprehensive text-to-speech solution that addresses the key challenges of building voice-enabled applications. The service offers significant advantages over traditional TTS solutions through its pay-per-use model, extensive voice portfolio, and seamless AWS integration. The neural voice engine delivers remarkably natural speech quality that closely mimics human intonation and rhythm patterns, while the newer generative voices provide the most human-like conversational experiences available.
 
-The distinction between standard and neural voices is crucial for application design. Standard voices use concatenative synthesis and are cost-effective for basic applications, while neural voices leverage advanced deep learning models to produce more expressive and natural-sounding speech. Neural voices are particularly valuable for customer-facing applications where voice quality directly impacts user experience and brand perception.
+The distinction between voice engines is crucial for application design. Standard voices use concatenative synthesis and are cost-effective for basic applications, while neural voices leverage advanced deep learning models to produce more expressive and natural-sounding speech. Generative voices represent the latest advancement, offering emotionally engaged and adaptive conversational capabilities ideal for customer service applications. Long-form voices are specifically optimized for longer content like training materials and marketing videos, providing enhanced expressiveness that maintains listener engagement.
 
-SSML (Speech Synthesis Markup Language) support enables sophisticated control over speech characteristics, including prosody, emphasis, and pronunciation. This functionality is essential for creating professional voice applications that can handle diverse content types, from casual conversation to technical documentation. The ability to control speech rate, pitch, and volume allows developers to create contextually appropriate voice experiences.
+SSML (Speech Synthesis Markup Language) support enables sophisticated control over speech characteristics, including prosody, emphasis, and pronunciation. This functionality is essential for creating professional voice applications that can handle diverse content types, from casual conversation to technical documentation. The ability to control speech rate, pitch, and volume allows developers to create contextually appropriate voice experiences that align with the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) reliability and performance efficiency principles.
 
-The batch synthesis capability is particularly valuable for content publishers and e-learning platforms that need to process large volumes of text efficiently. By leveraging S3 integration, organizations can implement scalable workflows that process audio content asynchronously, reducing costs and improving performance for bulk operations.
+The batch synthesis capability is particularly valuable for content publishers and e-learning platforms that need to process large volumes of text efficiently. By leveraging S3 integration, organizations can implement scalable workflows that process audio content asynchronously, reducing costs and improving performance for bulk operations. This approach follows AWS best practices for cost optimization while maintaining high availability and durability.
 
-> **Tip**: Use neural voices for customer-facing applications and standard voices for internal tools to optimize cost while maintaining quality where it matters most.
+> **Tip**: Use neural voices for customer-facing applications and standard voices for internal tools to optimize cost while maintaining quality where it matters most. Consider generative voices for the most sophisticated conversational experiences.
 
 ## Challenge
 
@@ -516,8 +515,15 @@ Extend this solution by implementing these enhancements:
 
 4. **Develop Accessibility Integration**: Implement a comprehensive accessibility solution that integrates Polly with screen readers, provides audio descriptions for visual content, and offers customizable speech settings for users with different needs.
 
-5. **Build Advanced Pronunciation Management**: Create a system that automatically detects technical terms, brand names, and proper nouns in text, then applies appropriate pronunciation rules and maintains pronunciation consistency across large content repositories.
+5. **Build Advanced Pronunciation Management**: Create a system that automatically detects technical terms, brand names, and proper nouns in text, then applies appropriate pronunciation rules and maintains pronunciation consistency across large content repositories using custom lexicons and machine learning.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

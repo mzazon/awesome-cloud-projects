@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: cost-anomaly-detection, sns, cloudwatch, eventbridge
 estimated-time: 60 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: cost,anomaly,detection,sns,cloudwatch,eventbridge
 recipe-generator-version: 1.3
@@ -89,7 +89,8 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of AWS billing and cost management concepts
 4. SNS topic creation and email subscription permissions
-5. Estimated cost: $5-15/month for SNS notifications and minimal CloudWatch charges
+5. Lambda execution role with necessary permissions for CloudWatch Logs
+6. Estimated cost: $5-15/month for SNS notifications and minimal CloudWatch charges
 
 > **Note**: Cost Anomaly Detection service itself is free. You only pay for the underlying AWS services used for notifications and automation.
 
@@ -114,19 +115,70 @@ export COST_ANOMALY_EMAIL="your-email@example.com"  # Replace with your email
 # Verify Cost Explorer is enabled (required for Cost Anomaly Detection)
 echo "Verifying Cost Explorer access..."
 aws ce get-cost-and-usage \
-    --time-period Start=2024-01-01,End=2024-01-02 \
+    --time-period Start=2025-01-01,End=2025-01-02 \
     --granularity MONTHLY \
     --metrics BlendedCost \
     --group-by Type=DIMENSION,Key=SERVICE \
     --query 'ResultsByTime[0].Total' 2>/dev/null || \
     echo "⚠️  Cost Explorer may not be enabled. Please enable it in the AWS Console first."
+
+# Create IAM role for Lambda function
+cat > /tmp/lambda-trust-policy.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "lambda.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+        }
+    ]
+}
+EOF
+
+aws iam create-role \
+    --role-name lambda-execution-role \
+    --assume-role-policy-document file:///tmp/lambda-trust-policy.json \
+    --description "Execution role for cost anomaly processor Lambda function"
+
+# Attach basic Lambda execution policy
+aws iam attach-role-policy \
+    --role-name lambda-execution-role \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# Create custom policy for CloudWatch Logs
+cat > /tmp/lambda-cloudwatch-policy.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": "arn:aws:logs:*:*:*"
+        }
+    ]
+}
+EOF
+
+aws iam put-role-policy \
+    --role-name lambda-execution-role \
+    --policy-name CloudWatchLogsPolicy \
+    --policy-document file:///tmp/lambda-cloudwatch-policy.json
+
+echo "✅ Lambda execution role created with necessary permissions"
 ```
 
 ## Steps
 
 1. **Create SNS Topic for Cost Anomaly Notifications**:
 
-   Amazon SNS (Simple Notification Service) provides a fully managed messaging service that enables asynchronous communication between distributed systems, applications, and services. For cost anomaly detection, SNS acts as the central notification hub, ensuring that anomaly alerts reach the appropriate stakeholders promptly. SNS supports multiple endpoint types including email, SMS, and application integrations, making it ideal for enterprise notification requirements. Learn more about SNS capabilities in the [Amazon SNS documentation](https://docs.aws.amazon.com/sns/latest/dg/welcome.html).
+   Amazon SNS (Simple Notification Service) provides a fully managed messaging service that enables asynchronous communication between distributed systems, applications, and services. For cost anomaly detection, SNS acts as the central notification hub, ensuring that anomaly alerts reach the appropriate stakeholders promptly. SNS supports multiple endpoint types including email, SMS, and application integrations, making it ideal for enterprise notification requirements. The service ensures reliable message delivery with built-in retry mechanisms and dead letter queue support. Learn more about SNS capabilities in the [Amazon SNS documentation](https://docs.aws.amazon.com/sns/latest/dg/welcome.html).
 
    ```bash
    # Create SNS topic for cost anomaly alerts
@@ -308,7 +360,7 @@ aws ce get-cost-and-usage \
 
 8. **Create Lambda Function for Automated Response**:
 
-   AWS Lambda provides serverless compute capabilities that enable you to run code in response to events without provisioning or managing servers. For cost anomaly detection, Lambda functions serve as the processing engine for automated responses to anomaly events. This function will receive cost anomaly events from EventBridge, analyze the anomaly details, categorize the severity, and take appropriate automated actions. The serverless nature of Lambda ensures that you only pay for the compute time consumed when processing anomalies, making it a cost-effective solution for automated cost governance.
+   AWS Lambda provides serverless compute capabilities that enable you to run code in response to events without provisioning or managing servers. For cost anomaly detection, Lambda functions serve as the processing engine for automated responses to anomaly events. This function will receive cost anomaly events from EventBridge, analyze the anomaly details, categorize the severity, and take appropriate automated actions. The serverless nature of Lambda ensures that you only pay for the compute time consumed when processing anomalies, making it a cost-effective solution for automated cost governance. Lambda's built-in retry mechanisms and error handling capabilities ensure reliable processing of anomaly events.
 
    ```bash
    # Create Lambda function for processing anomaly events
@@ -406,10 +458,10 @@ EOF
    # Create deployment package
    cd /tmp && zip anomaly-processor.zip anomaly-processor.py
    
-   # Create Lambda function
+   # Create Lambda function with updated runtime
    LAMBDA_ARN=$(aws lambda create-function \
        --function-name "cost-anomaly-processor" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role" \
        --handler anomaly-processor.lambda_handler \
        --zip-file fileb://anomaly-processor.zip \
@@ -615,44 +667,65 @@ EOF
    echo "✅ Deleted SNS topic and CloudWatch dashboard"
    ```
 
-5. **Remove Log Groups**:
+5. **Remove IAM Role and Log Groups**:
 
    ```bash
    # Delete CloudWatch log groups
    aws logs delete-log-group \
        --log-group-name "/aws/lambda/cost-anomaly-processor"
    
-   echo "✅ Deleted CloudWatch log groups"
+   # Detach policies from IAM role
+   aws iam detach-role-policy \
+       --role-name lambda-execution-role \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   # Delete inline policy
+   aws iam delete-role-policy \
+       --role-name lambda-execution-role \
+       --policy-name CloudWatchLogsPolicy
+   
+   # Delete IAM role
+   aws iam delete-role \
+       --role-name lambda-execution-role
+   
+   echo "✅ Deleted CloudWatch log groups and IAM role"
    ```
 
 ## Discussion
 
-AWS Cost Anomaly Detection leverages machine learning algorithms to establish baseline spending patterns and automatically detect deviations from normal behavior. Unlike traditional threshold-based monitoring, this approach adapts to your organization's unique spending patterns, seasonal variations, and natural growth trends, significantly reducing false positive alerts while catching genuine anomalies that might otherwise go unnoticed.
+AWS Cost Anomaly Detection leverages machine learning algorithms to establish baseline spending patterns and automatically detect deviations from normal behavior. Unlike traditional threshold-based monitoring, this approach adapts to your organization's unique spending patterns, seasonal variations, and natural growth trends, significantly reducing false positive alerts while catching genuine anomalies that might otherwise go unnoticed. The service uses historical data to build sophisticated models that can distinguish between expected cost fluctuations and truly anomalous behavior.
 
-The solution implements a multi-layered monitoring approach with three distinct monitor types. Service-based monitors track anomalies across individual AWS services, enabling detection of unusual usage patterns in specific services like EC2, S3, or Lambda. Account-based monitors are particularly valuable for organizations using AWS Organizations, allowing detection of anomalies within specific member accounts. Tag-based monitors provide the most granular control, enabling monitoring of specific environments, projects, or cost centers based on resource tagging strategies.
+The solution implements a multi-layered monitoring approach with three distinct monitor types. Service-based monitors track anomalies across individual AWS services, enabling detection of unusual usage patterns in specific services like EC2, S3, or Lambda. Account-based monitors are particularly valuable for organizations using AWS Organizations, allowing detection of anomalies within specific member accounts. Tag-based monitors provide the most granular control, enabling monitoring of specific environments, projects, or cost centers based on resource tagging strategies. This layered approach ensures comprehensive coverage while maintaining the ability to drill down into specific cost categories.
 
-The integration with EventBridge enables sophisticated automated response workflows beyond simple notifications. Organizations can implement automated cost governance actions such as creating service desk tickets, sending Slack notifications with custom formatting, or even triggering cost optimization Lambda functions. The machine learning models continuously learn from your spending patterns, improving detection accuracy over time while maintaining sensitivity to both gradual increases and sudden spikes in spending.
+The integration with EventBridge enables sophisticated automated response workflows beyond simple notifications. Organizations can implement automated cost governance actions such as creating service desk tickets, sending Slack notifications with custom formatting, or even triggering cost optimization Lambda functions. The machine learning models continuously learn from your spending patterns, improving detection accuracy over time while maintaining sensitivity to both gradual increases and sudden spikes in spending. This continuous learning capability ensures that the system adapts to your organization's evolving infrastructure and usage patterns.
 
-Cost Anomaly Detection analyzes net unblended costs, meaning it accounts for discounts, credits, and reserved instance pricing in its calculations. This provides a more accurate representation of actual spending anomalies compared to analyzing gross costs. The service requires at least 10 days of historical data for new services before it can detect anomalies, ensuring the machine learning models have sufficient data to establish reliable baselines.
+Cost Anomaly Detection analyzes net unblended costs, meaning it accounts for discounts, credits, and reserved instance pricing in its calculations. This provides a more accurate representation of actual spending anomalies compared to analyzing gross costs. The service requires at least 10 days of historical data for new services before it can detect anomalies, ensuring the machine learning models have sufficient data to establish reliable baselines. For organizations with seasonal spending patterns, the system can learn these patterns over time and adjust its anomaly detection accordingly.
 
-> **Tip**: Configure different threshold values for different environments or business units. Production environments might warrant lower thresholds ($50-100) for immediate alerts, while development environments might use higher thresholds ($200-500) to reduce notification noise.
+> **Tip**: Configure different threshold values for different environments or business units. Production environments might warrant lower thresholds ($50-100) for immediate alerts, while development environments might use higher thresholds ($200-500) to reduce notification noise. This tiered approach ensures appropriate alerting based on business criticality.
 
-> **Note**: Consider implementing anomaly detection alongside AWS Budgets for comprehensive cost governance. While Cost Anomaly Detection identifies unusual patterns, budgets provide absolute spending limits and can trigger automated actions when thresholds are exceeded. See the [AWS Budgets documentation](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/budgets-managing-costs.html) for integration strategies.
+> **Note**: Consider implementing anomaly detection alongside AWS Budgets for comprehensive cost governance. While Cost Anomaly Detection identifies unusual patterns, budgets provide absolute spending limits and can trigger automated actions when thresholds are exceeded. See the [AWS Budgets documentation](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/budgets-managing-costs.html) for integration strategies and best practices.
 
 ## Challenge
 
 Extend this solution by implementing these advanced cost anomaly detection capabilities:
 
-1. **Multi-Region Cost Anomaly Aggregation**: Create a centralized dashboard that aggregates cost anomaly data from multiple AWS regions, providing a unified view of spending anomalies across your global infrastructure.
+1. **Multi-Region Cost Anomaly Aggregation**: Create a centralized dashboard that aggregates cost anomaly data from multiple AWS regions, providing a unified view of spending anomalies across your global infrastructure. Implement cross-region data replication and correlation to identify anomalies that span multiple regions.
 
-2. **Predictive Cost Modeling Integration**: Combine Cost Anomaly Detection with Amazon Forecast to create predictive models that not only detect current anomalies but also predict potential future cost spikes based on historical patterns and detected anomalies.
+2. **Predictive Cost Modeling Integration**: Combine Cost Anomaly Detection with Amazon Forecast to create predictive models that not only detect current anomalies but also predict potential future cost spikes based on historical patterns and detected anomalies. Use machine learning to forecast cost trends and proactively alert on projected anomalies.
 
-3. **Automated Cost Optimization Triggers**: Implement Lambda functions that automatically respond to specific types of cost anomalies by triggering cost optimization actions, such as rightsizing recommendations, unused resource cleanup, or automatic scaling adjustments.
+3. **Automated Cost Optimization Triggers**: Implement Lambda functions that automatically respond to specific types of cost anomalies by triggering cost optimization actions, such as rightsizing recommendations, unused resource cleanup, or automatic scaling adjustments. Create workflows that can automatically remediate common cost anomaly causes.
 
-4. **Custom Machine Learning Enhancement**: Integrate Amazon SageMaker to build custom anomaly detection models that incorporate business-specific factors like marketing campaign schedules, seasonal patterns, or product launch timelines to improve detection accuracy.
+4. **Custom Machine Learning Enhancement**: Integrate Amazon SageMaker to build custom anomaly detection models that incorporate business-specific factors like marketing campaign schedules, seasonal patterns, or product launch timelines to improve detection accuracy. Train models on your organization's unique cost patterns for more precise anomaly identification.
 
-5. **Cost Anomaly Root Cause Analysis**: Develop an automated root cause analysis system using AWS X-Ray and CloudWatch Logs Insights that correlates cost anomalies with application performance metrics, deployment events, and infrastructure changes to provide deeper insights into spending deviations.
+5. **Cost Anomaly Root Cause Analysis**: Develop an automated root cause analysis system using AWS X-Ray and CloudWatch Logs Insights that correlates cost anomalies with application performance metrics, deployment events, and infrastructure changes to provide deeper insights into spending deviations. Create automated reports that link cost anomalies to specific operational events.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

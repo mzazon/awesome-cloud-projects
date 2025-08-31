@@ -1,0 +1,314 @@
+# Infrastructure Manager Configuration for Automated Solar Assessment
+# This configuration deploys a complete serverless solar assessment system
+# using Google Maps Platform Solar API, Cloud Functions, and Cloud Storage
+
+# Import required modules and define configuration variables
+imports:
+  - path: https://github.com/GoogleCloudPlatform/cloud-foundation-fabric/blueprints/modules/cloud-function-v2
+    name: cloud-function-v2
+  - path: https://github.com/GoogleCloudPlatform/cloud-foundation-fabric/blueprints/modules/gcs
+    name: gcs
+
+# Template variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for solar assessment infrastructure"
+    
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    
+  solar_api_key:
+    type: string
+    description: "Google Maps Platform Solar API key"
+    
+  function_name:
+    type: string
+    description: "Name for the solar processing Cloud Function"
+    default: "solar-processor"
+    
+  input_bucket_name:
+    type: string
+    description: "Name for the input storage bucket"
+    default: "solar-input"
+    
+  output_bucket_name:
+    type: string
+    description: "Name for the output storage bucket"
+    default: "solar-results"
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudfunctions.googleapis.com
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/storage.googleapis.com
+      
+  - name: enable-solar-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/solar.googleapis.com
+      
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudbuild.googleapis.com
+
+  # Input bucket for property coordinate CSV files
+  - name: solar-input-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.input_bucket_name)-$(ref.environment)
+      project: $(ref.project_id)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess:
+        enabled: true
+      lifecycleRule:
+        - condition:
+            age: 30
+          action:
+            type: Delete
+      iamConfiguration:
+        publicAccessPrevention: enforced
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Output bucket for solar assessment results
+  - name: solar-output-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.output_bucket_name)-$(ref.environment)
+      project: $(ref.project_id)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess:
+        enabled: true
+      lifecycleRule:
+        - condition:
+            age: 365
+          action:
+            type: Delete
+        - condition:
+            numNewerVersions: 3
+          action:
+            type: Delete
+      iamConfiguration:
+        publicAccessPrevention: enforced
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Service account for Cloud Function execution
+  - name: solar-function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: solar-function-sa-$(ref.environment)
+      project: $(ref.project_id)
+      serviceAccount:
+        displayName: "Solar Assessment Function Service Account"
+        description: "Service account for executing solar assessment Cloud Functions"
+
+  # IAM binding for service account to access Storage
+  - name: storage-object-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.solar-function-service-account.email)
+    metadata:
+      dependsOn:
+        - solar-function-service-account
+
+  # IAM binding for service account to access Solar API
+  - name: solar-api-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/serviceusage.serviceUsageConsumer
+      member: serviceAccount:$(ref.solar-function-service-account.email)
+    metadata:
+      dependsOn:
+        - solar-function-service-account
+
+  # Cloud Function for solar assessment processing
+  - name: solar-assessment-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      functionId: $(ref.function_name)-$(ref.environment)
+      function:
+        description: "Processes uploaded CSV files and performs solar assessments using Solar API"
+        buildConfig:
+          runtime: python311
+          entryPoint: process_solar_assessment
+          source:
+            storageSource:
+              bucket: $(ref.solar-input-bucket.name)
+              object: function-source.zip
+          environmentVariables:
+            SOLAR_API_KEY: $(ref.solar_api_key)
+            OUTPUT_BUCKET: $(ref.solar-output-bucket.name)
+        serviceConfig:
+          serviceAccountEmail: $(ref.solar-function-service-account.email)
+          timeoutSeconds: 540
+          availableMemory: 512Mi
+          maxInstanceCount: 10
+          minInstanceCount: 0
+          environmentVariables:
+            SOLAR_API_KEY: $(ref.solar_api_key)
+            OUTPUT_BUCKET: $(ref.solar-output-bucket.name)
+        eventTrigger:
+          trigger:
+            eventType: google.cloud.storage.object.v1.finalized
+            eventFilters:
+              - attribute: bucket
+                value: $(ref.solar-input-bucket.name)
+          retryPolicy: RETRY_POLICY_RETRY
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - solar-input-bucket
+        - solar-output-bucket
+        - solar-function-service-account
+        - storage-object-admin-binding
+
+  # Cloud Storage notification configuration for function trigger
+  - name: storage-notification
+    type: gcp-types/storage-v1:buckets.notifications
+    properties:
+      bucket: $(ref.solar-input-bucket.name)
+      topic: projects/$(ref.project_id)/topics/$(ref.function_name)-$(ref.environment)-trigger
+      payloadFormat: JSON_API_V1
+      eventTypes:
+        - OBJECT_FINALIZE
+      objectNamePrefix: ""
+    metadata:
+      dependsOn:
+        - solar-input-bucket
+        - solar-assessment-function
+
+  # Pub/Sub topic for function triggers (created automatically by Cloud Functions)
+  - name: function-trigger-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/$(ref.function_name)-$(ref.environment)-trigger
+      labels:
+        environment: $(ref.environment)
+        purpose: solar-assessment
+
+  # IAM binding for Cloud Storage to publish to Pub/Sub
+  - name: storage-pubsub-publisher-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/pubsub.publisher
+      member: serviceAccount:service-$(ref.project_id)@gs-project-accounts.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - function-trigger-topic
+
+  # Cloud Logging sink for function monitoring
+  - name: solar-function-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/$(ref.project_id)
+      uniqueWriterIdentity: true
+      sink:
+        name: solar-assessment-logs-$(ref.environment)
+        description: "Log sink for solar assessment function monitoring"
+        destination: storage.googleapis.com/$(ref.solar-output-bucket.name)/logs
+        filter: >
+          resource.type="cloud_function"
+          resource.labels.function_name="$(ref.function_name)-$(ref.environment)"
+        includeChildren: true
+
+  # Cloud Monitoring alert policy for function errors
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project_id)
+      alertPolicy:
+        displayName: "Solar Assessment Function Errors - $(ref.environment)"
+        documentation:
+          content: "Alert when solar assessment function experiences errors"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "Function Error Rate"
+            conditionThreshold:
+              filter: >
+                resource.type="cloud_function"
+                resource.label.function_name="$(ref.function_name)-$(ref.environment)"
+                metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                metric.label.status!="ok"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        enabled: true
+        notificationChannels: []
+
+# Output values for validation and integration
+outputs:
+  - name: input_bucket_url
+    value: gs://$(ref.solar-input-bucket.name)
+    description: "URL of the input bucket for uploading property CSV files"
+    
+  - name: output_bucket_url
+    value: gs://$(ref.solar-output-bucket.name)
+    description: "URL of the output bucket containing solar assessment results"
+    
+  - name: function_name
+    value: $(ref.solar-assessment-function.name)
+    description: "Full name of the deployed Cloud Function"
+    
+  - name: function_service_account
+    value: $(ref.solar-function-service-account.email)
+    description: "Service account email used by the Cloud Function"
+    
+  - name: project_id
+    value: $(ref.project_id)
+    description: "Google Cloud Project ID where resources are deployed"
+    
+  - name: region
+    value: $(ref.region)
+    description: "Google Cloud region where resources are deployed"
+    
+  - name: deployment_environment
+    value: $(ref.environment)
+    description: "Environment name for this deployment"
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for automated solar assessment system"
+  author: "Google Cloud Recipe Generator"
+  created: "2025-07-12"
+  tags:
+    - solar-energy
+    - serverless
+    - maps-platform
+    - batch-processing
+    - cloud-functions
+    - cloud-storage

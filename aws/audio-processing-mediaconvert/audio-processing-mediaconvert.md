@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: MediaConvert, S3, Lambda, IAM
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: media, audio, processing, pipelines, automation
 recipe-generator-version: 1.3
@@ -474,10 +474,10 @@ echo "✅ Created SNS topic: ${SNS_TOPIC_ARN}"
    # Wait for role to be available
    sleep 10
    
-   # Create Lambda function
+   # Create Lambda function with latest Python runtime
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
@@ -633,7 +633,7 @@ echo "✅ Created SNS topic: ${SNS_TOPIC_ARN}"
    cat > enhanced-audio-preset.json << EOF
    {
        "Name": "EnhancedAudioPreset-${RANDOM_SUFFIX}",
-       "Description": "Preset for enhanced audio processing with noise reduction",
+       "Description": "Preset for enhanced audio processing with loudness normalization",
        "Settings": {
            "ContainerSettings": {
                "Container": "MP4"
@@ -681,18 +681,22 @@ echo "✅ Created SNS topic: ${SNS_TOPIC_ARN}"
    Testing validates the complete pipeline integration and ensures all components work together seamlessly. This verification step confirms that S3 uploads trigger Lambda functions correctly, MediaConvert jobs execute successfully, and output files are delivered to the designated locations with expected quality and format specifications.
 
    ```bash
-   # Create a test audio file using text-to-speech (if available)
-   # Or download a sample audio file
+   # Create a test audio file placeholder
    echo "Testing audio processing pipeline..."
    
-   # Create a simple test file (you can replace this with actual audio)
-   echo "This is a test audio file for MediaConvert processing" > test-audio.txt
+   # Create a simple test marker file for the pipeline
+   echo "Audio processing test file" > test-audio.txt
+   
+   # Rename to audio extension to trigger processing
+   mv test-audio.txt test-audio.wav
    
    # Upload test file to trigger processing
-   aws s3 cp test-audio.txt s3://${BUCKET_INPUT}/test-audio.wav
+   aws s3 cp test-audio.wav s3://${BUCKET_INPUT}/
    
    echo "✅ Uploaded test file to trigger processing"
    echo "Monitor the pipeline through CloudWatch dashboard or AWS Console"
+   echo "For real testing, upload an actual audio file:"
+   echo "aws s3 cp your-audio-file.mp3 s3://${BUCKET_INPUT}/"
    ```
 
    The pipeline test demonstrates the complete automation workflow from upload to processing. You can now monitor job progress through the CloudWatch dashboard and verify that processed audio files appear in the output bucket with the expected formats and quality settings, confirming your pipeline is ready for production workloads.
@@ -708,7 +712,7 @@ echo "✅ Created SNS topic: ${SNS_TOPIC_ARN}"
    # Check output bucket
    aws s3 ls s3://${BUCKET_OUTPUT}
    
-   # Verify bucket policies
+   # Verify bucket notification configuration
    aws s3api get-bucket-notification-configuration \
        --bucket ${BUCKET_INPUT}
    ```
@@ -722,10 +726,11 @@ echo "✅ Created SNS topic: ${SNS_TOPIC_ARN}"
    aws logs describe-log-groups \
        --log-group-name-prefix "/aws/lambda/${LAMBDA_FUNCTION}"
    
-   # Get recent log events
+   # Get recent log events (if any exist)
    aws logs describe-log-streams \
        --log-group-name "/aws/lambda/${LAMBDA_FUNCTION}" \
-       --order-by LastEventTime --descending
+       --order-by LastEventTime --descending \
+       --max-items 5
    ```
 
 3. **Monitor MediaConvert jobs**:
@@ -736,7 +741,7 @@ echo "✅ Created SNS topic: ${SNS_TOPIC_ARN}"
        --endpoint-url ${MEDIACONVERT_ENDPOINT} \
        --max-results 10
    
-   # Check job template
+   # Check job template exists
    aws mediaconvert get-job-template \
        --endpoint-url ${MEDIACONVERT_ENDPOINT} \
        --name "AudioProcessingTemplate-${RANDOM_SUFFIX}"
@@ -745,7 +750,7 @@ echo "✅ Created SNS topic: ${SNS_TOPIC_ARN}"
 4. **Test audio processing with real audio file**:
 
    ```bash
-   # Upload a real audio file for processing
+   # Instructions for testing with real audio
    echo "Upload an actual audio file (MP3, WAV, FLAC) to test:"
    echo "aws s3 cp your-audio-file.mp3 s3://${BUCKET_INPUT}/"
    
@@ -848,20 +853,20 @@ echo "✅ Created SNS topic: ${SNS_TOPIC_ARN}"
        --topic-arn ${SNS_TOPIC_ARN}
    
    # Clean up local files
-   rm -f *.json *.py *.zip *.txt
+   rm -f *.json *.py *.zip *.txt *.wav
    
    echo "✅ Deleted monitoring resources and cleaned up local files"
    ```
 
 ## Discussion
 
-AWS Elemental MediaConvert provides a robust, serverless solution for audio processing that eliminates the need for managing infrastructure while offering professional-grade audio processing capabilities. The service supports over 20 audio formats and codecs, making it ideal for media companies that need to deliver content across multiple platforms and devices. The pay-per-use pricing model ensures cost efficiency, especially for variable workloads.
+AWS Elemental MediaConvert provides a robust, serverless solution for audio processing that eliminates the need for managing infrastructure while offering professional-grade audio processing capabilities. The service supports over 20 audio formats and codecs, making it ideal for media companies that need to deliver content across multiple platforms and devices. The pay-per-use pricing model ensures cost efficiency, especially for variable workloads following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles of cost optimization.
 
-The architecture implemented in this recipe leverages event-driven processing, where S3 object creation events automatically trigger Lambda functions that initiate MediaConvert jobs. This approach ensures immediate processing of uploaded audio files without manual intervention. The multiple output formats (MP3, AAC, FLAC) provide flexibility for different use cases: MP3 for web streaming, AAC for mobile applications, and FLAC for high-quality archival storage.
+The architecture implemented in this recipe leverages event-driven processing, where S3 object creation events automatically trigger Lambda functions that initiate MediaConvert jobs. This approach ensures immediate processing of uploaded audio files without manual intervention. The multiple output formats (MP3, AAC, FLAC) provide flexibility for different use cases: MP3 for web streaming, AAC for mobile applications, and FLAC for high-quality archival storage. This follows AWS best practices for [serverless application architecture](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html).
 
-Audio normalization is a critical feature implemented through the ITU-R BS.1770-2 standard, which ensures consistent loudness across different audio content. This is particularly important for streaming platforms and broadcast applications where audio level consistency enhances user experience. The preset system allows for standardized processing while maintaining the flexibility to customize parameters for specific content requirements.
+Audio normalization is a critical feature implemented through the ITU-R BS.1770-2 standard, which ensures consistent loudness across different audio content. This is particularly important for streaming platforms and broadcast applications where audio level consistency enhances user experience. The preset system allows for standardized processing while maintaining the flexibility to customize parameters for specific content requirements, supporting the reliability pillar of the Well-Architected Framework.
 
-The integration with CloudWatch provides comprehensive monitoring and logging capabilities, enabling teams to track processing metrics, identify bottlenecks, and optimize costs. The dashboard visualization helps operations teams maintain visibility into the pipeline's performance and troubleshoot issues quickly.
+The integration with CloudWatch provides comprehensive monitoring and logging capabilities, enabling teams to track processing metrics, identify bottlenecks, and optimize costs. The dashboard visualization helps operations teams maintain visibility into the pipeline's performance and troubleshoot issues quickly, supporting operational excellence through automated monitoring and alerting as described in the [MediaConvert monitoring documentation](https://docs.aws.amazon.com/mediaconvert/latest/ug/monitoring-mediaconvert.html).
 
 > **Tip**: Use MediaConvert's audio analysis features to automatically detect and correct audio issues like silence, loudness inconsistencies, and format incompatibilities before processing.
 
@@ -881,4 +886,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

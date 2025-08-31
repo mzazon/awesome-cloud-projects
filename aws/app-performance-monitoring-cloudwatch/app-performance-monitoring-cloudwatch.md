@@ -6,16 +6,16 @@ difficulty: 200
 subject: aws
 services: CloudWatch, EventBridge, Lambda, SNS
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: monitoring, automation, performance, cloudwatch, eventbridge, lambda, sns
 recipe-generator-version: 1.3
 ---
 
-# Application Performance Monitoring Automation
+# Application Performance Monitoring Automation with CloudWatch
 
 ## Problem
 
@@ -81,7 +81,7 @@ graph TB
 1. AWS account with appropriate permissions for CloudWatch, EventBridge, Lambda, SNS, and IAM services
 2. AWS CLI v2 installed and configured (minimum version 2.0) or AWS CloudShell access
 3. Basic knowledge of AWS monitoring services and event-driven architectures
-4. An existing application running on AWS (EKS, EC2, or Lambda functions)
+4. An existing application running on AWS (EKS, EC2, or Lambda functions) with Application Signals enabled
 5. Estimated cost: $20-50/month for moderate monitoring workload (varies based on metrics volume and notification frequency)
 
 > **Note**: This recipe follows AWS Well-Architected Framework principles for operational excellence and reliability. Ensure proper IAM permissions are configured before proceeding to avoid access denied errors.
@@ -132,35 +132,55 @@ echo "✅ AWS environment configured with resource identifiers"
 
 ## Steps
 
-1. **Enable CloudWatch Application Signals**:
+1. **Create Service Level Objective for Application Signals**:
 
-   CloudWatch Application Signals automatically instruments your applications to collect performance metrics, traces, and service maps without requiring code changes. This service provides unified visibility into application health by capturing key metrics like latency, error rates, and throughput across your distributed services, enabling proactive performance monitoring and rapid troubleshooting of complex architectures.
+   CloudWatch Application Signals Service Level Objectives (SLOs) provide automatic monitoring of your application's reliability and performance. Creating an SLO establishes performance targets that CloudWatch continuously measures, enabling proactive alerting when your application fails to meet defined service levels for latency, availability, or error rates.
 
    ```bash
-   # Enable Application Signals service
-   aws application-signals put-service-level-objective \
-       --service-level-objective-name "app-performance-slo" \
-       --service-level-objective-configuration '{
-           "MetricType": "Latency",
-           "ComparisonOperator": "LessThanThreshold",
-           "Threshold": 2000,
-           "EvaluationPeriods": 2,
-           "DatapointsToAlarm": 1
+   # Create Service Level Objective for application performance
+   aws application-signals create-service-level-objective \
+       --name "app-performance-slo-${RANDOM_SUFFIX}" \
+       --description "Monitor application latency performance" \
+       --sli-config '{
+           "SliMetricConfig": {
+               "MetricType": "LATENCY",
+               "Statistic": "Average",
+               "MetricDataQueries": [
+                   {
+                       "Id": "m1",
+                       "MetricStat": {
+                           "Metric": {
+                               "Namespace": "AWS/ApplicationSignals",
+                               "MetricName": "Latency",
+                               "Dimensions": [
+                                   {
+                                       "Name": "Service",
+                                       "Value": "sample-application"
+                                   }
+                               ]
+                           },
+                           "Period": 300,
+                           "Stat": "Average"
+                       }
+                   }
+               ]
+           }
+       }' \
+       --goal '{
+           "Interval": {
+               "RollingInterval": {
+                   "Duration": "P30D",
+                   "DurationUnit": "DAY"
+               }
+           },
+           "AttainmentGoal": 95.0,
+           "WarningThreshold": 90.0
        }'
    
-   # Create Application Signals log group for data collection
-   aws logs create-log-group \
-       --log-group-name /aws/application-signals/data \
-       --retention-in-days 30
-   
-   # Verify Application Signals is enabled
-   aws application-signals list-service-level-objectives \
-       --query 'ServiceLevelObjectives[0].{Name:Name,MetricType:MetricType}'
-   
-   echo "✅ CloudWatch Application Signals enabled and configured"
+   echo "✅ CloudWatch Application Signals SLO created"
    ```
 
-   Application Signals is now collecting performance metrics from your applications and providing automated service discovery. This establishes the foundation for comprehensive application performance monitoring with minimal operational overhead and automatic topology mapping.
+   The SLO is now monitoring your application performance and will trigger alerts when latency exceeds acceptable thresholds. This establishes the foundation for automated performance monitoring with clear business-relevant targets.
 
 2. **Create SNS Topic for Notifications**:
 
@@ -287,7 +307,7 @@ EOF
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_FUNCTION_NAME}-role \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -320,7 +340,7 @@ EOF
        --evaluation-periods 2 \
        --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME} \
        --ok-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME} \
-       --dimensions Name=Service,Value=MyApplication
+       --dimensions Name=Service,Value=sample-application
    
    # Create alarm for error rate
    aws cloudwatch put-metric-alarm \
@@ -335,7 +355,7 @@ EOF
        --evaluation-periods 1 \
        --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME} \
        --ok-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME} \
-       --dimensions Name=Service,Value=MyApplication
+       --dimensions Name=Service,Value=sample-application
    
    # Create alarm for throughput anomaly
    aws cloudwatch put-metric-alarm \
@@ -350,7 +370,7 @@ EOF
        --evaluation-periods 3 \
        --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME} \
        --ok-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME} \
-       --dimensions Name=Service,Value=MyApplication
+       --dimensions Name=Service,Value=sample-application
    
    echo "✅ CloudWatch alarms created for Application Signals metrics"
    ```
@@ -413,7 +433,7 @@ EOF
                    "height": 6,
                    "properties": {
                        "metrics": [
-                           ["AWS/ApplicationSignals", "Latency", "Service", "MyApplication"],
+                           ["AWS/ApplicationSignals", "Latency", "Service", "sample-application"],
                            [".", "ErrorRate", ".", "."],
                            [".", "CallCount", ".", "."]
                        ],
@@ -524,16 +544,15 @@ EOF
 
 ## Validation & Testing
 
-1. **Verify CloudWatch Application Signals is collecting metrics**:
+1. **Verify Application Signals SLO is active**:
 
    ```bash
-   # Check Application Signals metrics availability
-   aws cloudwatch list-metrics \
-       --namespace AWS/ApplicationSignals \
-       --query 'Metrics[?MetricName==`Latency`]'
+   # Check Service Level Objectives
+   aws application-signals list-service-level-objectives \
+       --query 'ServiceLevelObjectives[?contains(Name, `app-performance-slo`)]'
    ```
 
-   Expected output: JSON array with Application Signals metrics for your application services showing metric names and dimensions.
+   Expected output: JSON array with SLO configuration showing name, goal, and current status.
 
 2. **Test alarm functionality**:
 
@@ -617,7 +636,17 @@ EOF
    echo "✅ CloudWatch alarms deleted"
    ```
 
-4. **Delete Lambda function**:
+4. **Delete Service Level Objective**:
+
+   ```bash
+   # Delete Application Signals SLO
+   aws application-signals delete-service-level-objective \
+       --name "app-performance-slo-${RANDOM_SUFFIX}"
+   
+   echo "✅ Application Signals SLO deleted"
+   ```
+
+5. **Delete Lambda function**:
 
    ```bash
    # Delete Lambda function
@@ -630,7 +659,7 @@ EOF
    echo "✅ Lambda function and local files deleted"
    ```
 
-5. **Delete SNS topic**:
+6. **Delete SNS topic**:
 
    ```bash
    # Delete SNS topic and all subscriptions
@@ -640,7 +669,7 @@ EOF
    echo "✅ SNS topic and subscriptions deleted"
    ```
 
-6. **Remove IAM roles and policies**:
+7. **Remove IAM roles and policies**:
 
    ```bash
    # Detach policies from IAM role
@@ -667,18 +696,19 @@ EOF
 
 This automated performance monitoring solution demonstrates how CloudWatch Application Signals, EventBridge, Lambda, and SNS work together to create a comprehensive, event-driven monitoring system. The architecture follows AWS Well-Architected Framework principles by implementing operational excellence through automated monitoring, reliability through distributed event processing, and cost optimization through serverless components that scale based on demand.
 
-CloudWatch Application Signals provides the foundation by automatically collecting application-level metrics without requiring code changes. This service captures critical performance indicators like latency, error rates, and throughput across your distributed services, creating a unified view of application health. The automatic service discovery and topology mapping capabilities enable rapid troubleshooting and dependency analysis, essential for maintaining complex, microservices-based applications. This approach significantly reduces the operational overhead typically associated with instrumenting distributed applications.
+CloudWatch Application Signals provides the foundation by automatically collecting application-level metrics without requiring code changes. This service captures critical performance indicators like latency, error rates, and throughput across your distributed services, creating a unified view of application health. The Service Level Objectives feature enables business-relevant monitoring by setting specific performance targets that align with customer expectations. This approach significantly reduces the operational overhead typically associated with instrumenting distributed applications while providing meaningful insights into service reliability.
 
 The EventBridge integration creates a loosely coupled, event-driven architecture that can scale to handle thousands of alarms while maintaining system resilience. By routing CloudWatch alarm state changes through EventBridge, the system enables multiple downstream actions to process the same event simultaneously, supporting complex automation workflows. This approach also facilitates easy integration with third-party monitoring tools and custom business logic through additional EventBridge rules and targets, making the system extensible for future requirements.
 
-The Lambda function provides intelligent event processing capabilities that can implement sophisticated remediation logic based on alarm context, historical trends, and business rules. This serverless approach eliminates the need for dedicated monitoring infrastructure while providing automatic scaling and high availability. The function can be enhanced to integrate with external systems, implement machine learning-based anomaly detection, or trigger complex multi-service remediation workflows based on specific business requirements.
+The Lambda function provides intelligent event processing capabilities that can implement sophisticated remediation logic based on alarm context, historical trends, and business rules. Using Python 3.12 runtime ensures access to the latest performance improvements and security updates while maintaining compatibility with AWS services. This serverless approach eliminates the need for dedicated monitoring infrastructure while providing automatic scaling and high availability. The function can be enhanced to integrate with external systems, implement machine learning-based anomaly detection, or trigger complex multi-service remediation workflows based on specific business requirements.
 
 > **Tip**: Consider implementing exponential backoff and circuit breaker patterns in your Lambda function to handle downstream service failures gracefully. This approach ensures monitoring system reliability even when target services are experiencing issues.
 
 For production deployments, consider implementing additional features like alarm suppression during maintenance windows, escalation policies for critical alerts, and integration with incident management systems. The modular architecture makes it easy to extend functionality while maintaining system reliability and performance. Additionally, implementing cost monitoring and optimization features can help ensure the monitoring system remains cost-effective as it scales.
 
 **Key Documentation References:**
-- [AWS CloudWatch Application Signals](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Application-Monitoring-Sections.html)
+- [AWS CloudWatch Application Signals](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Application-Signals.html)
+- [Service Level Objectives (SLOs)](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-ServiceLevelObjectives.html)
 - [Amazon EventBridge User Guide](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-event-patterns.html)
 - [AWS Well-Architected Framework - Operational Excellence](https://docs.aws.amazon.com/wellarchitected/latest/framework/operational-excellence.html)
 - [CloudWatch Alarm State Changes](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch-events-and-eventbridge.html)
@@ -700,4 +730,11 @@ Extend this automated monitoring solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

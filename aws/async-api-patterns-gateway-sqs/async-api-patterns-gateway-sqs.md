@@ -4,18 +4,18 @@ id: j4p8q7r3
 category: serverless
 difficulty: 300
 subject: aws
-services: API Gateway, SQS, Lambda, IAM
+services: API Gateway, SQS, Lambda, DynamoDB
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: serverless, api-gateway, sqs, asynchronous, patterns
 recipe-generator-version: 1.3
 ---
 
-# Asynchronous API Patterns with SQS
+# Asynchronous API Patterns with API Gateway and SQS
 
 ## Problem
 
@@ -23,7 +23,7 @@ Modern applications often need to handle long-running tasks such as image proces
 
 ## Solution
 
-This solution implements an asynchronous API pattern using Amazon API Gateway and Amazon SQS to decouple request processing from response delivery. API Gateway receives client requests and immediately queues them in SQS for background processing, returning a job identifier to the client. Lambda functions process messages from the queue asynchronously, and clients can poll a status endpoint or receive notifications via webhooks. This architecture provides immediate response times, handles traffic spikes gracefully, and enables reliable processing of long-running tasks without client timeouts.
+This solution implements an asynchronous API pattern using Amazon API Gateway and Amazon SQS to decouple request processing from response delivery. API Gateway receives client requests and immediately queues them in SQS for background processing, returning a job identifier to the client. Lambda functions process messages from the queue asynchronously, and clients can poll a status endpoint to track progress. This architecture provides immediate response times, handles traffic spikes gracefully, and enables reliable processing of long-running tasks without client timeouts.
 
 ## Architecture Diagram
 
@@ -31,13 +31,11 @@ This solution implements an asynchronous API pattern using Amazon API Gateway an
 graph TB
     subgraph "Client Layer"
         CLIENT[Client Application]
-        WEBHOOK[Webhook Endpoint]
     end
     
     subgraph "API Gateway"
         API_SUBMIT[POST /submit]
         API_STATUS[GET /status/{jobId}]
-        API_WEBHOOK[POST /webhook]
     end
     
     subgraph "Message Queue"
@@ -48,7 +46,6 @@ graph TB
     subgraph "Processing Layer"
         LAMBDA_PROCESSOR[Job Processor Lambda]
         LAMBDA_STATUS[Status Check Lambda]
-        LAMBDA_WEBHOOK[Webhook Lambda]
     end
     
     subgraph "Storage"
@@ -61,12 +58,10 @@ graph TB
     SQS_MAIN -->|3. Process Job| LAMBDA_PROCESSOR
     LAMBDA_PROCESSOR -->|4. Update Status| DYNAMODB
     LAMBDA_PROCESSOR -->|5. Store Results| S3
-    LAMBDA_PROCESSOR -->|6. Send Notification| LAMBDA_WEBHOOK
-    LAMBDA_WEBHOOK -->|7. Notify Client| WEBHOOK
     
-    CLIENT -->|8. Check Status| API_STATUS
-    API_STATUS -->|9. Query Status| LAMBDA_STATUS
-    LAMBDA_STATUS -->|10. Read Status| DYNAMODB
+    CLIENT -->|6. Check Status| API_STATUS
+    API_STATUS -->|7. Query Status| LAMBDA_STATUS
+    LAMBDA_STATUS -->|8. Read Status| DYNAMODB
     
     SQS_MAIN -->|Failed Messages| SQS_DLQ
     
@@ -348,7 +343,7 @@ echo "✅ Created S3 bucket: ${RESULTS_BUCKET_NAME}"
    cat > /tmp/job-processor.py << 'EOF'
    import json
    import boto3
-   import uuid
+   import os
    import time
    from datetime import datetime, timezone
    
@@ -368,17 +363,14 @@ echo "✅ Created S3 bucket: ${RESULTS_BUCKET_NAME}"
                job_id = message_body['jobId']
                job_data = message_body['data']
                
-               # Update job status to processing
-               table.update_item(
-                   Key={'jobId': job_id},
-                   UpdateExpression='SET #status = :status, #updatedAt = :timestamp',
-                   ExpressionAttributeNames={
-                       '#status': 'status',
-                       '#updatedAt': 'updatedAt'
-                   },
-                   ExpressionAttributeValues={
-                       ':status': 'processing',
-                       ':timestamp': datetime.now(timezone.utc).isoformat()
+               # Create initial job record
+               table.put_item(
+                   Item={
+                       'jobId': job_id,
+                       'status': 'processing',
+                       'createdAt': datetime.now(timezone.utc).isoformat(),
+                       'updatedAt': datetime.now(timezone.utc).isoformat(),
+                       'data': job_data
                    }
                )
                
@@ -446,7 +438,7 @@ echo "✅ Created S3 bucket: ${RESULTS_BUCKET_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-job-processor \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler job-processor.lambda_handler \
        --zip-file fileb://job-processor.zip \
@@ -460,7 +452,7 @@ echo "✅ Created S3 bucket: ${RESULTS_BUCKET_NAME}"
    echo "✅ Created Job Processor Lambda function"
    ```
 
-   The job processor is now deployed and ready to handle incoming job requests. The function's error handling, status tracking, and result storage patterns provide a robust foundation for processing any type of long-running task in your asynchronous architecture.
+   The job processor is now deployed with Python 3.12 runtime and ready to handle incoming job requests. The function's error handling, status tracking, and result storage patterns provide a robust foundation for processing any type of long-running task in your asynchronous architecture.
 
 7. **Create Status Check Lambda Function**:
 
@@ -529,7 +521,7 @@ echo "✅ Created S3 bucket: ${RESULTS_BUCKET_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-status-checker \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler status-checker.lambda_handler \
        --zip-file fileb://status-checker.zip \
@@ -868,13 +860,13 @@ This asynchronous API pattern addresses several critical challenges in modern ap
 
 The architecture implements several best practices for reliable message processing. The dead letter queue captures failed messages for analysis and potential reprocessing, while the SQS visibility timeout and retry mechanism handle transient failures automatically. [DynamoDB's NoSQL design patterns](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-general-nosql-design.html) provide fast, scalable storage for job status tracking, enabling real-time status updates without impacting processing performance.
 
-Status polling represents a simple but effective approach for client-side job tracking. For applications requiring real-time updates, this pattern can be extended with WebSocket APIs or Server-Sent Events to push status changes to clients immediately. The webhook pattern demonstrated in the architecture diagram provides another option for server-initiated notifications.
+Status polling represents a simple but effective approach for client-side job tracking. For applications requiring real-time updates, this pattern can be extended with WebSocket APIs or Server-Sent Events to push status changes to clients immediately. The webhook pattern provides another option for server-initiated notifications when job processing completes.
+
+Performance optimization opportunities include implementing SQS FIFO queues for ordered processing, using Lambda reserved concurrency to control processing rates, and implementing exponential backoff for status polling to reduce API calls. Cost optimization can be achieved by using SQS batch operations, optimizing Lambda memory allocation based on actual usage patterns, and implementing DynamoDB on-demand billing for variable workloads.
 
 > **Tip**: Configure appropriate SQS message retention periods based on your processing SLAs. The default 14-day retention ensures messages aren't lost during extended outages, but shorter periods may be suitable for time-sensitive operations. Learn more about [SQS visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html) and [dead letter queue best practices](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/setting-up-dead-letter-queue-retention.html).
 
 > **Warning**: This pattern implements a polling-based status checking mechanism. For high-frequency status checks, consider implementing WebSocket connections or push notifications to reduce API Gateway costs and improve user experience.
-
-Performance optimization opportunities include implementing SQS FIFO queues for ordered processing, using Lambda reserved concurrency to control processing rates, and implementing exponential backoff for status polling to reduce API calls. Cost optimization can be achieved by using SQS batch operations, optimizing Lambda memory allocation based on actual usage patterns, and implementing DynamoDB on-demand billing for variable workloads.
 
 The pattern scales naturally with increased load. SQS handles millions of messages per second, Lambda scales automatically up to account limits, and DynamoDB scales seamlessly with demand. For extreme scale requirements, consider partitioning jobs across multiple queues or implementing priority-based processing using separate high and low priority queues.
 
@@ -894,4 +886,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

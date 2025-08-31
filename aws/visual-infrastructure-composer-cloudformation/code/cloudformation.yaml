@@ -1,0 +1,476 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Visual Infrastructure Design with Application Composer and CloudFormation
+  This template creates a static website using S3 bucket with website hosting,
+  demonstrating Infrastructure Composer capabilities for visual infrastructure design.
+  The template includes comprehensive security configurations and monitoring capabilities.
+
+# Metadata section provides additional information about the template
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Website Configuration"
+        Parameters:
+          - BucketName
+          - IndexDocument
+          - ErrorDocument
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableLogging
+          - EnableVersioning
+    ParameterLabels:
+      BucketName:
+        default: "S3 Bucket Name"
+      IndexDocument:
+        default: "Index Document"
+      ErrorDocument:
+        default: "Error Document"
+      Environment:
+        default: "Environment Type"
+      ProjectName:
+        default: "Project Name"
+      EnableLogging:
+        default: "Enable Access Logging"
+      EnableVersioning:
+        default: "Enable Bucket Versioning"
+
+# Parameters allow customization of the template during deployment
+Parameters:
+  BucketName:
+    Type: String
+    Description: >
+      Name for the S3 bucket hosting the static website. Must be globally unique.
+      Leave empty to auto-generate a unique name.
+    Default: ""
+    AllowedPattern: ^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: >
+      Bucket name must be empty (for auto-generation) or contain only lowercase letters, 
+      numbers, and hyphens. Must start and end with a letter or number.
+    MaxLength: 63
+    MinLength: 0
+
+  IndexDocument:
+    Type: String
+    Description: The name of the index document for the website
+    Default: index.html
+    AllowedPattern: ^[a-zA-Z0-9._-]+\.(html|htm)$
+    ConstraintDescription: Must be a valid HTML file name
+
+  ErrorDocument:
+    Type: String
+    Description: The name of the error document for the website
+    Default: error.html
+    AllowedPattern: ^[a-zA-Z0-9._-]+\.(html|htm)$
+    ConstraintDescription: Must be a valid HTML file name
+
+  Environment:
+    Type: String
+    Description: Environment type for resource tagging and configuration
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+    ConstraintDescription: Must be development, staging, or production
+
+  ProjectName:
+    Type: String
+    Description: Name of the project for resource tagging
+    Default: visual-infrastructure-demo
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+    MaxLength: 50
+    MinLength: 3
+
+  EnableLogging:
+    Type: String
+    Description: Enable S3 access logging for the website bucket
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  EnableVersioning:
+    Type: String
+    Description: Enable S3 versioning for the website bucket
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+# Conditions control resource creation based on parameter values
+Conditions:
+  # Create a unique bucket name if none provided
+  CreateBucketName: !Equals [!Ref BucketName, ""]
+  
+  # Enable logging based on parameter
+  LoggingEnabled: !Equals [!Ref EnableLogging, "true"]
+  
+  # Enable versioning based on parameter
+  VersioningEnabled: !Equals [!Ref EnableVersioning, "true"]
+  
+  # Production environment gets additional security features
+  IsProduction: !Equals [!Ref Environment, "production"]
+
+# Resources section defines the AWS infrastructure components
+Resources:
+  # S3 Bucket for hosting the static website
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateBucketName
+        - !Sub "${ProjectName}-website-${AWS::AccountId}-${AWS::Region}"
+        - !Ref BucketName
+      
+      # Configure static website hosting
+      WebsiteConfiguration:
+        IndexDocument: !Ref IndexDocument
+        ErrorDocument: !Ref ErrorDocument
+      
+      # Enable versioning if specified
+      VersioningConfiguration: !If
+        - VersioningEnabled
+        - Status: Enabled
+        - !Ref AWS::NoValue
+      
+      # Configure access logging if enabled
+      LoggingConfiguration: !If
+        - LoggingEnabled
+        - DestinationBucketName: !Ref LoggingBucket
+          LogFilePrefix: "access-logs/"
+        - !Ref AWS::NoValue
+      
+      # Configure public access block (allow public read for website)
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      
+      # Lifecycle configuration for cost optimization
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          
+          # For production, add intelligent tiering
+          - !If
+            - IsProduction
+            - Id: IntelligentTiering
+              Status: Enabled
+              Transitions:
+                - TransitionInDays: 30
+                  StorageClass: STANDARD_IA
+                - TransitionInDays: 90
+                  StorageClass: GLACIER
+            - !Ref AWS::NoValue
+      
+      # Server-side encryption for security
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      
+      # Notification configuration for monitoring (optional)
+      NotificationConfiguration: !If
+        - IsProduction
+        - CloudWatchConfigurations:
+            - Event: "s3:ObjectCreated:*"
+              CloudWatchConfiguration:
+                LogGroupName: !Ref WebsiteLogGroup
+        - !Ref AWS::NoValue
+      
+      # Resource tags for organization and cost tracking
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-website-bucket"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "Static Website Hosting"
+        - Key: CreatedBy
+          Value: "CloudFormation-Infrastructure-Composer"
+        - Key: ManagedBy
+          Value: "AWS CloudFormation"
+    
+    # Deletion policy to protect production data
+    DeletionPolicy: !If
+      - IsProduction
+      - Retain
+      - Delete
+    
+    UpdateReplacePolicy: !If
+      - IsProduction
+      - Retain
+      - Delete
+
+  # S3 Bucket Policy for public read access to website content
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow public read access to website objects
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub "${WebsiteBucket}/*"
+            # Add condition to deny access to sensitive files
+            Condition:
+              StringNotLike:
+                's3:prefix':
+                  - '*.log'
+                  - 'admin/*'
+                  - '.env*'
+                  - 'config/*'
+          
+          # Deny all access if secure transport is not used (HTTPS)
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: 
+              - !Sub "${WebsiteBucket}/*"
+              - !GetAtt WebsiteBucket.Arn
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # Optional: S3 Bucket for access logging (created only if logging is enabled)
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Condition: LoggingEnabled
+    Properties:
+      BucketName: !Sub "${ProjectName}-access-logs-${AWS::AccountId}-${AWS::Region}"
+      
+      # Configure lifecycle to manage log retention
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: !If
+              - IsProduction
+              - 365  # Keep logs for 1 year in production
+              - 30   # Keep logs for 30 days in non-production
+          
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      
+      # Server-side encryption for log files
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      
+      # Block all public access for logging bucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-access-logs"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "S3 Access Logging"
+        - Key: CreatedBy
+          Value: "CloudFormation-Infrastructure-Composer"
+
+  # CloudWatch Log Group for monitoring (production environments)
+  WebsiteLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsProduction
+    Properties:
+      LogGroupName: !Sub "/aws/s3/${ProjectName}-website"
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-website-logs"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for monitoring bucket size (production environments)
+  BucketSizeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub "${ProjectName}-bucket-size-alarm"
+      AlarmDescription: "Monitor S3 bucket size to detect unexpected growth"
+      MetricName: BucketSizeBytes
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 86400  # 24 hours
+      EvaluationPeriods: 1
+      Threshold: 1073741824  # 1 GB in bytes
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref WebsiteBucket
+        - Name: StorageType
+          Value: StandardStorage
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-bucket-size-alarm"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for monitoring 4xx errors (production environments)
+  WebsiteErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub "${ProjectName}-website-4xx-errors"
+      AlarmDescription: "Monitor 4xx errors on the static website"
+      MetricName: 4xxErrors
+      Namespace: AWS/S3
+      Statistic: Sum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref WebsiteBucket
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-4xx-error-alarm"
+        - Key: Environment
+          Value: !Ref Environment
+
+# Outputs provide important information about created resources
+Outputs:
+  # Website URL for accessing the static site
+  WebsiteURL:
+    Description: "URL of the static website hosted on S3"
+    Value: !Sub "http://${WebsiteBucket}.s3-website-${AWS::Region}.amazonaws.com"
+    Export:
+      Name: !Sub "${AWS::StackName}-WebsiteURL"
+
+  # Secure website URL (HTTPS)
+  SecureWebsiteURL:
+    Description: "Secure HTTPS URL for accessing S3 objects directly"
+    Value: !Sub "https://${WebsiteBucket}.s3.${AWS::Region}.amazonaws.com"
+    Export:
+      Name: !Sub "${AWS::StackName}-SecureWebsiteURL"
+
+  # S3 Bucket Name
+  BucketName:
+    Description: "Name of the S3 bucket hosting the website"
+    Value: !Ref WebsiteBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketName"
+
+  # S3 Bucket ARN
+  BucketArn:
+    Description: "ARN of the S3 bucket hosting the website"
+    Value: !GetAtt WebsiteBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketArn"
+
+  # S3 Bucket Domain Name
+  BucketDomainName:
+    Description: "Domain name of the S3 bucket"
+    Value: !GetAtt WebsiteBucket.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketDomainName"
+
+  # Regional domain name for the S3 bucket
+  BucketRegionalDomainName:
+    Description: "Regional domain name of the S3 bucket"
+    Value: !GetAtt WebsiteBucket.RegionalDomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketRegionalDomainName"
+
+  # Website domain for use in other templates
+  WebsiteDomain:
+    Description: "Domain name of the website endpoint"
+    Value: !Select [1, !Split ["//", !Sub "http://${WebsiteBucket}.s3-website-${AWS::Region}.amazonaws.com"]]
+    Export:
+      Name: !Sub "${AWS::StackName}-WebsiteDomain"
+
+  # Access logging bucket (if enabled)
+  LoggingBucketName:
+    Condition: LoggingEnabled
+    Description: "Name of the S3 bucket used for access logging"
+    Value: !Ref LoggingBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-LoggingBucketName"
+
+  # CloudWatch Log Group (if created)
+  LogGroupName:
+    Condition: IsProduction
+    Description: "Name of the CloudWatch Log Group for website monitoring"
+    Value: !Ref WebsiteLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroupName"
+
+  # Deployment information
+  DeploymentInfo:
+    Description: "Information about this deployment"
+    Value: !Sub |
+      Stack: ${AWS::StackName}
+      Region: ${AWS::Region}
+      Environment: ${Environment}
+      Project: ${ProjectName}
+      Bucket: ${WebsiteBucket}
+      Created: ${AWS::StackId}
+
+  # CLI commands for uploading content
+  UploadCommands:
+    Description: "AWS CLI commands to upload website content"
+    Value: !Sub |
+      # Upload index page:
+      aws s3 cp index.html s3://${WebsiteBucket}/
+      
+      # Upload error page:
+      aws s3 cp error.html s3://${WebsiteBucket}/
+      
+      # Upload entire directory:
+      aws s3 sync ./website-content/ s3://${WebsiteBucket}/ --delete
+      
+      # Set cache control for static assets:
+      aws s3 cp s3://${WebsiteBucket}/ s3://${WebsiteBucket}/ --recursive --metadata-directive REPLACE --cache-control "max-age=31536000" --exclude "*" --include "*.css" --include "*.js" --include "*.png" --include "*.jpg" --include "*.gif"
+
+  # Cleanup commands
+  CleanupCommands:
+    Description: "Commands to clean up resources"
+    Value: !Sub |
+      # Empty the bucket before deletion:
+      aws s3 rm s3://${WebsiteBucket} --recursive
+      
+      # Delete the CloudFormation stack:
+      aws cloudformation delete-stack --stack-name ${AWS::StackName}
+      
+      # Wait for stack deletion:
+      aws cloudformation wait stack-delete-complete --stack-name ${AWS::StackName}

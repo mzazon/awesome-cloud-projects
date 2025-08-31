@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Eventarc, Cloud Operations Suite, Cloud Functions, Cloud Run
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: incident-response, automation, monitoring, devops, event-driven
 recipe-generator-version: 1.3
@@ -266,13 +266,14 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-functions-framework==3.4.0
-google-cloud-pubsub==2.18.0
-google-cloud-monitoring==2.15.0
+functions-framework==3.5.0
+google-cloud-pubsub==2.20.0
+google-cloud-monitoring==2.16.0
 EOF
    
    # Deploy the triage function
    gcloud functions deploy ${TRIAGE_FUNCTION} \
+       --gen2 \
        --runtime=python311 \
        --source=. \
        --entry-point=triage_incident \
@@ -280,7 +281,8 @@ EOF
        --service-account=incident-response-sa@${PROJECT_ID}.iam.gserviceaccount.com \
        --memory=512MB \
        --timeout=540s \
-       --set-env-vars=GCP_PROJECT=${PROJECT_ID}
+       --set-env-vars=GCP_PROJECT=${PROJECT_ID} \
+       --region=${REGION}
    
    cd ../..
    echo "✅ Incident triage function deployed successfully"
@@ -296,6 +298,9 @@ EOF
    # Create notification function directory
    mkdir -p functions/notification
    cd functions/notification
+   
+   # Create additional Pub/Sub topic for notifications
+   gcloud pubsub topics create notification-topic
    
    # Create notification function code
    cat > main.py << 'EOF'
@@ -416,12 +421,13 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-functions-framework==3.4.0
-google-cloud-secret-manager==2.16.0
+functions-framework==3.5.0
+google-cloud-secret-manager==2.17.0
 EOF
    
    # Deploy notification function
    gcloud functions deploy ${NOTIFICATION_FUNCTION} \
+       --gen2 \
        --runtime=python311 \
        --source=. \
        --entry-point=send_notifications \
@@ -429,7 +435,8 @@ EOF
        --service-account=incident-response-sa@${PROJECT_ID}.iam.gserviceaccount.com \
        --memory=256MB \
        --timeout=300s \
-       --set-env-vars=GCP_PROJECT=${PROJECT_ID}
+       --set-env-vars=GCP_PROJECT=${PROJECT_ID} \
+       --region=${REGION}
    
    cd ../..
    echo "✅ Notification function deployed successfully"
@@ -445,6 +452,9 @@ EOF
    # Create remediation service directory
    mkdir -p services/remediation
    cd services/remediation
+   
+   # Create additional Pub/Sub topic for remediation
+   gcloud pubsub topics create remediation-topic
    
    # Create remediation service code
    cat > main.py << 'EOF'
@@ -598,9 +608,9 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-Flask==2.3.3
-google-cloud-compute==1.14.0
-google-cloud-monitoring==2.15.0
+Flask==3.0.0
+google-cloud-compute==1.15.0
+google-cloud-monitoring==2.16.0
 gunicorn==21.2.0
 EOF
    
@@ -630,6 +640,9 @@ EOF
    # Create escalation service directory
    mkdir -p services/escalation
    cd services/escalation
+   
+   # Create additional Pub/Sub topic for escalation
+   gcloud pubsub topics create escalation-topic
    
    # Create escalation service code
    cat > main.py << 'EOF'
@@ -816,7 +829,7 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-Flask==2.3.3
+Flask==3.0.0
 gunicorn==21.2.0
 EOF
    
@@ -843,10 +856,6 @@ EOF
    Eventarc provides the event routing infrastructure that connects Cloud Operations Suite monitoring alerts with the incident response services. Creating multiple triggers enables sophisticated event filtering and routing based on alert characteristics, ensuring each incident type is handled by the most appropriate response mechanism while maintaining loose coupling between system components.
 
    ```bash
-   # Create additional Pub/Sub topics for service-specific routing
-   gcloud pubsub topics create remediation-topic
-   gcloud pubsub topics create escalation-topic
-   
    # Create Eventarc trigger for Cloud Monitoring alerts
    gcloud eventarc triggers create monitoring-alert-trigger \
        --location=${REGION} \
@@ -995,7 +1004,7 @@ EOF
        --message='{"incident": {"incident_id": "test-001", "condition_name": "high_cpu_utilization", "resource_name": "test-vm"}, "timestamp": "2025-07-12T10:00:00Z"}'
    
    # Check Cloud Functions logs for triage processing
-   gcloud functions logs read ${TRIAGE_FUNCTION} --limit=10
+   gcloud functions logs read ${TRIAGE_FUNCTION} --limit=10 --region=${REGION}
    
    # Check Cloud Run service logs for remediation actions
    gcloud logs read "resource.type=cloud_run_revision AND resource.labels.service_name=${REMEDIATION_SERVICE}" \
@@ -1006,7 +1015,7 @@ EOF
 
    ```bash
    # Check notification function execution
-   gcloud functions logs read ${NOTIFICATION_FUNCTION} --limit=5
+   gcloud functions logs read ${NOTIFICATION_FUNCTION} --limit=5 --region=${REGION}
    
    # Verify escalation service responses
    gcloud logs read "resource.type=cloud_run_revision AND resource.labels.service_name=${ESCALATION_SERVICE}" \
@@ -1122,4 +1131,9 @@ Extend this incident response system by implementing these advanced capabilities
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

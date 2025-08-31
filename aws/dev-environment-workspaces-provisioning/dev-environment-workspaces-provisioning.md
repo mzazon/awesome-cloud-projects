@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: WorkSpaces, Systems Manager, Lambda, EventBridge
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, workspaces, automation, development, lambda, systems-manager
 recipe-generator-version: 1.3
@@ -277,7 +277,7 @@ echo "Lambda function: ${LAMBDA_FUNCTION_NAME}"
              "Write-Output 'Installing Chocolatey package manager...'",
              "Set-ExecutionPolicy Bypass -Scope Process -Force",
              "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072",
-             "iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))",
+             "iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))",
              "Write-Output 'Chocolatey installation completed'"
            ]
          }
@@ -544,7 +544,7 @@ echo "Lambda function: ${LAMBDA_FUNCTION_NAME}"
 
 6. **Deploy Lambda Function**:
 
-   Deploying the Lambda function establishes the core automation engine that responds to scheduled events or manual triggers. The function includes appropriate timeout settings for WorkSpaces operations and comprehensive error handling.
+   Deploying the Lambda function establishes the core automation engine that responds to scheduled events or manual triggers. The function uses Python 3.12 runtime for improved performance and includes appropriate timeout settings for WorkSpaces operations.
 
    ```bash
    # Get IAM role ARN
@@ -557,7 +557,7 @@ echo "Lambda function: ${LAMBDA_FUNCTION_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-deployment-package.zip \
@@ -644,7 +644,7 @@ echo "Lambda function: ${LAMBDA_FUNCTION_NAME}"
        --output table
    ```
 
-   Expected output: Function should show "Active" state with Python 3.9 runtime and 300-second timeout.
+   Expected output: Function should show "Active" state with Python 3.12 runtime and 300-second timeout.
 
 2. Test Systems Manager document functionality:
 
@@ -764,32 +764,39 @@ echo "Lambda function: ${LAMBDA_FUNCTION_NAME}"
 
 ## Discussion
 
-This automated WorkSpaces provisioning solution demonstrates the power of serverless automation for managing development environments at scale. By combining Lambda's event-driven architecture with Systems Manager's configuration management capabilities, organizations can achieve consistent, secure, and cost-effective development environment provisioning.
+This automated WorkSpaces provisioning solution demonstrates the power of serverless automation for managing development environments at scale. By combining Lambda's event-driven architecture with Systems Manager's configuration management capabilities, organizations can achieve consistent, secure, and cost-effective development environment provisioning that follows AWS Well-Architected Framework principles.
 
-The solution addresses several critical challenges in development environment management. Traditional manual provisioning processes often lead to configuration drift, security vulnerabilities, and significant time overhead. This automated approach ensures that all development environments are provisioned from approved base images with standardized tool installations and security configurations, following AWS Well-Architected Framework principles for operational excellence.
+The solution addresses several critical challenges in development environment management. Traditional manual provisioning processes often lead to configuration drift, security vulnerabilities, and significant time overhead. This automated approach ensures that all development environments are provisioned from approved base images with standardized tool installations and security configurations, reducing the risk of inconsistencies that can impact productivity and security posture.
 
-WorkSpaces Personal provides the ideal foundation for developer workstations because it offers persistent storage, customizable configurations, and the ability to install specialized development tools. Unlike non-persistent solutions, developers can maintain their personalized settings, installed applications, and local development data across sessions, improving productivity and user satisfaction.
+WorkSpaces Personal provides the ideal foundation for developer workstations because it offers persistent storage, customizable configurations, and the ability to install specialized development tools. Unlike non-persistent solutions, developers can maintain their personalized settings, installed applications, and local development data across sessions, improving productivity and user satisfaction while maintaining centralized security and compliance controls.
 
-The integration with Active Directory enables organizations to leverage existing identity management workflows. When developers join or leave teams, their WorkSpaces access is automatically managed through standard directory group membership processes, reducing administrative overhead and ensuring appropriate access controls. For more information on WorkSpaces directory integration, see the [AWS WorkSpaces Administration Guide](https://docs.aws.amazon.com/workspaces/latest/adminguide/manage-workspaces-directory.html).
+The integration with Active Directory enables organizations to leverage existing identity management workflows and security policies. When developers join or leave teams, their WorkSpaces access is automatically managed through standard directory group membership processes, reducing administrative overhead and ensuring appropriate access controls. For more information on WorkSpaces directory integration, see the [AWS WorkSpaces Administration Guide](https://docs.aws.amazon.com/workspaces/latest/adminguide/manage-workspaces-directory.html).
 
-Systems Manager Automation provides powerful configuration management capabilities that ensure consistent development environment setup across all provisioned WorkSpaces. The SSM documents can be versioned, tested, and deployed systematically, enabling infrastructure as code practices for desktop environment management. Additional information on automation best practices can be found in the [AWS Systems Manager User Guide](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-automation.html).
+Systems Manager Automation provides powerful configuration management capabilities that ensure consistent development environment setup across all provisioned WorkSpaces. The SSM documents can be versioned, tested, and deployed systematically, enabling infrastructure as code practices for desktop environment management. This approach allows teams to maintain development environment consistency while adapting to changing technology requirements. Additional information on automation best practices can be found in the [AWS Systems Manager User Guide](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-automation.html).
 
-> **Tip**: Consider implementing cost optimization by using Auto-Stop WorkSpaces that automatically shut down during non-business hours. This can reduce costs by up to 80% for developers who don't need 24/7 access to their development environments.
+> **Tip**: Consider implementing cost optimization by using Auto-Stop WorkSpaces that automatically shut down during non-business hours. This configuration, already implemented in the Lambda function, can reduce costs by up to 80% for developers who don't need 24/7 access to their development environments.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Team Environment Support**: Modify the Lambda function to support multiple development teams with different bundle configurations and tool sets. Implement team-specific Active Directory groups and corresponding WorkSpaces bundles for frontend, backend, and data science teams.
+1. **Multi-Team Environment Support**: Modify the Lambda function to support multiple development teams with different bundle configurations and tool sets. Implement team-specific Active Directory groups and corresponding WorkSpaces bundles for frontend, backend, and data science teams with customized development tool installations.
 
-2. **Advanced Configuration Management**: Integrate with AWS Config to monitor WorkSpaces compliance and automatically remediate configuration drift. Implement custom Config rules that verify development tool versions and security configurations.
+2. **Advanced Configuration Management**: Integrate with AWS Config to monitor WorkSpaces compliance and automatically remediate configuration drift. Implement custom Config rules that verify development tool versions, security configurations, and compliance with organizational policies.
 
-3. **Cost Optimization Dashboard**: Build a CloudWatch dashboard that tracks WorkSpaces usage patterns and costs per team. Implement automated recommendations for right-sizing bundles based on actual resource utilization data collected through CloudWatch metrics.
+3. **Cost Optimization Dashboard**: Build a CloudWatch dashboard that tracks WorkSpaces usage patterns and costs per team. Implement automated recommendations for right-sizing bundles based on actual resource utilization data collected through CloudWatch metrics and WorkSpaces connection logs.
 
-4. **Self-Service Portal**: Create a web-based self-service portal using AWS Amplify that allows developers to request specific development environments, track provisioning status, and manage their WorkSpaces lifecycle through a user-friendly interface.
+4. **Self-Service Portal**: Create a web-based self-service portal using AWS Amplify that allows developers to request specific development environments, track provisioning status, and manage their WorkSpaces lifecycle through a user-friendly interface with approval workflows.
 
-5. **Backup and Disaster Recovery**: Implement automated backup strategies using WorkSpaces Personal backup capabilities and cross-region replication for critical development environments, ensuring business continuity and data protection.
+5. **Backup and Disaster Recovery**: Implement automated backup strategies using WorkSpaces Personal backup capabilities and cross-region replication for critical development environments, ensuring business continuity and data protection with automated recovery procedures.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Gmail API, Cloud Scheduler, Cloud Functions, Cloud Storage
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: email-automation, workflow-orchestration, api-integration, scheduled-tasks
 recipe-generator-version: 1.3
@@ -265,14 +265,14 @@ def generate_personalization(purchase_history):
     }
 EOF
    
-   # Create requirements file
+   # Create requirements file with current stable versions
    cat > requirements.txt << 'EOF'
-google-cloud-storage==2.10.0
-google-cloud-bigquery==3.11.4
-functions-framework==3.4.0
+google-cloud-storage==2.17.0
+google-cloud-bigquery==3.21.0
+functions-framework==3.5.0
 EOF
    
-   # Deploy the function
+   # Deploy the function with Python 3.9 runtime
    gcloud functions deploy ${FUNCTION_NAME}-generator \
        --runtime python39 \
        --trigger-http \
@@ -431,17 +431,17 @@ def update_analytics(sent_count, failed_count):
     logging.info(f"Campaign analytics: {sent_count} sent, {failed_count} failed")
 EOF
    
-   # Create requirements file
+   # Create requirements file with current stable versions
    cat > requirements.txt << 'EOF'
-google-cloud-storage==2.10.0
-google-auth==2.21.0
-google-auth-oauthlib==1.0.0
-google-auth-httplib2==0.1.0
-google-api-python-client==2.88.0
-functions-framework==3.4.0
+google-cloud-storage==2.17.0
+google-auth==2.29.0
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.126.0
+functions-framework==3.5.0
 EOF
    
-   # Deploy the function
+   # Deploy the function with Python 3.9 runtime
    gcloud functions deploy ${FUNCTION_NAME}-sender \
        --runtime python39 \
        --trigger-http \
@@ -663,14 +663,14 @@ def generate_insights(open_rate, click_rate):
     return insights
 EOF
    
-   # Create requirements file
+   # Create requirements file with current stable versions
    cat > requirements.txt << 'EOF'
-google-cloud-bigquery==3.11.4
-google-cloud-monitoring==2.15.1
-functions-framework==3.4.0
+google-cloud-bigquery==3.21.0
+google-cloud-monitoring==2.20.0
+functions-framework==3.5.0
 EOF
    
-   # Deploy the function
+   # Deploy the function with Python 3.9 runtime
    gcloud functions deploy ${FUNCTION_NAME}-analytics \
        --runtime python39 \
        --trigger-http \
@@ -943,4 +943,9 @@ Extend this email campaign automation system by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud WAN, Network Intelligence Center, Cloud Monitoring, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: network-optimization, cloud-wan, network-intelligence, automation, enterprise-networking, performance-monitoring
 recipe-generator-version: 1.3
@@ -132,6 +132,8 @@ gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable pubsub.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable compute.googleapis.com
+gcloud services enable cloudbuild.googleapis.com
+gcloud services enable eventarc.googleapis.com
 
 # Create a Cloud Storage bucket for function code and data
 gsutil mb -p ${PROJECT_ID} \
@@ -205,16 +207,19 @@ echo "Storage Bucket: ${BUCKET_NAME}"
    ```bash
    # Create Cloud Monitoring metrics for network performance tracking
    cat > network_metrics.yaml << 'EOF'
-   displayName: "Network Performance Metrics"
-   combiner: COMBINE_MEAN
-   conditions:
-     - displayName: "High Latency Alert"
-       conditionThreshold:
-         filter: 'resource.type="gce_instance"'
-         comparison: COMPARISON_GREATER_THAN
-         thresholdValue: 100
-         duration: "60s"
-   EOF
+displayName: "Network Performance Metrics"
+combiner: OR
+conditions:
+  - displayName: "High Latency Alert"
+    conditionThreshold:
+      filter: 'resource.type="gce_instance"'
+      comparison: COMPARISON_GREATER_THAN
+      thresholdValue: 100
+      duration: "60s"
+notificationChannels: []
+alertStrategy:
+  autoClose: "1800s"
+EOF
    
    # Apply the monitoring configuration
    gcloud alpha monitoring policies create --policy-from-file=network_metrics.yaml
@@ -237,11 +242,12 @@ echo "Storage Bucket: ${BUCKET_NAME}"
 import functions_framework
 import json
 import logging
+import time
+import os
 from google.cloud import monitoring_v3
 from google.cloud import networkmanagement_v1
 from google.cloud import pubsub_v1
 import base64
-import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -378,40 +384,39 @@ def optimize_routing(network_client):
     # Implementation would include actual routing optimization logic
     # This is a simplified example for demonstration
     logger.info("Optimizing network routing for improved latency")
-    pass
 
 def scale_bandwidth():
     """
     Scale network bandwidth based on current demand.
     """
     logger.info("Scaling network bandwidth to meet demand")
-    pass
 
 def activate_failover():
     """
     Activate failover mechanisms for improved reliability.
     """
     logger.info("Activating network failover mechanisms")
-    pass
 EOF
    
    # Create requirements.txt for the function dependencies
    cat > requirements.txt << 'EOF'
-functions-framework==3.2.0
-google-cloud-monitoring==2.11.1
-google-cloud-network-management==1.5.1
-google-cloud-pubsub==2.18.1
+functions-framework==3.8.3
+google-cloud-monitoring==2.23.1
+google-cloud-network-management==1.9.1
+google-cloud-pubsub==2.24.0
 EOF
    
    # Deploy the Cloud Function
    gcloud functions deploy ${FUNCTION_NAME} \
        --gen2 \
-       --runtime=python39 \
+       --runtime=python311 \
        --region=${REGION} \
        --source=. \
        --entry-point=optimize_network \
        --trigger-topic=${TOPIC_NAME} \
-       --set-env-vars="GCP_PROJECT=${PROJECT_ID}"
+       --set-env-vars="GCP_PROJECT=${PROJECT_ID}" \
+       --memory=256MB \
+       --timeout=60s
    
    cd ..
    
@@ -430,19 +435,19 @@ EOF
    
    # Create a Cloud Monitoring policy for Network Analyzer insights
    cat > network_analyzer_policy.yaml << 'EOF'
-   displayName: "Network Analyzer Alerts"
-   combiner: OR
-   conditions:
-     - displayName: "Network Configuration Issue"
-       conditionThreshold:
-         filter: 'resource.type="network_analyzer"'
-         comparison: COMPARISON_GREATER_THAN
-         thresholdValue: 0
-         duration: "60s"
-   notificationChannels: []
-   alertStrategy:
-     autoClose: "1800s"
-   EOF
+displayName: "Network Analyzer Alerts"
+combiner: OR
+conditions:
+  - displayName: "Network Configuration Issue"
+    conditionThreshold:
+      filter: 'resource.type="gce_network"'
+      comparison: COMPARISON_GREATER_THAN
+      thresholdValue: 0
+      duration: "60s"
+notificationChannels: []
+alertStrategy:
+  autoClose: "1800s"
+EOF
    
    # Apply the Network Analyzer monitoring policy
    gcloud alpha monitoring policies create --policy-from-file=network_analyzer_policy.yaml
@@ -469,9 +474,10 @@ EOF
    cat > flow_analyzer.py << 'EOF'
 import functions_framework
 import logging
+import os
+import json
 from google.cloud import bigquery
 from google.cloud import pubsub_v1
-import json
 
 logger = logging.getLogger(__name__)
 
@@ -484,22 +490,21 @@ def analyze_traffic_flows(request):
         # Initialize BigQuery client for flow log analysis
         bq_client = bigquery.Client()
         
-        # Query to analyze traffic patterns
+        # Query to analyze traffic patterns (simplified for demonstration)
         query = """
         SELECT
-            src_ip,
-            dest_ip,
-            protocol,
-            AVG(bytes_sent) as avg_bytes,
-            COUNT(*) as connection_count,
-            AVG(rtt_msec) as avg_latency
-        FROM `{project}.vpc_flows.{table}`
-        WHERE _PARTITIONTIME >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+            jsonPayload.src_ip as src_ip,
+            jsonPayload.dest_ip as dest_ip,
+            jsonPayload.protocol as protocol,
+            AVG(CAST(jsonPayload.bytes_sent AS INT64)) as avg_bytes,
+            COUNT(*) as connection_count
+        FROM `{project}.compute_googleapis_com_vpc_flows`
+        WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
         GROUP BY src_ip, dest_ip, protocol
-        HAVING avg_latency > 100 OR connection_count > 1000
-        ORDER BY avg_latency DESC
+        HAVING connection_count > 1000
+        ORDER BY connection_count DESC
         LIMIT 100
-        """.format(project=os.environ.get('GCP_PROJECT'), table='vpc_flow_logs')
+        """.format(project=os.environ.get('GCP_PROJECT'))
         
         # Execute the analysis query
         query_job = bq_client.query(query)
@@ -508,13 +513,13 @@ def analyze_traffic_flows(request):
         # Process flow analysis results
         optimization_opportunities = []
         for row in results:
-            if row.avg_latency > 150:  # High latency threshold
+            if row.connection_count > 1500:  # High connection threshold
                 optimization_opportunities.append({
-                    "type": "high_latency_flow",
+                    "type": "high_connection_flow",
                     "src_ip": row.src_ip,
                     "dest_ip": row.dest_ip,
-                    "latency": row.avg_latency,
-                    "recommendation": "route_optimization"
+                    "connection_count": row.connection_count,
+                    "recommendation": "bandwidth_optimization"
                 })
         
         # Publish optimization opportunities to Pub/Sub
@@ -540,12 +545,14 @@ EOF
    # Deploy the flow analyzer function
    gcloud functions deploy flow-analyzer-${RANDOM_SUFFIX} \
        --gen2 \
-       --runtime=python39 \
+       --runtime=python311 \
        --region=${REGION} \
        --source=. \
        --entry-point=analyze_traffic_flows \
        --trigger-http \
-       --set-env-vars="GCP_PROJECT=${PROJECT_ID},TOPIC_NAME=${TOPIC_NAME}"
+       --set-env-vars="GCP_PROJECT=${PROJECT_ID},TOPIC_NAME=${TOPIC_NAME}" \
+       --memory=512MB \
+       --timeout=120s
    
    echo "✅ Flow Analyzer configured for traffic pattern analysis"
    ```
@@ -590,10 +597,10 @@ EOF
    cat > firewall_optimization.py << 'EOF'
 import functions_framework
 import logging
+import os
+import json
 from google.cloud import compute_v1
 from google.cloud import pubsub_v1
-import json
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -653,12 +660,14 @@ EOF
    # Deploy the firewall optimization function
    gcloud functions deploy firewall-optimizer-${RANDOM_SUFFIX} \
        --gen2 \
-       --runtime=python39 \
+       --runtime=python311 \
        --region=${REGION} \
        --source=. \
        --entry-point=optimize_firewall_rules \
        --trigger-http \
-       --set-env-vars="GCP_PROJECT=${PROJECT_ID},TOPIC_NAME=${TOPIC_NAME}"
+       --set-env-vars="GCP_PROJECT=${PROJECT_ID},TOPIC_NAME=${TOPIC_NAME}" \
+       --memory=256MB \
+       --timeout=60s
    
    echo "✅ Firewall Insights configured for security optimization"
    ```
@@ -715,7 +724,7 @@ EOF
    # Trigger flow analysis manually
    FLOW_ANALYZER_URL=$(gcloud functions describe flow-analyzer-${RANDOM_SUFFIX} \
        --region=${REGION} \
-       --format="value(httpsTrigger.url)")
+       --format="value(serviceConfig.uri)")
    
    curl -X GET "${FLOW_ANALYZER_URL}"
    ```
@@ -804,23 +813,21 @@ EOF
 
 This intelligent network performance optimization solution demonstrates the power of combining Google Cloud WAN's global infrastructure with Network Intelligence Center's AI-powered insights to create a self-healing network operations system. The architecture leverages multiple Google Cloud services working in harmony: Cloud WAN provides the high-performance global network backbone, Network Intelligence Center delivers comprehensive visibility and analysis, Cloud Functions enable serverless automation, and Cloud Monitoring ensures continuous oversight.
 
-The solution addresses common enterprise networking challenges through proactive intelligence rather than reactive troubleshooting. By automatically analyzing connectivity tests, traffic flow patterns, firewall configurations, and performance metrics, the system can identify optimization opportunities and implement corrective actions before issues impact end users. This approach significantly reduces mean time to resolution (MTTR) and improves overall network reliability.
+The solution addresses common enterprise networking challenges through proactive intelligence rather than reactive troubleshooting. By automatically analyzing connectivity tests, traffic flow patterns, firewall configurations, and performance metrics, the system can identify optimization opportunities and implement corrective actions before issues impact end users. This approach significantly reduces mean time to resolution (MTTR) and improves overall network reliability while following Google Cloud's best practices for security and performance.
 
-The serverless architecture ensures that optimization logic scales automatically with network complexity and event volume, while the event-driven design enables real-time responses to changing network conditions. The integration of multiple Network Intelligence Center modules—Connectivity Tests, Flow Analyzer, Performance Dashboard, Network Analyzer, and Firewall Insights—provides comprehensive coverage of network health aspects, creating a holistic optimization strategy.
+The serverless architecture ensures that optimization logic scales automatically with network complexity and event volume, while the event-driven design enables real-time responses to changing network conditions. The integration of multiple Network Intelligence Center modules—Connectivity Tests, Flow Analyzer, Performance Dashboard, Network Analyzer, and Firewall Insights—provides comprehensive coverage of network health aspects, creating a holistic optimization strategy that adheres to the Google Cloud Architecture Framework principles.
 
-Key benefits include automated remediation workflows that reduce operational overhead, intelligent routing optimizations that improve application performance, and proactive issue detection that prevents outages. The solution also provides detailed audit trails and reporting capabilities, enabling network teams to understand optimization decisions and continuously improve their infrastructure strategy.
+Key benefits include automated remediation workflows that reduce operational overhead, intelligent routing optimizations that improve application performance, and proactive issue detection that prevents outages. The solution also provides detailed audit trails and reporting capabilities, enabling network teams to understand optimization decisions and continuously improve their infrastructure strategy based on Google Cloud's operational excellence patterns.
 
-> **Tip**: Consider implementing custom machine learning models to enhance optimization decision-making based on historical network performance data and business-specific traffic patterns.
-
-### Official Documentation References
+> **Tip**: Consider implementing custom machine learning models using Vertex AI to enhance optimization decision-making based on historical network performance data and business-specific traffic patterns, following Google Cloud's AI/ML best practices.
 
 For deeper understanding and advanced configurations, refer to these official Google Cloud resources:
 
-- [Cloud WAN Documentation](https://cloud.google.com/solutions/cross-cloud-network) - Comprehensive guide to Google's managed global WAN solution
-- [Network Intelligence Center Overview](https://cloud.google.com/network-intelligence-center/docs) - Complete documentation for all NIC modules and capabilities  
+- [Network Intelligence Center Overview](https://cloud.google.com/network-intelligence-center/docs) - Complete documentation for all NIC modules and capabilities
 - [Connectivity Tests Guide](https://cloud.google.com/network-intelligence-center/docs/connectivity-tests/concepts/overview) - Detailed information on network path validation and troubleshooting
 - [Flow Analyzer Documentation](https://cloud.google.com/network-intelligence-center/docs/flow-analyzer/overview) - Guide to VPC Flow Logs analysis and traffic optimization
 - [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) - Best practices for designing resilient and efficient cloud architectures
+- [Cloud Functions Best Practices](https://cloud.google.com/functions/docs/bestpractices) - Optimization guidelines for serverless function development
 
 ## Challenge
 
@@ -838,4 +845,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

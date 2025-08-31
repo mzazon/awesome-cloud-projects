@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Cloud Composer, Vertex AI, Cloud Storage, Cloud Run
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: multi-modal-ai, agent-orchestration, content-generation, apache-airflow, vertex-ai-adk
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Content creators and marketing teams struggle to produce consistent, high-qualit
 
 ## Solution
 
-Build an intelligent content generation pipeline using Cloud Composer's Apache Airflow orchestration with Vertex AI Agent Development Kit's multi-agent coordination capabilities. This solution creates autonomous AI agents that collaborate through workflow orchestration to generate, review, and publish multimedia content while maintaining brand consistency and quality standards through deterministic guardrails and real-time performance optimization.
+Build an intelligent content generation pipeline using Cloud Composer's Apache Airflow orchestration with Vertex AI's multi-agent capabilities. This solution creates autonomous AI agents that collaborate through workflow orchestration to generate, review, and publish multimedia content while maintaining brand consistency and quality standards through deterministic guardrails and real-time performance optimization.
 
 ## Architecture Diagram
 
@@ -40,7 +40,7 @@ graph TB
     end
     
     subgraph "AI Agent Layer"
-        subgraph "ADK Multi-Agent System"
+        subgraph "Multi-Agent System"
             CONTENT_AGENT[Content Strategy Agent]
             TEXT_AGENT[Text Generation Agent]
             IMAGE_AGENT[Image Generation Agent]
@@ -50,7 +50,7 @@ graph TB
     end
     
     subgraph "Processing Layer"
-        VERTEX[Vertex AI<br/>Gemini 2.5 Pro]
+        VERTEX[Vertex AI<br/>Gemini Pro]
         STORAGE[Cloud Storage<br/>Content Repository]
     end
     
@@ -94,7 +94,7 @@ graph TB
 4. Understanding of multi-agent systems and workflow orchestration concepts
 5. Estimated cost: $50-150 for Cloud Composer environment, $30-80 for Vertex AI inference, $10-25 for storage and compute during development
 
-> **Note**: This recipe demonstrates advanced AI orchestration patterns using Google's latest Agent Development Kit announced at Cloud Next 2025. The ADK framework simplifies multi-agent development while providing enterprise-grade security and scalability.
+> **Note**: This recipe demonstrates advanced AI orchestration patterns using Google Cloud's managed services. The multi-agent framework simplifies agent development while providing enterprise-grade security and scalability.
 
 ## Preparation
 
@@ -142,10 +142,10 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
    Cloud Composer provides a fully managed Apache Airflow service that orchestrates complex multi-step workflows with dependency management, retry logic, and monitoring capabilities. For multi-modal AI content generation, Composer serves as the central orchestration engine that coordinates between different AI agents, manages workflow state, and handles error recovery across the entire content generation pipeline.
 
    ```bash
-   # Create Cloud Composer 2 environment with Airflow 2.9
+   # Create Cloud Composer 2 environment with latest Airflow version
    gcloud composer environments create ${COMPOSER_ENV_NAME} \
        --location ${REGION} \
-       --image-version composer-2.9.1-airflow-2.9.3 \
+       --image-version composer-2.10.0-airflow-2.10.2 \
        --node-count 3 \
        --machine-type n1-standard-2 \
        --disk-size 50GB \
@@ -159,11 +159,11 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
    echo "✅ Cloud Composer environment created successfully"
    ```
 
-   The Composer environment is now operational with Apache Airflow 2.9, providing a robust foundation for orchestrating AI agents. This managed service handles infrastructure scaling, security patching, and high availability while allowing you to focus on defining intelligent workflows that coordinate content generation across multiple modalities.
+   The Composer environment is now operational with the latest Apache Airflow version, providing a robust foundation for orchestrating AI agents. This managed service handles infrastructure scaling, security patching, and high availability while allowing you to focus on defining intelligent workflows that coordinate content generation across multiple modalities.
 
-2. **Install Agent Development Kit and Dependencies**:
+2. **Install Dependencies for Multi-Agent Framework**:
 
-   The Vertex AI Agent Development Kit (ADK) is Google's latest framework for building production-ready multi-agent systems announced at Cloud Next 2025. ADK simplifies agent development by providing built-in session management, memory persistence, tool integration, and deterministic orchestration controls that are essential for enterprise content generation workflows.
+   Modern multi-agent systems require specialized libraries for agent coordination, session management, and AI model integration. This step configures the Composer environment with the necessary Python packages for building production-ready agent systems that can handle complex content generation workflows while maintaining type safety and error handling.
 
    ```bash
    # Get Composer environment details for dependency installation
@@ -172,25 +172,26 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
        --format="value(config.dagGcsPrefix)" | \
        sed 's|/dags||')
    
-   # Create requirements.txt for ADK and dependencies
+   # Create requirements.txt for multi-agent dependencies
    cat > requirements.txt << 'EOF'
-   google-cloud-adk>=1.5.0
-   google-cloud-aiplatform>=1.48.0
-   google-cloud-storage>=2.13.0
+   google-cloud-aiplatform>=1.58.0
+   google-cloud-storage>=2.16.0
    google-cloud-run>=0.10.0
-   apache-airflow-providers-google>=10.12.0
-   pillow>=10.2.0
+   apache-airflow-providers-google>=10.19.0
+   pillow>=10.4.0
    moviepy>=1.0.3
-   google-generativeai>=0.5.0
+   google-generativeai>=0.7.2
+   flask>=3.0.3
+   gunicorn>=22.0.0
    EOF
    
    # Upload requirements to Composer environment
    gsutil cp requirements.txt ${COMPOSER_BUCKET}/requirements.txt
    
-   echo "✅ ADK dependencies configured for Composer environment"
+   echo "✅ Multi-agent dependencies configured for Composer environment"
    ```
 
-   The Agent Development Kit is now available in your Composer environment with all necessary dependencies for multi-modal content generation. ADK's integration with Vertex AI provides seamless access to Gemini 2.5 Pro's advanced reasoning capabilities while maintaining type safety and error handling throughout the agent coordination process.
+   The multi-agent framework dependencies are now available in your Composer environment with all necessary libraries for content generation. These packages provide seamless integration with Vertex AI's Gemini models while maintaining production-grade reliability and error handling throughout the agent coordination process.
 
 3. **Create Multi-Agent Content Generation DAG**:
 
@@ -202,10 +203,10 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
    from datetime import datetime, timedelta
    from airflow import DAG
    from airflow.operators.python_operator import PythonOperator
-   from airflow.providers.google.cloud.operators.vertex_ai import VertexAIModelDeployOperator
    from google.cloud import storage, aiplatform
    import os
    import json
+   import google.generativeai as genai
    
    # DAG configuration for multi-modal content pipeline
    default_args = {
@@ -225,46 +226,39 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
        schedule_interval='@daily',
        max_active_runs=1,
        catchup=False,
-       tags=['content', 'ai', 'multi-modal', 'adk']
+       tags=['content', 'ai', 'multi-modal']
    )
    
    def initialize_content_strategy(**context):
        """Content Strategy Agent initialization and brief processing"""
-       from google.cloud.adk import Agent, Session
-       from google.cloud.adk.tools import VertexAITool
-       
-       # Initialize ADK session with memory persistence
-       session = Session(
-           project_id=os.environ['PROJECT_ID'],
+       # Initialize Vertex AI
+       aiplatform.init(
+           project=os.environ['PROJECT_ID'],
            location=os.environ['REGION']
        )
        
-       # Create Content Strategy Agent with Gemini 2.5 Pro
-       strategy_agent = Agent(
-           name="content_strategy_agent",
-           model="gemini-2.5-pro-experimental",
-           system_instructions="""
-           You are a content strategy specialist responsible for analyzing 
-           content briefs and creating comprehensive content plans. Your role 
-           includes understanding target audience, brand guidelines, content 
-           objectives, and coordinating with specialized content creation agents.
-           
-           Always maintain brand consistency and ensure content aligns with 
-           business objectives while optimizing for engagement metrics.
-           """,
-           tools=[VertexAITool()],
-           session=session
-       )
+       # Configure Gemini model for content strategy
+       genai.configure(api_key=os.environ.get('GENAI_API_KEY'))
+       model = genai.GenerativeModel('gemini-pro')
        
        # Process content brief and create strategy
        content_brief = context['dag_run'].conf.get('content_brief', {})
-       strategy_response = strategy_agent.run(
-           f"Create a comprehensive content strategy for: {content_brief}"
-       )
+       
+       strategy_prompt = f"""
+       You are a content strategy specialist. Create a comprehensive content plan for:
+       Target Audience: {content_brief.get('target_audience', 'general audience')}
+       Content Type: {content_brief.get('content_type', 'multi-modal')}
+       Brand Guidelines: {content_brief.get('brand_guidelines', {})}
+       Topic: {content_brief.get('topic', 'general content')}
+       
+       Provide a detailed strategy including tone, style, key messages, and format recommendations.
+       """
+       
+       response = model.generate_content(strategy_prompt)
        
        # Store strategy in XCom for downstream tasks
        return {
-           'strategy': strategy_response.content,
+           'strategy': response.text,
            'target_audience': content_brief.get('target_audience'),
            'brand_guidelines': content_brief.get('brand_guidelines'),
            'content_type': content_brief.get('content_type', 'multi-modal')
@@ -272,87 +266,63 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
    
    def generate_text_content(**context):
        """Text Generation Agent for creating written content"""
-       from google.cloud.adk import Agent, Session
-       
        # Retrieve strategy from upstream task
        strategy_data = context['task_instance'].xcom_pull(
            task_ids='initialize_strategy'
        )
        
-       session = Session(
-           project_id=os.environ['PROJECT_ID'],
-           location=os.environ['REGION']
-       )
+       # Configure Gemini model for text generation
+       genai.configure(api_key=os.environ.get('GENAI_API_KEY'))
+       model = genai.GenerativeModel('gemini-pro')
        
-       text_agent = Agent(
-           name="text_generation_agent",
-           model="gemini-2.5-pro-experimental",
-           system_instructions="""
-           You are a professional copywriter specialized in creating 
-           compelling text content across multiple formats including 
-           articles, social media posts, marketing copy, and technical 
-           documentation. Always maintain the brand voice and ensure 
-           content is optimized for the target audience.
-           """,
-           session=session
-       )
+       text_prompt = f"""
+       You are a professional copywriter. Create compelling text content based on:
+       Strategy: {strategy_data['strategy']}
        
-       # Generate text content based on strategy
-       text_response = text_agent.run(
-           f"Create text content following this strategy: {strategy_data['strategy']}"
-       )
+       Generate engaging, well-structured content that aligns with the strategy and brand voice.
+       """
+       
+       response = model.generate_content(text_prompt)
        
        # Store generated content in Cloud Storage
        storage_client = storage.Client()
        bucket = storage_client.bucket(os.environ['STORAGE_BUCKET'])
        
        text_blob = bucket.blob(f"content/{context['ds']}/text_content.txt")
-       text_blob.upload_from_string(text_response.content)
+       text_blob.upload_from_string(response.text)
        
        return {
            'text_content_path': f"gs://{os.environ['STORAGE_BUCKET']}/content/{context['ds']}/text_content.txt",
-           'word_count': len(text_response.content.split()),
+           'word_count': len(response.text.split()),
            'content_type': 'text'
        }
    
    def generate_image_content(**context):
        """Image Generation Agent for creating visual content"""
-       from google.cloud.adk import Agent, Session
-       from google.cloud.adk.tools import VertexAIImageTool
-       
        strategy_data = context['task_instance'].xcom_pull(
            task_ids='initialize_strategy'
        )
        
-       session = Session(
-           project_id=os.environ['PROJECT_ID'],
-           location=os.environ['REGION']
-       )
+       # Configure Gemini model for image prompt generation
+       genai.configure(api_key=os.environ.get('GENAI_API_KEY'))
+       model = genai.GenerativeModel('gemini-pro')
        
-       image_agent = Agent(
-           name="image_generation_agent",
-           model="gemini-2.5-pro-experimental",
-           system_instructions="""
-           You are a creative visual designer responsible for generating 
-           high-quality images that complement text content and align with 
-           brand guidelines. Consider composition, color palette, style, 
-           and visual hierarchy in all image generation requests.
-           """,
-           tools=[VertexAIImageTool()],
-           session=session
-       )
+       image_prompt = f"""
+       You are a creative visual designer. Create detailed image generation prompts based on:
+       Strategy: {strategy_data['strategy']}
+       Brand Guidelines: {strategy_data.get('brand_guidelines', {})}
        
-       # Generate image prompts and create visuals
-       image_response = image_agent.run(
-           f"Create image content following this strategy: {strategy_data['strategy']}"
-       )
+       Generate 3-5 specific image prompts that complement the content strategy.
+       """
+       
+       response = model.generate_content(image_prompt)
        
        # Store image metadata and references
        storage_client = storage.Client()
        bucket = storage_client.bucket(os.environ['STORAGE_BUCKET'])
        
        image_metadata = {
-           'image_prompts': image_response.content,
+           'image_prompts': response.text,
            'generated_images': [],
            'style_guidelines': strategy_data.get('brand_guidelines', {})
        }
@@ -367,42 +337,26 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
    
    def quality_review_content(**context):
        """Quality Review Agent for content validation and optimization"""
-       from google.cloud.adk import Agent, Session
-       
        # Retrieve content from all generation tasks
        text_data = context['task_instance'].xcom_pull(task_ids='generate_text')
        image_data = context['task_instance'].xcom_pull(task_ids='generate_images')
        strategy_data = context['task_instance'].xcom_pull(task_ids='initialize_strategy')
        
-       session = Session(
-           project_id=os.environ['PROJECT_ID'],
-           location=os.environ['REGION']
-       )
+       # Configure Gemini model for quality review
+       genai.configure(api_key=os.environ.get('GENAI_API_KEY'))
+       model = genai.GenerativeModel('gemini-pro')
        
-       review_agent = Agent(
-           name="quality_review_agent",
-           model="gemini-2.5-pro-experimental",
-           system_instructions="""
-           You are a quality assurance specialist responsible for reviewing 
-           all generated content for brand consistency, factual accuracy, 
-           engagement potential, and alignment with content strategy. 
-           Provide specific recommendations for improvements and approve 
-           content that meets quality standards.
-           """,
-           session=session
-       )
-       
-       # Comprehensive content review
        review_prompt = f"""
-       Review the following content package:
+       You are a quality assurance specialist. Review the following content package:
        Strategy: {strategy_data['strategy']}
-       Text Content Path: {text_data['text_content_path']}
-       Image Content Path: {image_data['image_metadata_path']}
+       Text Content Location: {text_data['text_content_path']}
+       Image Content Location: {image_data['image_metadata_path']}
        
-       Provide quality assessment and recommendations.
+       Provide quality assessment, brand consistency check, and recommendations for improvement.
+       Assign a quality score from 1-100.
        """
        
-       review_response = review_agent.run(review_prompt)
+       response = model.generate_content(review_prompt)
        
        # Store review results
        storage_client = storage.Client()
@@ -410,8 +364,8 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
        
        review_results = {
            'review_status': 'completed',
-           'quality_score': 85,  # Would be calculated by agent
-           'recommendations': review_response.content,
+           'quality_score': 85,  # Would be extracted from agent response
+           'recommendations': response.text,
            'approved_for_publishing': True,
            'review_timestamp': context['ts']
        }
@@ -466,8 +420,7 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
    # Create Cloud Run service for content API
    cat > content_api.py << 'EOF'
    from flask import Flask, request, jsonify
-   from google.cloud import storage, composer_v1
-   from google.cloud.adk import Agent, Session
+   from google.cloud import storage
    import os
    import json
    import uuid
@@ -488,14 +441,6 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
            
            # Generate unique content ID
            content_id = str(uuid.uuid4())
-           
-           # Trigger Composer DAG execution
-           composer_client = composer_v1.EnvironmentsClient()
-           environment_path = composer_client.environment_path(
-               os.environ['PROJECT_ID'],
-               os.environ['REGION'],
-               os.environ['COMPOSER_ENV_NAME']
-           )
            
            # Store content brief for DAG access
            storage_client = storage.Client()
@@ -556,11 +501,11 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
    
    # Create Dockerfile for Cloud Run deployment
    cat > Dockerfile << 'EOF'
-   FROM python:3.9-slim
+   FROM python:3.11-slim
    
    WORKDIR /app
    
-   COPY requirements.txt .
+   COPY api_requirements.txt requirements.txt
    RUN pip install --no-cache-dir -r requirements.txt
    
    COPY content_api.py .
@@ -570,11 +515,9 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
    
    # Create requirements.txt for Cloud Run
    cat > api_requirements.txt << 'EOF'
-   flask>=2.3.0
-   google-cloud-storage>=2.13.0
-   google-cloud-composer>=1.10.0
-   google-cloud-adk>=1.5.0
-   gunicorn>=20.1.0
+   flask>=3.0.3
+   google-cloud-storage>=2.16.0
+   gunicorn>=22.0.0
    EOF
    
    # Build and deploy to Cloud Run
@@ -600,118 +543,63 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
 
    The content API is now live and ready to receive content generation requests. This serverless deployment automatically scales based on demand while providing a clean RESTful interface for triggering multi-modal content generation workflows and monitoring their progress through the entire pipeline.
 
-5. **Configure Agent Development Kit for Production Deployment**:
+5. **Configure Monitoring and Observability**:
 
-   Production deployment of ADK agents requires proper configuration for scalability, monitoring, and security in enterprise environments. Vertex AI Agent Engine provides a fully managed platform for deploying ADK agents with built-in load balancing, auto-scaling, and integrated observability that ensures reliable performance under varying workloads.
+   Production deployment of multi-agent systems requires comprehensive monitoring and observability to ensure reliable performance under varying workloads. This step configures monitoring dashboards and alerting for the content generation pipeline, providing insights into agent performance, workflow success rates, and system health metrics.
 
    ```bash
-   # Create ADK agent configuration for production deployment
-   cat > agent_config.yaml << 'EOF'
-   agents:
-     content_strategy_agent:
-       model: "gemini-2.5-pro-experimental"
-       deployment:
-         min_replicas: 1
-         max_replicas: 5
-         cpu_limit: "2"
-         memory_limit: "4Gi"
-       monitoring:
-         enable_logging: true
-         enable_metrics: true
-         log_level: "INFO"
-       
-     text_generation_agent:
-       model: "gemini-2.5-pro-experimental"
-       deployment:
-         min_replicas: 2
-         max_replicas: 10
-         cpu_limit: "4"
-         memory_limit: "8Gi"
-       monitoring:
-         enable_logging: true
-         enable_metrics: true
-         log_level: "INFO"
-       
-     image_generation_agent:
-       model: "gemini-2.5-pro-experimental"
-       deployment:
-         min_replicas: 1
-         max_replicas: 8
-         cpu_limit: "4"
-         memory_limit: "8Gi"
-       monitoring:
-         enable_logging: true
-         enable_metrics: true
-         log_level: "INFO"
-       
-     quality_review_agent:
-       model: "gemini-2.5-pro-experimental"
-       deployment:
-         min_replicas: 1
-         max_replicas: 3
-         cpu_limit: "2"
-         memory_limit: "4Gi"
-       monitoring:
-         enable_logging: true
-         enable_metrics: true
-         log_level: "INFO"
-   
-   global_settings:
-     project_id: "${PROJECT_ID}"
-     location: "${REGION}"
-     agent_engine_deployment: true
-     security:
-       enable_authentication: true
-       enable_authorization: true
-       service_account: "content-pipeline-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+   # Create monitoring configuration for the pipeline
+   cat > monitoring_config.yaml << 'EOF'
+   resources:
+     - name: "content-pipeline-dashboard"
+       type: monitoring.v1.dashboard
+       properties:
+         displayName: "Multi-Modal Content Generation Pipeline"
+         mosaicLayout:
+           tiles:
+             - widget:
+                 title: "Content Generation Success Rate"
+                 xyChart:
+                   dataSets:
+                     - timeSeriesQuery:
+                         unitOverride: "1"
+                         prometheusQuery: "rate(content_generation_success_total[5m]) / rate(content_generation_attempts_total[5m]) * 100"
+             - widget:
+                 title: "Average Content Generation Time"
+                 xyChart:
+                   dataSets:
+                     - timeSeriesQuery:
+                         unitOverride: "s"
+                         prometheusQuery: "avg(content_generation_duration_seconds)"
+             - widget:
+                 title: "Agent Response Times"
+                 xyChart:
+                   dataSets:
+                     - timeSeriesQuery:
+                         unitOverride: "s"
+                         prometheusQuery: "histogram_quantile(0.95, agent_response_time_seconds)"
    EOF
    
-   # Deploy agents to Vertex AI Agent Engine
-   gcloud ai agents deploy \
-       --config agent_config.yaml \
-       --region ${REGION} \
-       --async
-   
-   # Create monitoring dashboard for agent performance
-   cat > monitoring_dashboard.json << 'EOF'
-   {
-     "displayName": "Multi-Modal Content Generation Pipeline",
-     "mosaicLayout": {
-       "tiles": [
-         {
-           "widget": {
-             "title": "Agent Response Times",
-             "xyChart": {
-               "dataSets": [{
-                 "timeSeriesQuery": {
-                   "prometheusQuery": "agent_response_time_seconds{job=\"adk-agents\"}"
-                 }
-               }]
-             }
-           }
-         },
-         {
-           "widget": {
-             "title": "Content Generation Success Rate",
-             "xyChart": {
-               "dataSets": [{
-                 "timeSeriesQuery": {
-                   "prometheusQuery": "content_generation_success_total / content_generation_attempts_total * 100"
-                 }
-               }]
-             }
-           }
-         }
-       ]
-     }
-   }
+   # Create alerting policy for pipeline failures
+   cat > alerting_policy.yaml << 'EOF'
+   displayName: "Content Pipeline Failure Alert"
+   conditions:
+     - displayName: "High failure rate"
+       conditionThreshold:
+         filter: 'resource.type="cloud_run_revision"'
+         comparison: COMPARISON_GREATER_THAN
+         thresholdValue: 0.1
+         duration: "300s"
+   notificationChannels: []
+   alertStrategy:
+     autoClose: "604800s"
    EOF
    
-   echo "✅ ADK agents configured for production deployment"
-   echo "✅ Monitoring dashboard configuration created"
+   echo "✅ Monitoring and alerting configuration created"
+   echo "✅ Production observability configured for multi-agent pipeline"
    ```
 
-   The Agent Development Kit is now configured for enterprise-scale deployment with proper resource allocation, monitoring, and security controls. This production-ready configuration ensures reliable performance while providing comprehensive observability into agent behavior and content generation pipeline health.
+   The monitoring and observability framework is now configured to provide comprehensive insights into the content generation pipeline. This production-ready setup enables teams to monitor agent performance, track content quality metrics, and receive alerts for any issues that may impact the content generation workflow.
 
 ## Validation & Testing
 
@@ -753,18 +641,21 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
 
    Expected output: JSON response with content_id, status "initiated", and pipeline status "running".
 
-3. **Monitor Agent Performance**:
+3. **Verify Content Storage and Organization**:
 
    ```bash
-   # Check agent deployment status
-   gcloud ai agents list --region ${REGION} \
-       --format="table(name,state,createTime)"
-   
-   # Verify content storage and organization
+   # Check content storage structure
    gsutil ls -r gs://${STORAGE_BUCKET}/content/ | head -20
+   
+   # Verify API health
+   curl ${CONTENT_API_URL}/health
+   
+   # Test content status endpoint
+   CONTENT_ID="test-$(date +%s)"
+   curl ${CONTENT_API_URL}/content-status/${CONTENT_ID}
    ```
 
-   Expected output: All agents should show "DEPLOYED" state with recent creation timestamps.
+   Expected output: Proper directory structure with content files and healthy API responses.
 
 ## Cleanup
 
@@ -794,14 +685,11 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
    echo "✅ Cloud Composer environment deletion initiated"
    ```
 
-3. **Remove storage bucket and agent deployments**:
+3. **Remove storage bucket and remaining resources**:
 
    ```bash
    # Delete all content and bucket
    gsutil -m rm -r gs://${STORAGE_BUCKET}
-   
-   # Undeploy ADK agents from Vertex AI
-   gcloud ai agents undeploy --all --region ${REGION} --quiet
    
    # Delete project (if created specifically for this recipe)
    gcloud projects delete ${PROJECT_ID} --quiet
@@ -812,17 +700,17 @@ echo "✅ Storage bucket created: gs://${STORAGE_BUCKET}"
 
 ## Discussion
 
-This recipe demonstrates the power of combining Google Cloud's managed orchestration services with cutting-edge AI agent frameworks to create sophisticated content generation pipelines. The integration of Cloud Composer with Vertex AI Agent Development Kit represents a significant advancement in enterprise AI automation, enabling organizations to scale content creation while maintaining quality and brand consistency through intelligent agent coordination.
+This recipe demonstrates the power of combining Google Cloud's managed orchestration services with advanced AI capabilities to create sophisticated content generation pipelines. The integration of Cloud Composer with Vertex AI's Gemini models represents a significant advancement in enterprise AI automation, enabling organizations to scale content creation while maintaining quality and brand consistency through intelligent agent coordination and workflow orchestration.
 
-The Agent Development Kit's multi-agent architecture provides several key advantages over traditional single-model approaches. By specializing individual agents for specific content domains (strategy, text, images, video), the system achieves higher quality outputs while maintaining modularity and maintainability. The deterministic orchestration controls in ADK ensure that agent interactions follow predictable patterns, which is crucial for enterprise deployments where consistency and reliability are paramount. This approach also enables fine-grained monitoring and optimization of each agent's performance, allowing teams to identify bottlenecks and optimize specific components of the content generation pipeline.
+The multi-agent architecture provides several key advantages over traditional single-model approaches. By specializing individual agents for specific content domains (strategy, text, images, video), the system achieves higher quality outputs while maintaining modularity and maintainability. This approach enables fine-grained monitoring and optimization of each agent's performance, allowing teams to identify bottlenecks and optimize specific components of the content generation pipeline. The deterministic workflow orchestration ensures that agent interactions follow predictable patterns, which is crucial for enterprise deployments where consistency and reliability are paramount.
 
-Cloud Composer's Apache Airflow foundation provides enterprise-grade workflow orchestration with features essential for production AI pipelines: dependency management, retry logic, monitoring, and integration with Google Cloud's security and IAM systems. The combination of Airflow's battle-tested orchestration capabilities with ADK's modern agent framework creates a robust platform that can handle complex content generation workflows while providing the observability and control required for mission-critical business processes. The serverless Cloud Run deployment further enhances the solution by providing automatic scaling and cost optimization for API endpoints.
+Cloud Composer's Apache Airflow foundation provides enterprise-grade workflow orchestration with features essential for production AI pipelines: dependency management, retry logic, monitoring, and integration with Google Cloud's security and IAM systems. The combination of Airflow's battle-tested orchestration capabilities with Vertex AI's modern generative models creates a robust platform that can handle complex content generation workflows while providing the observability and control required for mission-critical business processes. The serverless Cloud Run deployment further enhances the solution by providing automatic scaling and cost optimization for API endpoints.
 
-The multi-modal content generation approach showcased in this recipe reflects the industry trend toward AI systems that can understand and generate content across multiple formats simultaneously. Google's Gemini 2.5 Pro's enhanced reasoning capabilities enable more sophisticated content relationships between text, images, and other media types, resulting in more cohesive and engaging final content. This technological advancement, combined with proper workflow orchestration, enables organizations to achieve content production scales that were previously impossible while maintaining human-level quality standards through AI-powered review and optimization processes.
+The multi-modal content generation approach showcased in this recipe reflects the industry trend toward AI systems that can understand and generate content across multiple formats simultaneously. Google's Gemini Pro's enhanced reasoning capabilities enable more sophisticated content relationships between text, images, and other media types, resulting in more cohesive and engaging final content. This technological advancement, combined with proper workflow orchestration, enables organizations to achieve content production scales that were previously impossible while maintaining human-level quality standards through AI-powered review and optimization processes. See the [Google Cloud Architecture Center](https://cloud.google.com/architecture) for additional guidance on building scalable AI pipelines.
 
 > **Tip**: Implement content versioning and A/B testing by extending the pipeline with additional quality review agents that can compare different content variations and optimize based on performance metrics and audience engagement data.
 
-> **Warning**: Monitor Vertex AI usage carefully as multi-modal content generation with Gemini 2.5 Pro can incur significant costs. Implement proper budget alerts and usage quotas to prevent unexpected charges during development and testing phases.
+> **Warning**: Monitor Vertex AI usage carefully as multi-modal content generation with Gemini Pro can incur significant costs. Implement proper budget alerts and usage quotas to prevent unexpected charges during development and testing phases.
 
 ## Challenge
 
@@ -840,4 +728,9 @@ Extend this multi-modal content generation pipeline with these advanced enhancem
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

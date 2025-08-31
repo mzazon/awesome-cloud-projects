@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Workstations, Firebase Studio, Cloud Source Repositories, Identity and Access Management
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: remote-development, developer-onboarding, cloud-workstations, firebase-studio, team-collaboration
 recipe-generator-version: 1.3
@@ -78,7 +78,7 @@ graph TB
 
 ## Prerequisites
 
-1. Google Cloud Project with billing enabled and sufficient quota for Compute Engine
+1. Google Cloud Project with billing enabled and sufficient quota for Compute Engine and Cloud Workstations
 2. Google Cloud CLI (gcloud) installed and authenticated with project owner permissions
 3. Firebase project created and linked to your Google Cloud project
 4. Basic understanding of cloud development environments and Git workflows
@@ -160,7 +160,6 @@ echo "✅ APIs enabled for workstations and source repositories"
        --project=${PROJECT_ID} \
        --file=workstation-developer-role.yaml
    
-   # Create IAM group for developers (requires Cloud Identity)
    echo "✅ Custom IAM role created for workstation access"
    echo "✅ Configure Cloud Identity groups separately in the Admin Console"
    ```
@@ -173,7 +172,7 @@ echo "✅ APIs enabled for workstations and source repositories"
 
    ```bash
    # Create workstation cluster with network configuration
-   gcloud beta workstations clusters create ${CLUSTER_NAME} \
+   gcloud workstations clusters create ${CLUSTER_NAME} \
        --region=${REGION} \
        --network="projects/${PROJECT_ID}/global/networks/default" \
        --subnetwork="projects/${PROJECT_ID}/regions/${REGION}/subnetworks/default" \
@@ -181,7 +180,7 @@ echo "✅ APIs enabled for workstations and source repositories"
        --labels=environment=development,team=engineering
    
    # Wait for cluster creation to complete
-   gcloud beta workstations clusters describe ${CLUSTER_NAME} \
+   gcloud workstations clusters describe ${CLUSTER_NAME} \
        --region=${REGION} \
        --format="value(state)"
    
@@ -196,40 +195,16 @@ echo "✅ APIs enabled for workstations and source repositories"
 
    ```bash
    # Create comprehensive workstation configuration
-   cat > workstation-config.yaml << 'EOF'
-   name: projects/${PROJECT_ID}/locations/${REGION}/workstationClusters/${CLUSTER_NAME}/workstationConfigs/${CONFIG_NAME}
-   displayName: "Full-Stack Developer Environment"
-   machineType: "e2-standard-4"
-   persistentDirectories:
-   - gcePd:
-       sizeGb: 200
-       fsType: "ext4"
-     mountPath: "/home"
-   container:
-     image: "us-central1-docker.pkg.dev/cloud-workstations-images/predefined/code-oss:latest"
-     env:
-       NODE_VERSION: "18"
-       PYTHON_VERSION: "3.11"
-       GO_VERSION: "1.21"
-   runAs:
-     user: "developer"
-   idleTimeout: 7200s
-   enableAuditAgent: true
-   labels:
-     environment: "development"
-     type: "fullstack"
-   EOF
-   
-   # Apply the workstation configuration
-   gcloud beta workstations configs create ${CONFIG_NAME} \
+   gcloud workstations configs create ${CONFIG_NAME} \
        --cluster=${CLUSTER_NAME} \
        --region=${REGION} \
        --machine-type=e2-standard-4 \
-       --pd-disk-size=200GB \
+       --pd-disk-size=100GB \
        --pd-disk-type=pd-standard \
        --container-image="us-central1-docker.pkg.dev/cloud-workstations-images/predefined/code-oss:latest" \
        --idle-timeout=7200s \
-       --enable-audit-agent
+       --enable-audit-agent \
+       --labels=environment=development,type=fullstack
    
    echo "✅ Workstation configuration created with development tools"
    ```
@@ -238,13 +213,19 @@ echo "✅ APIs enabled for workstations and source repositories"
 
 5. **Set Up Firebase Studio Integration**:
 
-   Firebase Studio provides an AI-powered development environment that accelerates application development through intelligent code generation and project templates. Integrating Firebase Studio with your workstation environment enables rapid prototyping and collaborative development with built-in access to Google Cloud services.
+   Firebase Studio provides an AI-powered development environment that accelerates application development through intelligent code generation and project templates powered by Gemini 2.5. Integrating Firebase Studio with your workstation environment enables rapid prototyping and collaborative development with built-in access to Google Cloud services.
 
    ```bash
    # Initialize Firebase project connection
    gcloud firebase projects list --format="table(projectId,displayName)"
    
-   # Create Firebase Studio workspace template
+   # Enable Firebase APIs and services
+   gcloud services enable firebase.googleapis.com \
+       firebasehosting.googleapis.com \
+       firestore.googleapis.com \
+       firebasedatabase.googleapis.com
+   
+   # Create Firebase Studio workspace template metadata
    cat > firebase-studio-template.json << 'EOF'
    {
      "name": "Team Development Template",
@@ -264,16 +245,11 @@ echo "✅ APIs enabled for workstations and source repositories"
    }
    EOF
    
-   # Enable Firebase APIs and services
-   gcloud services enable firebase.googleapis.com \
-       firebasehosting.googleapis.com \
-       firestore.googleapis.com
-   
    echo "✅ Firebase Studio integration configured"
-   echo "✅ Project template created for rapid development"
+   echo "✅ Project template metadata created for rapid development"
    ```
 
-   Firebase Studio integration provides developers with AI-assisted development capabilities and pre-configured project templates. This accelerates the development process by automating routine tasks and providing intelligent suggestions for application architecture and implementation.
+   Firebase Studio integration provides developers with AI-assisted development capabilities and pre-configured project templates. This accelerates the development process by automating routine tasks and providing intelligent suggestions for application architecture and implementation through Gemini's advanced AI capabilities.
 
 6. **Create Developer Onboarding Automation Script**:
 
@@ -295,14 +271,14 @@ echo "✅ APIs enabled for workstations and source repositories"
    echo "🚀 Onboarding developer: $DEVELOPER_EMAIL"
    
    # Create workstation instance for the developer
-   gcloud beta workstations create $WORKSTATION_ID \
+   gcloud workstations create $WORKSTATION_ID \
        --cluster=${CLUSTER_NAME} \
        --config=${CONFIG_NAME} \
        --region=${REGION} \
        --labels=owner=${DEVELOPER_EMAIL%@*},team=engineering
    
    # Grant workstation access to the developer
-   gcloud beta workstations add-iam-policy-binding $WORKSTATION_ID \
+   gcloud workstations add-iam-policy-binding $WORKSTATION_ID \
        --cluster=${CLUSTER_NAME} \
        --config=${CONFIG_NAME} \
        --region=${REGION} \
@@ -381,39 +357,43 @@ echo "✅ APIs enabled for workstations and source repositories"
    Monitoring and cost management ensure the development infrastructure operates efficiently while providing visibility into resource utilization and team productivity. Implementing these controls helps maintain budget compliance and identifies optimization opportunities.
 
    ```bash
-   # Create monitoring dashboard for workstation usage
-   cat > monitoring-config.yaml << 'EOF'
-   dashboardFilters: []
-   displayName: "Developer Workstations Dashboard"
-   labels:
-     team: "engineering"
-   mosaicLayout:
-     tiles:
-     - width: 6
-       height: 4
-       widget:
-         title: "Active Workstations"
-         scorecard:
-           timeSeriesQuery:
-             timeSeriesFilter:
-               filter: 'resource.type="gce_instance" resource.label.instance_name=~"workstation-.*"'
-               aggregation:
-                 alignmentPeriod: "60s"
-                 perSeriesAligner: "ALIGN_MEAN"
-   EOF
-   
    # Set up budget alerts for workstation costs
-   gcloud billing budgets create \
-       --billing-account=$(gcloud beta billing accounts list --format="value(name)" | head -1) \
-       --display-name="Developer Workstations Budget" \
-       --budget-amount=1000 \
-       --threshold-rule=percent=75,spend-basis=current-spend \
-       --threshold-rule=percent=90,spend-basis=current-spend \
-       --threshold-rule=percent=100,spend-basis=current-spend \
-       --credit-types-treatment=exclude-all-credits
+   BILLING_ACCOUNT=$(gcloud beta billing accounts list \
+       --format="value(name)" | head -1)
    
-   echo "✅ Monitoring dashboard configured for workstation metrics"
-   echo "✅ Budget alerts set up for cost management"
+   if [ ! -z "$BILLING_ACCOUNT" ]; then
+       gcloud billing budgets create \
+           --billing-account=$BILLING_ACCOUNT \
+           --display-name="Developer Workstations Budget" \
+           --budget-amount=1000 \
+           --threshold-rule=percent=75,spend-basis=current-spend \
+           --threshold-rule=percent=90,spend-basis=current-spend \
+           --threshold-rule=percent=100,spend-basis=current-spend \
+           --credit-types-treatment=exclude-all-credits
+       
+       echo "✅ Budget alerts set up for cost management"
+   else
+       echo "⚠️ No billing account found. Set up budget alerts manually in the console"
+   fi
+   
+   # Create monitoring policy for workstation usage
+   gcloud alpha monitoring policies create \
+       --policy-from-file=<(cat << 'EOF'
+   displayName: "Workstation High Usage Alert"
+   conditions:
+   - displayName: "High workstation CPU usage"
+     conditionThreshold:
+       filter: 'resource.type="workstation"'
+       comparison: COMPARISON_GREATER_THAN
+       thresholdValue: 0.8
+       duration: 300s
+   notificationChannels: []
+   alertStrategy:
+     autoClose: 1800s
+   EOF
+   )
+   
+   echo "✅ Monitoring policies configured for workstation metrics"
    ```
 
    Monitoring and cost controls provide essential visibility into development infrastructure usage and expenses. These insights enable data-driven decisions about resource allocation and help maintain sustainable development operations.
@@ -424,15 +404,15 @@ echo "✅ APIs enabled for workstations and source repositories"
 
    ```bash
    # Check cluster status
-   gcloud beta workstations clusters describe ${CLUSTER_NAME} \
+   gcloud workstations clusters describe ${CLUSTER_NAME} \
        --region=${REGION} \
        --format="table(name,state,createTime)"
    
    # Verify configuration details
-   gcloud beta workstations configs describe ${CONFIG_NAME} \
+   gcloud workstations configs describe ${CONFIG_NAME} \
        --cluster=${CLUSTER_NAME} \
        --region=${REGION} \
-       --format="table(name,machineType,container.image)"
+       --format="table(name,host.gceInstance.machineType,container.image)"
    ```
 
    Expected output: Cluster should show "ACTIVE" state and configuration should display correct machine type and container image.
@@ -444,20 +424,20 @@ echo "✅ APIs enabled for workstations and source repositories"
    ./onboard-developer.sh test-developer@example.com
    
    # Verify workstation creation
-   gcloud beta workstations list \
+   gcloud workstations list \
        --cluster=${CLUSTER_NAME} \
        --config=${CONFIG_NAME} \
        --region=${REGION} \
-       --format="table(name,state,owner)"
+       --format="table(name,state,displayName)"
    ```
 
-   Expected output: New workstation should be created and show "READY" state with correct owner assignment.
+   Expected output: New workstation should be created and show "STATE_STARTING" or "STATE_RUNNING" state with correct name assignment.
 
 3. **Validate Firebase Studio integration**:
 
    ```bash
    # Verify Firebase project connection
-   gcloud firebase projects describe ${PROJECT_ID}
+   firebase projects:list
    
    # Check enabled APIs
    gcloud services list --enabled \
@@ -473,12 +453,12 @@ echo "✅ APIs enabled for workstations and source repositories"
 
    ```bash
    # Delete all workstation instances
-   gcloud beta workstations list \
+   gcloud workstations list \
        --cluster=${CLUSTER_NAME} \
        --config=${CONFIG_NAME} \
        --region=${REGION} \
        --format="value(name)" | \
-   xargs -I {} gcloud beta workstations delete {} \
+   xargs -I {} gcloud workstations delete {} \
        --cluster=${CLUSTER_NAME} \
        --config=${CONFIG_NAME} \
        --region=${REGION} \
@@ -491,13 +471,13 @@ echo "✅ APIs enabled for workstations and source repositories"
 
    ```bash
    # Delete workstation configuration
-   gcloud beta workstations configs delete ${CONFIG_NAME} \
+   gcloud workstations configs delete ${CONFIG_NAME} \
        --cluster=${CLUSTER_NAME} \
        --region=${REGION} \
        --quiet
    
    # Delete workstation cluster
-   gcloud beta workstations clusters delete ${CLUSTER_NAME} \
+   gcloud workstations clusters delete ${CLUSTER_NAME} \
        --region=${REGION} \
        --quiet
    
@@ -518,8 +498,8 @@ echo "✅ APIs enabled for workstations and source repositories"
        --quiet
    
    # Clean up local files
-   rm -rf ${REPO_NAME} onboard-developer.sh workstation-config.yaml \
-          monitoring-config.yaml firebase-studio-template.json \
+   rm -rf ${REPO_NAME} onboard-developer.sh \
+          firebase-studio-template.json \
           workstation-developer-role.yaml
    
    echo "✅ All resources and local files cleaned up"
@@ -533,7 +513,7 @@ The architecture emphasizes security through Identity and Access Management inte
 
 From a cost optimization perspective, the solution includes automatic idle timeout configurations and budget monitoring to prevent runaway expenses. Cloud Workstations' pay-per-use model aligns costs with actual development activity, while persistent disk storage ensures developers don't lose work between sessions. The monitoring dashboard provides visibility into usage patterns, enabling data-driven decisions about resource scaling and optimization.
 
-The collaborative features built into this system support distributed team productivity through shared development environments and integrated toolchains. According to [Google Cloud's remote development best practices](https://cloud.google.com/workstations/docs/overview), this approach can reduce onboarding time from weeks to hours while improving code quality through standardized environments. For additional implementation guidance, see the [Cloud Workstations configuration guide](https://cloud.google.com/workstations/docs/configure-workstations) and [Firebase Studio documentation](https://firebase.google.com/docs/studio) for current features and capabilities.
+The collaborative features built into this system support distributed team productivity through shared development environments and integrated toolchains. According to [Google Cloud's remote development best practices](https://cloud.google.com/workstations/docs/overview), this approach can reduce onboarding time from weeks to hours while improving code quality through standardized environments. For additional implementation guidance, see the [Cloud Workstations configuration guide](https://cloud.google.com/workstations/docs/create-configuration) and [Firebase Studio documentation](https://firebase.google.com/docs/studio) for current features and capabilities.
 
 > **Tip**: Configure workstation idle timeouts based on your team's work patterns to optimize costs. Most teams benefit from 2-4 hour timeouts during business hours and shorter timeouts for after-hours development.
 
@@ -553,4 +533,9 @@ Extend this developer onboarding solution with these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

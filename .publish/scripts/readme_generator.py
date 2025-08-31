@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 class ReadmeGenerator:
     """Generates README.md from recipe metadata using Jinja2 templates."""
     
-    def __init__(self, config_path: str = 'data/config.json'):
+    def __init__(self, config_path: str = '../data/config.json'):
         """Initialize the README generator with configuration."""
         self.config = self._load_config(config_path)
         self.parser = RecipeParser(config_path)

@@ -1,15 +1,15 @@
 ---
-title: Distributed Tracing with X-Ray
+title: Distributed Tracing with X-Ray and EventBridge
 id: c4d6e8f0
 category: application integration
 difficulty: 300
 subject: aws
 services: x-ray,eventbridge,lambda,api-gateway
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: aws-x-ray,amazon-eventbridge,distributed-tracing,microservices,application-integration,lambda,api-gateway
 recipe-generator-version: 1.3
@@ -144,6 +144,9 @@ aws iam attach-role-policy \
     --role-name $LAMBDA_ROLE_NAME \
     --policy-arn arn:aws:iam::aws:policy/AmazonEventBridgeFullAccess
 
+# Wait for role propagation
+sleep 10
+
 export LAMBDA_ROLE_ARN=$(aws iam get-role \
     --role-name $LAMBDA_ROLE_NAME \
     --query Role.Arn --output text)
@@ -160,8 +163,7 @@ echo "✅ Created IAM role: $LAMBDA_ROLE_ARN"
    ```bash
    # Create custom event bus for distributed tracing
    aws events create-event-bus \
-       --name $EVENT_BUS_NAME \
-       --event-source-name "distributed-tracing-demo"
+       --name $EVENT_BUS_NAME
    
    export EVENT_BUS_ARN=$(aws events describe-event-bus \
        --name $EVENT_BUS_NAME \
@@ -179,80 +181,80 @@ echo "✅ Created IAM role: $LAMBDA_ROLE_ARN"
    ```bash
    # Create order service function code
    cat > order-service.py << 'EOF'
-   import json
-   import boto3
-   import os
-   from aws_xray_sdk.core import xray_recorder
-   from aws_xray_sdk.core import patch_all
-   from datetime import datetime
-   
-   # Patch AWS SDK calls for X-Ray tracing
-   patch_all()
-   
-   eventbridge = boto3.client('events')
-   
-   @xray_recorder.capture('order_service_handler')
-   def lambda_handler(event, context):
-       # Extract trace context from API Gateway
-       trace_header = event.get('headers', {}).get('X-Amzn-Trace-Id')
-       
-       # Create subsegment for order processing
-       subsegment = xray_recorder.begin_subsegment('process_order')
-       
-       try:
-           # Simulate order processing
-           order_id = f"order-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-           customer_id = event.get('pathParameters', {}).get('customerId', 'anonymous')
-           
-           # Add metadata to trace
-           subsegment.put_metadata('order_details', {
-               'order_id': order_id,
-               'customer_id': customer_id,
-               'timestamp': datetime.now().isoformat()
-           })
-           
-           # Publish event to EventBridge with trace context
-           event_detail = {
-               'orderId': order_id,
-               'customerId': customer_id,
-               'amount': 99.99,
-               'status': 'created'
-           }
-           
-           response = eventbridge.put_events(
-               Entries=[
-                   {
-                       'Source': 'order.service',
-                       'DetailType': 'Order Created',
-                       'Detail': json.dumps(event_detail),
-                       'EventBusName': os.environ['EVENT_BUS_NAME']
-                   }
-               ]
-           )
-           
-           # Add annotation for filtering
-           xray_recorder.put_annotation('order_id', order_id)
-           xray_recorder.put_annotation('service_name', 'order-service')
-           
-           return {
-               'statusCode': 200,
-               'headers': {
-                   'Content-Type': 'application/json',
-                   'X-Amzn-Trace-Id': trace_header
-               },
-               'body': json.dumps({
-                   'orderId': order_id,
-                   'status': 'created',
-                   'message': 'Order created successfully'
-               })
-           }
-           
-       except Exception as e:
-           xray_recorder.put_annotation('error', str(e))
-           raise e
-       finally:
-           xray_recorder.end_subsegment()
-   EOF
+import json
+import boto3
+import os
+from aws_xray_sdk.core import xray_recorder
+from aws_xray_sdk.core import patch_all
+from datetime import datetime
+
+# Patch AWS SDK calls for X-Ray tracing
+patch_all()
+
+eventbridge = boto3.client('events')
+
+@xray_recorder.capture('order_service_handler')
+def lambda_handler(event, context):
+    # Extract trace context from API Gateway
+    trace_header = event.get('headers', {}).get('X-Amzn-Trace-Id', '')
+    
+    # Create subsegment for order processing
+    subsegment = xray_recorder.begin_subsegment('process_order')
+    
+    try:
+        # Simulate order processing
+        order_id = f"order-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        customer_id = event.get('pathParameters', {}).get('customerId', 'anonymous')
+        
+        # Add metadata to trace
+        subsegment.put_metadata('order_details', {
+            'order_id': order_id,
+            'customer_id': customer_id,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Publish event to EventBridge with trace context
+        event_detail = {
+            'orderId': order_id,
+            'customerId': customer_id,
+            'amount': 99.99,
+            'status': 'created'
+        }
+        
+        response = eventbridge.put_events(
+            Entries=[
+                {
+                    'Source': 'order.service',
+                    'DetailType': 'Order Created',
+                    'Detail': json.dumps(event_detail),
+                    'EventBusName': os.environ['EVENT_BUS_NAME']
+                }
+            ]
+        )
+        
+        # Add annotation for filtering
+        xray_recorder.put_annotation('order_id', order_id)
+        xray_recorder.put_annotation('service_name', 'order-service')
+        
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'X-Amzn-Trace-Id': trace_header
+            },
+            'body': json.dumps({
+                'orderId': order_id,
+                'status': 'created',
+                'message': 'Order created successfully'
+            })
+        }
+        
+    except Exception as e:
+        xray_recorder.put_annotation('error', str(e))
+        raise e
+    finally:
+        xray_recorder.end_subsegment()
+EOF
    
    # Create deployment package
    zip order-service.zip order-service.py
@@ -260,7 +262,7 @@ echo "✅ Created IAM role: $LAMBDA_ROLE_ARN"
    # Create Lambda function with X-Ray tracing enabled
    aws lambda create-function \
        --function-name order-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler order-service.lambda_handler \
        --zip-file fileb://order-service.zip \
@@ -279,78 +281,78 @@ echo "✅ Created IAM role: $LAMBDA_ROLE_ARN"
 
 3. **Create Payment Service Lambda Function**:
 
-   The payment service demonstrates asynchronous event processing patterns where EventBridge delivers events to Lambda functions. This architecture enables loose coupling between services while maintaining trace context propagation. The X-Ray SDK's `patch_all()` function automatically instruments all AWS service calls, ensuring that every EventBridge interaction, DynamoDB operation, and external API call is captured in the distributed trace.
+   The payment service demonstrates asynchronous event processing patterns where EventBridge delivers events to Lambda functions. This architecture enables loose coupling between services while maintaining trace context propagation. The X-Ray SDK's `patch_all()` function automatically instruments all AWS service calls, ensuring that every EventBridge interaction and external API call is captured in the distributed trace.
 
    ```bash
    # Create payment service function code
    cat > payment-service.py << 'EOF'
-   import json
-   import boto3
-   import os
-   import time
-   from aws_xray_sdk.core import xray_recorder
-   from aws_xray_sdk.core import patch_all
-   
-   # Patch AWS SDK calls for X-Ray tracing
-   patch_all()
-   
-   eventbridge = boto3.client('events')
-   
-   @xray_recorder.capture('payment_service_handler')
-   def lambda_handler(event, context):
-       # Process EventBridge event
-       for record in event['Records']:
-           detail = json.loads(record['body'])
-           
-           # Create subsegment for payment processing
-           subsegment = xray_recorder.begin_subsegment('process_payment')
-           
-           try:
-               order_id = detail['detail']['orderId']
-               amount = detail['detail']['amount']
-               
-               # Add metadata to trace
-               subsegment.put_metadata('payment_details', {
-                   'order_id': order_id,
-                   'amount': amount,
-                   'processor': 'stripe'
-               })
-               
-               # Simulate payment processing delay
-               time.sleep(0.5)
-               
-               # Publish payment processed event
-               payment_event = {
-                   'orderId': order_id,
-                   'amount': amount,
-                   'paymentId': f"pay-{order_id}",
-                   'status': 'processed'
-               }
-               
-               eventbridge.put_events(
-                   Entries=[
-                       {
-                           'Source': 'payment.service',
-                           'DetailType': 'Payment Processed',
-                           'Detail': json.dumps(payment_event),
-                           'EventBusName': os.environ['EVENT_BUS_NAME']
-                       }
-                   ]
-               )
-               
-               # Add annotations for filtering
-               xray_recorder.put_annotation('order_id', order_id)
-               xray_recorder.put_annotation('service_name', 'payment-service')
-               xray_recorder.put_annotation('payment_amount', amount)
-               
-           except Exception as e:
-               xray_recorder.put_annotation('error', str(e))
-               raise e
-           finally:
-               xray_recorder.end_subsegment()
-   
-       return {'statusCode': 200}
-   EOF
+import json
+import boto3
+import os
+import time
+from aws_xray_sdk.core import xray_recorder
+from aws_xray_sdk.core import patch_all
+
+# Patch AWS SDK calls for X-Ray tracing
+patch_all()
+
+eventbridge = boto3.client('events')
+
+@xray_recorder.capture('payment_service_handler')
+def lambda_handler(event, context):
+    # Process EventBridge event directly (not SQS)
+    if 'source' in event and event['source'] == 'order.service':
+        detail = event['detail']
+        
+        # Create subsegment for payment processing
+        subsegment = xray_recorder.begin_subsegment('process_payment')
+        
+        try:
+            order_id = detail['orderId']
+            amount = detail['amount']
+            
+            # Add metadata to trace
+            subsegment.put_metadata('payment_details', {
+                'order_id': order_id,
+                'amount': amount,
+                'processor': 'stripe'
+            })
+            
+            # Simulate payment processing delay
+            time.sleep(0.5)
+            
+            # Publish payment processed event
+            payment_event = {
+                'orderId': order_id,
+                'amount': amount,
+                'paymentId': f"pay-{order_id}",
+                'status': 'processed'
+            }
+            
+            eventbridge.put_events(
+                Entries=[
+                    {
+                        'Source': 'payment.service',
+                        'DetailType': 'Payment Processed',
+                        'Detail': json.dumps(payment_event),
+                        'EventBusName': os.environ['EVENT_BUS_NAME']
+                    }
+                ]
+            )
+            
+            # Add annotations for filtering
+            xray_recorder.put_annotation('order_id', order_id)
+            xray_recorder.put_annotation('service_name', 'payment-service')
+            xray_recorder.put_annotation('payment_amount', amount)
+            
+        except Exception as e:
+            xray_recorder.put_annotation('error', str(e))
+            raise e
+        finally:
+            xray_recorder.end_subsegment()
+    
+    return {'statusCode': 200}
+EOF
    
    # Create deployment package
    zip payment-service.zip payment-service.py
@@ -358,7 +360,7 @@ echo "✅ Created IAM role: $LAMBDA_ROLE_ARN"
    # Create Lambda function
    aws lambda create-function \
        --function-name payment-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler payment-service.lambda_handler \
        --zip-file fileb://payment-service.zip \
@@ -382,105 +384,107 @@ echo "✅ Created IAM role: $LAMBDA_ROLE_ARN"
    ```bash
    # Create inventory service function code
    cat > inventory-service.py << 'EOF'
-   import json
-   import boto3
-   import os
-   from aws_xray_sdk.core import xray_recorder
-   from aws_xray_sdk.core import patch_all
-   
-   # Patch AWS SDK calls for X-Ray tracing
-   patch_all()
-   
-   eventbridge = boto3.client('events')
-   
-   @xray_recorder.capture('inventory_service_handler')
-   def lambda_handler(event, context):
-       for record in event['Records']:
-           detail = json.loads(record['body'])
-           
-           subsegment = xray_recorder.begin_subsegment('update_inventory')
-           
-           try:
-               order_id = detail['detail']['orderId']
-               
-               # Add metadata to trace
-               subsegment.put_metadata('inventory_update', {
-                   'order_id': order_id,
-                   'items_reserved': 1,
-                   'warehouse': 'east-coast'
-               })
-               
-               # Publish inventory updated event
-               inventory_event = {
-                   'orderId': order_id,
-                   'status': 'reserved',
-                   'warehouse': 'east-coast'
-               }
-               
-               eventbridge.put_events(
-                   Entries=[
-                       {
-                           'Source': 'inventory.service',
-                           'DetailType': 'Inventory Updated',
-                           'Detail': json.dumps(inventory_event),
-                           'EventBusName': os.environ['EVENT_BUS_NAME']
-                       }
-                   ]
-               )
-               
-               xray_recorder.put_annotation('order_id', order_id)
-               xray_recorder.put_annotation('service_name', 'inventory-service')
-               
-           except Exception as e:
-               xray_recorder.put_annotation('error', str(e))
-               raise e
-           finally:
-               xray_recorder.end_subsegment()
-   
-       return {'statusCode': 200}
-   EOF
+import json
+import boto3
+import os
+from aws_xray_sdk.core import xray_recorder
+from aws_xray_sdk.core import patch_all
+
+# Patch AWS SDK calls for X-Ray tracing
+patch_all()
+
+eventbridge = boto3.client('events')
+
+@xray_recorder.capture('inventory_service_handler')
+def lambda_handler(event, context):
+    # Process EventBridge event directly
+    if 'source' in event and event['source'] == 'order.service':
+        detail = event['detail']
+        
+        subsegment = xray_recorder.begin_subsegment('update_inventory')
+        
+        try:
+            order_id = detail['orderId']
+            
+            # Add metadata to trace
+            subsegment.put_metadata('inventory_update', {
+                'order_id': order_id,
+                'items_reserved': 1,
+                'warehouse': 'east-coast'
+            })
+            
+            # Publish inventory updated event
+            inventory_event = {
+                'orderId': order_id,
+                'status': 'reserved',
+                'warehouse': 'east-coast'
+            }
+            
+            eventbridge.put_events(
+                Entries=[
+                    {
+                        'Source': 'inventory.service',
+                        'DetailType': 'Inventory Updated',
+                        'Detail': json.dumps(inventory_event),
+                        'EventBusName': os.environ['EVENT_BUS_NAME']
+                    }
+                ]
+            )
+            
+            xray_recorder.put_annotation('order_id', order_id)
+            xray_recorder.put_annotation('service_name', 'inventory-service')
+            
+        except Exception as e:
+            xray_recorder.put_annotation('error', str(e))
+            raise e
+        finally:
+            xray_recorder.end_subsegment()
+    
+    return {'statusCode': 200}
+EOF
    
    # Create notification service function code
    cat > notification-service.py << 'EOF'
-   import json
-   import boto3
-   import os
-   from aws_xray_sdk.core import xray_recorder
-   from aws_xray_sdk.core import patch_all
-   
-   # Patch AWS SDK calls for X-Ray tracing
-   patch_all()
-   
-   @xray_recorder.capture('notification_service_handler')
-   def lambda_handler(event, context):
-       for record in event['Records']:
-           detail = json.loads(record['body'])
-           
-           subsegment = xray_recorder.begin_subsegment('send_notification')
-           
-           try:
-               order_id = detail['detail']['orderId']
-               event_type = detail['detail-type']
-               
-               # Add metadata to trace
-               subsegment.put_metadata('notification_sent', {
-                   'order_id': order_id,
-                   'event_type': event_type,
-                   'channel': 'email'
-               })
-               
-               xray_recorder.put_annotation('order_id', order_id)
-               xray_recorder.put_annotation('service_name', 'notification-service')
-               xray_recorder.put_annotation('notification_type', event_type)
-               
-           except Exception as e:
-               xray_recorder.put_annotation('error', str(e))
-               raise e
-           finally:
-               xray_recorder.end_subsegment()
-   
-       return {'statusCode': 200}
-   EOF
+import json
+import boto3
+import os
+from aws_xray_sdk.core import xray_recorder
+from aws_xray_sdk.core import patch_all
+
+# Patch AWS SDK calls for X-Ray tracing
+patch_all()
+
+@xray_recorder.capture('notification_service_handler')
+def lambda_handler(event, context):
+    # Process EventBridge event directly
+    if 'source' in event and event['source'] in ['payment.service', 'inventory.service']:
+        detail = event['detail']
+        
+        subsegment = xray_recorder.begin_subsegment('send_notification')
+        
+        try:
+            order_id = detail['orderId']
+            event_type = event['detail-type']
+            
+            # Add metadata to trace
+            subsegment.put_metadata('notification_sent', {
+                'order_id': order_id,
+                'event_type': event_type,
+                'channel': 'email'
+            })
+            
+            xray_recorder.put_annotation('order_id', order_id)
+            xray_recorder.put_annotation('service_name', 'notification-service')
+            xray_recorder.put_annotation('notification_type', event_type)
+            
+        except Exception as e:
+            xray_recorder.put_annotation('error', str(e))
+            raise e
+        finally:
+            xray_recorder.end_subsegment()
+    
+    return {'statusCode': 200}
+EOF
    
    # Create deployment packages and functions
    zip inventory-service.zip inventory-service.py
@@ -489,7 +493,7 @@ echo "✅ Created IAM role: $LAMBDA_ROLE_ARN"
    # Create inventory service
    aws lambda create-function \
        --function-name inventory-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler inventory-service.lambda_handler \
        --zip-file fileb://inventory-service.zip \
@@ -500,7 +504,7 @@ echo "✅ Created IAM role: $LAMBDA_ROLE_ARN"
    # Create notification service
    aws lambda create-function \
        --function-name notification-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler notification-service.lambda_handler \
        --zip-file fileb://notification-service.zip \
@@ -631,15 +635,17 @@ echo "✅ Created IAM role: $LAMBDA_ROLE_ARN"
        --integration-http-method POST \
        --uri "arn:aws:apigateway:${AWS_REGION}:lambda:path/2015-03-31/functions/${ORDER_SERVICE_ARN}/invocations"
    
-   # Enable X-Ray tracing
-   aws apigateway put-stage \
+   # Create deployment first
+   DEPLOYMENT_ID=$(aws apigateway create-deployment \
        --rest-api-id $API_ID \
        --stage-name prod \
-       --deployment-id $(aws apigateway create-deployment \
-           --rest-api-id $API_ID \
-           --stage-name prod \
-           --query id --output text) \
-       --tracing-config TracingEnabled=true
+       --query id --output text)
+   
+   # Enable X-Ray tracing on the stage
+   aws apigateway update-stage \
+       --rest-api-id $API_ID \
+       --stage-name prod \
+       --patch-ops op=replace,path=/tracingEnabled,value=true
    
    # Grant API Gateway permission to invoke Lambda
    aws lambda add-permission \
@@ -858,12 +864,19 @@ For production environments, consider implementing trace sampling strategies to 
 
 Extend this solution by implementing these enhancements:
 
-1. **Add custom sampling rules** to reduce costs while maintaining coverage for high-value transactions like payments over $1000
+1. **Add custom sampling rules** to reduce costs while maintaining coverage for high-value transactions like payments over $1000 using [X-Ray sampling configuration](https://docs.aws.amazon.com/xray/latest/devguide/xray-console-sampling.html)
 2. **Implement trace-based alerting** using CloudWatch alarms triggered by X-Ray service map metrics for automated incident response
 3. **Create a dead letter queue pattern** with EventBridge to handle failed events while maintaining trace context throughout retry mechanisms
 4. **Build a custom dashboard** that combines X-Ray analytics with business metrics to show both technical and business KPIs in a single view
-5. **Add distributed tracing for external API calls** by instrumenting HTTP clients and propagating trace context to third-party services
+5. **Add distributed tracing for external API calls** by instrumenting HTTP clients and propagating trace context to third-party services using the [X-Ray SDK](https://docs.aws.amazon.com/xray/latest/devguide/xray-sdk-python.html)
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

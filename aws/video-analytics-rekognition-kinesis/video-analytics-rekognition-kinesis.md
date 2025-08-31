@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: rekognition, kinesis-video-streams, lambda, dynamodb
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: rekognition, kinesis-video-streams, video-analytics, computer-vision, real-time
 recipe-generator-version: 1.3
@@ -102,7 +102,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with Rekognition, Kinesis Video Streams, and Lambda permissions
+1. AWS account with Rekognition, Kinesis Video Streams, Lambda, DynamoDB, and SNS permissions
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of video streaming and computer vision concepts
 4. Test video sources or IP cameras for streaming (or use provided sample video)
@@ -148,9 +148,56 @@ cat > trust-policy.json << EOF
 }
 EOF
 
+# Create custom policy for DynamoDB and SNS access
+cat > video-analytics-policy.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:GetItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:${AWS_REGION}:${AWS_ACCOUNT_ID}:table/${PROJECT_NAME}-*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sns:Publish"
+      ],
+      "Resource": "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${PROJECT_NAME}-*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "kinesis:PutRecord",
+        "kinesis:PutRecords",
+        "kinesis:GetRecords",
+        "kinesis:GetShardIterator",
+        "kinesis:DescribeStream",
+        "kinesis:ListStreams"
+      ],
+      "Resource": "arn:aws:kinesis:${AWS_REGION}:${AWS_ACCOUNT_ID}:stream/${PROJECT_NAME}-*"
+    }
+  ]
+}
+EOF
+
 aws iam create-role \
     --role-name ${ROLE_NAME} \
     --assume-role-policy-document file://trust-policy.json
+
+# Create and attach custom policy
+aws iam create-policy \
+    --policy-name "${PROJECT_NAME}-policy" \
+    --policy-document file://video-analytics-policy.json
 
 # Attach required policies
 aws iam attach-role-policy \
@@ -164,6 +211,10 @@ aws iam attach-role-policy \
 aws iam attach-role-policy \
     --role-name ${ROLE_NAME} \
     --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+aws iam attach-role-policy \
+    --role-name ${ROLE_NAME} \
+    --policy-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-policy"
 
 export ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${ROLE_NAME}"
 
@@ -182,6 +233,9 @@ echo "✅ Created IAM role and set environment variables"
        --stream-name ${STREAM_NAME} \
        --data-retention-in-hours 24 \
        --media-type "video/h264"
+   
+   # Wait for stream to be active
+   sleep 10
    
    # Get stream information
    STREAM_ARN=$(aws kinesisvideo describe-stream \
@@ -203,8 +257,10 @@ echo "✅ Created IAM role and set environment variables"
    aws rekognition create-collection \
        --collection-id ${COLLECTION_NAME}
    
-   # Add sample faces to collection (optional - for demo purposes)
-   # You would typically add authorized personnel faces here
+   # Verify collection creation
+   aws rekognition describe-collection \
+       --collection-id ${COLLECTION_NAME}
+   
    echo "✅ Created face collection: ${COLLECTION_NAME}"
    ```
 
@@ -279,135 +335,135 @@ echo "✅ Created IAM role and set environment variables"
    ```bash
    # Create analytics processing Lambda function
    cat > analytics_processor.py << 'EOF'
-   import json
-   import boto3
-   import base64
-   from datetime import datetime
-   import os
-   
-   dynamodb = boto3.resource('dynamodb')
-   sns = boto3.client('sns')
-   rekognition = boto3.client('rekognition')
-   
-   DETECTIONS_TABLE = os.environ['DETECTIONS_TABLE']
-   FACES_TABLE = os.environ['FACES_TABLE']
-   SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
-   
-   def lambda_handler(event, context):
-       for record in event['Records']:
-           # Decode Kinesis data
-           payload = base64.b64decode(record['kinesis']['data'])
-           data = json.loads(payload)
-           
-           try:
-               process_detection_event(data)
-           except Exception as e:
-               print(f"Error processing record: {str(e)}")
-               
-       return {'statusCode': 200}
-   
-   def process_detection_event(data):
-       timestamp = datetime.now().timestamp()
-       stream_name = data.get('StreamName', 'unknown')
-       
-       # Process face detections
-       if 'FaceSearchResponse' in data:
-           process_face_detection(data['FaceSearchResponse'], stream_name, timestamp)
-       
-       # Process label detections
-       if 'LabelDetectionResponse' in data:
-           process_label_detection(data['LabelDetectionResponse'], stream_name, timestamp)
-       
-       # Process person tracking
-       if 'PersonTrackingResponse' in data:
-           process_person_tracking(data['PersonTrackingResponse'], stream_name, timestamp)
-   
-   def process_face_detection(face_data, stream_name, timestamp):
-       table = dynamodb.Table(FACES_TABLE)
-       
-       for face_match in face_data.get('FaceMatches', []):
-           face_id = face_match['Face']['FaceId']
-           confidence = face_match['Face']['Confidence']
-           similarity = face_match['Similarity']
-           
-           # Store face detection event
-           table.put_item(
-               Item={
-                   'FaceId': face_id,
-                   'Timestamp': int(timestamp * 1000),
-                   'StreamName': stream_name,
-                   'Confidence': str(confidence),
-                   'Similarity': str(similarity),
-                   'BoundingBox': face_match['Face']['BoundingBox']
-               }
-           )
-           
-           # Send alert for high-confidence matches
-           if similarity > 90:
-               send_alert(f"High confidence face match detected: {face_id}", 
-                         f"Similarity: {similarity}%, Stream: {stream_name}")
-   
-   def process_label_detection(label_data, stream_name, timestamp):
-       table = dynamodb.Table(DETECTIONS_TABLE)
-       
-       for label in label_data.get('Labels', []):
-           label_name = label['Label']['Name']
-           confidence = label['Label']['Confidence']
-           
-           # Store detection event
-           table.put_item(
-               Item={
-                   'StreamName': stream_name,
-                   'Timestamp': int(timestamp * 1000),
-                   'DetectionType': 'Label',
-                   'Label': label_name,
-                   'Confidence': str(confidence),
-                   'BoundingBox': json.dumps(label['Label'].get('BoundingBox', {}))
-               }
-           )
-           
-           # Check for security-relevant objects
-           security_objects = ['Weapon', 'Gun', 'Knife', 'Person', 'Car', 'Motorcycle']
-           if label_name in security_objects and confidence > 80:
-               send_alert(f"Security object detected: {label_name}", 
-                         f"Confidence: {confidence}%, Stream: {stream_name}")
-   
-   def process_person_tracking(person_data, stream_name, timestamp):
-       table = dynamodb.Table(DETECTIONS_TABLE)
-       
-       for person in person_data.get('Persons', []):
-           person_id = person.get('Index', 'unknown')
-           
-           # Store person tracking event
-           table.put_item(
-               Item={
-                   'StreamName': stream_name,
-                   'Timestamp': int(timestamp * 1000),
-                   'DetectionType': 'Person',
-                   'PersonId': str(person_id),
-                   'BoundingBox': json.dumps(person.get('BoundingBox', {}))
-               }
-           )
-   
-   def send_alert(subject, message):
-       if SNS_TOPIC_ARN:
-           try:
-               sns.publish(
-                   TopicArn=SNS_TOPIC_ARN,
-                   Subject=subject,
-                   Message=message
-               )
-           except Exception as e:
-               print(f"Failed to send alert: {str(e)}")
-   EOF
+import json
+import boto3
+import base64
+from datetime import datetime
+import os
+
+dynamodb = boto3.resource('dynamodb')
+sns = boto3.client('sns')
+rekognition = boto3.client('rekognition')
+
+DETECTIONS_TABLE = os.environ['DETECTIONS_TABLE']
+FACES_TABLE = os.environ['FACES_TABLE']
+SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+
+def lambda_handler(event, context):
+    for record in event['Records']:
+        # Decode Kinesis data
+        payload = base64.b64decode(record['kinesis']['data'])
+        data = json.loads(payload)
+        
+        try:
+            process_detection_event(data)
+        except Exception as e:
+            print(f"Error processing record: {str(e)}")
+            
+    return {'statusCode': 200}
+
+def process_detection_event(data):
+    timestamp = datetime.now().timestamp()
+    stream_name = data.get('StreamName', 'unknown')
+    
+    # Process face detections
+    if 'FaceSearchResponse' in data:
+        process_face_detection(data['FaceSearchResponse'], stream_name, timestamp)
+    
+    # Process label detections
+    if 'LabelDetectionResponse' in data:
+        process_label_detection(data['LabelDetectionResponse'], stream_name, timestamp)
+    
+    # Process person tracking
+    if 'PersonTrackingResponse' in data:
+        process_person_tracking(data['PersonTrackingResponse'], stream_name, timestamp)
+
+def process_face_detection(face_data, stream_name, timestamp):
+    table = dynamodb.Table(FACES_TABLE)
+    
+    for face_match in face_data.get('FaceMatches', []):
+        face_id = face_match['Face']['FaceId']
+        confidence = face_match['Face']['Confidence']
+        similarity = face_match['Similarity']
+        
+        # Store face detection event
+        table.put_item(
+            Item={
+                'FaceId': face_id,
+                'Timestamp': int(timestamp * 1000),
+                'StreamName': stream_name,
+                'Confidence': str(confidence),
+                'Similarity': str(similarity),
+                'BoundingBox': face_match['Face']['BoundingBox']
+            }
+        )
+        
+        # Send alert for high-confidence matches
+        if similarity > 90:
+            send_alert(f"High confidence face match detected: {face_id}", 
+                      f"Similarity: {similarity}%, Stream: {stream_name}")
+
+def process_label_detection(label_data, stream_name, timestamp):
+    table = dynamodb.Table(DETECTIONS_TABLE)
+    
+    for label in label_data.get('Labels', []):
+        label_name = label['Label']['Name']
+        confidence = label['Label']['Confidence']
+        
+        # Store detection event
+        table.put_item(
+            Item={
+                'StreamName': stream_name,
+                'Timestamp': int(timestamp * 1000),
+                'DetectionType': 'Label',
+                'Label': label_name,
+                'Confidence': str(confidence),
+                'BoundingBox': json.dumps(label['Label'].get('BoundingBox', {}))
+            }
+        )
+        
+        # Check for security-relevant objects
+        security_objects = ['Weapon', 'Gun', 'Knife', 'Person', 'Car', 'Motorcycle']
+        if label_name in security_objects and confidence > 80:
+            send_alert(f"Security object detected: {label_name}", 
+                      f"Confidence: {confidence}%, Stream: {stream_name}")
+
+def process_person_tracking(person_data, stream_name, timestamp):
+    table = dynamodb.Table(DETECTIONS_TABLE)
+    
+    for person in person_data.get('Persons', []):
+        person_id = person.get('Index', 'unknown')
+        
+        # Store person tracking event
+        table.put_item(
+            Item={
+                'StreamName': stream_name,
+                'Timestamp': int(timestamp * 1000),
+                'DetectionType': 'Person',
+                'PersonId': str(person_id),
+                'BoundingBox': json.dumps(person.get('BoundingBox', {}))
+            }
+        )
+
+def send_alert(subject, message):
+    if SNS_TOPIC_ARN:
+        try:
+            sns.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Subject=subject,
+                Message=message
+            )
+        except Exception as e:
+            print(f"Failed to send alert: {str(e)}")
+EOF
    
    # Create deployment package
    zip analytics_processor.zip analytics_processor.py
    
-   # Create Lambda function
+   # Create Lambda function with updated runtime
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-analytics-processor" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler analytics_processor.lambda_handler \
        --zip-file fileb://analytics_processor.zip \
@@ -426,31 +482,34 @@ echo "✅ Created IAM role and set environment variables"
    ```bash
    # Create stream processor configuration
    cat > stream_processor_config.json << EOF
-   {
-     "Name": "${PROJECT_NAME}-processor",
-     "Input": {
-       "KinesisVideoStream": {
-         "Arn": "${STREAM_ARN}"
-       }
-     },
-     "Output": {
-       "KinesisDataStream": {
-         "Arn": "${DATA_STREAM_ARN}"
-       }
-     },
-     "RoleArn": "${ROLE_ARN}",
-     "Settings": {
-       "FaceSearch": {
-         "CollectionId": "${COLLECTION_NAME}",
-         "FaceMatchThreshold": 80.0
-       }
-     }
-   }
-   EOF
+{
+  "Name": "${PROJECT_NAME}-processor",
+  "Input": {
+    "KinesisVideoStream": {
+      "Arn": "${STREAM_ARN}"
+    }
+  },
+  "Output": {
+    "KinesisDataStream": {
+      "Arn": "${DATA_STREAM_ARN}"
+    }
+  },
+  "RoleArn": "${ROLE_ARN}",
+  "Settings": {
+    "FaceSearch": {
+      "CollectionId": "${COLLECTION_NAME}",
+      "FaceMatchThreshold": 80.0
+    }
+  }
+}
+EOF
    
    # Create the stream processor
    aws rekognition create-stream-processor \
        --cli-input-json file://stream_processor_config.json
+   
+   # Wait for processor to be ready
+   sleep 10
    
    # Start the stream processor
    aws rekognition start-stream-processor \
@@ -513,106 +572,106 @@ echo "✅ Created IAM role and set environment variables"
    ```bash
    # Create Lambda function for API queries
    cat > query_api.py << 'EOF'
-   import json
-   import boto3
-   from boto3.dynamodb.conditions import Key
-   from datetime import datetime, timedelta
-   
-   dynamodb = boto3.resource('dynamodb')
-   
-   def lambda_handler(event, context):
-       try:
-           # Parse request
-           http_method = event['httpMethod']
-           path = event['path']
-           query_params = event.get('queryStringParameters', {}) or {}
-           
-           if path == '/detections' and http_method == 'GET':
-               return get_detections(query_params)
-           elif path == '/faces' and http_method == 'GET':
-               return get_face_detections(query_params)
-           elif path == '/stats' and http_method == 'GET':
-               return get_statistics(query_params)
-           else:
-               return {
-                   'statusCode': 404,
-                   'body': json.dumps({'error': 'Not found'})
-               }
-               
-       except Exception as e:
-           return {
-               'statusCode': 500,
-               'body': json.dumps({'error': str(e)})
-           }
-   
-   def get_detections(params):
-       table = dynamodb.Table(f"{params.get('project', 'video-analytics')}-detections")
-       
-       stream_name = params.get('stream')
-       hours_back = int(params.get('hours', 24))
-       
-       if not stream_name:
-           return {
-               'statusCode': 400,
-               'body': json.dumps({'error': 'stream parameter required'})
-           }
-       
-       # Query recent detections
-       start_time = int((datetime.now() - timedelta(hours=hours_back)).timestamp() * 1000)
-       
-       response = table.query(
-           KeyConditionExpression=Key('StreamName').eq(stream_name) & 
-                                Key('Timestamp').gte(start_time),
-           ScanIndexForward=False,
-           Limit=100
-       )
-       
-       return {
-           'statusCode': 200,
-           'headers': {
-               'Content-Type': 'application/json',
-               'Access-Control-Allow-Origin': '*'
-           },
-           'body': json.dumps({
-               'detections': response['Items'],
-               'count': len(response['Items'])
-           })
-       }
-   
-   def get_face_detections(params):
-       table = dynamodb.Table(f"{params.get('project', 'video-analytics')}-faces")
-       
-       # Scan recent face detections (in production, use GSI for better performance)
-       response = table.scan(
-           Limit=50
-       )
-       
-       return {
-           'statusCode': 200,
-           'headers': {
-               'Content-Type': 'application/json',
-               'Access-Control-Allow-Origin': '*'
-           },
-           'body': json.dumps({
-               'faces': response['Items'],
-               'count': len(response['Items'])
-           })
-       }
-   
-   def get_statistics(params):
-       # Simple statistics - in production, use ElasticSearch or analytics service
-       return {
-           'statusCode': 200,
-           'headers': {
-               'Content-Type': 'application/json',
-               'Access-Control-Allow-Origin': '*'
-           },
-           'body': json.dumps({
-               'message': 'Statistics endpoint - implement with your analytics requirements',
-               'timestamp': datetime.now().isoformat()
-           })
-       }
-   EOF
+import json
+import boto3
+from boto3.dynamodb.conditions import Key
+from datetime import datetime, timedelta
+
+dynamodb = boto3.resource('dynamodb')
+
+def lambda_handler(event, context):
+    try:
+        # Parse request
+        http_method = event['httpMethod']
+        path = event['path']
+        query_params = event.get('queryStringParameters', {}) or {}
+        
+        if path == '/detections' and http_method == 'GET':
+            return get_detections(query_params)
+        elif path == '/faces' and http_method == 'GET':
+            return get_face_detections(query_params)
+        elif path == '/stats' and http_method == 'GET':
+            return get_statistics(query_params)
+        else:
+            return {
+                'statusCode': 404,
+                'body': json.dumps({'error': 'Not found'})
+            }
+            
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+
+def get_detections(params):
+    table = dynamodb.Table(f"{params.get('project', 'video-analytics')}-detections")
+    
+    stream_name = params.get('stream')
+    hours_back = int(params.get('hours', 24))
+    
+    if not stream_name:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': 'stream parameter required'})
+        }
+    
+    # Query recent detections
+    start_time = int((datetime.now() - timedelta(hours=hours_back)).timestamp() * 1000)
+    
+    response = table.query(
+        KeyConditionExpression=Key('StreamName').eq(stream_name) & 
+                             Key('Timestamp').gte(start_time),
+        ScanIndexForward=False,
+        Limit=100
+    )
+    
+    return {
+        'statusCode': 200,
+        'headers': {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+        },
+        'body': json.dumps({
+            'detections': response['Items'],
+            'count': len(response['Items'])
+        })
+    }
+
+def get_face_detections(params):
+    table = dynamodb.Table(f"{params.get('project', 'video-analytics')}-faces")
+    
+    # Scan recent face detections (in production, use GSI for better performance)
+    response = table.scan(
+        Limit=50
+    )
+    
+    return {
+        'statusCode': 200,
+        'headers': {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+        },
+        'body': json.dumps({
+            'faces': response['Items'],
+            'count': len(response['Items'])
+        })
+    }
+
+def get_statistics(params):
+    # Simple statistics - in production, use OpenSearch or analytics service
+    return {
+        'statusCode': 200,
+        'headers': {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+        },
+        'body': json.dumps({
+            'message': 'Statistics endpoint - implement with your analytics requirements',
+            'timestamp': datetime.now().isoformat()
+        })
+    }
+EOF
    
    # Create deployment package
    zip query_api.zip query_api.py
@@ -620,13 +679,13 @@ echo "✅ Created IAM role and set environment variables"
    # Create API Lambda function
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-query-api" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler query_api.lambda_handler \
        --zip-file fileb://query_api.zip \
        --timeout 30
    
-   # Create API Gateway
+   # Create API Gateway (HTTP API)
    API_ID=$(aws apigatewayv2 create-api \
        --name "${PROJECT_NAME}-api" \
        --protocol-type HTTP \
@@ -705,6 +764,21 @@ echo "✅ Created IAM role and set environment variables"
        --limit 10
    ```
 
+5. **Verify Lambda Function Logs**:
+
+   ```bash
+   # Check Lambda function logs for processing activity
+   aws logs describe-log-groups \
+       --log-group-name-prefix "/aws/lambda/${PROJECT_NAME}"
+   
+   # View recent log events
+   aws logs describe-log-streams \
+       --log-group-name "/aws/lambda/${PROJECT_NAME}-analytics-processor" \
+       --order-by LastEventTime \
+       --descending \
+       --max-items 1
+   ```
+
 ## Cleanup
 
 1. **Stop Stream Processor**:
@@ -726,6 +800,17 @@ echo "✅ Created IAM role and set environment variables"
 2. **Delete Lambda Functions and API Gateway**:
 
    ```bash
+   # Delete event source mapping first
+   EVENT_SOURCE_UUID=$(aws lambda list-event-source-mappings \
+       --function-name "${PROJECT_NAME}-analytics-processor" \
+       --query 'EventSourceMappings[0].UUID' \
+       --output text)
+   
+   if [ "$EVENT_SOURCE_UUID" != "None" ]; then
+       aws lambda delete-event-source-mapping \
+           --uuid ${EVENT_SOURCE_UUID}
+   fi
+   
    # Delete Lambda functions
    aws lambda delete-function \
        --function-name "${PROJECT_NAME}-analytics-processor"
@@ -751,7 +836,8 @@ echo "✅ Created IAM role and set environment variables"
    
    # Delete Kinesis streams
    aws kinesis delete-stream \
-       --stream-name "${PROJECT_NAME}-analytics"
+       --stream-name "${PROJECT_NAME}-analytics" \
+       --enforce-consumer-deletion
    
    aws kinesisvideo delete-stream \
        --stream-arn ${STREAM_ARN}
@@ -769,7 +855,7 @@ echo "✅ Created IAM role and set environment variables"
    # Delete SNS topic
    aws sns delete-topic --topic-arn ${TOPIC_ARN}
    
-   # Delete IAM role
+   # Delete IAM role and policy
    aws iam detach-role-policy \
        --role-name ${ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/AmazonRekognitionFullAccess
@@ -782,10 +868,18 @@ echo "✅ Created IAM role and set environment variables"
        --role-name ${ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
+   aws iam detach-role-policy \
+       --role-name ${ROLE_NAME} \
+       --policy-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-policy"
+   
+   aws iam delete-policy \
+       --policy-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-policy"
+   
    aws iam delete-role --role-name ${ROLE_NAME}
    
    # Clean up local files
-   rm -f trust-policy.json stream_processor_config.json \
+   rm -f trust-policy.json video-analytics-policy.json \
+         stream_processor_config.json \
          analytics_processor.py analytics_processor.zip \
          query_api.py query_api.zip
    
@@ -794,17 +888,19 @@ echo "✅ Created IAM role and set environment variables"
 
 ## Discussion
 
-This real-time video analytics solution demonstrates the power of combining Amazon Rekognition's computer vision capabilities with Kinesis Video Streams for scalable video ingestion and processing. The architecture supports high-throughput video analysis with low latency, making it suitable for security monitoring, retail analytics, and smart city applications.
+This real-time video analytics solution demonstrates the power of combining Amazon Rekognition's computer vision capabilities with Kinesis Video Streams for scalable video ingestion and processing. The architecture supports high-throughput video analysis with low latency, making it suitable for security monitoring, retail analytics, and smart city applications following AWS Well-Architected Framework principles for operational excellence, security, and cost optimization.
 
-The stream processor provides continuous analysis of video feeds, automatically detecting faces, objects, and activities without requiring manual intervention. The event-driven architecture using Lambda ensures that detection results are processed immediately and can trigger real-time alerts or actions. DynamoDB provides fast access to detection metadata, enabling rapid searches and analytics queries.
+The stream processor provides continuous analysis of video feeds, automatically detecting faces, objects, and activities without requiring manual intervention. The event-driven architecture using Lambda ensures that detection results are processed immediately and can trigger real-time alerts or actions. DynamoDB provides fast access to detection metadata, enabling rapid searches and analytics queries with single-digit millisecond response times.
 
 For production deployments, consider implementing additional features such as custom Rekognition models for domain-specific object detection, integration with existing security systems through webhooks or message queues, and advanced analytics using Amazon OpenSearch Service for complex queries and visualizations. The solution can be extended to support facial recognition with privacy controls, anomaly detection using Amazon Lookout for Vision, and automated incident response workflows.
 
-> **Note**: Amazon Rekognition Video supports multiple concurrent stream processors, enabling analysis of dozens of camera feeds simultaneously. For large-scale deployments, consider implementing regional distribution and edge processing with AWS IoT Greengrass to reduce latency and bandwidth costs.
+The serverless architecture automatically scales to handle varying video processing loads while maintaining cost efficiency through pay-per-use pricing models. This approach eliminates infrastructure management overhead while providing enterprise-grade reliability and security. See the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) for additional architectural guidance.
+
+> **Note**: Amazon Rekognition Video supports multiple concurrent stream processors, enabling analysis of dozens of camera feeds simultaneously. For large-scale deployments, consider implementing regional distribution and edge processing with AWS IoT Greengrass to reduce latency and bandwidth costs. Review the [Amazon Rekognition Video streaming documentation](https://docs.aws.amazon.com/rekognition/latest/dg/streaming-video.html) for scaling best practices.
 
 > **Tip**: Use Rekognition Custom Labels to train models for specific objects relevant to your use case, such as detecting specific uniforms, equipment, or safety violations in industrial environments. See the [Amazon Rekognition Custom Labels Developer Guide](https://docs.aws.amazon.com/rekognition/latest/customlabels-dg/) for training requirements and best practices.
 
-> **Warning**: Monitor Rekognition and Kinesis Video Streams costs carefully, as continuous video processing can generate significant charges. Implement automated shutoff mechanisms and cost alerts to prevent unexpected billing.
+> **Warning**: Monitor Rekognition and Kinesis Video Streams costs carefully, as continuous video processing can generate significant charges. Implement automated shutoff mechanisms and cost alerts to prevent unexpected billing. Use [AWS Cost Anomaly Detection](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/manage-ad.html) for proactive cost monitoring.
 
 ## Challenge
 
@@ -818,4 +914,11 @@ Enhance this video analytics platform with these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

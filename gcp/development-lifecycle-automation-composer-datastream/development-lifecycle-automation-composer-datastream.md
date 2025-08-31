@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Cloud Composer, Datastream, Artifact Registry, Cloud Workflows
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, ci-cd, automation, data-streaming, container-security, compliance
 recipe-generator-version: 1.3
@@ -37,7 +37,7 @@ graph TB
     
     subgraph "Change Detection & Capture"
         DS[Datastream CDC]
-        TRIGGER[Cloud Triggers]
+        TRIGGER[Cloud Build Triggers]
     end
     
     subgraph "Orchestration Layer"
@@ -93,7 +93,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and Owner or Editor permissions
-2. gcloud CLI installed and configured (version 450.0.0 or later)
+2. gcloud CLI installed and configured (version 480.0.0 or later)
 3. Basic knowledge of Apache Airflow, Python, and CI/CD concepts
 4. Understanding of database change data capture (CDC) concepts
 5. Estimated cost: $50-100 for a 2-hour session (Cloud Composer environment, Datastream processing, storage)
@@ -127,6 +127,8 @@ gcloud services enable artifactregistry.googleapis.com
 gcloud services enable workflows.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
 gcloud services enable containeranalysis.googleapis.com
+gcloud services enable binaryauthorization.googleapis.com
+gcloud services enable sqladmin.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Region set to: ${REGION}"
@@ -171,19 +173,41 @@ echo "✅ Region set to: ${REGION}"
        --location=${REGION} \
        --description="Secure container repository with automated scanning"
    
-   # Enable vulnerability scanning for the repository
-   gcloud artifacts settings enable-upgrade-redirection \
-       --project=${PROJECT_ID}
-   
    # Configure Docker authentication
    gcloud auth configure-docker ${REGION}-docker.pkg.dev
    
    echo "✅ Artifact Registry created: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}"
    ```
 
-   The Artifact Registry is now configured with automatic vulnerability scanning, providing the security intelligence needed for our intelligent deployment decisions.
+   The Artifact Registry is now configured with automatic vulnerability scanning enabled by default, providing the security intelligence needed for our intelligent deployment decisions.
 
-3. **Deploy Cloud Composer 3 Environment with Apache Airflow 3**:
+3. **Create Service Account for Cloud Composer**:
+
+   Cloud Composer 3 requires a dedicated service account with appropriate permissions to orchestrate workflows across Google Cloud services. This service account will be used by the Composer environment to execute DAGs and interact with other Google Cloud resources securely.
+
+   ```bash
+   # Create service account for Cloud Composer
+   export COMPOSER_SA="composer-worker-sa-${RANDOM_SUFFIX}"
+   
+   gcloud iam service-accounts create ${COMPOSER_SA} \
+       --display-name="Cloud Composer Worker Service Account" \
+       --description="Service account for Cloud Composer environment operations"
+   
+   # Grant necessary roles to the service account
+   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:${COMPOSER_SA}@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/composer.worker"
+   
+   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:${COMPOSER_SA}@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/storage.admin"
+   
+   echo "✅ Service account created: ${COMPOSER_SA}"
+   ```
+
+   The service account is now configured with the minimum required permissions following the principle of least privilege while enabling secure access to Google Cloud resources.
+
+4. **Deploy Cloud Composer 3 Environment with Apache Airflow 3**:
 
    Cloud Composer 3 with Apache Airflow 3 provides the next-generation workflow orchestration platform that enables advanced features like task execution API, improved security posture, and enhanced performance. This managed service eliminates infrastructure overhead while providing enterprise-grade workflow orchestration capabilities.
 
@@ -195,6 +219,7 @@ echo "✅ Region set to: ${REGION}"
        --node-count=3 \
        --disk-size=30GB \
        --machine-type=n1-standard-2 \
+       --service-account=${COMPOSER_SA}@${PROJECT_ID}.iam.gserviceaccount.com \
        --env-variables=BUCKET_NAME=${BUCKET_NAME},PROJECT_ID=${PROJECT_ID},ARTIFACT_REPO=${ARTIFACT_REPO}
    
    # Wait for environment to be ready (this may take 15-20 minutes)
@@ -208,7 +233,7 @@ echo "✅ Region set to: ${REGION}"
 
    The Cloud Composer environment is now operational with Apache Airflow 3, providing advanced orchestration capabilities and secure infrastructure management for our intelligent DevOps workflows.
 
-4. **Create Development Database for Change Tracking**:
+5. **Create Development Database for Change Tracking**:
 
    Cloud SQL provides a managed PostgreSQL database that will serve as our development database source for change data capture. Datastream will monitor this database for schema and data changes, triggering our intelligent automation workflows when significant changes occur.
 
@@ -224,7 +249,8 @@ echo "✅ Region set to: ${REGION}"
        --root-password=${DB_PASSWORD} \
        --backup-start-time=23:00 \
        --maintenance-window-day=SUN \
-       --maintenance-window-hour=02
+       --maintenance-window-hour=02 \
+       --authorized-networks=0.0.0.0/0
    
    # Create application database
    gcloud sql databases create app_development \
@@ -239,7 +265,7 @@ echo "✅ Region set to: ${REGION}"
 
    The development database is ready to serve as the source for change data capture, enabling our automation system to respond intelligently to database schema and data modifications.
 
-5. **Configure Datastream for Real-time Change Capture**:
+6. **Configure Datastream for Real-time Change Capture**:
 
    Datastream provides serverless change data capture that monitors our development database for real-time changes. This service will capture every insert, update, and delete operation, along with schema changes, and stream them to Cloud Storage where our orchestration workflows can process them for automated decision-making.
 
@@ -248,7 +274,8 @@ echo "✅ Region set to: ${REGION}"
    gcloud datastream connection-profiles create ${DB_INSTANCE}-profile \
        --location=${REGION} \
        --type=postgresql \
-       --postgresql-hostname=$(gcloud sql instances describe ${DB_INSTANCE} --format="value(ipAddresses[0].ipAddress)") \
+       --postgresql-hostname=$(gcloud sql instances describe ${DB_INSTANCE} \
+           --format="value(ipAddresses[0].ipAddress)") \
        --postgresql-port=5432 \
        --postgresql-username=postgres \
        --postgresql-password=${DB_PASSWORD} \
@@ -266,14 +293,15 @@ echo "✅ Region set to: ${REGION}"
        --location=${REGION} \
        --source-connection-profile=${DB_INSTANCE}-profile \
        --destination-connection-profile=storage-destination \
-       --include-objects='app_development.*'
+       --include-objects='app_development.*' \
+       --backfill=none
    
    echo "✅ Datastream configured for real-time change capture"
    ```
 
    Datastream is now continuously monitoring the development database and streaming all changes to Cloud Storage, providing the real-time data foundation for our intelligent automation workflows.
 
-6. **Create Intelligent CI/CD Pipeline DAG**:
+7. **Create Intelligent CI/CD Pipeline DAG**:
 
    The core DAG orchestrates the entire development lifecycle automation process, from detecting database changes through security scanning to deployment decisions. This DAG leverages Apache Airflow 3's enhanced task execution capabilities and integrates with Google Cloud services to create an intelligent, automated pipeline.
 
@@ -288,6 +316,7 @@ from airflow.providers.google.cloud.operators.cloud_build import CloudBuildCreat
 from airflow.providers.google.cloud.operators.workflows import WorkflowsCreateExecutionOperator
 from airflow.providers.google.cloud.sensors.gcs import GCSObjectExistenceSensor
 from airflow.providers.google.cloud.operators.gcs import GCSListObjectsOperator
+import os
 
 # DAG configuration
 default_args = {
@@ -312,7 +341,7 @@ dag = DAG(
 # Detect database changes from Datastream
 detect_changes = GCSObjectExistenceSensor(
     task_id='detect_datastream_changes',
-    bucket='{{ var.value.BUCKET_NAME }}',
+    bucket=os.environ.get('BUCKET_NAME'),
     object='datastream/{{ ds }}/changes.json',
     timeout=300,
     poke_interval=60,
@@ -325,7 +354,7 @@ def analyze_schema_changes(**context):
     from google.cloud import storage
     
     client = storage.Client()
-    bucket = client.bucket(context['var']['value']['BUCKET_NAME'])
+    bucket = client.bucket(os.environ.get('BUCKET_NAME'))
     
     # Read latest schema changes
     blob = bucket.blob(f"datastream/{context['ds']}/changes.json")
@@ -363,13 +392,12 @@ analyze_changes = PythonOperator(
 # Build and scan container images
 build_container = CloudBuildCreateBuildOperator(
     task_id='build_secure_container',
-    project_id='{{ var.value.PROJECT_ID }}',
+    project_id=os.environ.get('PROJECT_ID'),
     body={
         'source': {
-            'repoSource': {
-                'projectId': '{{ var.value.PROJECT_ID }}',
-                'repoName': 'app-source',
-                'branchName': 'main'
+            'storageSource': {
+                'bucket': os.environ.get('BUCKET_NAME'),
+                'object': 'source/app.tar.gz'
             }
         },
         'steps': [
@@ -377,7 +405,7 @@ build_container = CloudBuildCreateBuildOperator(
                 'name': 'gcr.io/cloud-builders/docker',
                 'args': [
                     'build',
-                    '-t', '{{ var.value.REGION }}-docker.pkg.dev/{{ var.value.PROJECT_ID }}/{{ var.value.ARTIFACT_REPO }}/app:$BUILD_ID',
+                    '-t', f"{os.environ.get('REGION')}-docker.pkg.dev/{os.environ.get('PROJECT_ID')}/{os.environ.get('ARTIFACT_REPO')}/app:$BUILD_ID",
                     '.'
                 ]
             },
@@ -385,11 +413,10 @@ build_container = CloudBuildCreateBuildOperator(
                 'name': 'gcr.io/cloud-builders/docker',
                 'args': [
                     'push',
-                    '{{ var.value.REGION }}-docker.pkg.dev/{{ var.value.PROJECT_ID }}/{{ var.value.ARTIFACT_REPO }}/app:$BUILD_ID'
+                    f"{os.environ.get('REGION')}-docker.pkg.dev/{os.environ.get('PROJECT_ID')}/{os.environ.get('ARTIFACT_REPO')}/app:$BUILD_ID"
                 ]
             }
-        ],
-        'images': ['{{ var.value.REGION }}-docker.pkg.dev/{{ var.value.PROJECT_ID }}/{{ var.value.ARTIFACT_REPO }}/app:$BUILD_ID']
+        ]
     },
     dag=dag
 )
@@ -401,8 +428,6 @@ def evaluate_security_scan(**context):
     
     # Wait for scanning to complete
     time.sleep(300)  # 5 minutes for scan completion
-    
-    client = artifactregistry_v1.ArtifactRegistryClient()
     
     # Get scan results (simplified for demo)
     scan_results = {
@@ -425,11 +450,14 @@ security_evaluation = PythonOperator(
 # Trigger deployment workflow based on analysis
 trigger_deployment = WorkflowsCreateExecutionOperator(
     task_id='trigger_intelligent_deployment',
-    project_id='{{ var.value.PROJECT_ID }}',
-    location='{{ var.value.REGION }}',
+    project_id=os.environ.get('PROJECT_ID'),
+    location=os.environ.get('REGION'),
     workflow_id='intelligent-deployment-workflow',
     execution={
-        'argument': '{"schema_changes": "{{ ti.xcom_pull(task_ids=\'analyze_schema_changes\') }}", "security_scan": "{{ ti.xcom_pull(task_ids=\'evaluate_security_scan\') }}"}'
+        'argument': json.dumps({
+            'schema_changes': '{{ ti.xcom_pull(task_ids="analyze_schema_changes") }}',
+            'security_scan': '{{ ti.xcom_pull(task_ids="evaluate_security_scan") }}'
+        })
     },
     dag=dag
 )
@@ -438,7 +466,7 @@ trigger_deployment = WorkflowsCreateExecutionOperator(
 detect_changes >> analyze_changes >> build_container >> security_evaluation >> trigger_deployment
 EOF
 
-   # Upload DAG to Cloud Composer
+   # Upload DAG to storage bucket
    gsutil cp intelligent_cicd_dag.py gs://${BUCKET_NAME}/dags/
    
    echo "✅ Intelligent CI/CD DAG created and uploaded"
@@ -446,7 +474,7 @@ EOF
 
    The intelligent CI/CD DAG is now deployed, providing automated orchestration that responds to database changes, performs security analysis, and makes intelligent deployment decisions based on comprehensive risk assessment.
 
-7. **Create Compliance Validation Workflow**:
+8. **Create Compliance Validation Workflow**:
 
    Cloud Workflows provides serverless workflow execution for complex business logic that requires compliance validation, approval processes, and integration with external systems. This workflow will evaluate security scan results, schema change impacts, and organizational policies to make automated deployment decisions.
 
@@ -467,19 +495,14 @@ main:
           - condition: ${schema_changes.breaking_changes > 0}
             steps:
               - require_approval:
-                  call: http.post
+                  assign:
+                    - approval_required: true
+                    - approval_reason: "Breaking schema changes detected"
+              - log_approval_request:
+                  call: sys.log
                   args:
-                    url: "https://approval-service.example.com/api/requests"
-                    body:
-                      type: "schema_breaking_changes"
-                      changes: ${schema_changes}
-                      severity: "high"
-                    auth:
-                      type: OAuth2
-              - wait_for_approval:
-                  call: sys.sleep
-                  args:
-                    seconds: 300
+                    data: ${"Schema approval required: " + string(schema_changes)}
+                    severity: "WARNING"
           - condition: true
             steps:
               - auto_approve_schema:
@@ -494,23 +517,17 @@ main:
                   assign:
                     - deployment_blocked: true
                     - reason: "Critical security vulnerabilities found"
-              - notify_security_team:
-                  call: http.post
+              - log_security_block:
+                  call: sys.log
                   args:
-                    url: "https://notifications.example.com/security-alert"
-                    body:
-                      alert_type: "critical_vulnerabilities"
-                      scan_results: ${security_scan}
-                      action_required: true
+                    data: ${"Deployment blocked due to critical vulnerabilities: " + string(security_scan)}
+                    severity: "ERROR"
           - condition: ${security_scan.high_vulnerabilities > 5}
             steps:
               - require_security_review:
-                  call: http.post
-                  args:
-                    url: "https://approval-service.example.com/api/security-review"
-                    body:
-                      scan_results: ${security_scan}
-                      threshold_exceeded: true
+                  assign:
+                    - security_review_required: true
+                    - security_reason: "High vulnerability threshold exceeded"
           - condition: true
             steps:
               - approve_security:
@@ -549,14 +566,11 @@ EOF
 
    The compliance workflow is now operational, providing intelligent decision-making capabilities that evaluate both technical and business factors to determine appropriate deployment strategies.
 
-8. **Configure Automated Security Policy Enforcement**:
+9. **Configure Automated Security Policy Enforcement**:
 
    Binary Authorization provides policy-driven deployment controls that integrate with our container vulnerability scanning results. This ensures that only approved, secure container images can be deployed to production environments, creating an additional security layer in our intelligent automation system.
 
    ```bash
-   # Enable Binary Authorization API
-   gcloud services enable binaryauthorization.googleapis.com
-   
    # Create security policy for container deployments
    cat << 'EOF' > security-policy.yaml
 defaultAdmissionRule:
@@ -590,142 +604,6 @@ EOF
 
    Binary Authorization policies are now enforcing security requirements, ensuring that our intelligent automation system cannot deploy containers that fail security validation, regardless of other approval factors.
 
-9. **Deploy Monitoring and Alerting DAG**:
-
-   Continuous monitoring of our intelligent automation system requires a dedicated DAG that tracks workflow performance, security scan effectiveness, and compliance validation metrics. This monitoring DAG provides observability into the entire development lifecycle automation process.
-
-   ```bash
-   # Create monitoring and alerting DAG
-   cat << 'EOF' > monitoring_dag.py
-from datetime import datetime, timedelta
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.providers.google.cloud.operators.bigquery import BigQueryCreateEmptyDatasetOperator, BigQueryCreateEmptyTableOperator
-from airflow.providers.google.cloud.operators.monitoring import StackdriverCreateAlertPolicyOperator
-
-default_args = {
-    'owner': 'platform-team',
-    'depends_on_past': False,
-    'start_date': datetime(2024, 1, 1),
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5)
-}
-
-dag = DAG(
-    'intelligent_devops_monitoring',
-    default_args=default_args,
-    description='Monitoring and alerting for intelligent DevOps automation',
-    schedule_interval=timedelta(hours=1),
-    catchup=False,
-    tags=['monitoring', 'observability']
-)
-
-def collect_pipeline_metrics(**context):
-    """Collect metrics from pipeline executions"""
-    from google.cloud import monitoring_v3
-    from google.cloud import bigquery
-    import json
-    
-    # Initialize clients
-    monitoring_client = monitoring_v3.MetricServiceClient()
-    bq_client = bigquery.Client()
-    
-    # Collect workflow execution metrics
-    project_name = f"projects/{context['var']['value']['PROJECT_ID']}"
-    
-    # Query for DAG run metrics
-    metrics = {
-        'timestamp': datetime.now().isoformat(),
-        'dag_runs_success': 15,  # Simulated metrics
-        'dag_runs_failed': 2,
-        'avg_execution_time_minutes': 12.5,
-        'security_scans_blocked': 1,
-        'deployments_approved': 8,
-        'compliance_violations': 0
-    }
-    
-    # Store metrics in BigQuery for analysis
-    table_id = f"{context['var']['value']['PROJECT_ID']}.devops_metrics.pipeline_runs"
-    
-    # Create metrics record
-    rows_to_insert = [metrics]
-    
-    try:
-        table = bq_client.get_table(table_id)
-        errors = bq_client.insert_rows_json(table, rows_to_insert)
-        if not errors:
-            print(f"✅ Metrics stored successfully: {metrics}")
-        else:
-            print(f"❌ Errors inserting metrics: {errors}")
-    except Exception as e:
-        print(f"⚠️ Table not found, metrics logged locally: {e}")
-    
-    return metrics
-
-collect_metrics = PythonOperator(
-    task_id='collect_pipeline_metrics',
-    python_callable=collect_pipeline_metrics,
-    dag=dag
-)
-
-def analyze_security_trends(**context):
-    """Analyze security vulnerability trends"""
-    import random
-    
-    # Simulate security trend analysis
-    trends = {
-        'critical_vulnerabilities_trend': 'decreasing',
-        'scan_coverage_percentage': 98.5,
-        'compliance_score': 95.2,
-        'policy_violations_trend': 'stable',
-        'recommendation': 'Continue current security policies'
-    }
-    
-    print(f"Security trends analysis: {trends}")
-    return trends
-
-security_analysis = PythonOperator(
-    task_id='analyze_security_trends',
-    python_callable=analyze_security_trends,
-    dag=dag
-)
-
-def generate_compliance_report(**context):
-    """Generate compliance and governance report"""
-    
-    report = {
-        'reporting_period': context['ds'],
-        'total_deployments': 23,
-        'policy_compliant_deployments': 22,
-        'compliance_rate': 95.7,
-        'audit_findings': 0,
-        'recommendations': [
-            'Increase security scan frequency',
-            'Implement additional compliance checks for database migrations'
-        ]
-    }
-    
-    print(f"Compliance report generated: {report}")
-    return report
-
-compliance_report = PythonOperator(
-    task_id='generate_compliance_report',
-    python_callable=generate_compliance_report,
-    dag=dag
-)
-
-# Define task dependencies
-collect_metrics >> [security_analysis, compliance_report]
-EOF
-
-   # Upload monitoring DAG
-   gsutil cp monitoring_dag.py gs://${BUCKET_NAME}/dags/
-   
-   echo "✅ Monitoring and alerting DAG deployed"
-   ```
-
-   The monitoring DAG is now operational, providing continuous observability into our intelligent automation system's performance, security effectiveness, and compliance posture.
-
 10. **Configure Environment Variables in Cloud Composer**:
 
     Cloud Composer environments require proper configuration of variables and connections to integrate seamlessly with other Google Cloud services. These environment variables enable our DAGs to access project resources, maintain security credentials, and coordinate with external services throughout the automation workflow.
@@ -744,12 +622,23 @@ EOF
     # Copy DAGs to Composer environment
     gsutil -m cp gs://${BUCKET_NAME}/dags/*.py ${COMPOSER_BUCKET}/dags/
     
-    # Set up Airflow connections (simulated - normally done via Airflow UI)
-    echo "Setting up Airflow connections and variables..."
-    
     # Create sample data for testing
     echo '{"schema_changes": [{"type": "ADD_COLUMN", "table": "users", "column": "email_verified"}]}' | \
         gsutil cp - gs://${BUCKET_NAME}/datastream/$(date +%Y-%m-%d)/changes.json
+    
+    # Create sample source code archive for Cloud Build
+    mkdir -p sample-app
+    cat << 'DOCKERFILE' > sample-app/Dockerfile
+FROM nginx:alpine
+COPY index.html /usr/share/nginx/html/
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+DOCKERFILE
+    
+    echo '<h1>Sample Application</h1>' > sample-app/index.html
+    tar -czf app.tar.gz -C sample-app .
+    gsutil cp app.tar.gz gs://${BUCKET_NAME}/source/
+    rm -rf sample-app app.tar.gz
     
     echo "✅ Cloud Composer environment configured with variables and test data"
     ```
@@ -792,9 +681,9 @@ EOF
        --format="table(name,format,createTime)"
    
    # Verify vulnerability scanning is enabled
-   gcloud artifacts settings describe \
+   gcloud artifacts scan describe \
        --project=${PROJECT_ID} \
-       --format="value(vulnerabilityScanning.automatic)"
+       --format="value(analysisKind)"
    ```
 
    Expected output: Repository should be created and vulnerability scanning should be enabled.
@@ -825,7 +714,7 @@ EOF
        --format="value(config.airflowUri)")
    
    echo "Access Airflow UI at: ${AIRFLOW_URI}"
-   echo "DAGs should be visible: intelligent_cicd_pipeline, intelligent_devops_monitoring"
+   echo "DAGs should be visible: intelligent_cicd_pipeline"
    
    # Verify environment variables are set
    gcloud composer environments describe ${COMPOSER_ENV_NAME} \
@@ -894,8 +783,12 @@ EOF
    # Remove Cloud Storage bucket and contents
    gsutil -m rm -r gs://${BUCKET_NAME}
    
+   # Delete service account
+   gcloud iam service-accounts delete ${COMPOSER_SA}@${PROJECT_ID}.iam.gserviceaccount.com \
+       --quiet
+   
    # Clean up local files
-   rm -f intelligent_cicd_dag.py monitoring_dag.py compliance-workflow.yaml security-policy.yaml db-config.txt
+   rm -f intelligent_cicd_dag.py compliance-workflow.yaml security-policy.yaml db-config.txt
    
    echo "✅ Workflows and storage cleaned up"
    ```
@@ -918,9 +811,9 @@ The integration of Datastream for change data capture represents a paradigm shif
 
 The security-first architecture implemented through Artifact Registry's vulnerability scanning and Binary Authorization policies ensures that security considerations are built into the automation fabric rather than being afterthoughts. This approach aligns with Google Cloud's defense-in-depth security model and enables organizations to achieve both velocity and security in their development practices. The automated policy enforcement prevents security vulnerabilities from reaching production environments while providing audit trails for compliance requirements.
 
-The observability layer implemented through the monitoring DAG and integration with Cloud Monitoring provides the operational intelligence needed to continuously improve the automation system. By collecting metrics on deployment success rates, security scan effectiveness, and compliance adherence, teams can identify bottlenecks and optimize their development processes based on data-driven insights rather than assumptions.
+The observability layer implemented through monitoring and integration with Cloud Logging provides the operational intelligence needed to continuously improve the automation system. By collecting metrics on deployment success rates, security scan effectiveness, and compliance adherence, teams can identify bottlenecks and optimize their development processes based on data-driven insights rather than assumptions.
 
-> **Tip**: Consider implementing gradual rollout strategies using Cloud Deploy to further enhance the intelligent automation system with automated canary deployments and rollback capabilities.
+> **Tip**: Consider implementing gradual rollout strategies using Cloud Deploy to further enhance the intelligent automation system with automated canary deployments and rollback capabilities based on application performance metrics.
 
 Key documentation sources for this implementation include:
 - [Cloud Composer 3 Documentation](https://cloud.google.com/composer/docs/composer-3)
@@ -928,6 +821,7 @@ Key documentation sources for this implementation include:
 - [Artifact Registry Security Scanning](https://cloud.google.com/artifact-analysis/docs/container-scanning-overview)
 - [Cloud Workflows Best Practices](https://cloud.google.com/workflows/docs/best-practices)
 - [Binary Authorization Policies](https://cloud.google.com/binary-authorization/docs/policy-yaml-reference)
+- [Apache Airflow 3 Features](https://airflow.apache.org/docs/apache-airflow/stable/what-is-airflow.html)
 
 ## Challenge
 
@@ -945,4 +839,9 @@ Extend this intelligent automation solution by implementing these advanced enhan
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

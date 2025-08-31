@@ -4,19 +4,18 @@ id: 3e3e722e
 category: analytics
 difficulty: 300
 subject: aws
-services: Rekognition, S3, Lambda, API Gateway
-estimated-time: 70 minutes
-recipe-version: 1.2
+services: Rekognition, S3, Lambda, Kinesis
+estimated-time: 75 minutes
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: rekognition, computer-vision, machine-learning, image-analysis
 recipe-generator-version: 1.3
 ---
 
 # Computer Vision Applications with Rekognition
-
 
 ## Problem
 
@@ -75,14 +74,14 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for Amazon Rekognition, S3, and Kinesis Video Streams
+1. AWS account with appropriate permissions for Amazon Rekognition, S3, Kinesis Video Streams, and IAM
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of computer vision concepts and AWS services
 4. Sample images and videos for testing (retail/security footage recommended)
 5. Understanding of facial recognition privacy and compliance requirements
-6. Estimated cost: $15-25 USD for processing 1,000 images and 1 hour of video (varies by region)
+6. Estimated cost: $15-30 USD for processing 1,000 images and 1 hour of video (varies by region)
 
-> **Note**: Free tier includes 5,000 images processed per month for the first 12 months. Video analysis charges apply separately.
+> **Note**: Free tier includes 5,000 images processed per month for the first 12 months. Video analysis charges apply separately based on processing duration.
 
 ## Preparation
 
@@ -107,6 +106,16 @@ export KDS_STREAM_NAME="rekognition-results-${RANDOM_SUFFIX}"
 # Create S3 bucket for storing images and videos
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
 
+# Enable versioning and encryption for security
+aws s3api put-bucket-versioning \
+    --bucket ${S3_BUCKET_NAME} \
+    --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+    --bucket ${S3_BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
 # Create directories for organized storage
 aws s3api put-object --bucket ${S3_BUCKET_NAME} \
     --key images/
@@ -125,7 +134,7 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
 
 1. **Create Face Collection for Person Recognition**:
 
-   Face collections in Amazon Rekognition act as databases for storing facial feature vectors, enabling fast face recognition and search capabilities. This is essential for identifying known individuals in your computer vision applications.
+   Face collections in Amazon Rekognition act as databases for storing facial feature vectors, enabling fast face recognition and search capabilities. This is essential for identifying known individuals in your computer vision applications, whether for security monitoring, VIP customer recognition, or employee access control systems.
 
    ```bash
    # Create a face collection for storing known faces
@@ -142,11 +151,11 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
    echo "✅ Face collection created: ${FACE_COLLECTION_NAME}"
    ```
 
-   The face collection stores only mathematical representations (feature vectors) of faces, not the actual images, ensuring privacy compliance while enabling fast recognition.
+   The face collection stores only mathematical representations (feature vectors) of faces, not the actual images, ensuring privacy compliance while enabling fast recognition. Each collection can store up to 20 million face vectors, providing scalability for enterprise deployments.
 
 2. **Upload Sample Images and Index Known Faces**:
 
-   Face indexing is the cornerstone of identity management in computer vision systems. When you index faces, Amazon Rekognition extracts mathematical feature vectors from facial geometries and stores them in your collection, enabling rapid identification of individuals across thousands of images or video frames. This process is essential for retail security systems, employee access control, and customer experience personalization, as it allows the system to recognize known individuals in real-time without storing sensitive biometric images.
+   Face indexing is the cornerstone of identity management in computer vision systems. When you index faces, Amazon Rekognition extracts mathematical feature vectors from facial geometries and stores them in your collection, enabling rapid identification of individuals across thousands of images or video frames. This process is essential for retail security systems, employee access control, and customer experience personalization.
 
    ```bash
    # Download sample images (or use your own)
@@ -169,7 +178,7 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
        --region ${AWS_REGION} \
        > ~/computer-vision-demo/results/index-faces-result.json
    
-   # Extract and store the Face ID
+   # Extract and store the Face ID for later use
    FACE_ID_1=$(cat ~/computer-vision-demo/results/index-faces-result.json | \
        jq -r '.FaceRecords[0].Face.FaceId')
    
@@ -180,18 +189,18 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
 
 3. **Comprehensive Image Analysis**:
 
-   This step demonstrates Rekognition's multi-modal analysis capabilities, running several AI models in parallel to extract different types of information from images. Each analysis type serves specific business use cases.
+   Amazon Rekognition provides multiple specialized AI models that can analyze different aspects of the same image simultaneously. This parallel processing approach maximizes the insights extracted from each image while minimizing API calls and processing time. Each analysis type serves specific business use cases and can be combined to create comprehensive intelligence about your visual content.
 
    ```bash
    # Set image to analyze
    IMAGE_NAME="person2.jpg"
    
    # 1. Detect labels (objects and scenes)
-   # This uses deep learning models trained on millions of images to identify objects, scenes, activities, and concepts
+   # Uses deep learning models trained on millions of images
    aws rekognition detect-labels \
        --image "S3Object={Bucket=${S3_BUCKET_NAME},Name=images/${IMAGE_NAME}}" \
        --features GENERAL_LABELS,IMAGE_PROPERTIES \
-       --settings '{"GeneralLabels":{"LabelInclusionFilters":[],"LabelExclusionFilters":[],"LabelCategoryInclusionFilters":[],"LabelCategoryExclusionFilters":[],"MaxLabels":20},"ImageProperties":{"MaxDominantColors":10}}' \
+       --settings '{"GeneralLabels":{"MaxLabels":20},"ImageProperties":{"MaxDominantColors":10}}' \
        --region ${AWS_REGION} \
        > ~/computer-vision-demo/results/labels-analysis.json
    
@@ -303,12 +312,12 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
        --role-name RekognitionVideoAnalysisRole \
        --assume-role-policy-document file://~/computer-vision-demo/trust-policy.json
    
-   # Attach necessary policies
+   # Attach necessary policies for video analysis operations
    aws iam attach-role-policy \
        --role-name RekognitionVideoAnalysisRole \
        --policy-arn arn:aws:iam::aws:policy/service-role/AmazonRekognitionServiceRole
    
-   # Get the role ARN
+   # Get the role ARN for later use
    ROLE_ARN=$(aws iam get-role \
        --role-name RekognitionVideoAnalysisRole \
        --query 'Role.Arn' --output text)
@@ -320,7 +329,7 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
 
 6. **Start Video Analysis Jobs**:
 
-   Video analysis in Rekognition is asynchronous due to the computational complexity of processing potentially hours of video content. Multiple analysis jobs can run in parallel to extract different insights from the same video.
+   Video analysis in Rekognition is asynchronous due to the computational complexity of processing potentially hours of video content. Multiple analysis jobs can run in parallel to extract different insights from the same video. Amazon Rekognition supports a maximum of 20 concurrent video analysis jobs per account, processing them sequentially to manage costs and resources efficiently.
 
    ```bash
    # Download sample video or upload your own
@@ -355,7 +364,7 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
    echo "Person Tracking Job ID: ${PERSON_TRACKING_JOB}"
    ```
 
-   Three parallel analysis jobs are now processing your video content in the background. Face detection tracks facial appearances throughout the video timeline, label detection identifies objects and activities in each frame, and person tracking follows individual movement patterns. This asynchronous processing approach enables efficient analysis of large video files without blocking your application. The job IDs allow you to monitor progress and retrieve results when processing completes. Learn more about video analysis in the [Amazon Rekognition streaming video documentation](https://docs.aws.amazon.com/rekognition/latest/dg/streaming-video.html).
+   Three parallel analysis jobs are now processing your video content in the background. Face detection tracks facial appearances throughout the video timeline, label detection identifies objects and activities in each frame, and person tracking follows individual movement patterns. This asynchronous processing approach enables efficient analysis of large video files without blocking your application. The job IDs allow you to monitor progress and retrieve results when processing completes. Learn more about video analysis quotas in the [Amazon Rekognition Guidelines and Quotas documentation](https://docs.aws.amazon.com/rekognition/latest/dg/limits.html).
 
 7. **Monitor Video Analysis Progress**:
 
@@ -414,7 +423,7 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
 
 8. **Retrieve and Analyze Video Results**:
 
-   Video analysis results provide temporal insights that are impossible to achieve with static image analysis alone. By processing video content frame by frame, you can understand movement patterns, track individual subjects over time, and identify behavioral trends that inform business decisions. This temporal dimension enables applications like customer flow analysis, security incident tracking, and operational efficiency monitoring that rely on understanding how situations develop over time.
+   Video analysis results provide temporal insights that are impossible to achieve with static image analysis alone. By processing video content frame by frame, you can understand movement patterns, track individual subjects over time, and identify behavioral trends that inform business decisions. This temporal dimension enables applications like customer flow analysis, security incident tracking, and operational efficiency monitoring.
 
    ```bash
    # Get face detection results
@@ -443,7 +452,7 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
        jq -r '.Faces | length')
    echo "Total faces detected: ${FACE_COUNT}"
    
-   # Show top labels
+   # Show top labels with aggregated statistics
    echo "Top 5 labels detected in video:"
    cat ~/computer-vision-demo/results/video-label-detection.json | \
        jq -r '.Labels | group_by(.Label.Name) | map({name: .[0].Label.Name, count: length, confidence: (map(.Label.Confidence) | add / length)}) | sort_by(-.count) | .[0:5] | .[] | "\(.name): \(.count) instances, avg confidence: \(.confidence | floor)%"'
@@ -463,7 +472,7 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
    Transforming raw computer vision data into actionable business intelligence requires structured reporting that combines multiple analysis types into cohesive insights. This comprehensive report generation process demonstrates how to aggregate image and video analysis results, calculate business metrics, and present findings in a format suitable for decision-making. Automated reporting enables regular monitoring of key performance indicators and helps identify trends that inform strategic business decisions.
 
    ```bash
-   # Generate a comprehensive report
+   # Generate a comprehensive analytics report
    cat > ~/computer-vision-demo/generate-analytics-report.py << 'EOF'
    #!/usr/bin/env python3
    import json
@@ -602,7 +611,7 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
         --data-retention-in-hours 24 \
         --region ${AWS_REGION}
     
-    # Get stream ARNs
+    # Get stream ARNs for later use
     KVS_ARN=$(aws kinesisvideo describe-stream \
         --stream-name ${KVS_STREAM_NAME} \
         --query 'StreamInfo.StreamARN' --output text)
@@ -766,32 +775,39 @@ echo "✅ Preparation complete. Resources created with suffix: ${RANDOM_SUFFIX}"
 
 ## Discussion
 
-Amazon Rekognition provides a comprehensive computer vision platform that eliminates the need for specialized machine learning expertise while delivering enterprise-grade accuracy. This solution demonstrates the full spectrum of Rekognition's capabilities, from basic object detection to advanced facial analysis and real-time video processing. The architecture we built separates batch processing from real-time streaming, allowing organizations to handle both historical analysis and live monitoring efficiently.
+Amazon Rekognition provides a comprehensive computer vision platform that eliminates the need for specialized machine learning expertise while delivering enterprise-grade accuracy. This solution demonstrates the full spectrum of Rekognition's capabilities, from basic object detection to advanced facial analysis and real-time video processing. The architecture we built separates batch processing from real-time streaming, allowing organizations to handle both historical analysis and live monitoring efficiently according to the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
-The integration of face collections enables powerful identity management scenarios, particularly valuable for retail security, employee access control, and customer experience personalization. By maintaining a database of known faces, businesses can automatically identify VIP customers, detect known shoplifters, or monitor employee attendance. However, this capability requires careful consideration of privacy laws and ethical guidelines, particularly GDPR, CCPA, and other regional regulations governing biometric data processing.
+The integration of face collections enables powerful identity management scenarios, particularly valuable for retail security, employee access control, and customer experience personalization. By maintaining a database of known faces, businesses can automatically identify VIP customers, detect known shoplifters, or monitor employee attendance. However, this capability requires careful consideration of privacy laws and ethical guidelines, particularly GDPR, CCPA, and other regional regulations governing biometric data processing. Each face collection can store up to 20 million face vectors, providing enterprise-scale capabilities for large organizations.
 
-Real-time streaming analysis through Kinesis Video Streams and stream processors provides immediate insights for time-sensitive applications. This is particularly valuable for security monitoring, where immediate alerts for suspicious behavior or unauthorized access can prevent incidents. The streaming architecture also enables scalable processing of multiple video feeds simultaneously, making it suitable for large retail chains or multi-location enterprises.
+Real-time streaming analysis through Kinesis Video Streams and stream processors provides immediate insights for time-sensitive applications. This is particularly valuable for security monitoring, where immediate alerts for suspicious behavior or unauthorized access can prevent incidents. The streaming architecture also enables scalable processing of multiple video feeds simultaneously, making it suitable for large retail chains or multi-location enterprises. Amazon Rekognition supports a maximum of 20 concurrent video analysis jobs per account, processing them in a queue to manage costs and resource utilization efficiently.
 
-> **Tip**: For production deployments, implement confidence thresholds based on your specific use case. Security applications typically require 95%+ confidence for automated actions, while analytics applications may accept lower thresholds for broader insights.
+> **Tip**: For production deployments, implement confidence thresholds based on your specific use case. Security applications typically require 95%+ confidence for automated actions, while analytics applications may accept lower thresholds for broader insights. See the [Amazon Rekognition best practices documentation](https://docs.aws.amazon.com/rekognition/latest/dg/best-practices.html) for detailed guidance.
 
-> **Warning**: When implementing facial recognition, ensure compliance with local privacy laws such as GDPR, CCPA, and biometric privacy regulations. Always obtain proper consent and implement data retention policies.
+> **Warning**: When implementing facial recognition, ensure compliance with local privacy laws such as GDPR, CCPA, and biometric privacy regulations. Always obtain proper consent and implement data retention policies. Review the [Amazon Rekognition data privacy documentation](https://docs.aws.amazon.com/rekognition/latest/dg/considerations.html) for compliance guidance.
 
-The solution's modular design allows organizations to implement only the features they need, starting with basic object detection and gradually adding facial recognition, text extraction, and content moderation as requirements evolve. Amazon Rekognition automatically scales to handle varying workloads, but video analysis jobs are queued and processed sequentially per account in each region to manage costs and resources. This incremental approach helps manage costs while building operational confidence in the system's accuracy and reliability.
+The solution's modular design allows organizations to implement only the features they need, starting with basic object detection and gradually adding facial recognition, text extraction, and content moderation as requirements evolve. This incremental approach helps manage costs while building operational confidence in the system's accuracy and reliability.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Build a real-time dashboard** using Amazon QuickSight or a custom web application to visualize analytics in real-time, showing customer demographics, dwell time, and traffic patterns across different store locations.
+1. **Build a real-time dashboard** using Amazon QuickSight or a custom web application to visualize analytics in real-time, showing customer demographics, dwell time, and traffic patterns across different store locations with automated refresh capabilities.
 
-2. **Implement custom label detection** using Amazon Rekognition Custom Labels to identify specific products, brands, or store-specific objects that general labels might miss, enabling detailed inventory tracking and product placement analysis.
+2. **Implement custom label detection** using Amazon Rekognition Custom Labels to identify specific products, brands, or store-specific objects that general labels might miss, enabling detailed inventory tracking and product placement analysis for retail optimization.
 
-3. **Create an automated alert system** using Amazon SNS and Lambda that triggers notifications when specific conditions are met (e.g., overcrowding, unattended items, or VIP customer detection) with configurable rules for different business scenarios.
+3. **Create an automated alert system** using Amazon SNS and Lambda that triggers notifications when specific conditions are met (e.g., overcrowding, unattended items, or VIP customer detection) with configurable rules for different business scenarios and escalation paths.
 
-4. **Develop privacy-compliant face recognition** by implementing automatic face blurring for non-essential personnel while maintaining recognition capabilities for authorized use cases, ensuring compliance with privacy regulations.
+4. **Develop privacy-compliant face recognition** by implementing automatic face blurring for non-essential personnel while maintaining recognition capabilities for authorized use cases, ensuring compliance with privacy regulations and ethical guidelines.
 
-5. **Build a comprehensive analytics pipeline** using Amazon Kinesis Data Analytics to process streaming results, calculate business metrics (customer conversion rates, popular product areas, peak hours), and generate actionable insights for store operations and marketing teams.
+5. **Build a comprehensive analytics pipeline** using Amazon Kinesis Data Analytics to process streaming results, calculate business metrics (customer conversion rates, popular product areas, peak hours), and generate actionable insights for store operations and marketing teams with automated reporting and alerting.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

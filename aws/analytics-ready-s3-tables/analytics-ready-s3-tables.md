@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: S3, S3 Tables, Athena, Glue
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: analytics, data-lake, iceberg, structured-data, query-optimization
 recipe-generator-version: 1.3
@@ -44,7 +44,7 @@ graph TB
     subgraph "Analytics Services"
         ATHENA[Amazon Athena]
         GLUE[AWS Glue Data Catalog]
-        LAKE[SageMaker Lakehouse]
+        LAKE[Lake Formation]
     end
     
     subgraph "Query & Visualization"
@@ -61,7 +61,7 @@ graph TB
     
     TABLE-->GLUE
     GLUE-->ATHENA
-    ATHENA-->LAKE
+    LAKE-->ATHENA
     
     ATHENA-->QUERY
     QUERY-->DASH
@@ -73,7 +73,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with administrator permissions for S3, S3 Tables, Athena, and AWS Glue
+1. AWS account with administrator permissions for S3, S3 Tables, Athena, AWS Glue, and Lake Formation
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic knowledge of SQL and Apache Iceberg table format
 4. Understanding of AWS analytics services architecture
@@ -116,13 +116,12 @@ echo "✅ Environment configured with unique identifiers"
 
 1. **Create S3 Table Bucket for Analytics Storage**:
 
-   S3 Tables provides a specialized bucket type designed specifically for Apache Iceberg tabular data storage. Unlike traditional S3 buckets that store unstructured objects, table buckets automatically optimize storage layout, manage metadata, and provide built-in table maintenance capabilities. This creates the foundation for high-performance analytics workloads with automatic optimization and cost efficiency.
+   S3 Tables provides a specialized bucket type designed specifically for Apache Iceberg tabular data storage. Unlike traditional S3 buckets that store unstructured objects, table buckets automatically optimize storage layout, manage metadata, and provide built-in table maintenance capabilities through automatic compaction and snapshot management. This creates the foundation for high-performance analytics workloads with automatic optimization and cost efficiency.
 
    ```bash
    # Create the table bucket
    aws s3tables create-table-bucket \
-       --name ${TABLE_BUCKET_NAME} \
-       --region ${AWS_REGION}
+       --name ${TABLE_BUCKET_NAME}
    
    # Store the table bucket ARN for future commands
    export TABLE_BUCKET_ARN=$(aws s3tables get-table-bucket \
@@ -132,11 +131,11 @@ echo "✅ Environment configured with unique identifiers"
    echo "✅ Table bucket created: ${TABLE_BUCKET_ARN}"
    ```
 
-   The table bucket is now ready to store Iceberg tables with automatic maintenance features enabled. This managed approach eliminates the operational overhead of manual table optimization while providing enterprise-grade durability and availability.
+   The table bucket is now ready to store Iceberg tables with automatic maintenance features enabled. This managed approach eliminates the operational overhead of manual table optimization while providing enterprise-grade durability (99.999999999% - 11 9's) and availability following AWS Well-Architected Framework principles.
 
 2. **Create Namespace for Logical Data Organization**:
 
-   Namespaces in S3 Tables provide logical grouping for related tables, similar to databases in traditional data warehouses. They enable better access control, organization, and management of table collections. Creating a well-structured namespace hierarchy supports data governance and simplifies permission management across analytics teams.
+   Namespaces in S3 Tables provide logical grouping for related tables, similar to databases in traditional data warehouses. They enable better access control, organization, and management of table collections through AWS Lake Formation integration. Creating a well-structured namespace hierarchy supports data governance and simplifies permission management across analytics teams.
 
    ```bash
    # Create namespace for analytics data
@@ -152,11 +151,11 @@ echo "✅ Environment configured with unique identifiers"
    echo "✅ Namespace '${NAMESPACE_NAME}' created successfully"
    ```
 
-   The namespace provides a logical container for organizing related tables while supporting fine-grained access control and resource management policies.
+   The namespace provides a logical container for organizing related tables while supporting fine-grained access control through Lake Formation and resource management policies.
 
 3. **Create Apache Iceberg Table with Optimized Schema**:
 
-   Apache Iceberg tables in S3 Tables provide schema evolution, time travel capabilities, and automatic optimization features. The table schema definition establishes the structure for storing structured data with built-in performance optimizations and maintenance automation.
+   Apache Iceberg tables in S3 Tables provide schema evolution, time travel capabilities, and automatic optimization features. The table creation establishes the structure for storing structured data with built-in performance optimizations including automatic file compaction, snapshot management, and garbage collection for continuous query performance optimization.
 
    ```bash
    # Create sample table for customer events
@@ -176,11 +175,11 @@ echo "✅ Environment configured with unique identifiers"
    echo "✅ Iceberg table '${SAMPLE_TABLE_NAME}' created"
    ```
 
-   The Iceberg table now supports advanced analytics features including ACID transactions, schema evolution, and time travel queries while maintaining optimal query performance through automatic optimization.
+   The Iceberg table now supports advanced analytics features including ACID transactions, schema evolution, and time travel queries while maintaining optimal query performance through automatic optimization and maintenance.
 
 4. **Enable AWS Analytics Services Integration**:
 
-   Integration with AWS analytics services connects S3 Tables with Amazon Athena, Redshift, EMR, and other query engines through AWS Glue Data Catalog. This integration enables automatic table discovery and provides a unified interface for accessing table data across different analytics tools.
+   Integration with AWS analytics services connects S3 Tables with Amazon Athena, Redshift, EMR, and other query engines through AWS Glue Data Catalog and Lake Formation. This integration enables automatic table discovery and provides a unified interface for accessing table data across different analytics tools with proper security and governance controls.
 
    ```bash
    # Enable integration with AWS analytics services
@@ -192,7 +191,10 @@ echo "✅ Environment configured with unique identifiers"
                {
                    "Effect": "Allow",
                    "Principal": {
-                       "Service": "glue.amazonaws.com"
+                       "Service": [
+                           "glue.amazonaws.com",
+                           "lakeformation.amazonaws.com"
+                       ]
                    },
                    "Action": [
                        "s3tables:GetTable",
@@ -203,17 +205,17 @@ echo "✅ Environment configured with unique identifiers"
            ]
        }'
    
-   # Wait for integration to complete
+   # Wait for integration to propagate
    sleep 30
    
    echo "✅ Analytics services integration enabled"
    ```
 
-   The integration now allows AWS analytics services to automatically discover and query tables through the unified data catalog interface.
+   The integration now allows AWS analytics services to automatically discover and query tables through the unified data catalog interface with proper Lake Formation governance and security controls.
 
 5. **Configure Athena Workgroup for Table Queries**:
 
-   Amazon Athena provides serverless SQL query capabilities for S3 Tables with automatic scaling and pay-per-query pricing. Creating a dedicated workgroup establishes query execution settings, result location configuration, and cost controls for analytics workloads.
+   Amazon Athena provides serverless SQL query capabilities for S3 Tables with automatic scaling and pay-per-query pricing. Creating a dedicated workgroup establishes query execution settings, result location configuration, and cost controls for analytics workloads while enabling query result management and performance monitoring.
 
    ```bash
    # Create Athena workgroup for S3 Tables queries
@@ -231,11 +233,11 @@ echo "✅ Environment configured with unique identifiers"
    echo "✅ Athena workgroup configured for S3 Tables"
    ```
 
-   The Athena workgroup is now ready to execute SQL queries against S3 Tables with optimized performance and cost management features.
+   The Athena workgroup is now ready to execute SQL queries against S3 Tables with optimized performance and cost management features through dedicated resource allocation and query result management.
 
 6. **Create Sample Data Definition Language (DDL) Schema**:
 
-   Defining the table schema through DDL statements establishes the structure for storing analytics data with proper data types, partitioning, and optimization settings. This schema definition enables efficient data ingestion and query performance optimization.
+   Defining the table schema through DDL statements establishes the structure for storing analytics data with proper data types, partitioning, and optimization settings. This schema definition enables efficient data ingestion and query performance optimization through Apache Iceberg's advanced features including partition evolution and hidden partitioning.
 
    ```bash
    # Create DDL file for customer events table
@@ -263,31 +265,41 @@ echo "✅ Environment configured with unique identifiers"
    echo "✅ DDL schema definition created"
    ```
 
-   The schema definition provides optimized storage configuration with partitioning and compression settings for efficient analytics queries.
+   The schema definition provides optimized storage configuration with date-based partitioning and SNAPPY compression settings for efficient analytics queries and cost-effective storage management.
 
 7. **Insert Sample Analytics Data**:
 
-   Loading sample data demonstrates the table's capabilities for storing structured analytics data while showcasing the automatic optimization features. The sample dataset represents common e-commerce analytics use cases with time-series data and categorical dimensions.
+   Loading sample data demonstrates the table's capabilities for storing structured analytics data while showcasing the automatic optimization features. The sample dataset represents common e-commerce analytics use cases with time-series data and categorical dimensions that demonstrate ACID transaction capabilities and query optimization.
 
    ```bash
    # Create sample data insertion script
    cat > insert_sample_data.sql << 'EOF'
    INSERT INTO s3tablescatalog.analytics_data.customer_events VALUES
-   ('evt_001', 'cust_12345', 'page_view', TIMESTAMP '2025-01-15 10:30:00', 'electronics', 0.00, 'sess_abc123', 'Mozilla/5.0', DATE '2025-01-15'),
-   ('evt_002', 'cust_12345', 'add_to_cart', TIMESTAMP '2025-01-15 10:35:00', 'electronics', 299.99, 'sess_abc123', 'Mozilla/5.0', DATE '2025-01-15'),
-   ('evt_003', 'cust_67890', 'purchase', TIMESTAMP '2025-01-15 11:00:00', 'clothing', 89.99, 'sess_def456', 'Chrome/100.0', DATE '2025-01-15'),
-   ('evt_004', 'cust_54321', 'page_view', TIMESTAMP '2025-01-15 11:15:00', 'books', 0.00, 'sess_ghi789', 'Safari/14.0', DATE '2025-01-15'),
-   ('evt_005', 'cust_54321', 'purchase', TIMESTAMP '2025-01-15 11:30:00', 'books', 24.99, 'sess_ghi789', 'Safari/14.0', DATE '2025-01-15');
+   ('evt_001', 'cust_12345', 'page_view', 
+    TIMESTAMP '2025-01-15 10:30:00', 'electronics', 0.00, 
+    'sess_abc123', 'Mozilla/5.0', DATE '2025-01-15'),
+   ('evt_002', 'cust_12345', 'add_to_cart', 
+    TIMESTAMP '2025-01-15 10:35:00', 'electronics', 299.99, 
+    'sess_abc123', 'Mozilla/5.0', DATE '2025-01-15'),
+   ('evt_003', 'cust_67890', 'purchase', 
+    TIMESTAMP '2025-01-15 11:00:00', 'clothing', 89.99, 
+    'sess_def456', 'Chrome/100.0', DATE '2025-01-15'),
+   ('evt_004', 'cust_54321', 'page_view', 
+    TIMESTAMP '2025-01-15 11:15:00', 'books', 0.00, 
+    'sess_ghi789', 'Safari/14.0', DATE '2025-01-15'),
+   ('evt_005', 'cust_54321', 'purchase', 
+    TIMESTAMP '2025-01-15 11:30:00', 'books', 24.99, 
+    'sess_ghi789', 'Safari/14.0', DATE '2025-01-15');
    EOF
    
    echo "✅ Sample data prepared for insertion"
    ```
 
-   The sample data represents realistic analytics scenarios with customer events, timestamps, and business metrics ready for analysis.
+   The sample data represents realistic analytics scenarios with customer events, timestamps, and business metrics ready for analysis with proper data type formatting and partition-aware organization.
 
 8. **Execute Athena Queries on S3 Tables**:
 
-   Running analytical queries demonstrates the performance benefits and capabilities of S3 Tables for business intelligence workloads. These queries showcase the automatic optimization features and integration with AWS analytics services.
+   Running analytical queries demonstrates the performance benefits and capabilities of S3 Tables for business intelligence workloads. These queries showcase the automatic optimization features, ACID transaction support, and integration with AWS analytics services through the s3tablescatalog namespace.
 
    ```bash
    # Execute DDL query to create table structure
@@ -297,9 +309,10 @@ echo "✅ Environment configured with unique identifiers"
        --query 'QueryExecutionId' --output text)
    
    # Wait for DDL query completion
-   aws athena get-query-execution \
-       --query-execution-id ${QUERY_ID} \
-       --query 'QueryExecution.Status.State' --output text
+   aws athena wait query-execution-complete \
+       --query-execution-id ${QUERY_ID}
+   
+   echo "✅ DDL query completed successfully"
    
    # Execute data insertion query
    INSERT_QUERY_ID=$(aws athena start-query-execution \
@@ -307,10 +320,14 @@ echo "✅ Environment configured with unique identifiers"
        --work-group s3-tables-workgroup \
        --query 'QueryExecutionId' --output text)
    
-   echo "✅ Athena queries executed successfully"
+   # Wait for insertion to complete
+   aws athena wait query-execution-complete \
+       --query-execution-id ${INSERT_QUERY_ID}
+   
+   echo "✅ Data insertion completed successfully"
    ```
 
-   The queries demonstrate S3 Tables' ability to handle both DDL and DML operations with optimized performance and automatic maintenance.
+   The queries demonstrate S3 Tables' ability to handle both DDL and DML operations with optimized performance, automatic maintenance, and ACID transaction guarantees for reliable analytics operations.
 
 ## Validation & Testing
 
@@ -344,13 +361,16 @@ echo "✅ Environment configured with unique identifiers"
        --work-group s3-tables-workgroup \
        --query 'QueryExecutionId' --output text)
    
-   # Check query results
+   # Wait for query completion and get results
+   aws athena wait query-execution-complete \
+       --query-execution-id ${ANALYTICS_QUERY_ID}
+   
    aws athena get-query-results \
        --query-execution-id ${ANALYTICS_QUERY_ID} \
        --query 'ResultSet.Rows' --output table
    ```
 
-   Expected output: Aggregated event counts and average amounts by event type, demonstrating query optimization.
+   Expected output: Aggregated event counts and average amounts by event type, demonstrating query optimization and partition pruning capabilities.
 
 3. **Validate Integration with AWS Analytics Services**:
 
@@ -363,7 +383,7 @@ echo "✅ Environment configured with unique identifiers"
        --query 'Table.StorageDescriptor.Location' --output text
    ```
 
-   Expected output: S3 Tables location URI showing successful integration with Glue Data Catalog.
+   Expected output: S3 Tables location URI showing successful integration with Glue Data Catalog for unified metadata management.
 
 ## Cleanup
 
@@ -414,30 +434,37 @@ echo "✅ Environment configured with unique identifiers"
 
 ## Discussion
 
-Amazon S3 Tables represents a significant advancement in cloud-based analytics storage by providing purpose-built infrastructure for Apache Iceberg tables with automatic optimization and maintenance capabilities. This fully managed service addresses the operational complexity traditionally associated with large-scale analytics workloads while delivering substantial performance improvements over self-managed solutions.
+Amazon S3 Tables represents a significant advancement in cloud-based analytics storage by providing purpose-built infrastructure for Apache Iceberg tables with automatic optimization and maintenance capabilities. This fully managed service addresses the operational complexity traditionally associated with large-scale analytics workloads while delivering substantial performance improvements over self-managed solutions, following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles for operational excellence and performance efficiency.
 
-The integration with AWS analytics services through SageMaker Lakehouse creates a unified data platform that automatically discovers and catalogs tables across the organization. This seamless integration eliminates the need for complex ETL pipelines and manual metadata management, enabling data teams to focus on deriving insights rather than managing infrastructure. The automatic population of tables in AWS Glue Data Catalog ensures consistent metadata across different query engines and analytics tools.
+The integration with AWS analytics services through AWS Glue Data Catalog and Lake Formation creates a unified data platform that automatically discovers and catalogs tables across the organization. This seamless integration eliminates the need for complex ETL pipelines and manual metadata management, enabling data teams to focus on deriving insights rather than managing infrastructure. The automatic population of tables in AWS Glue Data Catalog ensures consistent metadata across different query engines and analytics tools while maintaining security through Lake Formation governance.
 
-The Apache Iceberg foundation provides enterprise-grade features including ACID transactions, schema evolution, and time travel capabilities while maintaining optimal query performance through automatic compaction and optimization. Organizations can expect up to 3x faster query performance compared to traditional S3 storage solutions, with the added benefit of automatic maintenance that continuously optimizes storage layout and manages metadata overhead.
+The Apache Iceberg foundation provides enterprise-grade features including ACID transactions, schema evolution, and time travel capabilities while maintaining optimal query performance through automatic compaction and optimization. Organizations can expect up to 3x faster query performance compared to traditional S3 storage solutions, with the added benefit of automatic maintenance that continuously optimizes storage layout and manages metadata overhead according to [S3 Tables best practices](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables.html).
 
-Cost optimization is achieved through intelligent storage tiering, automatic compression, and efficient metadata management that reduces both storage costs and query execution time. The pay-per-query model of integrated analytics services like Athena, combined with S3 Tables' performance optimizations, creates a cost-effective solution for analytics workloads at any scale.
+Cost optimization is achieved through intelligent storage tiering, automatic compression, and efficient metadata management that reduces both storage costs and query execution time. The pay-per-query model of integrated analytics services like Athena, combined with S3 Tables' performance optimizations, creates a cost-effective solution for analytics workloads at any scale while supporting the AWS Well-Architected Framework's cost optimization pillar.
 
-> **Tip**: Use S3 Tables' automatic partitioning and clustering features to optimize query performance for your specific access patterns. The service continuously learns from query patterns to improve data organization.
+> **Tip**: Use S3 Tables' automatic partitioning and clustering features to optimize query performance for your specific access patterns. The service continuously learns from query patterns to improve data organization. See the [S3 Tables performance optimization guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-maintenance.html) for additional guidance.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Advanced Partitioning Strategy**: Implement dynamic partitioning based on multiple dimensions (date, region, product category) to optimize query performance for complex analytical workloads.
+1. **Advanced Partitioning Strategy**: Implement dynamic partitioning based on multiple dimensions (date, region, product category) to optimize query performance for complex analytical workloads using Iceberg's partition evolution capabilities.
 
-2. **Real-time Data Ingestion**: Integrate Amazon Kinesis Data Firehose to continuously stream data into S3 Tables with automatic format conversion and compression optimization.
+2. **Real-time Data Ingestion**: Integrate Amazon Kinesis Data Firehose to continuously stream data into S3 Tables with automatic format conversion and compression optimization for real-time analytics.
 
-3. **Multi-table Analytics Pipeline**: Create a comprehensive data pipeline with multiple interconnected tables supporting star schema design for dimensional analytics and reporting.
+3. **Multi-table Analytics Pipeline**: Create a comprehensive data pipeline with multiple interconnected tables supporting star schema design for dimensional analytics and reporting with automated data quality checks.
 
-4. **Advanced Query Optimization**: Implement materialized views and query result caching using Amazon Athena and S3 Tables to accelerate frequently accessed analytical queries.
+4. **Advanced Query Optimization**: Implement materialized views and query result caching using Amazon Athena and S3 Tables to accelerate frequently accessed analytical queries with automated refresh policies.
 
-5. **Cross-region Replication**: Set up cross-region table replication for disaster recovery and global analytics access with automated failover capabilities.
+5. **Cross-region Replication**: Set up cross-region table replication for disaster recovery and global analytics access with automated failover capabilities using AWS Backup for S3 Tables.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

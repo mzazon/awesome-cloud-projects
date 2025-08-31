@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Document AI, Cloud Run, Pub/Sub, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: document-processing, ai-ml, serverless, workflow-automation, forms, invoices
 recipe-generator-version: 1.3
@@ -65,7 +65,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and appropriate permissions
-2. gcloud CLI v2 installed and configured (or Cloud Shell)
+2. gcloud CLI installed and configured (or Cloud Shell)
 3. Basic understanding of serverless architectures and document processing
 4. Docker Desktop installed for local container building (optional)
 5. Estimated cost: $10-15 for processing 100 documents during testing
@@ -110,19 +110,29 @@ echo "✅ Region set to: ${REGION}"
    Document AI processors are specialized machine learning models that extract structured data from specific document types. The Form Parser processor uses advanced OCR and natural language processing to identify key-value pairs, tables, and text elements in documents, providing consistent extraction across various form layouts and quality levels.
 
    ```bash
-   # Create a Form Parser processor for general document processing
-   gcloud documentai processors create \
-       --location=${REGION} \
-       --display-name=${PROCESSOR_DISPLAY_NAME} \
-       --type=FORM_PARSER_PROCESSOR
+   # Create a Form Parser processor using REST API
+   # (Note: Document AI does not have direct gcloud CLI commands)
+   cat > processor_request.json << EOF
+{
+  "type": "FORM_PARSER_PROCESSOR",
+  "displayName": "${PROCESSOR_DISPLAY_NAME}"
+}
+EOF
    
-   # Store the processor ID for later use
-   export PROCESSOR_ID=$(gcloud documentai processors list \
-       --location=${REGION} \
-       --filter="displayName:${PROCESSOR_DISPLAY_NAME}" \
-       --format="value(name)" | cut -d'/' -f6)
+   # Create the processor via REST API
+   curl -X POST \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       -H "Content-Type: application/json; charset=utf-8" \
+       -d @processor_request.json \
+       "https://${REGION}-documentai.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/processors" \
+       > processor_response.json
+   
+   # Extract and store the processor ID
+   export PROCESSOR_ID=$(cat processor_response.json | \
+       python3 -c "import json, sys; print(json.load(sys.stdin)['name'].split('/')[-1])")
    
    echo "✅ Document AI processor created with ID: ${PROCESSOR_ID}"
+   rm processor_request.json processor_response.json
    ```
 
    The Form Parser processor is now active and ready to process documents. This general-purpose processor can handle various form types including applications, surveys, and basic invoices, providing structured JSON output with confidence scores for each extracted element.
@@ -141,7 +151,6 @@ echo "✅ Region set to: ${REGION}"
    # Enable object versioning for data protection
    gsutil versioning set on gs://${BUCKET_NAME}
    
-   # Configure bucket notification to trigger processing
    echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
    ```
 
@@ -195,31 +204,44 @@ echo "✅ Region set to: ${REGION}"
 import os
 import json
 import base64
+import logging
 from google.cloud import documentai_v1 as documentai
 from google.cloud import storage
 from flask import Flask, request
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 @app.route('/', methods=['POST'])
 def process_document():
+    """Process documents from Pub/Sub messages."""
     # Parse Pub/Sub message
     envelope = request.get_json()
     if not envelope:
+        logger.error("No JSON envelope received")
         return 'Bad Request', 400
     
     pubsub_message = envelope.get('message', {})
     data = pubsub_message.get('data', '')
     
     if not data:
+        logger.error("No data in Pub/Sub message")
         return 'No data', 400
     
     # Decode the message data
-    message_data = json.loads(base64.b64decode(data).decode('utf-8'))
-    bucket_name = message_data.get('bucketId')
-    object_name = message_data.get('objectId')
+    try:
+        message_data = json.loads(base64.b64decode(data).decode('utf-8'))
+        bucket_name = message_data.get('bucketId')
+        object_name = message_data.get('objectId')
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.error(f"Failed to parse message data: {e}")
+        return 'Invalid message format', 400
     
     if not bucket_name or not object_name:
+        logger.error("Missing bucket or object info in message")
         return 'Missing bucket or object info', 400
     
     try:
@@ -227,16 +249,17 @@ def process_document():
         result = process_with_documentai(bucket_name, object_name)
         
         # Log successful processing
-        print(f"Successfully processed: {object_name}")
-        print(f"Extracted entities: {len(result.get('entities', []))}")
+        logger.info(f"Successfully processed: {object_name}")
+        logger.info(f"Extracted entities: {len(result.get('entities', []))}")
         
         return 'OK', 200
     
     except Exception as e:
-        print(f"Error processing {object_name}: {str(e)}")
+        logger.error(f"Error processing {object_name}: {str(e)}")
         return f'Error: {str(e)}', 500
 
 def process_with_documentai(bucket_name, object_name):
+    """Process document using Document AI."""
     # Initialize Document AI client
     client = documentai.DocumentProcessorServiceClient()
     
@@ -245,17 +268,37 @@ def process_with_documentai(bucket_name, object_name):
     location = os.environ.get('REGION')
     processor_id = os.environ.get('PROCESSOR_ID')
     
+    if not all([project_id, location, processor_id]):
+        raise ValueError("Missing required environment variables")
+    
     processor_name = f"projects/{project_id}/locations/{location}/processors/{processor_id}"
     
     # Download document from Cloud Storage
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(object_name)
+    
+    if not blob.exists():
+        raise FileNotFoundError(f"Document {object_name} not found in bucket {bucket_name}")
+    
     document_content = blob.download_as_bytes()
     
+    # Determine MIME type based on file extension
+    file_extension = object_name.lower().split('.')[-1] if '.' in object_name else ''
+    mime_type_map = {
+        'pdf': 'application/pdf',
+        'png': 'image/png',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'tiff': 'image/tiff',
+        'tif': 'image/tiff',
+        'gif': 'image/gif'
+    }
+    mime_type = mime_type_map.get(file_extension, 'application/pdf')
+    
     # Process document
-    document = documentai.Document(content=document_content, mime_type="application/pdf")
-    request = documentai.ProcessRequest(name=processor_name, document=document)
+    raw_document = documentai.RawDocument(content=document_content, mime_type=mime_type)
+    request = documentai.ProcessRequest(name=processor_name, raw_document=raw_document)
     
     result = client.process_document(request=request)
     
@@ -267,31 +310,61 @@ def process_with_documentai(bucket_name, object_name):
         'tables': []
     }
     
-    # Process form fields
-    for form_field in result.document.pages[0].form_fields:
-        if form_field.field_name and form_field.field_value:
-            extracted_data['entities'].append({
-                'name': form_field.field_name.text_anchor.content.strip(),
-                'value': form_field.field_value.text_anchor.content.strip(),
-                'confidence': form_field.field_value.confidence
-            })
+    # Process form fields if available
+    if result.document.pages:
+        for page in result.document.pages:
+            if hasattr(page, 'form_fields'):
+                for form_field in page.form_fields:
+                    if form_field.field_name and form_field.field_value:
+                        # Extract text content safely
+                        field_name = ""
+                        field_value = ""
+                        field_confidence = 0.0
+                        
+                        if hasattr(form_field.field_name, 'text_anchor'):
+                            field_name = get_text_from_anchor(result.document.text, form_field.field_name.text_anchor)
+                        
+                        if hasattr(form_field.field_value, 'text_anchor'):
+                            field_value = get_text_from_anchor(result.document.text, form_field.field_value.text_anchor)
+                            field_confidence = getattr(form_field.field_value, 'confidence', 0.0)
+                        
+                        if field_name and field_value:
+                            extracted_data['entities'].append({
+                                'name': field_name.strip(),
+                                'value': field_value.strip(),
+                                'confidence': field_confidence
+                            })
     
     # Save results to Cloud Storage
     results_blob = bucket.blob(f"processed/{object_name}.json")
     results_blob.upload_from_string(json.dumps(extracted_data, indent=2))
     
+    logger.info(f"Results saved to gs://{bucket_name}/processed/{object_name}.json")
     return extracted_data
+
+def get_text_from_anchor(document_text, text_anchor):
+    """Extract text from a text anchor."""
+    if not hasattr(text_anchor, 'text_segments'):
+        return ""
+    
+    text_segments = []
+    for segment in text_anchor.text_segments:
+        start_index = int(segment.start_index) if hasattr(segment, 'start_index') else 0
+        end_index = int(segment.end_index) if hasattr(segment, 'end_index') else len(document_text)
+        text_segments.append(document_text[start_index:end_index])
+    
+    return ''.join(text_segments)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 EOF
    
-   # Create requirements file
+   # Create requirements file with updated versions
    cat > requirements.txt << 'EOF'
-google-cloud-documentai==2.20.1
-google-cloud-storage==2.10.0
-google-cloud-pubsub==2.18.0
-flask==2.3.3
+google-cloud-documentai==2.24.0
+google-cloud-storage==2.14.0
+google-cloud-pubsub==2.21.0
+flask==3.0.0
 gunicorn==21.2.0
 EOF
    
@@ -311,7 +384,7 @@ EOF
    echo "✅ Cloud Run service code created"
    ```
 
-   The processing service is now configured with comprehensive error handling, structured data extraction, and automatic result storage. This containerized application leverages Google Cloud client libraries for seamless integration with Document AI and storage services.
+   The processing service is now configured with comprehensive error handling, improved logging, structured data extraction, and automatic result storage. This containerized application leverages Google Cloud client libraries for seamless integration with Document AI and storage services.
 
 6. **Deploy Cloud Run Service with Environment Variables**:
 
@@ -394,14 +467,10 @@ EOF
 1. **Verify Document AI Processor Status**:
 
    ```bash
-   # Check processor availability and configuration
-   gcloud documentai processors list \
-       --location=${REGION} \
-       --format="table(name,displayName,type,state)"
-   
-   # Verify processor details
-   gcloud documentai processors describe ${PROCESSOR_ID} \
-       --location=${REGION}
+   # Check processor availability using REST API
+   curl -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       "https://${REGION}-documentai.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/processors" \
+       | python3 -c "import json, sys; data = json.load(sys.stdin); [print(f\"Processor: {p['displayName']} - State: {p['state']} - Type: {p['type']}\") for p in data.get('processors', [])]"
    ```
 
    Expected output: Processor state should show "ENABLED" and type should show "FORM_PARSER_PROCESSOR".
@@ -415,13 +484,17 @@ EOF
    # Upload test file to trigger processing
    gsutil cp test-document.txt gs://${BUCKET_NAME}/
    
-   # Check Pub/Sub message delivery
+   # Wait a moment for message delivery
+   sleep 5
+   
+   # Check Pub/Sub message delivery (optional verification)
    gcloud pubsub subscriptions pull ${PUBSUB_SUBSCRIPTION} \
        --limit=1 \
-       --auto-ack
+       --auto-ack \
+       --format="table(message.data.decode('base64'))" || echo "No messages (expected if already processed)"
    ```
 
-   Expected output: Pub/Sub message containing storage event details should be visible.
+   Expected output: If messages exist, they should contain storage event details.
 
 3. **Verify Cloud Run Service Processing**:
 
@@ -442,19 +515,34 @@ EOF
 4. **Test End-to-End Document Processing**:
 
    ```bash
-   # Create sample PDF for testing (requires pandoc)
-   if command -v pandoc &> /dev/null; then
-       echo -e "# Sample Invoice\n\nInvoice Number: INV-001\nDate: $(date)\nAmount: \$150.00\nCustomer: Test Company" | \
-       pandoc -o sample-invoice.pdf
-       
-       # Upload and process
-       gsutil cp sample-invoice.pdf gs://${BUCKET_NAME}/
-       
-       # Wait for processing
-       sleep 30
-       
-       # Check results
-       gsutil ls gs://${BUCKET_NAME}/processed/
+   # Create sample form document for testing
+   cat > sample-form.txt << 'EOF'
+Form Application
+
+Name: John Doe
+Email: john.doe@example.com
+Phone: (555) 123-4567
+Date: $(date)
+Company: Acme Corporation
+Position: Software Engineer
+Salary: $75,000
+EOF
+   
+   # Upload and process
+   gsutil cp sample-form.txt gs://${BUCKET_NAME}/
+   
+   # Wait for processing
+   echo "Waiting 30 seconds for processing..."
+   sleep 30
+   
+   # Check results
+   echo "Checking processed results:"
+   gsutil ls gs://${BUCKET_NAME}/processed/
+   
+   # Display a sample result if available
+   if gsutil ls gs://${BUCKET_NAME}/processed/sample-form.txt.json &>/dev/null; then
+       echo "Sample extraction result:"
+       gsutil cat gs://${BUCKET_NAME}/processed/sample-form.txt.json | head -20
    fi
    ```
 
@@ -493,10 +581,10 @@ EOF
 4. **Remove Document AI Processor**:
 
    ```bash
-   # Delete Document AI processor
-   gcloud documentai processors delete ${PROCESSOR_ID} \
-       --location=${REGION} \
-       --quiet
+   # Delete Document AI processor using REST API
+   curl -X DELETE \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       "https://${REGION}-documentai.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/processors/${PROCESSOR_ID}"
    
    echo "✅ Deleted Document AI processor"
    ```
@@ -543,4 +631,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

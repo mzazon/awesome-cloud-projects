@@ -6,10 +6,10 @@ difficulty: 100
 subject: aws
 services: CloudShell, CodeCommit, IAM
 estimated-time: 60 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: development, git, cloud-native, devops, security, workflows
 recipe-generator-version: 1.3
@@ -71,7 +71,7 @@ graph TB
 4. Familiarity with command line interface operations
 5. Estimated cost: $0-5 per month (CloudShell free tier: 10 hours/month, CodeCommit free tier: 5 users)
 
-> **Note**: AWS CodeCommit is no longer available to new customers as of July 2024. Existing customers can continue using the service. Consider alternatives like GitHub, GitLab, or AWS CodeStar Connections for new implementations.
+> **Note**: AWS CodeCommit is no longer available to new customers as of July 25, 2024. Existing customers can continue using the service. Consider alternatives like GitHub, GitLab, or AWS CodeStar Connections for new implementations.
 
 ## Preparation
 
@@ -174,21 +174,21 @@ echo "✅ Repository name: ${REPO_NAME}"
    
    # Create README file
    cat > README.md << 'EOF'
-   # Cloud-Based Development Workflow Demo
-   
-   This project demonstrates cloud-based development workflows using AWS CloudShell and CodeCommit.
-   
-   ## Features
-   - Browser-based development environment
-   - Integrated Git version control
-   - Pre-configured development tools
-   - Secure IAM-based authentication
-   
-   ## Getting Started
-   1. Access AWS CloudShell from the console
-   2. Clone this repository
-   3. Start developing!
-   EOF
+# Cloud-Based Development Workflow Demo
+
+This project demonstrates cloud-based development workflows using AWS CloudShell and CodeCommit.
+
+## Features
+- Browser-based development environment
+- Integrated Git version control
+- Pre-configured development tools
+- Secure IAM-based authentication
+
+## Getting Started
+1. Access AWS CloudShell from the console
+2. Clone this repository
+3. Start developing!
+EOF
    
    echo "✅ Local repository initialized with project structure"
    ```
@@ -202,67 +202,67 @@ echo "✅ Repository name: ${REPO_NAME}"
    ```bash
    # Create a simple Python application
    cat > src/hello_world.py << 'EOF'
-   #!/usr/bin/env python3
-   """
-   Simple Hello World application for demonstrating cloud-based development workflows.
-   """
-   
-   import sys
-   from datetime import datetime
-   
-   def hello_world(name="World"):
-       """Return a greeting message with timestamp."""
-       timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-       return f"Hello, {name}! Current time: {timestamp}"
-   
-   def main():
-       """Main function to run the application."""
-       if len(sys.argv) > 1:
-           name = sys.argv[1]
-       else:
-           name = "World"
-       
-       message = hello_world(name)
-       print(message)
-       return 0
-   
-   if __name__ == "__main__":
-       sys.exit(main())
-   EOF
+#!/usr/bin/env python3
+"""
+Simple Hello World application for demonstrating cloud-based development workflows.
+"""
+
+import sys
+from datetime import datetime
+
+def hello_world(name="World"):
+    """Return a greeting message with timestamp."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return f"Hello, {name}! Current time: {timestamp}"
+
+def main():
+    """Main function to run the application."""
+    if len(sys.argv) > 1:
+        name = sys.argv[1]
+    else:
+        name = "World"
+    
+    message = hello_world(name)
+    print(message)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOF
    
    # Make the script executable
    chmod +x src/hello_world.py
    
    # Create a simple test
    cat > tests/test_hello_world.py << 'EOF'
-   #!/usr/bin/env python3
-   """
-   Tests for the hello_world module.
-   """
-   
-   import sys
-   import os
-   sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-   
-   from hello_world import hello_world
-   
-   def test_hello_world_default():
-       """Test hello_world with default parameter."""
-       result = hello_world()
-       assert "Hello, World!" in result
-       assert "Current time:" in result
-   
-   def test_hello_world_custom_name():
-       """Test hello_world with custom name."""
-       result = hello_world("Developer")
-       assert "Hello, Developer!" in result
-       assert "Current time:" in result
-   
-   if __name__ == "__main__":
-       test_hello_world_default()
-       test_hello_world_custom_name()
-       print("✅ All tests passed!")
-   EOF
+#!/usr/bin/env python3
+"""
+Tests for the hello_world module.
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+from hello_world import hello_world
+
+def test_hello_world_default():
+    """Test hello_world with default parameter."""
+    result = hello_world()
+    assert "Hello, World!" in result
+    assert "Current time:" in result
+
+def test_hello_world_custom_name():
+    """Test hello_world with custom name."""
+    result = hello_world("Developer")
+    assert "Hello, Developer!" in result
+    assert "Current time:" in result
+
+if __name__ == "__main__":
+    test_hello_world_default()
+    test_hello_world_custom_name()
+    print("✅ All tests passed!")
+EOF
    
    # Test the application
    python3 src/hello_world.py "CloudShell Developer"
@@ -284,10 +284,10 @@ echo "✅ Repository name: ${REPO_NAME}"
    # Create initial commit
    git commit -m "Initial commit: Add hello world application with tests
 
-   - Add Python hello world application with timestamp
-   - Include comprehensive test suite
-   - Add project documentation and structure
-   - Configure for cloud-based development workflow"
+- Add Python hello world application with timestamp
+- Include comprehensive test suite
+- Add project documentation and structure
+- Configure for cloud-based development workflow"
    
    # Add remote origin
    git remote add origin ${REPO_URL}
@@ -310,71 +310,71 @@ echo "✅ Repository name: ${REPO_NAME}"
    
    # Create configuration file
    cat > src/config.py << 'EOF'
-   """
-   Configuration settings for the hello world application.
-   """
-   
-   import os
-   
-   # Application configuration
-   APP_NAME = os.getenv("APP_NAME", "Hello World App")
-   APP_VERSION = "1.0.0"
-   DEBUG_MODE = os.getenv("DEBUG", "false").lower() == "true"
-   
-   # Message configuration
-   DEFAULT_NAME = os.getenv("DEFAULT_NAME", "World")
-   TIME_FORMAT = os.getenv("TIME_FORMAT", "%Y-%m-%d %H:%M:%S")
-   
-   def get_config():
-       """Return application configuration dictionary."""
-       return {
-           "app_name": APP_NAME,
-           "app_version": APP_VERSION,
-           "debug_mode": DEBUG_MODE,
-           "default_name": DEFAULT_NAME,
-           "time_format": TIME_FORMAT,
-       }
-   EOF
+"""
+Configuration settings for the hello world application.
+"""
+
+import os
+
+# Application configuration
+APP_NAME = os.getenv("APP_NAME", "Hello World App")
+APP_VERSION = "1.0.0"
+DEBUG_MODE = os.getenv("DEBUG", "false").lower() == "true"
+
+# Message configuration
+DEFAULT_NAME = os.getenv("DEFAULT_NAME", "World")
+TIME_FORMAT = os.getenv("TIME_FORMAT", "%Y-%m-%d %H:%M:%S")
+
+def get_config():
+    """Return application configuration dictionary."""
+    return {
+        "app_name": APP_NAME,
+        "app_version": APP_VERSION,
+        "debug_mode": DEBUG_MODE,
+        "default_name": DEFAULT_NAME,
+        "time_format": TIME_FORMAT,
+    }
+EOF
    
    # Update hello_world.py to use configuration
    cat > src/hello_world.py << 'EOF'
-   #!/usr/bin/env python3
-   """
-   Configurable Hello World application for demonstrating cloud-based development workflows.
-   """
-   
-   import sys
-   from datetime import datetime
-   from config import get_config
-   
-   def hello_world(name=None):
-       """Return a greeting message with timestamp."""
-       config = get_config()
-       if name is None:
-           name = config["default_name"]
-       
-       timestamp = datetime.now().strftime(config["time_format"])
-       return f"Hello, {name}! Current time: {timestamp}"
-   
-   def main():
-       """Main function to run the application."""
-       config = get_config()
-       
-       if config["debug_mode"]:
-           print(f"Debug: Running {config['app_name']} v{config['app_version']}")
-       
-       if len(sys.argv) > 1:
-           name = sys.argv[1]
-       else:
-           name = None
-       
-       message = hello_world(name)
-       print(message)
-       return 0
-   
-   if __name__ == "__main__":
-       sys.exit(main())
-   EOF
+#!/usr/bin/env python3
+"""
+Configurable Hello World application for demonstrating cloud-based development workflows.
+"""
+
+import sys
+from datetime import datetime
+from config import get_config
+
+def hello_world(name=None):
+    """Return a greeting message with timestamp."""
+    config = get_config()
+    if name is None:
+        name = config["default_name"]
+    
+    timestamp = datetime.now().strftime(config["time_format"])
+    return f"Hello, {name}! Current time: {timestamp}"
+
+def main():
+    """Main function to run the application."""
+    config = get_config()
+    
+    if config["debug_mode"]:
+        print(f"Debug: Running {config['app_name']} v{config['app_version']}")
+    
+    if len(sys.argv) > 1:
+        name = sys.argv[1]
+    else:
+        name = None
+    
+    message = hello_world(name)
+    print(message)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOF
    
    # Test the updated application
    python3 src/hello_world.py "CloudShell Developer"
@@ -383,10 +383,10 @@ echo "✅ Repository name: ${REPO_NAME}"
    git add .
    git commit -m "Add configuration system
 
-   - Add config.py for centralized configuration management
-   - Update hello_world.py to use configuration
-   - Support environment variables for customization
-   - Add debug mode and configurable time format"
+- Add config.py for centralized configuration management
+- Update hello_world.py to use configuration
+- Support environment variables for customization
+- Add debug mode and configurable time format"
    
    # Push feature branch
    git push -u origin feature/add-configuration
@@ -518,13 +518,13 @@ echo "✅ Repository name: ${REPO_NAME}"
 
 Cloud-based development workflows represent a significant shift from traditional local development environments, offering numerous advantages for modern development teams. AWS CloudShell eliminates the complexity of local environment setup by providing a pre-configured, browser-based development environment that includes essential tools like Git, AWS CLI, Python, and Node.js. This approach ensures consistency across team members and reduces the "it works on my machine" problem that often plagues development teams.
 
-The integration between CloudShell and CodeCommit demonstrates how cloud-native development can enhance security and collaboration. IAM-based authentication eliminates the need for separate Git credentials while providing fine-grained access control through policies. This approach aligns with the AWS Well-Architected Framework's security pillar by implementing defense in depth and following the principle of least privilege. The persistent storage in CloudShell ensures that development work remains available across sessions while maintaining the flexibility to scale compute resources as needed.
+The integration between CloudShell and CodeCommit demonstrates how cloud-native development can enhance security and collaboration. IAM-based authentication eliminates the need for separate Git credentials while providing fine-grained access control through policies. This approach aligns with the [AWS Well-Architected Framework's](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) security pillar by implementing defense in depth and following the principle of least privilege. The persistent storage in CloudShell ensures that development work remains available across sessions while maintaining the flexibility to scale compute resources as needed.
 
-While CodeCommit provides robust Git repository hosting, it's important to note that AWS announced in July 2024 that CodeCommit is no longer available to new customers. Existing customers can continue using the service, but new implementations should consider alternatives like [GitHub](https://github.com/features/actions), [GitLab](https://docs.gitlab.com/ee/ci/), or [AWS CodeStar Connections](https://docs.aws.amazon.com/codestar-connections/latest/userguide/welcome.html) for Git repository hosting. The principles demonstrated in this recipe, however, remain applicable to any Git-based workflow and can be adapted to work with alternative repository hosting solutions.
+While CodeCommit provides robust Git repository hosting, it's important to note that AWS announced on July 25, 2024 that CodeCommit is no longer available to new customers. Existing customers can continue using the service, but new implementations should consider alternatives like [GitHub](https://github.com/features/actions), [GitLab](https://docs.gitlab.com/ee/ci/), or [AWS CodeStar Connections](https://docs.aws.amazon.com/codestar-connections/latest/userguide/welcome.html) for Git repository hosting. The principles demonstrated in this recipe, however, remain applicable to any Git-based workflow and can be adapted to work with alternative repository hosting solutions.
 
 The development workflow shown here follows DevOps best practices by incorporating version control, feature branching, and automated testing into the development process. This approach supports continuous integration and deployment practices while maintaining code quality through structured development workflows. The browser-based nature of CloudShell also enables development from any device with internet access, supporting remote work and distributed teams.
 
-For additional guidance on implementing cloud-based development workflows, refer to the [AWS CloudShell User Guide](https://docs.aws.amazon.com/cloudshell/latest/userguide/welcome.html) which provides comprehensive information about CloudShell features and capabilities. The [AWS CodeCommit Getting Started Guide](https://docs.aws.amazon.com/codecommit/latest/userguide/getting-started.html) offers detailed instructions for Git workflows, while the [IAM Security Best Practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html) documentation covers security considerations. The [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) provides architectural guidance for building secure, efficient systems.
+For additional guidance on implementing cloud-based development workflows, refer to the [AWS CloudShell User Guide](https://docs.aws.amazon.com/cloudshell/latest/userguide/welcome.html) which provides comprehensive information about CloudShell features and capabilities. The [AWS CodeCommit Getting Started Guide](https://docs.aws.amazon.com/codecommit/latest/userguide/getting-started.html) offers detailed instructions for Git workflows, while the [IAM Security Best Practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html) documentation covers security considerations.
 
 > **Tip**: CloudShell environments automatically shut down after periods of inactivity, but your home directory (up to 1GB) persists across sessions. Use this storage for long-term projects while leveraging the environment's auto-scaling capabilities for compute resources.
 
@@ -544,4 +544,11 @@ Extend this cloud-based development workflow by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

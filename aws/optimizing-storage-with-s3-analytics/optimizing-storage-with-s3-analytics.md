@@ -5,11 +5,11 @@ category: storage
 difficulty: 300
 subject: aws
 services: s3,athena,quicksight,cloudwatch
-estimated-time: 60 minutes
-recipe-version: 1.1
+estimated-time: 90 minutes
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: storage,analytics,cost-optimization,inventory,reporting
 recipe-generator-version: 1.3
@@ -77,7 +77,7 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of S3 storage classes and lifecycle policies
 4. Existing S3 bucket with objects to analyze (or sample data will be created)
-5. Estimated cost: $5-15 per month for small datasets (S3 inventory $0.0025 per million objects, Athena $5 per TB scanned, QuickSight $9 per user)
+5. Estimated cost: $5-20 per month for small datasets (S3 inventory $0.0025 per million objects, Athena $5 per TB scanned, QuickSight $9 per user, Lambda minimal cost for low-frequency execution)
 
 > **Note**: S3 Inventory reports are generated daily or weekly and may take up to 48 hours for the first report to appear.
 
@@ -510,7 +510,7 @@ echo "✅ Created buckets and uploaded sample data"
    
    aws lambda create-function \
        --function-name StorageAnalyticsFunction-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda-function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
@@ -687,7 +687,7 @@ echo "✅ Created buckets and uploaded sample data"
    # Drop Athena database
    aws athena start-query-execution \
        --query-string "DROP DATABASE IF EXISTS ${ATHENA_DATABASE} CASCADE" \
-       --result-configuration OutputLocation=s3://aws-athena-query-results-${AWS_ACCOUNT_ID}-${AWS_REGION}/ \
+       --result-configuration OutputLocation=s3://${DEST_BUCKET}/athena-results/ \
        --work-group primary
    
    echo "✅ Removed CloudWatch dashboard and Athena database"
@@ -695,28 +695,35 @@ echo "✅ Created buckets and uploaded sample data"
 
 ## Discussion
 
-This solution provides a comprehensive approach to S3 storage analytics and cost optimization through automated inventory reporting and storage class analysis. S3 Inventory generates detailed reports about your objects and their metadata on a scheduled basis, providing visibility into storage usage patterns without the performance impact of LIST operations. The inventory reports include critical metadata such as storage class, size, last modified date, and encryption status, enabling data-driven decisions about storage optimization.
+This solution provides a comprehensive approach to S3 storage analytics and cost optimization through automated inventory reporting and storage class analysis. [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html) generates detailed reports about your objects and their metadata on a scheduled basis, providing visibility into storage usage patterns without the performance impact of LIST operations. The inventory reports include critical metadata such as storage class, size, last modified date, and encryption status, enabling data-driven decisions about storage optimization.
 
-Storage Class Analysis complements inventory reporting by observing actual access patterns over time and providing recommendations for transitioning objects to more cost-effective storage tiers. The analysis typically requires 30 days of observation to provide meaningful insights, but delivers actionable recommendations for optimizing storage costs. By combining these tools with Amazon Athena for querying and Amazon QuickSight for visualization, organizations can create powerful dashboards that surface storage optimization opportunities and track cost savings over time.
+[Storage Class Analysis](https://docs.aws.amazon.com/AmazonS3/latest/userguide/analytics-storage-class.html) complements inventory reporting by observing actual access patterns over time and providing recommendations for transitioning objects to more cost-effective storage tiers. The analysis typically requires 30 days of observation to provide meaningful insights, but delivers actionable recommendations for optimizing storage costs. By combining these tools with [Amazon Athena](https://docs.aws.amazon.com/athena/latest/ug/what-is.html) for querying and Amazon QuickSight for visualization, organizations can create powerful dashboards that surface storage optimization opportunities and track cost savings over time.
 
-The automated reporting workflow using Lambda and EventBridge ensures that storage analytics insights are generated consistently and can trigger automated actions such as lifecycle policy updates or cost optimization notifications. This approach scales effectively from small workloads to enterprise-level implementations with petabytes of data across thousands of buckets.
+The automated reporting workflow using Lambda and EventBridge ensures that storage analytics insights are generated consistently and can trigger automated actions such as lifecycle policy updates or cost optimization notifications. This approach follows [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) cost optimization principles and scales effectively from small workloads to enterprise-level implementations with petabytes of data across thousands of buckets.
 
-> **Tip**: Start with a small subset of your data using prefix filters in both inventory and analytics configurations to validate the solution before scaling to your entire storage footprint.
+> **Tip**: Start with a small subset of your data using prefix filters in both inventory and analytics configurations to validate the solution before scaling to your entire storage footprint. This approach aligns with AWS best practices for gradual implementation and testing.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Account Analytics**: Configure cross-account inventory reporting to consolidate storage analytics across multiple AWS accounts using Organizations and cross-account IAM roles.
+1. **Multi-Account Analytics**: Configure cross-account inventory reporting to consolidate storage analytics across multiple AWS accounts using [AWS Organizations](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_introduction.html) and cross-account IAM roles for centralized governance.
 
-2. **Advanced Cost Modeling**: Integrate AWS Cost Explorer APIs to calculate actual storage costs by storage class and create ROI projections for lifecycle transitions.
+2. **Advanced Cost Modeling**: Integrate [AWS Cost Explorer APIs](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/ce-api.html) to calculate actual storage costs by storage class and create ROI projections for lifecycle transitions with real-time cost tracking.
 
-3. **Predictive Analytics**: Use Amazon SageMaker to build machine learning models that predict future storage growth and recommend proactive optimization strategies.
+3. **Predictive Analytics**: Use [Amazon SageMaker](https://docs.aws.amazon.com/sagemaker/latest/dg/whatis.html) to build machine learning models that predict future storage growth patterns and recommend proactive optimization strategies based on historical access patterns.
 
-4. **Automated Lifecycle Management**: Create Lambda functions that automatically update S3 lifecycle policies based on storage analytics insights, with approval workflows for significant changes.
+4. **Automated Lifecycle Management**: Create Lambda functions that automatically update [S3 lifecycle policies](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html) based on storage analytics insights, with approval workflows for significant changes using AWS Step Functions.
 
-5. **Real-time Alerting**: Implement CloudWatch alarms that trigger when storage costs exceed thresholds or when optimization opportunities are identified, with integration to Slack or other notification systems.
+5. **Real-time Alerting**: Implement [CloudWatch alarms](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html) that trigger when storage costs exceed thresholds or when optimization opportunities are identified, with integration to Slack or other notification systems via SNS.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

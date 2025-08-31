@@ -4,12 +4,12 @@ id: c4d8e2f3
 category: machine-learning
 difficulty: 200
 subject: azure
-services: Azure Custom Vision, Azure Logic Apps, Azure Blob Storage, Azure Monitor
+services: Custom Vision, Logic Apps, Blob Storage, Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: machine-learning, computer-vision, automation, mlops, workflow-orchestration
 recipe-generator-version: 1.3
@@ -125,7 +125,7 @@ echo "✅ Log Analytics workspace created: ${MONITOR_WORKSPACE}"
    Azure Blob Storage provides scalable, cost-effective storage for training images and model artifacts. The hot tier ensures fast access for frequent retraining operations, while hierarchical namespace enables efficient organization of training datasets by category, version, and timestamp.
 
    ```bash
-   # Create storage account with hierarchical namespace
+   # Create storage account
    az storage account create \
        --name ${STORAGE_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
@@ -224,7 +224,7 @@ echo "✅ Log Analytics workspace created: ${MONITOR_WORKSPACE}"
            "classificationType": "Multiclass",
            "domainId": "ee85a74c-405e-4adc-bb47-ffa8ca0c9f31"
        }' \
-       "${CUSTOM_VISION_ENDPOINT}customvision/v3.0/Training/projects")
+       "${CUSTOM_VISION_ENDPOINT}customvision/v3.3/Training/projects")
    
    # Extract project ID
    PROJECT_ID=$(echo $PROJECT_RESPONSE | jq -r '.id')
@@ -247,7 +247,7 @@ echo "✅ Log Analytics workspace created: ${MONITOR_WORKSPACE}"
    Azure Logic Apps provides serverless workflow orchestration with built-in connectors for Azure services. The consumption plan offers cost-effective execution for event-driven scenarios, automatically scaling based on incoming triggers while maintaining high availability.
 
    ```bash
-   # Create Logic App
+   # Create Logic App with basic workflow definition
    az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
@@ -257,28 +257,9 @@ echo "✅ Log Analytics workspace created: ${MONITOR_WORKSPACE}"
            "contentVersion": "1.0.0.0",
            "parameters": {},
            "triggers": {
-               "When_a_blob_is_added_or_modified": {
-                   "type": "ApiConnection",
-                   "inputs": {
-                       "host": {
-                           "connection": {
-                               "name": "@parameters(\"$connections\")[\"azureblob\"][\"connectionId\"]"
-                           }
-                       },
-                       "method": "get",
-                       "path": "/datasets/default/triggers/batch/onupdatedfile",
-                       "queries": {
-                           "folderId": "training-images",
-                           "maxFileCount": 10
-                       }
-                   },
-                   "recurrence": {
-                       "frequency": "Minute",
-                       "interval": 5
-                   },
-                   "metadata": {
-                       "training-images": "training-images"
-                   }
+               "manual": {
+                   "type": "Request",
+                   "kind": "Http"
                }
            },
            "actions": {},
@@ -288,7 +269,7 @@ echo "✅ Log Analytics workspace created: ${MONITOR_WORKSPACE}"
    echo "✅ Logic App created: ${LOGIC_APP_NAME}"
    ```
 
-   The Logic App is initialized with a blob trigger that monitors the training-images container for new files. This event-driven approach ensures immediate response to new training data while minimizing resource consumption.
+   The Logic App is initialized with a basic manual trigger that will be updated with blob monitoring capabilities. This event-driven approach ensures immediate response to new training data while minimizing resource consumption.
 
 6. **Configure Logic App Connections**:
 
@@ -408,7 +389,7 @@ echo "✅ Log Analytics workspace created: ${MONITOR_WORKSPACE}"
                "type": "Http",
                "inputs": {
                    "method": "POST",
-                   "uri": "@{body('Parse_project_config')['endpoint']}customvision/v3.0/Training/projects/@{body('Parse_project_config')['projectId']}/train",
+                   "uri": "@{body('Parse_project_config')['endpoint']}customvision/v3.3/Training/projects/@{body('Parse_project_config')['projectId']}/train",
                    "headers": {
                        "Training-Key": "@{body('Parse_project_config')['trainingKey']}",
                        "Content-Type": "application/json"
@@ -417,33 +398,16 @@ echo "✅ Log Analytics workspace created: ${MONITOR_WORKSPACE}"
                "runAfter": {
                    "Parse_project_config": ["Succeeded"]
                }
-           },
-           "Log_training_started": {
-               "type": "Http",
-               "inputs": {
-                   "method": "POST",
-                   "uri": "https://YOUR_LOG_ANALYTICS_WORKSPACE.ods.opinsights.azure.com/api/logs?api-version=2016-04-01",
-                   "headers": {
-                       "Content-Type": "application/json"
-                   },
-                   "body": {
-                       "message": "Training started for project @{body('Parse_project_config')['projectId']}",
-                       "timestamp": "@{utcnow()}",
-                       "level": "Info"
-                   }
-               },
-               "runAfter": {
-                   "Start_training": ["Succeeded"]
-               }
            }
        }
    }
    EOF
    
    # Update Logic App with complete workflow
-   az logic workflow update \
+   az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
+       --location ${LOCATION} \
        --definition @workflow-definition.json
    
    echo "✅ Logic App workflow deployed successfully"
@@ -456,27 +420,27 @@ echo "✅ Log Analytics workspace created: ${MONITOR_WORKSPACE}"
    Azure Monitor provides comprehensive observability for the automated retraining pipeline. Custom metrics, logs, and alerts enable proactive monitoring of model performance, training success rates, and system health across the entire MLOps workflow.
 
    ```bash
-   # Create custom metric for training success rate
-   az monitor metrics alert create \
-       --name "CustomVision-Training-Success-Rate" \
-       --resource-group ${RESOURCE_GROUP} \
-       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.CognitiveServices/accounts/${CUSTOM_VISION_NAME}" \
-       --condition "count > 0" \
-       --description "Alert when Custom Vision training success rate drops" \
-       --evaluation-frequency PT5M \
-       --window-size PT15M \
-       --severity 2
-   
    # Create alert for Logic App failures
    az monitor metrics alert create \
        --name "LogicApp-Failure-Alert" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Logic/workflows/${LOGIC_APP_NAME}" \
-       --condition "count > 0" \
+       --condition "count WorkflowRunsCompleted > 0 where ResultType includes Failed" \
        --description "Alert when Logic App workflow fails" \
        --evaluation-frequency PT1M \
        --window-size PT5M \
        --severity 1
+   
+   # Create alert for Custom Vision service availability
+   az monitor metrics alert create \
+       --name "CustomVision-Service-Alert" \
+       --resource-group ${RESOURCE_GROUP} \
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.CognitiveServices/accounts/${CUSTOM_VISION_NAME}" \
+       --condition "avg SuccessfulCalls < 90" \
+       --description "Alert when Custom Vision service availability drops" \
+       --evaluation-frequency PT5M \
+       --window-size PT15M \
+       --severity 2
    
    echo "✅ Azure Monitor alerts configured"
    ```
@@ -491,7 +455,7 @@ echo "✅ Log Analytics workspace created: ${MONITOR_WORKSPACE}"
    # Test Custom Vision service connectivity
    curl -X GET \
        -H "Training-Key: ${CUSTOM_VISION_KEY}" \
-       "${CUSTOM_VISION_ENDPOINT}customvision/v3.0/Training/projects"
+       "${CUSTOM_VISION_ENDPOINT}customvision/v3.3/Training/projects"
    ```
 
    Expected output: JSON response with project list including the created project.
@@ -527,16 +491,18 @@ echo "✅ Log Analytics workspace created: ${MONITOR_WORKSPACE}"
        --name ${LOGIC_APP_NAME} \
        --output table
    
-   # Check specific run details
+   # Check specific run details if runs exist
    RUN_ID=$(az logic workflow list-runs \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
-       --query '[0].name' --output tsv)
+       --query '[0].name' --output tsv 2>/dev/null)
    
-   az logic workflow show-run \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${LOGIC_APP_NAME} \
-       --run-name ${RUN_ID}
+   if [ ! -z "$RUN_ID" ]; then
+       az logic workflow show-run \
+           --resource-group ${RESOURCE_GROUP} \
+           --name ${LOGIC_APP_NAME} \
+           --run-name ${RUN_ID}
+   fi
    ```
 
    Expected output: Run history showing successful executions and detailed status information.
@@ -565,7 +531,7 @@ echo "✅ Log Analytics workspace created: ${MONITOR_WORKSPACE}"
    # Clear environment variables
    unset RESOURCE_GROUP LOCATION STORAGE_ACCOUNT CUSTOM_VISION_NAME
    unset LOGIC_APP_NAME MONITOR_WORKSPACE STORAGE_KEY CUSTOM_VISION_KEY
-   unset CUSTOM_VISION_ENDPOINT PROJECT_ID SUBSCRIPTION_ID
+   unset CUSTOM_VISION_ENDPOINT PROJECT_ID SUBSCRIPTION_ID RANDOM_SUFFIX
    
    echo "✅ Local cleanup completed"
    ```
@@ -598,4 +564,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

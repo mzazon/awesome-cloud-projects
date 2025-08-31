@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Binary Authorization, Cloud Deploy, Artifact Registry, Cloud Build
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: container-security, binary-authorization, cloud-deploy, canary-deployment, devsecops, supply-chain-security
 recipe-generator-version: 1.3
@@ -71,7 +71,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with appropriate permissions for Binary Authorization, Cloud Deploy, GKE, and Artifact Registry
-2. gcloud CLI installed and configured
+2. gcloud CLI installed and configured (version 400.0.0 or later)
 3. Understanding of Kubernetes, Docker, and container security concepts
 4. Basic knowledge of CI/CD pipelines and deployment strategies
 5. Estimated cost: $15-25 for GKE clusters, minimal costs for other services during testing
@@ -138,7 +138,7 @@ echo "✅ Project configured: ${PROJECT_ID}"
        --zone=${ZONE} \
        --num-nodes=2 \
        --machine-type=e2-standard-2 \
-       --enable-binauthz \
+       --binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE \
        --enable-network-policy \
        --enable-autorepair \
        --enable-autoupgrade
@@ -148,7 +148,7 @@ echo "✅ Project configured: ${PROJECT_ID}"
        --zone=${ZONE} \
        --num-nodes=3 \
        --machine-type=e2-standard-2 \
-       --enable-binauthz \
+       --binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE \
        --enable-network-policy \
        --enable-autorepair \
        --enable-autoupgrade
@@ -168,12 +168,12 @@ echo "✅ Project configured: ${PROJECT_ID}"
    export NOTE_ID="build-note-${RANDOM_SUFFIX}"
    
    # Create attestation note
-   cat > note.json <<EOF
+   cat > /tmp/note_payload.json <<EOF
 {
   "name": "projects/${PROJECT_ID}/notes/${NOTE_ID}",
-  "attestationAuthority": {
+  "attestation": {
     "hint": {
-      "humanReadableName": "Build verification attestor"
+      "human_readable_name": "Build verification attestor"
     }
   }
 }
@@ -182,8 +182,13 @@ EOF
    curl -X POST \
        -H "Content-Type: application/json" \
        -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-       -d @note.json \
-       "https://containeranalysis.googleapis.com/v1beta1/projects/${PROJECT_ID}/notes?noteId=${NOTE_ID}"
+       -d @/tmp/note_payload.json \
+       "https://containeranalysis.googleapis.com/v1/projects/${PROJECT_ID}/notes/?noteId=${NOTE_ID}"
+   
+   # Create Binary Authorization attestor
+   gcloud container binauthz attestors create ${ATTESTOR_NAME} \
+       --attestation-authority-note=${NOTE_ID} \
+       --attestation-authority-note-project=${PROJECT_ID}
    
    # Create PGP key for signing
    gpg --quick-generate-key \
@@ -193,11 +198,6 @@ EOF
    
    # Export public key
    gpg --armor --export "Build Attestor <build@${PROJECT_ID}.example.com>" > attestor-key.pub
-   
-   # Create Binary Authorization attestor
-   gcloud container binauthz attestors create ${ATTESTOR_NAME} \
-       --attestation-authority-note=${NOTE_ID} \
-       --attestation-authority-note-project=${PROJECT_ID}
    
    # Add public key to attestor
    gcloud container binauthz attestors public-keys add \
@@ -215,26 +215,27 @@ EOF
 
    ```bash
    # Create Binary Authorization policy
-   cat > binauthz-policy.yaml <<EOF
-admissionWhitelistPatterns:
-- namePattern: gcr.io/distroless/*
-- namePattern: gcr.io/gke-release/*
+   cat > /tmp/policy.yaml <<EOF
+globalPolicyEvaluationMode: ENABLE
 defaultAdmissionRule:
+  evaluationMode: REQUIRE_ATTESTATION
+  enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
   requireAttestationsBy:
   - projects/${PROJECT_ID}/attestors/${ATTESTOR_NAME}
-  enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
 clusterAdmissionRules:
   ${ZONE}.staging-cluster-${RANDOM_SUFFIX}:
-    requireAttestationsBy: []
+    evaluationMode: ALWAYS_ALLOW
     enforcementMode: DRYRUN_AUDIT_LOG_ONLY
   ${ZONE}.prod-cluster-${RANDOM_SUFFIX}:
+    evaluationMode: REQUIRE_ATTESTATION
+    enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
     requireAttestationsBy:
     - projects/${PROJECT_ID}/attestors/${ATTESTOR_NAME}
-    enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
+name: projects/${PROJECT_ID}/policy
 EOF
    
    # Import the policy
-   gcloud container binauthz policy import binauthz-policy.yaml
+   gcloud container binauthz policy import /tmp/policy.yaml
    
    echo "✅ Binary Authorization policy configured with attestation requirements"
    ```
@@ -272,7 +273,7 @@ EOF
    
    # Create Dockerfile
    cat > Dockerfile <<EOF
-FROM python:3.9-slim
+FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
@@ -283,7 +284,7 @@ CMD ["python", "app.py"]
 EOF
    
    # Create requirements file
-   echo "Flask==2.3.3" > requirements.txt
+   echo "Flask==3.0.0" > requirements.txt
    
    # Create Cloud Build configuration with attestation
    cat > cloudbuild.yaml <<EOF
@@ -306,34 +307,16 @@ steps:
     IMAGE_DIGEST=\$(gcloud artifacts docker images describe ${REPO_URL}/secure-app:v1.0.0 --format='value(image_summary.digest)')
     IMAGE_URL="${REPO_URL}/secure-app@\$IMAGE_DIGEST"
     
-    # Create attestation payload
-    cat > /tmp/payload.json <<EOL
-    {
-      "critical": {
-        "identity": {
-          "docker-reference": "\$IMAGE_URL"
-        },
-        "image": {
-          "docker-manifest-digest": "\$IMAGE_DIGEST"
-        },
-        "type": "Google Cloud Build"
-      },
-      "non-critical": {
-        "build": {
-          "build-id": "\$BUILD_ID",
-          "project-id": "${PROJECT_ID}",
-          "build-timestamp": "\$(date -Iseconds)"
-        }
-      }
-    }
-    EOL
-    
-    # Sign payload and create attestation
+    # Create attestation
     gcloud container binauthz attestations sign-and-create \
         --artifact-url="\$IMAGE_URL" \
         --attestor=${ATTESTOR_NAME} \
         --attestor-project=${PROJECT_ID} \
-        --payload-file=/tmp/payload.json
+        --keyversion-project=${PROJECT_ID} \
+        --keyversion-location=global \
+        --keyversion-keyring=binauthz-attestor-keyring \
+        --keyversion-key=binauthz-attestor-key \
+        --keyversion=1
 images:
 - '${REPO_URL}/secure-app:v1.0.0'
 EOF
@@ -376,7 +359,7 @@ spec:
     spec:
       containers:
       - name: secure-app
-        image: ${REPO_URL}/secure-app:v1.0.0
+        image: secure-app-image
         ports:
         - containerPort: 8080
         env:
@@ -389,6 +372,18 @@ spec:
           limits:
             memory: "128Mi"
             cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
 ---
 apiVersion: v1
 kind: Service
@@ -405,15 +400,10 @@ EOF
    
    # Create skaffold configuration
    cat > skaffold.yaml <<EOF
-apiVersion: skaffold/v4beta6
+apiVersion: skaffold/v4beta7
 kind: Config
 metadata:
   name: secure-app
-build:
-  artifacts:
-  - image: secure-app
-    docker:
-      dockerfile: Dockerfile
 manifests:
   rawYaml:
   - deployment.yaml
@@ -486,7 +476,8 @@ EOF
    gcloud deploy releases create secure-app-v1-0-0 \
        --delivery-pipeline=secure-app-pipeline \
        --region=${REGION} \
-       --source=.
+       --source=. \
+       --images=secure-app-image=${REPO_URL}/secure-app:v1.0.0
    
    # Monitor deployment progress
    echo "Monitor the deployment in the Cloud Console:"
@@ -514,7 +505,7 @@ EOF
 
    ```bash
    # Check Binary Authorization policy status
-   gcloud container binauthz policy list
+   gcloud container binauthz policy export
    
    # Verify attestations exist for deployed image
    gcloud container binauthz attestations list \
@@ -602,8 +593,15 @@ EOF
    gcloud container binauthz attestors delete ${ATTESTOR_NAME} --quiet
    
    # Reset Binary Authorization policy to default
-   gcloud container binauthz policy import \
-       --policy-file=<(echo "defaultAdmissionRule: {enforcementMode: ALWAYS_ALLOW}")
+   cat > /tmp/default_policy.yaml <<EOF
+globalPolicyEvaluationMode: ENABLE
+defaultAdmissionRule:
+  evaluationMode: ALWAYS_ALLOW
+  enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
+name: projects/${PROJECT_ID}/policy
+EOF
+   
+   gcloud container binauthz policy import /tmp/default_policy.yaml
    
    echo "✅ Cleaned up Binary Authorization resources"
    ```
@@ -618,7 +616,8 @@ EOF
    
    # Clean up local files
    rm -rf sample-app k8s-manifests
-   rm -f binauthz-policy.yaml clouddeploy.yaml note.json attestor-key.pub
+   rm -f /tmp/policy.yaml /tmp/default_policy.yaml /tmp/note_payload.json
+   rm -f clouddeploy.yaml attestor-key.pub
    
    # Remove GPG key
    gpg --delete-secret-keys "Build Attestor <build@${PROJECT_ID}.example.com>"
@@ -635,7 +634,7 @@ The integration of vulnerability scanning through Artifact Registry provides con
 
 The canary deployment strategy implemented through Cloud Deploy minimizes risk during updates by gradually shifting traffic from stable to new versions. This approach allows teams to detect issues early and rollback quickly if problems arise, while the percentage-based traffic distribution provides fine-grained control over exposure to potential issues. The combination of security enforcement and safe deployment practices creates a robust foundation for production container workloads.
 
-The architecture follows Google Cloud's software supply chain security best practices by implementing multiple layers of verification and control. From vulnerability scanning and attestation creation in the build process to policy enforcement at deployment time, this approach provides comprehensive protection against supply chain attacks and unauthorized deployments.
+The architecture follows Google Cloud's software supply chain security best practices by implementing multiple layers of verification and control. From vulnerability scanning and attestation creation in the build process to policy enforcement at deployment time, this approach provides comprehensive protection against supply chain attacks and unauthorized deployments. For more information on Google Cloud security best practices, see the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework/security).
 
 > **Tip**: Consider implementing continuous validation with Binary Authorization to monitor running containers for policy compliance over time, providing ongoing security assurance beyond initial deployment verification.
 
@@ -644,11 +643,16 @@ The architecture follows Google Cloud's software supply chain security best prac
 Extend this solution by implementing these enhancements:
 
 1. **Multi-environment attestation workflow** - Configure separate attestors for different stages (build, test, security scan) requiring multiple signatures before production deployment
-2. **Custom vulnerability policies** - Implement severity-based policies that automatically block deployments containing critical or high-severity vulnerabilities
+2. **Custom vulnerability policies** - Implement severity-based policies that automatically block deployments containing critical or high-severity vulnerabilities using Container Analysis API
 3. **Integration with external security tools** - Connect third-party security scanners or compliance tools to create additional attestations based on custom security checks
-4. **Advanced canary metrics** - Implement automated promotion or rollback based on application metrics, error rates, and performance indicators during canary phases
+4. **Advanced canary metrics** - Implement automated promotion or rollback based on application metrics, error rates, and performance indicators during canary phases using Cloud Operations
 5. **Cross-region disaster recovery** - Extend the pipeline to support automated failover deployments across multiple regions with consistent security policies
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -4,14 +4,14 @@ id: f7a4e9c2
 category: ai-machine-learning
 difficulty: 400
 subject: gcp
-services: Dynamic Workload Scheduler, Confidential Computing, Vertex AI, Cloud KMS
-estimated-time: 150 minutes
-recipe-version: 1.0
+services: Compute Engine, Confidential Computing, Vertex AI, Cloud KMS
+estimated-time: 180 minutes
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: ai-security, trusted-execution-environments, tpu-optimization, enterprise-ml, confidential-workloads
+tags: ai-security, trusted-execution-environments, gpu-optimization, enterprise-ml, confidential-workloads
 recipe-generator-version: 1.3
 ---
 
@@ -19,11 +19,11 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Enterprise AI teams face a critical challenge when training machine learning models with sensitive data: balancing optimal resource allocation across high-demand TPU/GPU infrastructure while maintaining the highest security standards for proprietary datasets and model parameters. Traditional cloud-based training workflows expose sensitive data during processing, creating compliance risks and limiting collaboration opportunities with external partners or vendors who cannot access confidential intellectual property.
+Enterprise AI teams face a critical challenge when training machine learning models with sensitive data: balancing optimal resource allocation across high-demand GPU infrastructure while maintaining the highest security standards for proprietary datasets and model parameters. Traditional cloud-based training workflows expose sensitive data during processing, creating compliance risks and limiting collaboration opportunities with external partners or vendors who cannot access confidential intellectual property.
 
 ## Solution
 
-This solution leverages Google Cloud's Dynamic Workload Scheduler to optimize TPU and GPU resource allocation while protecting sensitive training data through Confidential Computing's Trusted Execution Environments (TEEs). The architecture ensures that training data and model parameters remain encrypted and isolated even during active processing, enabling secure multi-party collaboration and meeting the strictest enterprise compliance requirements while maintaining optimal cost efficiency.
+This solution leverages Google Cloud's intelligent resource scheduling capabilities to optimize GPU resource allocation while protecting sensitive training data through Confidential Computing's Trusted Execution Environments (TEEs). The architecture ensures that training data and model parameters remain encrypted and isolated even during active processing, enabling secure multi-party collaboration and meeting the strictest enterprise compliance requirements while maintaining optimal cost efficiency.
 
 ## Architecture Diagram
 
@@ -31,15 +31,15 @@ This solution leverages Google Cloud's Dynamic Workload Scheduler to optimize TP
 graph TB
     subgraph "Secure Training Environment"
         subgraph "Confidential Computing TEE"
-            CONF_VM[Confidential VM with H100 GPUs]
+            CONF_VM[Confidential VM with GPU]
             KMS_KEY[Cloud KMS Encryption]
             VERTEX[Vertex AI Training Job]
         end
         
-        subgraph "Dynamic Workload Scheduler"
-            DWS[Dynamic Workload Scheduler]
-            FLEX[Flex Start Mode]
-            CAL[Calendar Mode]
+        subgraph "Resource Scheduling"
+            RESERVATION[Compute Reservations]
+            FLEX[Flexible Resource Access]
+            QUEUE[Queued Provisioning]
         end
     end
     
@@ -55,8 +55,8 @@ graph TB
         ATTEST[Attestation Service]
     end
     
-    USER[Data Scientists] --> DWS
-    DWS --> CONF_VM
+    USER[Data Scientists] --> RESERVATION
+    RESERVATION --> CONF_VM
     CONF_VM --> VERTEX
     VERTEX --> BUCKET
     KMS_KEY --> BUCKET
@@ -66,18 +66,18 @@ graph TB
     
     style CONF_VM fill:#FF6B6B,stroke:#333,stroke-width:3px
     style KMS_KEY fill:#4ECDC4,stroke:#333,stroke-width:2px
-    style DWS fill:#45B7D1,stroke:#333,stroke-width:2px
+    style RESERVATION fill:#45B7D1,stroke:#333,stroke-width:2px
 ```
 
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and appropriate IAM permissions (Compute Admin, Vertex AI User, Cloud KMS Admin)
-2. Google Cloud CLI (gcloud) installed and configured (version 450.0.0 or later)
+2. Google Cloud CLI (gcloud) installed and configured (version 455.0.0 or later)
 3. Understanding of machine learning workflows, enterprise security compliance, and Google Cloud security architecture
-4. Access to TPU/GPU resources in your project region (requires quota approval for high-performance accelerators)
-5. Estimated cost: $150-300 for TPU/GPU usage during training, $10-20 for storage and KMS operations
+4. Access to GPU resources in your project region (requires quota approval for high-performance accelerators)
+5. Estimated cost: $200-400 for GPU usage during training, $15-30 for storage and KMS operations
 
-> **Warning**: This configuration uses premium TPU/GPU resources that can incur significant charges. Monitor usage closely and implement cost controls through budgets and alerts.
+> **Warning**: This configuration uses premium GPU resources that can incur significant charges. Monitor usage closely and implement cost controls through budgets and alerts.
 
 ## Preparation
 
@@ -162,7 +162,7 @@ echo "✅ APIs enabled for secure AI training pipeline"
    
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
-       --role="roles/confidentialcomputing.workloadUser"
+       --role="roles/compute.instanceAdmin"
    
    echo "✅ Confidential computing service account configured"
    ```
@@ -191,11 +191,17 @@ echo "✅ APIs enabled for secure AI training pipeline"
      "lifecycle": {
        "rule": [
          {
-           "action": {"type": "SetStorageClass", "storageClass": "NEARLINE"},
+           "action": {
+             "type": "SetStorageClass", 
+             "storageClass": "NEARLINE"
+           },
            "condition": {"age": 30}
          },
          {
-           "action": {"type": "SetStorageClass", "storageClass": "COLDLINE"},
+           "action": {
+             "type": "SetStorageClass", 
+             "storageClass": "COLDLINE"
+           },
            "condition": {"age": 90}
          }
        ]
@@ -272,20 +278,18 @@ echo "✅ APIs enabled for secure AI training pipeline"
 
    The training data and scripts are now stored in the encrypted bucket, demonstrating how sensitive datasets can be securely managed and accessed only by authorized confidential computing environments.
 
-5. **Configure Dynamic Workload Scheduler Reservation**:
+5. **Configure GPU Resource Reservation**:
 
-   Dynamic Workload Scheduler optimizes access to high-demand TPU and GPU resources by providing predictable scheduling and cost-effective resource allocation. Configuring reservations ensures that confidential training workloads can access the necessary compute resources when needed while minimizing costs through flexible scheduling modes.
+   Google Cloud compute reservations provide guaranteed access to specific GPU resources, ensuring that confidential training workloads can access the necessary compute resources when needed while enabling predictable scheduling and cost optimization through flexible resource allocation.
 
    ```bash
-   # Create Dynamic Workload Scheduler reservation for TPU/GPU resources
-   # Note: This creates a Flex Start reservation for cost optimization
-   gcloud beta compute reservations create secure-ai-training-reservation \
+   # Create compute reservation for GPU resources
+   gcloud compute reservations create secure-ai-training-reservation \
        --zone=${ZONE} \
        --vm-count=1 \
        --machine-type=a2-highgpu-1g \
        --accelerator=type=nvidia-tesla-a100,count=1 \
-       --require-specific-reservation \
-       --reservation-affinity=specific
+       --require-specific-reservation
    
    # Create compute instance template for confidential computing
    gcloud compute instance-templates create confidential-training-template \
@@ -295,14 +299,17 @@ echo "✅ APIs enabled for secure AI training pipeline"
        --image-project=ml-images \
        --boot-disk-size=100GB \
        --boot-disk-type=pd-ssd \
-       --confidential-compute \
+       --confidential-compute-type=SEV_SNP \
+       --min-cpu-platform="AMD Milan" \
+       --maintenance-policy=TERMINATE \
        --service-account=${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com \
        --scopes=https://www.googleapis.com/auth/cloud-platform \
        --metadata=enable-oslogin=true \
        --tags=confidential-training \
+       --reservation-affinity=specific \
        --reservation=${ZONE}/secure-ai-training-reservation
    
-   echo "✅ Dynamic Workload Scheduler reservation configured"
+   echo "✅ GPU resource reservation configured"
    ```
 
    The reservation and instance template are configured to use confidential computing with GPU acceleration, ensuring that training workloads can access optimized hardware while maintaining the security guarantees of Trusted Execution Environments.
@@ -315,32 +322,32 @@ echo "✅ APIs enabled for secure AI training pipeline"
    # Create confidential computing instance for training
    gcloud compute instances create confidential-training-vm \
        --source-instance-template=confidential-training-template \
-       --zone=${ZONE} \
-       --confidential-compute \
-       --confidential-compute-type=SEV
+       --zone=${ZONE}
    
    # Wait for instance to be ready
    echo "Waiting for confidential VM to be ready..."
-   gcloud compute instances describe confidential-training-vm \
-       --zone=${ZONE} \
-       --format="value(status)" | \
-       while read status; do
-           if [ "$status" = "RUNNING" ]; then
-               break
-           fi
-           sleep 10
-       done
+   while true; do
+       STATUS=$(gcloud compute instances describe confidential-training-vm \
+           --zone=${ZONE} \
+           --format="value(status)")
+       if [ "$STATUS" = "RUNNING" ]; then
+           break
+       fi
+       echo "Instance status: $STATUS - waiting..."
+       sleep 10
+   done
    
-   # Configure instance for secure training
+   # Verify GPU and confidential computing are available
    gcloud compute ssh confidential-training-vm \
        --zone=${ZONE} \
-       --command="sudo nvidia-smi" \
+       --command="sudo nvidia-smi && \
+                 sudo dmesg | grep -i sev" \
        --quiet
    
    echo "✅ Confidential computing training environment deployed"
    ```
 
-   The confidential VM is now running with GPU acceleration and SEV encryption, providing a secure environment where training can occur with hardware-level protection of sensitive data and model parameters.
+   The confidential VM is now running with GPU acceleration and SEV-SNP encryption, providing a secure environment where training can occur with hardware-level protection of sensitive data and model parameters.
 
 7. **Execute Secure Training Workflow with Vertex AI**:
 
@@ -410,7 +417,8 @@ echo "✅ APIs enabled for secure AI training pipeline"
    EOF
    
    # Create monitoring policy
-   gcloud alpha monitoring policies create --policy-from-file=monitoring_policy.yaml
+   gcloud alpha monitoring policies create \
+       --policy-from-file=monitoring_policy.yaml
    
    # Enable audit logging for confidential computing
    cat > audit_policy.yaml << EOF
@@ -420,15 +428,11 @@ echo "✅ APIs enabled for secure AI training pipeline"
      - logType: ADMIN_READ
      - logType: DATA_READ
      - logType: DATA_WRITE
-   - service: confidentialcomputing.googleapis.com
-     auditLogConfigs:
-     - logType: ADMIN_READ
-     - logType: DATA_READ
    EOF
    
    gcloud logging sinks create confidential-training-audit \
-       cloud-logging-bucket \
-       --log-filter='protoPayload.serviceName=("compute.googleapis.com" OR "confidentialcomputing.googleapis.com")' \
+       bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/audit_logs \
+       --log-filter='protoPayload.serviceName="compute.googleapis.com"' \
        --project=${PROJECT_ID}
    
    echo "✅ Attestation and compliance monitoring configured"
@@ -444,7 +448,7 @@ echo "✅ APIs enabled for secure AI training pipeline"
    # Check confidential VM attestation status
    gcloud compute instances describe confidential-training-vm \
        --zone=${ZONE} \
-       --format="value(confidentialInstanceConfig.enableConfidentialCompute)"
+       --format="value(confidentialInstanceConfig.confidentialInstanceType)"
    
    # Verify encryption keys are accessible
    gcloud kms keys describe ${KEY_NAME} \
@@ -453,9 +457,9 @@ echo "✅ APIs enabled for secure AI training pipeline"
        --format="value(primary.state)"
    ```
 
-   Expected output: `True` for confidential compute status and `ENABLED` for key state.
+   Expected output: `SEV_SNP` for confidential compute status and `ENABLED` for key state.
 
-2. **Test Dynamic Workload Scheduler Integration**:
+2. **Test GPU Resource Reservation Integration**:
 
    ```bash
    # Check reservation utilization
@@ -504,7 +508,7 @@ echo "✅ APIs enabled for secure AI training pipeline"
    echo "✅ Confidential computing resources deleted"
    ```
 
-2. **Remove Dynamic Workload Scheduler reservations**:
+2. **Remove GPU resource reservations**:
 
    ```bash
    # Delete compute reservation
@@ -516,7 +520,7 @@ echo "✅ APIs enabled for secure AI training pipeline"
    gcloud compute instance-templates delete confidential-training-template \
        --quiet
    
-   echo "✅ Dynamic Workload Scheduler resources cleaned up"
+   echo "✅ GPU resource reservations cleaned up"
    ```
 
 3. **Clean up storage and encryption resources**:
@@ -529,7 +533,8 @@ echo "✅ APIs enabled for secure AI training pipeline"
    gcloud kms keys versions destroy 1 \
        --key=${KEY_NAME} \
        --location=${REGION} \
-       --keyring=${KEYRING_NAME}
+       --keyring=${KEYRING_NAME} \
+       --quiet
    
    # Delete service account
    gcloud iam service-accounts delete \
@@ -541,13 +546,13 @@ echo "✅ APIs enabled for secure AI training pipeline"
 
 ## Discussion
 
-This recipe demonstrates how Google Cloud's Dynamic Workload Scheduler and Confidential Computing work together to solve one of enterprise AI's most challenging problems: maintaining data security while optimizing expensive compute resources. The Dynamic Workload Scheduler addresses the economic challenge of AI infrastructure by providing intelligent resource allocation across TPU and GPU fleets, using Google's Borg technology to optimize scheduling at massive scale. Meanwhile, Confidential Computing's Trusted Execution Environments ensure that sensitive training data never exists in unencrypted form, even during active processing.
+This recipe demonstrates how Google Cloud's intelligent resource scheduling and Confidential Computing work together to solve one of enterprise AI's most challenging problems: maintaining data security while optimizing expensive compute resources. The resource reservation system addresses the economic challenge of AI infrastructure by providing guaranteed access to GPU resources while enabling flexible scheduling for cost optimization. Meanwhile, Confidential Computing's Trusted Execution Environments ensure that sensitive training data never exists in unencrypted form, even during active processing.
 
 The integration between these services creates a powerful platform for enterprise AI workflows. Organizations can now train models on highly sensitive datasets—such as financial records, healthcare data, or proprietary research—while maintaining strict security isolation. The TEE environment protects against both external threats and privileged access, meaning that even Google Cloud operations teams cannot access the data during processing. This capability enables new collaboration models, such as federated learning between competitive organizations or training on regulated datasets that previously couldn't be processed in cloud environments.
 
-From an operational perspective, this architecture provides significant cost optimization opportunities. The Dynamic Workload Scheduler's Flex Start mode can reduce GPU costs by up to 70% compared to on-demand pricing, while Calendar mode enables predictable capacity planning for production training workflows. The confidential computing overhead is minimal—typically less than 5% performance impact—making this approach practical for production-scale AI training. Organizations should consider implementing additional cost controls through Cloud Billing budgets and quotas to prevent unexpected charges from intensive training workloads.
+From an operational perspective, this architecture provides significant cost optimization opportunities. GPU reservations can reduce compute costs by up to 30% compared to on-demand pricing when using sustained workloads, while flex-start scheduling can provide additional savings for non-urgent training jobs. The confidential computing overhead is minimal—typically less than 5% performance impact—making this approach practical for production-scale AI training. Organizations should consider implementing additional cost controls through Cloud Billing budgets and quotas to prevent unexpected charges from intensive training workloads.
 
-The monitoring and attestation capabilities demonstrated here are crucial for enterprise adoption. The ability to provide cryptographic proof that training occurred in a genuine TEE environment supports compliance with regulations like GDPR, HIPAA, and financial services requirements. For more detailed information on confidential computing security guarantees, see the [Google Cloud Confidential Computing documentation](https://cloud.google.com/confidential-computing/docs/about-confidential-computing). For Dynamic Workload Scheduler optimization strategies, refer to the [AI Hypercomputer documentation](https://cloud.google.com/ai-hypercomputer/docs). Additional security best practices can be found in the [Google Cloud Security Command Center documentation](https://cloud.google.com/security-command-center/docs/concepts-security-command-center-overview).
+The monitoring and attestation capabilities demonstrated here are crucial for enterprise adoption. The ability to provide cryptographic proof that training occurred in a genuine TEE environment supports compliance with regulations like GDPR, HIPAA, and financial services requirements. For more detailed information on confidential computing security guarantees, see the [Google Cloud Confidential Computing documentation](https://cloud.google.com/confidential-computing/docs/about-confidential-computing). For GPU resource optimization strategies, refer to the [Compute Engine GPU documentation](https://cloud.google.com/compute/docs/gpus). Additional security best practices can be found in the [Google Cloud Security Command Center documentation](https://cloud.google.com/security-command-center/docs/concepts-security-command-center-overview).
 
 > **Tip**: Enable Cloud Asset Inventory to track confidential computing resources across your organization and ensure compliance with security policies. Use Cloud KMS automatic key rotation to maintain long-term security without operational overhead.
 
@@ -555,11 +560,11 @@ The monitoring and attestation capabilities demonstrated here are crucial for en
 
 Extend this solution by implementing these advanced security and optimization enhancements:
 
-1. **Multi-Region Federated Learning**: Configure confidential computing environments across multiple regions to enable federated learning workflows while maintaining data residency requirements and optimizing for regional TPU/GPU availability.
+1. **Multi-Region Federated Learning**: Configure confidential computing environments across multiple regions to enable federated learning workflows while maintaining data residency requirements and optimizing for regional GPU availability.
 
 2. **Automated Compliance Reporting**: Implement Cloud Functions that automatically generate compliance reports from attestation logs, creating audit trails that demonstrate TEE integrity for regulatory submissions and security assessments.
 
-3. **Dynamic Cost Optimization**: Build an intelligent scheduling system that automatically switches between Calendar and Flex Start modes based on training urgency, budget constraints, and resource availability predictions using Cloud AI forecasting capabilities.
+3. **Dynamic Cost Optimization**: Build an intelligent scheduling system that automatically switches between reserved and on-demand GPU instances based on training urgency, budget constraints, and resource availability predictions using Cloud AI forecasting capabilities.
 
 4. **Secure Model Serving Pipeline**: Extend the confidential training environment to include secure model serving using Cloud Run with confidential computing, ensuring that model inference also occurs within TEEs for end-to-end data protection.
 
@@ -567,4 +572,9 @@ Extend this solution by implementing these advanced security and optimization en
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

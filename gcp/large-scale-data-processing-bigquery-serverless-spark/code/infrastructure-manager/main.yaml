@@ -1,0 +1,496 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: Large-Scale Data Processing with BigQuery Serverless Spark
+# Description: Complete infrastructure for processing large datasets using BigQuery Serverless Spark
+# Version: 1.0
+# Last Updated: 2025-07-12
+
+# Import required templates
+imports:
+  - path: "modules/storage/main.jinja"
+    name: storage.jinja
+  - path: "modules/bigquery/main.jinja"
+    name: bigquery.jinja
+  - path: "modules/iam/main.jinja"
+    name: iam.jinja
+
+# Configuration parameters
+resources:
+  # Project Configuration
+  - name: project-config
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(ref.project-info.projectId)
+      name: "BigQuery Serverless Spark Data Processing"
+    metadata:
+      dependsOn:
+        - project-info
+
+  # Enable Required APIs
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-info.projectId)/services/bigquery.googleapis.com"
+    metadata:
+      dependsOn:
+        - project-config
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-info.projectId)/services/storage.googleapis.com"
+    metadata:
+      dependsOn:
+        - project-config
+
+  - name: enable-dataproc-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-info.projectId)/services/dataproc.googleapis.com"
+    metadata:
+      dependsOn:
+        - project-config
+
+  - name: enable-notebooks-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-info.projectId)/services/notebooks.googleapis.com"
+    metadata:
+      dependsOn:
+        - project-config
+
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-info.projectId)/services/logging.googleapis.com"
+    metadata:
+      dependsOn:
+        - project-config
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-info.projectId)/services/monitoring.googleapis.com"
+    metadata:
+      dependsOn:
+        - project-config
+
+  # Project Information Resource
+  - name: project-info
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: "{{ env['project'] }}"
+
+  # Generate unique suffix for resource naming
+  - name: random-suffix
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "temp-$(ref.project-info.projectNumber)"
+    metadata:
+      dependsOn:
+        - enable-storage-api
+    
+  # Cloud Storage Bucket for Data Lake
+  - name: data-lake-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "data-lake-spark-{{ env['deployment'] }}-$(ref.project-info.projectNumber)"
+      project: $(ref.project-info.projectId)
+      location: "{{ properties['region'] }}"
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      labels:
+        environment: "{{ properties['environment'] }}"
+        recipe: "bigquery-serverless-spark"
+        purpose: "data-lake"
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365
+              matchesStorageClass:
+                - STANDARD
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              matchesStorageClass:
+                - STANDARD
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+              matchesStorageClass:
+                - NEARLINE
+    metadata:
+      dependsOn:
+        - enable-storage-api
+        - project-info
+
+  # Storage Bucket Objects for Folder Structure
+  - name: raw-data-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.data-lake-bucket.name)
+      name: "raw-data/.gitkeep"
+      contentType: "text/plain"
+    metadata:
+      dependsOn:
+        - data-lake-bucket
+
+  - name: processed-data-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.data-lake-bucket.name)
+      name: "processed-data/.gitkeep"
+      contentType: "text/plain"
+    metadata:
+      dependsOn:
+        - data-lake-bucket
+
+  - name: scripts-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.data-lake-bucket.name)
+      name: "scripts/.gitkeep"
+      contentType: "text/plain"
+    metadata:
+      dependsOn:
+        - data-lake-bucket
+
+  # BigQuery Dataset for Analytics
+  - name: analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: "analytics_dataset_{{ env['deployment'] }}_$(ref.project-info.projectNumber)"
+      projectId: $(ref.project-info.projectId)
+      location: "{{ properties['region'] }}"
+      description: "Analytics dataset for Serverless Spark processing - managed by Infrastructure Manager"
+      friendlyName: "Serverless Spark Analytics Dataset"
+      labels:
+        environment: "{{ properties['environment'] }}"
+        recipe: "bigquery-serverless-spark"
+        managed-by: "infrastructure-manager"
+      access:
+        - role: OWNER
+          userByEmail: "{{ properties['owner_email'] }}"
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+      defaultTableExpirationMs: "{{ properties['table_expiration_days'] * 24 * 60 * 60 * 1000 }}"
+      defaultPartitionExpirationMs: "{{ properties['partition_expiration_days'] * 24 * 60 * 60 * 1000 }}"
+    metadata:
+      dependsOn:
+        - enable-bigquery-api
+        - project-info
+
+  # Service Account for Serverless Spark Jobs
+  - name: spark-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: "spark-processing-sa-{{ env['deployment'] }}"
+      projectId: $(ref.project-info.projectId)
+      serviceAccount:
+        displayName: "Serverless Spark Processing Service Account"
+        description: "Service account for BigQuery Serverless Spark data processing jobs"
+    metadata:
+      dependsOn:
+        - project-info
+
+  # IAM Role Bindings for Service Account
+  - name: spark-sa-bigquery-admin
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/bigquery.admin
+      members:
+        - "serviceAccount:$(ref.spark-service-account.email)"
+    metadata:
+      dependsOn:
+        - spark-service-account
+
+  - name: spark-sa-storage-admin
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/storage.admin
+      members:
+        - "serviceAccount:$(ref.spark-service-account.email)"
+    metadata:
+      dependsOn:
+        - spark-service-account
+
+  - name: spark-sa-dataproc-editor
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/dataproc.editor
+      members:
+        - "serviceAccount:$(ref.spark-service-account.email)"
+    metadata:
+      dependsOn:
+        - spark-service-account
+
+  - name: spark-sa-logging-writer
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/logging.logWriter
+      members:
+        - "serviceAccount:$(ref.spark-service-account.email)"
+    metadata:
+      dependsOn:
+        - spark-service-account
+
+  - name: spark-sa-monitoring-writer
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/monitoring.metricWriter
+      members:
+        - "serviceAccount:$(ref.spark-service-account.email)"
+    metadata:
+      dependsOn:
+        - spark-service-account
+
+  # Cloud Logging Sink for Spark Jobs
+  - name: spark-logging-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: "projects/$(ref.project-info.projectId)"
+      uniqueWriterIdentity: true
+      sink:
+        name: "spark-processing-logs-{{ env['deployment'] }}"
+        description: "Logging sink for Serverless Spark processing jobs"
+        destination: "storage.googleapis.com/$(ref.data-lake-bucket.name)/logs"
+        filter: |
+          resource.type="dataproc_batch"
+          OR (resource.type="gce_instance" AND labels.job_type="spark")
+          OR logName:"projects/$(ref.project-info.projectId)/logs/dataproc"
+        includeChildren: true
+    metadata:
+      dependsOn:
+        - enable-logging-api
+        - data-lake-bucket
+        - project-info
+
+  # Cloud Monitoring Alert Policy for Failed Spark Jobs
+  - name: spark-job-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: "projects/$(ref.project-info.projectId)"
+      alertPolicy:
+        displayName: "Serverless Spark Job Failures - {{ env['deployment'] }}"
+        documentation:
+          content: "Alert triggered when Serverless Spark jobs fail"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Dataproc Batch Job Failed"
+            conditionThreshold:
+              filter: |
+                resource.type="dataproc_batch"
+                metric.type="compute.googleapis.com/instance/up"
+              comparison: COMPARISON_EQUAL
+              thresholdValue:
+                doubleValue: 0
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "300s"
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - "resource.label.job_id"
+        enabled: true
+        combiner: OR
+        notificationChannels: []
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - project-info
+
+  # BigQuery Scheduled Query for Sample Data Processing (Optional)
+  - name: sample-data-processing-query
+    type: gcp-types/bigquerydatatransfer-v1:projects.locations.transferConfigs
+    properties:
+      parent: "projects/$(ref.project-info.projectId)/locations/{{ properties['region'] }}"
+      transferConfig:
+        displayName: "Sample Analytics Processing - {{ env['deployment'] }}"
+        description: "Scheduled query for processing sample transaction data"
+        dataSourceId: "scheduled_query"
+        destinationDatasetId: $(ref.analytics-dataset.datasetId)
+        schedule: "every 24 hours"
+        params:
+          query: |
+            -- Sample analytics query for demonstration
+            SELECT 
+              DATE(CURRENT_DATE()) as processing_date,
+              'sample' as data_source,
+              COUNT(*) as total_records,
+              'Infrastructure Manager deployed' as status
+          write_disposition: "WRITE_TRUNCATE"
+        disabled: false
+    metadata:
+      dependsOn:
+        - analytics-dataset
+        - enable-bigquery-api
+
+# Template Properties Definition
+properties:
+  # Deployment Configuration
+  - name: region
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    allowed:
+      - "us-central1"
+      - "us-east1"
+      - "us-west1"
+      - "europe-west1"
+      - "europe-west2"
+      - "asia-southeast1"
+      - "asia-northeast1"
+
+  - name: environment
+    description: "Environment label for resources (dev, staging, prod)"
+    type: string
+    default: "dev"
+    allowed:
+      - "dev"
+      - "staging"
+      - "prod"
+
+  - name: owner_email
+    description: "Email address of the dataset owner"
+    type: string
+    pattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+
+  # BigQuery Configuration
+  - name: table_expiration_days
+    description: "Default table expiration in days"
+    type: integer
+    default: 90
+    minimum: 1
+    maximum: 365
+
+  - name: partition_expiration_days
+    description: "Default partition expiration in days"
+    type: integer
+    default: 30
+    minimum: 1
+    maximum: 90
+
+  # Storage Configuration
+  - name: enable_lifecycle_policies
+    description: "Enable storage lifecycle policies for cost optimization"
+    type: boolean
+    default: true
+
+  # Monitoring Configuration
+  - name: enable_monitoring
+    description: "Enable comprehensive monitoring and alerting"
+    type: boolean
+    default: true
+
+  - name: enable_logging
+    description: "Enable detailed logging for Spark jobs"
+    type: boolean
+    default: true
+
+# Output Values
+outputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    value: $(ref.project-info.projectId)
+
+  - name: data_lake_bucket_name
+    description: "Name of the Cloud Storage data lake bucket"
+    value: $(ref.data-lake-bucket.name)
+
+  - name: data_lake_bucket_url
+    description: "URL of the Cloud Storage data lake bucket"
+    value: "gs://$(ref.data-lake-bucket.name)"
+
+  - name: analytics_dataset_id
+    description: "BigQuery analytics dataset ID"
+    value: $(ref.analytics-dataset.datasetId)
+
+  - name: analytics_dataset_location
+    description: "BigQuery analytics dataset location"
+    value: $(ref.analytics-dataset.location)
+
+  - name: spark_service_account_email
+    description: "Email of the Serverless Spark service account"
+    value: $(ref.spark-service-account.email)
+
+  - name: bigquery_studio_url
+    description: "URL to BigQuery Studio for interactive Spark development"
+    value: "https://console.cloud.google.com/bigquery/studio?project=$(ref.project-info.projectId)"
+
+  - name: dataproc_batches_url
+    description: "URL to monitor Dataproc Serverless batches"
+    value: "https://console.cloud.google.com/dataproc/batches?project=$(ref.project-info.projectId)"
+
+  - name: sample_spark_job_command
+    description: "Sample command to submit a Serverless Spark job"
+    value: |
+      gcloud dataproc batches submit pyspark \
+        gs://$(ref.data-lake-bucket.name)/scripts/data_processing_spark.py \
+        --batch=analytics-processing-job \
+        --region={{ properties['region'] }} \
+        --project=$(ref.project-info.projectId) \
+        --jars=gs://spark-lib/bigquery/spark-bigquery-latest.jar \
+        --service-account=$(ref.spark-service-account.email)
+
+  - name: deployment_summary
+    description: "Summary of deployed resources"
+    value: |
+      BigQuery Serverless Spark Infrastructure Deployed:
+      
+      ✅ Cloud Storage Data Lake: $(ref.data-lake-bucket.name)
+      ✅ BigQuery Analytics Dataset: $(ref.analytics-dataset.datasetId)
+      ✅ Serverless Spark Service Account: $(ref.spark-service-account.email)
+      ✅ Monitoring and Logging: Enabled
+      ✅ APIs Enabled: BigQuery, Storage, Dataproc, Notebooks
+      
+      Next Steps:
+      1. Upload data to gs://$(ref.data-lake-bucket.name)/raw-data/
+      2. Create Spark processing scripts in gs://$(ref.data-lake-bucket.name)/scripts/
+      3. Submit Serverless Spark jobs using the sample command above
+      4. Monitor jobs at: https://console.cloud.google.com/dataproc/batches
+
+# Resource Dependencies and Constraints
+constraints:
+  # Ensure APIs are enabled before creating dependent resources
+  - enforcement: true
+    condition: |
+      resources["enable-bigquery-api"].state == "READY" &&
+      resources["enable-storage-api"].state == "READY" &&
+      resources["enable-dataproc-api"].state == "READY"
+    message: "Required APIs must be enabled before deploying resources"
+
+# Deployment Metadata
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for BigQuery Serverless Spark data processing"
+  author: "Google Cloud Infrastructure Manager"
+  recipe_id: "a7f3b1c8"
+  recipe_name: "large-scale-data-processing-bigquery-serverless-spark"
+  last_updated: "2025-07-12"
+  deployment_time_estimate: "5-10 minutes"
+  cleanup_time_estimate: "2-5 minutes"
+  cost_estimate: "$10-50 per month depending on usage"
+  
+  # Tags for resource organization
+  labels:
+    recipe: "bigquery-serverless-spark"
+    category: "analytics"
+    difficulty: "250"
+    managed-by: "infrastructure-manager"
+    auto-deployed: "true"

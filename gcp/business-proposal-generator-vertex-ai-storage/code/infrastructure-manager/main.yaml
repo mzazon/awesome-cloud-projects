@@ -1,0 +1,444 @@
+# Infrastructure Manager Configuration for Business Proposal Generator
+# This configuration creates a complete AI-powered business proposal generation system
+# using Vertex AI, Cloud Functions, and Cloud Storage on Google Cloud Platform
+
+# Define configuration metadata
+apiVersion: v1
+kind: InfraManager
+metadata:
+  name: business-proposal-generator
+  description: "AI-powered business proposal generation system with Vertex AI and Cloud Storage"
+  version: "1.0"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+  
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+  
+  resource_prefix:
+    description: "Prefix for all resource names"
+    type: string
+    default: "proposal-gen"
+
+# Local values for resource naming and configuration
+locals:
+  # Generate unique suffix for resource names to avoid conflicts
+  random_suffix: ${random_id.suffix.hex}
+  
+  # Resource names with consistent naming convention
+  templates_bucket_name: "${var.project_id}-${var.resource_prefix}-templates-${local.random_suffix}"
+  client_data_bucket_name: "${var.project_id}-${var.resource_prefix}-client-data-${local.random_suffix}"
+  output_bucket_name: "${var.project_id}-${var.resource_prefix}-output-${local.random_suffix}"
+  function_name: "${var.resource_prefix}-generator-${local.random_suffix}"
+  
+  # Common labels for all resources
+  common_labels:
+    project: "business-proposal-generator"
+    environment: ${var.environment}
+    managed-by: "infrastructure-manager"
+    component: "ai-proposal-system"
+
+# Random resource for unique naming
+resources:
+  # Generate random suffix for unique resource names
+  random_id.suffix:
+    type: random_id
+    properties:
+      byte_length: 4
+
+  # Enable required Google Cloud APIs
+  google_project_service.vertex_ai:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: aiplatform.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  google_project_service.storage:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: storage-api.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  google_project_service.cloud_functions:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudfunctions.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  google_project_service.cloud_build:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudbuild.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  google_project_service.eventarc:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: eventarc.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  # Cloud Storage Buckets for the proposal generation pipeline
+
+  # Bucket for storing proposal templates
+  google_storage_bucket.templates:
+    type: google_storage_bucket
+    properties:
+      name: ${local.templates_bucket_name}
+      project: ${var.project_id}
+      location: ${var.region}
+      force_destroy: true
+      
+      # Storage class configuration for cost optimization
+      storage_class: STANDARD
+      
+      # Lifecycle management for template versioning
+      lifecycle_rule:
+        - condition:
+            age: 365  # Delete old versions after 1 year
+          action:
+            type: Delete
+        - condition:
+            age: 30   # Move to Nearline after 30 days for cost savings
+          action:
+            type: SetStorageClass
+            storage_class: NEARLINE
+      
+      # Enable versioning for template management
+      versioning:
+        enabled: true
+      
+      # Labels for resource management
+      labels: ${local.common_labels}
+    
+    depends_on:
+      - google_project_service.storage
+
+  # Bucket for client data uploads (triggers proposal generation)
+  google_storage_bucket.client_data:
+    type: google_storage_bucket
+    properties:
+      name: ${local.client_data_bucket_name}
+      project: ${var.project_id}
+      location: ${var.region}
+      force_destroy: true
+      
+      # Storage class for frequently accessed client data
+      storage_class: STANDARD
+      
+      # Lifecycle management for client data retention
+      lifecycle_rule:
+        - condition:
+            age: 90   # Delete client data after 90 days for privacy
+          action:
+            type: Delete
+        - condition:
+            age: 7    # Move to Nearline after 7 days
+          action:
+            type: SetStorageClass
+            storage_class: NEARLINE
+      
+      # Enable uniform bucket-level access for security
+      uniform_bucket_level_access: true
+      
+      # Labels for resource management
+      labels: ${local.common_labels}
+    
+    depends_on:
+      - google_project_service.storage
+
+  # Bucket for generated proposals output
+  google_storage_bucket.output:
+    type: google_storage_bucket
+    properties:
+      name: ${local.output_bucket_name}
+      project: ${var.project_id}
+      location: ${var.region}
+      force_destroy: true
+      
+      # Storage class for generated proposals
+      storage_class: STANDARD
+      
+      # Lifecycle management for proposal retention
+      lifecycle_rule:
+        - condition:
+            age: 180  # Move to Coldline after 6 months
+          action:
+            type: SetStorageClass
+            storage_class: COLDLINE
+        - condition:
+            age: 2555 # Delete after 7 years (typical business retention)
+          action:
+            type: Delete
+      
+      # Enable versioning for proposal history
+      versioning:
+        enabled: true
+      
+      # Enable uniform bucket-level access for security
+      uniform_bucket_level_access: true
+      
+      # Labels for resource management
+      labels: ${local.common_labels}
+    
+    depends_on:
+      - google_project_service.storage
+
+  # IAM Service Account for Cloud Function
+  google_service_account.function_sa:
+    type: google_service_account
+    properties:
+      project: ${var.project_id}
+      account_id: "${var.resource_prefix}-func-sa-${local.random_suffix}"
+      display_name: "Business Proposal Generator Function Service Account"
+      description: "Service account for the business proposal generator Cloud Function"
+
+  # IAM binding for Vertex AI access
+  google_project_iam_member.vertex_ai_user:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/aiplatform.user"
+      member: "serviceAccount:${google_service_account.function_sa.email}"
+    
+    depends_on:
+      - google_service_account.function_sa
+
+  # IAM binding for Storage access
+  google_project_iam_member.storage_admin:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/storage.admin"
+      member: "serviceAccount:${google_service_account.function_sa.email}"
+    
+    depends_on:
+      - google_service_account.function_sa
+
+  # Cloud Storage bucket notification for triggering Cloud Function
+  google_storage_notification.client_data_notification:
+    type: google_storage_notification
+    properties:
+      bucket: ${google_storage_bucket.client_data.name}
+      payload_format: JSON_API_V1
+      topic: ${google_pubsub_topic.function_trigger.id}
+      event_types:
+        - OBJECT_FINALIZE  # Trigger when new objects are uploaded
+      
+      # Filter to only trigger on JSON files
+      object_name_prefix: ""
+      
+    depends_on:
+      - google_storage_bucket.client_data
+      - google_pubsub_topic.function_trigger
+
+  # Pub/Sub topic for Cloud Function triggers
+  google_pubsub_topic.function_trigger:
+    type: google_pubsub_topic
+    properties:
+      project: ${var.project_id}
+      name: "${var.resource_prefix}-trigger-${local.random_suffix}"
+      
+      # Message retention for reliability
+      message_retention_duration: "604800s"  # 7 days
+      
+      labels: ${local.common_labels}
+
+  # Cloud Function source code bucket
+  google_storage_bucket.function_source:
+    type: google_storage_bucket
+    properties:
+      name: "${var.project_id}-${var.resource_prefix}-function-source-${local.random_suffix}"
+      project: ${var.project_id}
+      location: ${var.region}
+      force_destroy: true
+      storage_class: STANDARD
+      
+      # Uniform bucket-level access for security
+      uniform_bucket_level_access: true
+      
+      labels: ${local.common_labels}
+    
+    depends_on:
+      - google_project_service.storage
+
+  # Cloud Function source code archive
+  google_storage_bucket_object.function_source:
+    type: google_storage_bucket_object
+    properties:
+      name: "function-source.zip"
+      bucket: ${google_storage_bucket.function_source.name}
+      
+      # Function source code (this would be populated by the deployment script)
+      source: "./function-source.zip"
+      
+    depends_on:
+      - google_storage_bucket.function_source
+
+  # Cloud Function for AI-powered proposal generation
+  google_cloudfunctions2_function.proposal_generator:
+    type: google_cloudfunctions2_function
+    properties:
+      project: ${var.project_id}
+      location: ${var.region}
+      name: ${local.function_name}
+      description: "AI-powered business proposal generator using Vertex AI"
+      
+      # Function configuration
+      build_config:
+        runtime: "nodejs20"
+        entry_point: "generateProposal"
+        source:
+          storage_source:
+            bucket: ${google_storage_bucket.function_source.name}
+            object: ${google_storage_bucket_object.function_source.name}
+      
+      # Service configuration
+      service_config:
+        max_instance_count: 10
+        min_instance_count: 0
+        available_memory: "512Mi"
+        timeout_seconds: 540
+        max_instance_request_concurrency: 1
+        available_cpu: "1"
+        
+        # Environment variables for function configuration
+        environment_variables:
+          TEMPLATES_BUCKET: ${google_storage_bucket.templates.name}
+          OUTPUT_BUCKET: ${google_storage_bucket.output.name}
+          REGION: ${var.region}
+          GOOGLE_CLOUD_PROJECT: ${var.project_id}
+        
+        # Service account for secure access
+        service_account_email: ${google_service_account.function_sa.email}
+        
+        # Security settings
+        ingress_settings: "ALLOW_INTERNAL_ONLY"
+        all_traffic_on_latest_revision: true
+      
+      # Event trigger configuration
+      event_trigger:
+        trigger_region: ${var.region}
+        event_type: "google.cloud.pubsub.topic.v1.messagePublished"
+        pubsub_topic: ${google_pubsub_topic.function_trigger.id}
+        
+        # Retry policy for reliability
+        retry_policy: "RETRY_POLICY_RETRY"
+      
+      labels: ${local.common_labels}
+    
+    depends_on:
+      - google_project_service.cloud_functions
+      - google_project_service.cloud_build
+      - google_project_service.eventarc
+      - google_service_account.function_sa
+      - google_project_iam_member.vertex_ai_user
+      - google_project_iam_member.storage_admin
+      - google_storage_bucket_object.function_source
+      - google_pubsub_topic.function_trigger
+
+  # Upload sample proposal template
+  google_storage_bucket_object.sample_template:
+    type: google_storage_bucket_object
+    properties:
+      name: "proposal-template.txt"
+      bucket: ${google_storage_bucket.templates.name}
+      content: |
+        BUSINESS PROPOSAL TEMPLATE
+
+        Dear {{CLIENT_NAME}},
+
+        Thank you for considering our services for {{PROJECT_TYPE}}. Based on our understanding of your requirements, we propose the following solution:
+
+        PROJECT OVERVIEW:
+        {{PROJECT_OVERVIEW}}
+
+        SOLUTION APPROACH:
+        {{SOLUTION_APPROACH}}
+
+        TIMELINE:
+        {{TIMELINE}}
+
+        INVESTMENT:
+        {{INVESTMENT}}
+
+        NEXT STEPS:
+        {{NEXT_STEPS}}
+
+        We look forward to partnering with you.
+
+        Best regards,
+        Business Development Team
+      
+      content_type: "text/plain"
+    
+    depends_on:
+      - google_storage_bucket.templates
+
+# Output values for verification and integration
+outputs:
+  templates_bucket_name:
+    description: "Name of the bucket for proposal templates"
+    value: ${google_storage_bucket.templates.name}
+  
+  client_data_bucket_name:
+    description: "Name of the bucket for client data uploads"
+    value: ${google_storage_bucket.client_data.name}
+  
+  output_bucket_name:
+    description: "Name of the bucket for generated proposals"
+    value: ${google_storage_bucket.output.name}
+  
+  function_name:
+    description: "Name of the Cloud Function"
+    value: ${google_cloudfunctions2_function.proposal_generator.name}
+  
+  function_url:
+    description: "URL of the deployed Cloud Function"
+    value: ${google_cloudfunctions2_function.proposal_generator.service_config[0].uri}
+  
+  service_account_email:
+    description: "Email of the service account used by the function"
+    value: ${google_service_account.function_sa.email}
+  
+  pubsub_topic:
+    description: "Name of the Pub/Sub topic for function triggers"
+    value: ${google_pubsub_topic.function_trigger.name}
+  
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+  
+  region:
+    description: "Google Cloud region where resources are deployed"
+    value: ${var.region}
+
+# Resource dependencies and lifecycle management
+depends_on:
+  # Ensure all APIs are enabled before creating resources
+  - google_project_service.vertex_ai
+  - google_project_service.storage
+  - google_project_service.cloud_functions
+  - google_project_service.cloud_build
+  - google_project_service.eventarc

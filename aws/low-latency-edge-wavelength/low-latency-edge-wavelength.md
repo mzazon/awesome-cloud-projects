@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: AWS Wavelength, Amazon CloudFront, Amazon EC2, Amazon Route 53
 estimated-time: 150 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: edge-computing, 5g, low-latency, content-delivery, networking
 recipe-generator-version: 1.3
@@ -84,7 +84,7 @@ graph TB
 5. Domain name registered for DNS configuration
 6. Estimated cost: $150-200 for running this recipe (includes EC2, data transfer, and CloudFront costs)
 
-> **Note**: Wavelength Zones are available in select metropolitan areas through carrier partnerships. Check [AWS Wavelength locations](https://aws.amazon.com/wavelength/locations/) for availability in your region.
+> **Note**: Wavelength Zones are available in select metropolitan areas through carrier partnerships. Check [AWS Wavelength locations](https://aws.amazon.com/wavelength/locations/) for current availability in your region.
 
 ## Preparation
 
@@ -109,9 +109,9 @@ aws ec2 describe-availability-zones \
     --query 'AvailabilityZones[*].[ZoneName,GroupName,State]' \
     --output table
 
-# Set the Wavelength Zone (replace with available zone)
-export WAVELENGTH_ZONE="us-west-2-wl1-las-wlz-1"
-export WAVELENGTH_GROUP="us-west-2-wl1-las-1"
+# Set the Wavelength Zone (replace with available zone from your region)
+export WAVELENGTH_ZONE="us-east-1-wl1-bos-wlz-1"
+export WAVELENGTH_GROUP="us-east-1-wl1-bos-1"
 
 echo "✅ Environment configured for project: ${PROJECT_NAME}"
 ```
@@ -269,7 +269,8 @@ echo "✅ Environment configured for project: ${PROJECT_NAME}"
    # Get latest Amazon Linux 2 AMI
    AMI_ID=$(aws ec2 describe-images \
        --owners amazon \
-       --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" \
+       --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" \
+           "Name=state,Values=available" \
        --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
        --output text)
    
@@ -486,12 +487,8 @@ EOF
         "TargetOriginId": "S3-${S3_BUCKET}",
         "ViewerProtocolPolicy": "redirect-to-https",
         "MinTTL": 0,
-        "ForwardedValues": {
-            "QueryString": false,
-            "Cookies": {
-                "Forward": "none"
-            }
-        },
+        "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+        "OriginRequestPolicyId": "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf",
         "TrustedSigners": {
             "Enabled": false,
             "Quantity": 0
@@ -507,12 +504,8 @@ EOF
                 "MinTTL": 0,
                 "MaxTTL": 0,
                 "DefaultTTL": 0,
-                "ForwardedValues": {
-                    "QueryString": true,
-                    "Cookies": {
-                        "Forward": "all"
-                    }
-                },
+                "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+                "OriginRequestPolicyId": "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf",
                 "TrustedSigners": {
                     "Enabled": false,
                     "Quantity": 0
@@ -549,19 +542,25 @@ EOF
    Route 53 provides intelligent DNS routing that can direct traffic based on geolocation, latency, or health checks. This enables sophisticated traffic management between different origins based on user location and network conditions. The DNS configuration creates a friendly domain name for the edge application while enabling advanced routing policies for optimal user experience.
 
    ```bash
-   # Create hosted zone (if not exists)
-   HOSTED_ZONE_ID=$(aws route53 create-hosted-zone \
-       --name ${DOMAIN_NAME} \
-       --caller-reference "${PROJECT_NAME}-$(date +%s)" \
-       --hosted-zone-config Comment="Edge application DNS zone" \
-       --query 'HostedZone.Id' --output text | cut -d'/' -f3)
+   # Check if hosted zone exists, create if it doesn't
+   HOSTED_ZONE_ID=$(aws route53 list-hosted-zones \
+       --query "HostedZones[?Name=='${DOMAIN_NAME}.'].Id" \
+       --output text | cut -d'/' -f3)
+   
+   if [ -z "$HOSTED_ZONE_ID" ]; then
+       HOSTED_ZONE_ID=$(aws route53 create-hosted-zone \
+           --name ${DOMAIN_NAME} \
+           --caller-reference "${PROJECT_NAME}-$(date +%s)" \
+           --hosted-zone-config Comment="Edge application DNS zone" \
+           --query 'HostedZone.Id' --output text | cut -d'/' -f3)
+   fi
    
    # Create CNAME record for CloudFront
    cat > dns-change.json << EOF
 {
     "Changes": [
         {
-            "Action": "CREATE",
+            "Action": "UPSERT",
             "ResourceRecordSet": {
                 "Name": "app.${DOMAIN_NAME}",
                 "Type": "CNAME",
@@ -708,6 +707,10 @@ EOF
    
    # Wait for distribution to be disabled, then delete
    sleep 300
+   ETAG=$(aws cloudfront get-distribution \
+       --id ${DISTRIBUTION_ID} \
+       --query 'ETag' --output text)
+   
    aws cloudfront delete-distribution \
        --id ${DISTRIBUTION_ID} \
        --if-match ${ETAG}
@@ -734,10 +737,10 @@ EOF
            }]
        }'
    
-   # Delete hosted zone
-   aws route53 delete-hosted-zone --id ${HOSTED_ZONE_ID}
+   # Delete hosted zone (optional - only if created by this recipe)
+   # aws route53 delete-hosted-zone --id ${HOSTED_ZONE_ID}
    
-   echo "✅ Route 53 resources deleted"
+   echo "✅ Route 53 records deleted"
    ```
 
 3. Delete load balancer and target group:
@@ -745,6 +748,9 @@ EOF
    ```bash
    # Delete load balancer
    aws elbv2 delete-load-balancer --load-balancer-arn ${ALB_ARN}
+   
+   # Wait for load balancer deletion
+   sleep 60
    
    # Delete target group
    aws elbv2 delete-target-group --target-group-arn ${TG_ARN}
@@ -809,22 +815,29 @@ This architecture pattern is particularly valuable for use cases requiring real-
 
 > **Tip**: Monitor Wavelength application performance using CloudWatch metrics and consider implementing auto-scaling policies based on mobile network traffic patterns. Use [AWS X-Ray](https://docs.aws.amazon.com/xray/latest/devguide/) for distributed tracing across edge and regional components to optimize the entire application stack.
 
-> **Warning**: Wavelength Zones have limited EC2 instance type availability compared to standard AWS regions. Plan your application architecture accordingly and consider using t3.medium or larger instances for production workloads.
+> **Warning**: Wavelength Zones have limited EC2 instance type availability compared to standard AWS regions. Plan your application architecture accordingly and consider using t3.medium or larger instances for production workloads. ALB support is available in select Wavelength Zones only.
 
 ## Challenge
 
 Extend this edge computing solution with these advanced implementations:
 
-1. **Multi-Wavelength Zone Deployment**: Deploy the application across multiple Wavelength Zones in different metropolitan areas and implement intelligent traffic routing based on user geolocation and network conditions.
+1. **Multi-Wavelength Zone Deployment**: Deploy the application across multiple Wavelength Zones in different metropolitan areas and implement intelligent traffic routing based on user geolocation and network conditions using Route 53 latency-based routing.
 
-2. **Edge Machine Learning**: Add real-time ML inference capabilities using Amazon SageMaker Edge or AWS Inferentia chips deployed in Wavelength Zones for applications like computer vision or natural language processing.
+2. **Edge Machine Learning**: Add real-time ML inference capabilities using Amazon SageMaker Edge or AWS Inferentia chips deployed in Wavelength Zones for applications like computer vision or natural language processing with sub-10ms response times.
 
-3. **Hybrid Edge-Cloud Data Pipeline**: Implement a data streaming architecture using Amazon Kinesis that processes real-time events at the edge while aggregating long-term analytics in regional AWS services.
+3. **Hybrid Edge-Cloud Data Pipeline**: Implement a data streaming architecture using Amazon Kinesis that processes real-time events at the edge while aggregating long-term analytics in regional AWS services, maintaining data locality requirements.
 
-4. **Edge-Native Microservices**: Redesign the application as containerized microservices using Amazon EKS on Wavelength with service mesh integration for complex edge application architectures.
+4. **Edge-Native Microservices**: Redesign the application as containerized microservices using Amazon EKS on Wavelength with service mesh integration for complex edge application architectures that require inter-service communication.
 
-5. **5G Network Slicing Integration**: Work with telecommunications partners to implement network slicing that dedicates specific bandwidth and latency guarantees for your edge applications through programmatic APIs.
+5. **5G Network Slicing Integration**: Work with telecommunications partners to implement network slicing that dedicates specific bandwidth and latency guarantees for your edge applications through programmatic APIs and custom network configurations.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

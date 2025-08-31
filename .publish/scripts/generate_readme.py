@@ -62,8 +62,8 @@ Examples:
     parser.add_argument(
         '--config', '-c',
         type=str,
-        default='data/config.json',
-        help='Path to configuration file (default: data/config.json)'
+        default='../data/config.json',
+        help='Path to configuration file (default: ../data/config.json)'
     )
     
     parser.add_argument(
@@ -75,8 +75,8 @@ Examples:
     parser.add_argument(
         '--root', '-r',
         type=str,
-        default='.',
-        help='Root directory to search for recipes (default: current directory)'
+        default='../..',
+        help='Root directory to search for recipes (default: repository root)'
     )
     
     parser.add_argument(

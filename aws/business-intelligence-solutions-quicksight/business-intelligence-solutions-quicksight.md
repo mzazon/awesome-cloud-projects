@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: QuickSight, S3, Athena, Redshift
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: business-intelligence, analytics, visualization, self-service
 recipe-generator-version: 1.3
@@ -218,7 +218,20 @@ echo "✅ Preparation completed with bucket: ${BUCKET_NAME}"
                    "Key": "sales/sales_data.csv"
                }
            }
-       }
+       },
+       "Permissions": [
+           {
+               "Principal": "${QUICKSIGHT_USER_ARN}",
+               "Actions": [
+                   "quicksight:DescribeDataSource",
+                   "quicksight:DescribeDataSourcePermissions",
+                   "quicksight:PassDataSource",
+                   "quicksight:UpdateDataSource",
+                   "quicksight:DeleteDataSource",
+                   "quicksight:UpdateDataSourcePermissions"
+               ]
+           }
+       ]
    }
    EOF
    
@@ -286,6 +299,13 @@ echo "✅ Preparation completed with bucket: ${BUCKET_NAME}"
            "sales_table": {
                "S3Source": {
                    "DataSourceArn": "arn:aws:quicksight:${AWS_REGION}:${AWS_ACCOUNT_ID}:datasource/sales-data-s3",
+                   "UploadSettings": {
+                       "Format": "CSV",
+                       "StartFromRow": 1,
+                       "ContainsHeader": true,
+                       "TextQualifier": "DOUBLE_QUOTE",
+                       "Delimiter": ","
+                   },
                    "InputColumns": [
                        {"Name": "date", "Type": "STRING"},
                        {"Name": "region", "Type": "STRING"},
@@ -313,7 +333,25 @@ echo "✅ Preparation completed with bucket: ${BUCKET_NAME}"
                    }
                ]
            }
-       }
+       },
+       "ImportMode": "SPICE",
+       "Permissions": [
+           {
+               "Principal": "${QUICKSIGHT_USER_ARN}",
+               "Actions": [
+                   "quicksight:PassDataSet",
+                   "quicksight:DescribeIngestion",
+                   "quicksight:CreateIngestion",
+                   "quicksight:UpdateDataSet",
+                   "quicksight:DeleteDataSet",
+                   "quicksight:DescribeDataSet",
+                   "quicksight:CancelIngestion",
+                   "quicksight:DescribeDataSetPermissions",
+                   "quicksight:ListIngestions",
+                   "quicksight:UpdateDataSetPermissions"
+               ]
+           }
+       ]
    }
    EOF
    
@@ -414,50 +452,12 @@ echo "✅ Preparation completed with bucket: ${BUCKET_NAME}"
 
    ```bash
    # Create dashboard from analysis
-   cat > dashboard-config.json << EOF
-   {
-       "Name": "Sales Performance Dashboard",
-       "DashboardId": "sales-dashboard",
-       "Definition": {
-           "DataSetIdentifierDeclarations": [
-               {
-                   "DataSetArn": "arn:aws:quicksight:${AWS_REGION}:${AWS_ACCOUNT_ID}:dataset/sales-dataset",
-                   "Identifier": "sales_data"
-               }
-           ],
-           "Sheets": [
-               {
-                   "SheetId": "dashboard_sheet",
-                   "Name": "Sales Dashboard",
-                   "Visuals": [
-                       {
-                           "BarChartVisual": {
-                               "VisualId": "sales_by_region_chart",
-                               "Title": {
-                                   "Text": "Sales by Region"
-                               }
-                           }
-                       },
-                       {
-                           "PieChartVisual": {
-                               "VisualId": "sales_by_product_pie",
-                               "Title": {
-                                   "Text": "Sales Distribution by Product"
-                               }
-                           }
-                       }
-                   ]
-               }
-           ]
-       }
-   }
-   EOF
-   
-   # Create the dashboard
+   # Create dashboard from analysis
    aws quicksight create-dashboard \
        --aws-account-id ${AWS_ACCOUNT_ID} \
        --dashboard-id sales-dashboard \
-       --cli-input-json file://dashboard-config.json \
+       --name "Sales Performance Dashboard" \
+       --source-entity AnalysisArn="arn:aws:quicksight:${AWS_REGION}:${AWS_ACCOUNT_ID}:analysis/sales-analysis" \
        --region ${AWS_REGION}
    
    echo "✅ Interactive dashboard created"
@@ -689,11 +689,11 @@ echo "✅ Preparation completed with bucket: ${BUCKET_NAME}"
 
 ## Discussion
 
-Amazon QuickSight represents a paradigm shift in business intelligence by providing a serverless, pay-per-session model that eliminates the need for complex infrastructure management. The service integrates seamlessly with AWS data services like S3, RDS, and Redshift, enabling organizations to build comprehensive analytics solutions without the overhead of traditional BI tools. The architecture demonstrated here shows how to connect multiple data sources, create interactive visualizations, and enable self-service analytics for business users.
+Amazon QuickSight represents a paradigm shift in business intelligence by providing a serverless, pay-per-session model that eliminates the need for complex infrastructure management. The service integrates seamlessly with AWS data services like S3, RDS, and Redshift, enabling organizations to build comprehensive analytics solutions without the overhead of traditional BI tools. The architecture demonstrated here shows how to connect multiple data sources, create interactive visualizations, and enable self-service analytics for business users. QuickSight follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles by providing operational excellence through automation, security through IAM integration, reliability through auto-scaling, performance efficiency through SPICE optimization, and cost optimization through pay-per-session pricing.
 
-The embedded analytics capability is particularly powerful for SaaS applications, allowing developers to integrate dashboards directly into their applications without requiring users to access a separate BI tool. QuickSight's SPICE (Super-fast, Parallel, In-memory Calculation Engine) provides sub-second query performance on large datasets, while the automatic scaling ensures consistent performance as data volumes grow. The pay-per-session pricing model makes it cost-effective for organizations with sporadic usage patterns.
+The embedded analytics capability is particularly powerful for SaaS applications, allowing developers to integrate dashboards directly into their applications without requiring users to access a separate BI tool. QuickSight's SPICE (Super-fast, Parallel, In-memory Calculation Engine) provides sub-second query performance on large datasets, while the automatic scaling ensures consistent performance as data volumes grow. The pay-per-session pricing model makes it cost-effective for organizations with sporadic usage patterns, aligning with [AWS cost optimization best practices](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html).
 
-Security is built into QuickSight through integration with AWS IAM, enabling fine-grained access controls and secure data sharing. The service supports row-level security, allowing administrators to ensure users only see data relevant to their roles. Additionally, QuickSight's ML-powered insights can automatically detect anomalies and provide natural language narratives about data trends, reducing the burden on analysts to manually identify patterns.
+Security is built into QuickSight through integration with AWS IAM, enabling fine-grained access controls and secure data sharing following the [principle of least privilege](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege). The service supports row-level security, allowing administrators to ensure users only see data relevant to their roles. Additionally, QuickSight's ML-powered insights can automatically detect anomalies and provide natural language narratives about data trends, reducing the burden on analysts to manually identify patterns. For comprehensive security guidance, see the [QuickSight security documentation](https://docs.aws.amazon.com/quicksight/latest/user/security.html).
 
 > **Tip**: Use QuickSight's calculated fields and parameters to create dynamic dashboards that allow users to explore data interactively without creating multiple static reports. Learn more about advanced features in the [QuickSight Embedded Analytics documentation](https://docs.aws.amazon.com/quicksight/latest/user/embedded-analytics.html).
 
@@ -715,4 +715,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: Config, Lambda, IAM, SNS
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: config, lambda, auto-remediation, governance, compliance
 recipe-generator-version: 1.3
 ---
 
 # Auto-Remediation with Config and Lambda
-
 
 ## Problem
 
@@ -121,7 +120,7 @@ echo "Lambda Role: ${LAMBDA_ROLE_NAME}"
 echo "S3 Bucket: ${S3_BUCKET_NAME}"
 ```
 
-# Steps
+## Steps
 
 1. **Set up AWS Config with configuration recorder**:
 
@@ -302,7 +301,8 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
                    "s3:GetBucketPolicy",
                    "s3:PutBucketAcl",
                    "s3:PutBucketPolicy",
-                   "s3:DeleteBucketPolicy"
+                   "s3:DeleteBucketPolicy",
+                   "s3:PutPublicAccessBlock"
                ],
                "Resource": "*"
            },
@@ -356,12 +356,14 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
    import json
    import boto3
    import logging
+   import os
    from datetime import datetime
+   from botocore.exceptions import ClientError
    
    logger = logging.getLogger()
    logger.setLevel(logging.INFO)
    
-   ec2= boto3.client('ec2')
+   ec2 = boto3.client('ec2')
    sns = boto3.client('sns')
    
    def lambda_handler(event, context):
@@ -401,7 +403,7 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
                            )
                            remediation_actions.append(f"Removed unrestricted inbound rule: {rule}")
                            logger.info(f"Removed unrestricted inbound rule from {resource_id}")
-                       except Exception as e:
+                       except ClientError as e:
                            logger.error(f"Failed to remove inbound rule: {e}")
            
            # Add tag to indicate remediation
@@ -460,7 +462,7 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name "SecurityGroupRemediation-${RANDOM_SUFFIX}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler sg-remediation-function.lambda_handler \
        --zip-file fileb://sg-remediation-function.zip \
@@ -685,6 +687,8 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
        --query 'ComplianceSummary'
    ```
 
+   Expected output: Configuration recorder should show "default" with allSupported as true, Config rules should be in "ACTIVE" state, and compliance summary should show evaluation counts.
+
 2. **Test remediation by creating non-compliant resource**:
 
    ```bash
@@ -711,6 +715,8 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
        --query 'SecurityGroups[0].IpPermissions'
    ```
 
+   Expected output: After Config evaluation, the unrestricted SSH rule should be automatically removed by the remediation system.
+
 3. **Monitor remediation execution**:
 
    ```bash
@@ -734,6 +740,8 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
        --limit 10 \
        --query 'events[*].message'
    ```
+
+   Expected output: Remediation execution should show successful completion, and Lambda logs should contain detailed information about the remediation actions taken.
 
 ## Cleanup
 
@@ -834,9 +842,11 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
 
 AWS Config with automated remediation provides a powerful framework for maintaining compliance and security posture across cloud infrastructure. The solution demonstrates how to combine Config's continuous monitoring capabilities with Lambda functions and Systems Manager automation to create self-healing infrastructure that automatically corrects configuration drift and policy violations.
 
-The key advantage of this approach is the reduction in mean time to remediation (MTTR) for security and compliance issues. Instead of waiting for manual intervention, violations are detected and corrected within minutes of occurrence. The integration with CloudWatch and SNS provides comprehensive visibility and alerting, while the audit trail through CloudTrail ensures all remediation actions are logged for compliance purposes.
+The key advantage of this approach is the reduction in mean time to remediation (MTTR) for security and compliance issues. Instead of waiting for manual intervention, violations are detected and corrected within minutes of occurrence. The integration with CloudWatch and SNS provides comprehensive visibility and alerting, while the audit trail through CloudTrail ensures all remediation actions are logged for compliance purposes according to the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
-Cost optimization comes through targeted remediation that prevents security incidents and compliance violations that could result in significant financial and reputational costs. The automated approach also reduces operational overhead by eliminating manual remediation tasks, allowing teams to focus on strategic initiatives rather than reactive maintenance.
+Cost optimization comes through targeted remediation that prevents security incidents and compliance violations that could result in significant financial and reputational costs. The automated approach also reduces operational overhead by eliminating manual remediation tasks, allowing teams to focus on strategic initiatives rather than reactive maintenance. This follows AWS operational excellence principles by implementing automation for common operational tasks.
+
+The solution architecture follows AWS security best practices by implementing least-privilege IAM policies, encryption for data at rest in S3, and comprehensive logging through CloudTrail. The Lambda function uses error handling and defensive programming practices to ensure reliability and transparency in remediation actions.
 
 > **Warning**: Test remediation actions thoroughly in non-production environments before enabling automatic remediation in production. Some remediation actions may impact application functionality if not properly configured. Review the [AWS Config remediation best practices](https://docs.aws.amazon.com/config/latest/developerguide/setup-autoremediation.html) for guidance on safe implementation.
 
@@ -846,12 +856,19 @@ Cost optimization comes through targeted remediation that prevents security inci
 
 Extend this solution by implementing these enhancements:
 
-1. **Advanced Remediation Logic**: Create sophisticated remediation workflows that consider business context, maintenance windows, and approval processes for critical resources
-2. **Multi-Account Governance**: Implement organization-wide compliance monitoring and remediation across multiple AWS accounts using Config aggregators and cross-account roles
-3. **Custom Compliance Rules**: Develop custom Config rules using Lambda functions to evaluate organization-specific compliance requirements and industry standards
-4. **Integration with ITSM**: Connect the remediation system with IT Service Management tools to create tickets, track changes, and manage approval workflows
-5. **Predictive Compliance**: Use machine learning to predict potential compliance violations based on configuration trends and proactively remediate before violations occur
+1. **Advanced Remediation Logic**: Create sophisticated remediation workflows that consider business context, maintenance windows, and approval processes for critical resources using Step Functions and EventBridge
+2. **Multi-Account Governance**: Implement organization-wide compliance monitoring and remediation across multiple AWS accounts using Config aggregators and cross-account roles with AWS Organizations
+3. **Custom Compliance Rules**: Develop custom Config rules using Lambda functions to evaluate organization-specific compliance requirements and industry standards like SOC 2 or PCI DSS
+4. **Integration with ITSM**: Connect the remediation system with IT Service Management tools like ServiceNow to create tickets, track changes, and manage approval workflows
+5. **Predictive Compliance**: Use Amazon Forecast or SageMaker to predict potential compliance violations based on configuration trends and proactively remediate before violations occur
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

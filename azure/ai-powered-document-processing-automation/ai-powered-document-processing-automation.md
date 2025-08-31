@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure OpenAI Service, Azure Container Apps Jobs, Azure Service Bus, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: azure-openai, assistants, container-apps, service-bus, automation, ai, serverless
 recipe-generator-version: 1.3
@@ -84,7 +84,8 @@ graph TB
 2. Azure CLI v2.50.0 or later installed and configured (or Azure Cloud Shell)
 3. Basic understanding of Azure Container Apps, Service Bus, and OpenAI concepts
 4. Docker knowledge for containerizing job applications
-5. Estimated cost: $50-100 for running this recipe (includes OpenAI API usage, Container Apps, and Service Bus)
+5. Python 3.11+ for running test scripts and assistant creation
+6. Estimated cost: $50-100 for running this recipe (includes OpenAI API usage, Container Apps, and Service Bus)
 
 > **Note**: Azure OpenAI Assistants API is currently in preview and requires approval for access. Apply for access through the Azure OpenAI Service application process.
 
@@ -92,26 +93,25 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-intelligent-automation"
+export RESOURCE_GROUP="rg-recipe-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
-export UNIQUE_SUFFIX=$RANDOM_SUFFIX
 
 # Set resource names with unique identifiers
-export OPENAI_ACCOUNT_NAME="openai-automation-${UNIQUE_SUFFIX}"
-export SERVICEBUS_NAMESPACE="sb-automation-${UNIQUE_SUFFIX}"
-export CONTAINER_ENV="aca-env-${UNIQUE_SUFFIX}"
-export LOG_ANALYTICS_WORKSPACE="law-automation-${UNIQUE_SUFFIX}"
-export CONTAINER_REGISTRY="acr${UNIQUE_SUFFIX}"
+export OPENAI_ACCOUNT_NAME="openai-automation-${RANDOM_SUFFIX}"
+export SERVICEBUS_NAMESPACE="sb-automation-${RANDOM_SUFFIX}"
+export CONTAINER_ENV="aca-env-${RANDOM_SUFFIX}"
+export LOG_ANALYTICS_WORKSPACE="law-automation-${RANDOM_SUFFIX}"
+export CONTAINER_REGISTRY="acr${RANDOM_SUFFIX}"
 
 # Create resource group
 az group create \
     --name ${RESOURCE_GROUP} \
     --location ${LOCATION} \
-    --tags purpose=intelligent-automation environment=demo
+    --tags purpose=recipe environment=demo
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
@@ -147,9 +147,10 @@ echo "✅ Log Analytics workspace created"
        --resource-group ${RESOURCE_GROUP} \
        --deployment-name gpt-4 \
        --model-name gpt-4 \
-       --model-version "0613" \
+       --model-version "1106-Preview" \
        --model-format OpenAI \
-       --scale-settings-scale-type Standard
+       --sku-capacity 1 \
+       --sku-name Standard
 
    # Get OpenAI endpoint and key
    export OPENAI_ENDPOINT=$(az cognitiveservices account show \
@@ -410,9 +411,7 @@ echo "✅ Log Analytics workspace created"
        --scale-rule-name servicebus-scale \
        --scale-rule-type azure-servicebus \
        --scale-rule-metadata \
-           connectionFromEnv=SERVICEBUS_CONNECTION \
-           queueName=processing-queue \
-           messageCount=1 \
+           "connectionFromEnv=SERVICEBUS_CONNECTION queueName=processing-queue messageCount=1" \
        --env-vars \
            SERVICEBUS_CONNECTION=secretref:servicebus-connection \
        --secrets \
@@ -432,10 +431,7 @@ echo "✅ Log Analytics workspace created"
        --scale-rule-name servicebus-topic-scale \
        --scale-rule-type azure-servicebus \
        --scale-rule-metadata \
-           connectionFromEnv=SERVICEBUS_CONNECTION \
-           topicName=processing-results \
-           subscriptionName=notification-sub \
-           messageCount=1 \
+           "connectionFromEnv=SERVICEBUS_CONNECTION topicName=processing-results subscriptionName=notification-sub messageCount=1" \
        --env-vars \
            SERVICEBUS_CONNECTION=secretref:servicebus-connection \
        --secrets \
@@ -455,6 +451,7 @@ echo "✅ Log Analytics workspace created"
    cat > create_assistant.py << 'EOF'
    import os
    import json
+   import time
    import requests
    from azure.servicebus import ServiceBusClient
 
@@ -555,11 +552,10 @@ echo "✅ Log Analytics workspace created"
            print("Save this ID for interacting with the assistant")
    EOF
 
-   # Set environment variables and create assistant
-   export OPENAI_ENDPOINT=$OPENAI_ENDPOINT
-   export OPENAI_KEY=$OPENAI_KEY
-   export SERVICEBUS_CONNECTION=$SERVICEBUS_CONNECTION
+   # Install required Python packages
+   pip install azure-servicebus requests
 
+   # Set environment variables and create assistant
    python create_assistant.py
 
    echo "✅ Azure OpenAI Assistant created for intelligent document processing"
@@ -582,37 +578,6 @@ echo "✅ Log Analytics workspace created"
            --workspace-name ${LOG_ANALYTICS_WORKSPACE} \
            --query id \
            --output tsv)
-
-   # Create monitoring dashboard
-   az monitor dashboard create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name "Intelligent Automation Dashboard" \
-       --input-path dashboard-config.json
-
-   # Create dashboard configuration
-   cat > dashboard-config.json << 'EOF'
-   {
-       "lenses": {
-           "0": {
-               "order": 0,
-               "parts": {
-                   "0": {
-                       "position": {
-                           "x": 0,
-                           "y": 0,
-                           "rowSpan": 4,
-                           "colSpan": 6
-                       },
-                       "metadata": {
-                           "inputs": [],
-                           "type": "Extension/Microsoft_Azure_Monitoring/PartType/MetricsChartPart"
-                       }
-                   }
-               }
-           }
-       }
-   }
-   EOF
 
    # Set up alerts for system health
    az monitor metrics alert create \
@@ -648,12 +613,30 @@ echo "✅ Log Analytics workspace created"
 2. **Test Service Bus Message Processing**:
 
    ```bash
-   # Send test message to processing queue
-   az servicebus queue send \
-       --name processing-queue \
-       --namespace-name ${SERVICEBUS_NAMESPACE} \
-       --resource-group ${RESOURCE_GROUP} \
-       --messages '[{"document_id": "test-doc-001", "processing_type": "analysis", "priority": "high"}]'
+   # Install Python Service Bus package if not already installed
+   pip install azure-servicebus
+
+   # Create test message file
+   echo '{"document_id": "test-doc-001", "processing_type": "analysis", "priority": "high"}' > test-message.json
+
+   # Send test message using Python script
+   python -c "
+import json
+import os
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
+
+connection_string = os.getenv('SERVICEBUS_CONNECTION')
+with open('test-message.json', 'r') as f:
+    message_data = f.read()
+
+servicebus_client = ServiceBusClient.from_connection_string(connection_string)
+with servicebus_client:
+    sender = servicebus_client.get_queue_sender(queue_name='processing-queue')
+    with sender:
+        message = ServiceBusMessage(message_data)
+        sender.send_messages(message)
+        print('✅ Test message sent successfully')
+"
 
    # Check queue metrics
    az servicebus queue show \
@@ -688,10 +671,11 @@ echo "✅ Log Analytics workspace created"
    ```bash
    # Create test script for workflow validation
    cat > test_workflow.py << 'EOF'
+   import os
    import json
    import requests
    import time
-   from azure.servicebus import ServiceBusClient
+   from azure.servicebus import ServiceBusClient, ServiceBusMessage
 
    def test_intelligent_automation():
        # Test document processing through assistant
@@ -711,7 +695,7 @@ echo "✅ Log Analytics workspace created"
            sender = servicebus_client.get_queue_sender(queue_name="processing-queue")
            
            with sender:
-               message = json.dumps(test_document)
+               message = ServiceBusMessage(json.dumps(test_document))
                sender.send_messages(message)
                print("✅ Test document queued for processing")
        
@@ -842,4 +826,9 @@ Extend this intelligent automation solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

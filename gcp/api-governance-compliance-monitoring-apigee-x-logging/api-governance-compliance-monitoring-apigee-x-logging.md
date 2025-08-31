@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Apigee X, Cloud Logging, Eventarc, Cloud Functions
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: api-governance, compliance, monitoring, security, automation
 recipe-generator-version: 1.3
@@ -120,6 +120,7 @@ gcloud services enable eventarc.googleapis.com
 gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable pubsub.googleapis.com
 gcloud services enable storage.googleapis.com
+gcloud services enable bigquery.googleapis.com
 
 # Create Cloud Storage bucket for function code
 gsutil mb -p ${PROJECT_ID} \
@@ -156,13 +157,7 @@ echo "✅ Apigee organization: ${APIGEE_ORG}"
    API proxies in Apigee act as a security and governance layer between clients and backend services. By implementing standardized policies for authentication, rate limiting, and threat protection, we establish consistent governance rules that apply across all APIs in the organization.
 
    ```bash
-   # Create API proxy configuration
-   cat > api-proxy-bundle.zip << 'EOF'
-   # This would contain the proxy bundle with governance policies
-   # Including OAuth validation, rate limiting, and compliance logging
-   EOF
-   
-   # For demo, create a simple proxy configuration
+   # Create API proxy configuration directory structure
    mkdir -p proxy-config/apiproxy/policies
    mkdir -p proxy-config/apiproxy/proxies
    mkdir -p proxy-config/apiproxy/targets
@@ -198,6 +193,11 @@ echo "✅ Apigee organization: ${APIGEE_ORG}"
    Cloud Logging captures all API access patterns, security events, and policy violations from Apigee X. Creating structured log sinks enables real-time analysis of API behavior and provides the comprehensive audit trail required for regulatory compliance and security monitoring.
 
    ```bash
+   # Create BigQuery dataset for log analysis
+   bq mk --project_id=${PROJECT_ID} \
+       --location=${REGION} \
+       api_governance
+   
    # Create log sink for Apigee audit logs
    gcloud logging sinks create apigee-governance-sink \
        bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/api_governance \
@@ -205,11 +205,6 @@ echo "✅ Apigee organization: ${APIGEE_ORG}"
                      resource.type="apigee_environment" OR
                      protoPayload.serviceName="apigee.googleapis.com"' \
        --use-partitioned-tables
-   
-   # Create BigQuery dataset for log analysis
-   bq mk --project_id=${PROJECT_ID} \
-       --location=${REGION} \
-       api_governance
    
    # Create Pub/Sub topic for real-time log processing
    gcloud pubsub topics create api-governance-events
@@ -238,9 +233,11 @@ echo "✅ Apigee organization: ${APIGEE_ORG}"
    cat > main.py << 'EOF'
    import json
    import logging
+   import os
+   import base64
+   from datetime import datetime
    from google.cloud import logging_v2
    from google.cloud import monitoring_v3
-   import base64
    
    def monitor_api_compliance(event, context):
        """Monitor API compliance and trigger alerts for violations."""
@@ -305,13 +302,13 @@ echo "✅ Apigee organization: ${APIGEE_ORG}"
    
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
-   google-cloud-logging==3.8.0
-   google-cloud-monitoring==2.16.0
+   google-cloud-logging==3.10.0
+   google-cloud-monitoring==2.19.0
    EOF
    
    # Deploy the function
    gcloud functions deploy api-compliance-monitor \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-topic api-governance-events \
        --source . \
        --entry-point monitor_api_compliance \
@@ -445,6 +442,9 @@ echo "✅ Apigee organization: ${APIGEE_ORG}"
    cat > main.py << 'EOF'
    import json
    import logging
+   import os
+   import base64
+   from datetime import datetime
    from google.cloud import apigeeconnect_v1
    from google.cloud import logging_v2
    
@@ -501,9 +501,15 @@ echo "✅ Apigee organization: ${APIGEE_ORG}"
        })
    EOF
    
+   # Create requirements.txt
+   cat > requirements.txt << 'EOF'
+   google-cloud-apigee-connect==1.8.0
+   google-cloud-logging==3.10.0
+   EOF
+   
    # Deploy policy enforcement function
    gcloud functions deploy api-policy-enforcer \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-topic api-governance-events \
        --source . \
        --entry-point enforce_api_policies \
@@ -628,11 +634,11 @@ echo "✅ Apigee organization: ${APIGEE_ORG}"
 
 ## Discussion
 
-This automated API governance solution demonstrates how to build comprehensive compliance monitoring using Google Cloud's native API management and event-driven architecture capabilities. The combination of Apigee X's built-in security policies with Cloud Logging's centralized audit trails creates a robust foundation for enterprise API governance that scales with organizational growth.
+This automated API governance solution demonstrates how to build comprehensive compliance monitoring using Google Cloud's native API management and event-driven architecture capabilities. The combination of Apigee X's built-in security policies with Cloud Logging's centralized audit trails creates a robust foundation for enterprise API governance that scales with organizational growth. This architecture follows [Google Cloud's security best practices](https://cloud.google.com/security/best-practices) and the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
 
-The architecture leverages Google Cloud's serverless computing model through Cloud Functions and Eventarc to create reactive compliance monitoring that responds to violations in real-time. This event-driven approach ensures that security incidents are immediately detected and addressed, while the comprehensive logging infrastructure provides the detailed audit trails required for regulatory compliance frameworks like SOX, HIPAA, and GDPR.
+The architecture leverages Google Cloud's serverless computing model through Cloud Functions and Eventarc to create reactive compliance monitoring that responds to violations in real-time. This event-driven approach ensures that security incidents are immediately detected and addressed, while the comprehensive logging infrastructure provides the detailed audit trails required for regulatory compliance frameworks like SOX, HIPAA, and GDPR. The implementation utilizes Google Cloud's [Well-Architected Framework principles](https://cloud.google.com/architecture/framework) to ensure operational excellence, security, reliability, performance efficiency, and cost optimization.
 
-The solution's strength lies in its automation capabilities, which eliminate the manual overhead traditionally associated with API governance while ensuring consistent policy enforcement across all APIs. By integrating monitoring, alerting, and automated remediation, organizations can maintain security standards and compliance requirements without sacrificing development velocity or operational efficiency. The BigQuery integration enables advanced analytics and reporting capabilities that support continuous improvement of governance policies based on actual usage patterns and threat intelligence.
+The solution's strength lies in its automation capabilities, which eliminate the manual overhead traditionally associated with API governance while ensuring consistent policy enforcement across all APIs. By integrating monitoring, alerting, and automated remediation, organizations can maintain security standards and compliance requirements without sacrificing development velocity or operational efficiency. The BigQuery integration enables advanced analytics and reporting capabilities that support continuous improvement of governance policies based on actual usage patterns and threat intelligence, following [Google Cloud's data analytics best practices](https://cloud.google.com/architecture/data-analytics).
 
 > **Tip**: Use Cloud Monitoring's custom metrics to track API governance KPIs like policy compliance rates, mean time to violation detection, and automated remediation success rates for continuous improvement of your governance posture.
 
@@ -652,4 +658,9 @@ Extend this solution by implementing these advanced governance capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

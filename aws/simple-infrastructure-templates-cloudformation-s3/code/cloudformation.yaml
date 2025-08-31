@@ -1,0 +1,602 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple S3 bucket infrastructure template with enterprise security best practices and compliance configurations. Deploys a secure S3 bucket with AES-256 encryption, versioning, public access blocking, and comprehensive monitoring capabilities.'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Bucket Configuration"
+        Parameters:
+          - BucketName
+          - Environment
+          - EnableVersioning
+          - EnableLogging
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EncryptionType
+          - BucketKeyEnabled
+          - EnableMfaDelete
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableNotifications
+          - NotificationEmail
+          - EnableCloudTrail
+    ParameterLabels:
+      BucketName:
+        default: "S3 Bucket Name"
+      Environment:
+        default: "Deployment Environment"
+      EnableVersioning:
+        default: "Enable Object Versioning"
+      EncryptionType:
+        default: "Server-Side Encryption Algorithm"
+      NotificationEmail:
+        default: "Email for Bucket Notifications"
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: 'Name for the S3 bucket (must be globally unique, 3-63 characters, lowercase letters, numbers, and hyphens only)'
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Bucket name must be between 3-63 characters, contain only lowercase letters, numbers, and hyphens, and cannot start or end with a hyphen'
+    Default: 'my-infrastructure-bucket'
+
+  Environment:
+    Type: String
+    Description: 'Environment for the S3 bucket deployment (affects tagging and naming conventions)'
+    Default: 'Development'
+    AllowedValues:
+      - 'Development'
+      - 'Staging'
+      - 'Production'
+      - 'Testing'
+    ConstraintDescription: 'Must be one of: Development, Staging, Production, Testing'
+
+  EnableVersioning:
+    Type: String
+    Description: 'Enable S3 object versioning for data protection and recovery capabilities'
+    Default: 'Enabled'
+    AllowedValues:
+      - 'Enabled'
+      - 'Suspended'
+    ConstraintDescription: 'Must be either Enabled or Suspended'
+
+  EncryptionType:
+    Type: String
+    Description: 'Server-side encryption algorithm for S3 objects (AES256 or KMS)'
+    Default: 'AES256'
+    AllowedValues:
+      - 'AES256'
+      - 'aws:kms'
+    ConstraintDescription: 'Must be either AES256 or aws:kms'
+
+  BucketKeyEnabled:
+    Type: String
+    Description: 'Enable S3 Bucket Key to reduce KMS API calls and costs (only applicable for KMS encryption)'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: 'Must be either true or false'
+
+  EnableMfaDelete:
+    Type: String
+    Description: 'Require MFA for object deletion (can only be enabled via CLI/API after stack creation)'
+    Default: 'Disabled'
+    AllowedValues:
+      - 'Enabled'
+      - 'Disabled'
+    ConstraintDescription: 'Must be either Enabled or Disabled'
+
+  EnableLogging:
+    Type: String
+    Description: 'Enable S3 server access logging for audit and compliance purposes'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: 'Must be either true or false'
+
+  EnableNotifications:
+    Type: String
+    Description: 'Enable SNS notifications for bucket events (requires valid email address)'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: 'Must be either true or false'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for S3 bucket event notifications (required if EnableNotifications is true)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+  EnableCloudTrail:
+    Type: String
+    Description: 'Enable CloudTrail logging for S3 API calls and data events'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: 'Must be either true or false'
+
+Conditions:
+  # Condition to check if KMS encryption is selected
+  UseKMSEncryption: !Equals [!Ref EncryptionType, 'aws:kms']
+  
+  # Condition to check if bucket key should be enabled (only for KMS)
+  EnableBucketKey: !And
+    - !Equals [!Ref BucketKeyEnabled, 'true']
+    - !Condition UseKMSEncryption
+  
+  # Condition for enabling access logging
+  CreateLoggingBucket: !Equals [!Ref EnableLogging, 'true']
+  
+  # Condition for enabling notifications
+  CreateNotifications: !And
+    - !Equals [!Ref EnableNotifications, 'true']
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+  
+  # Condition for enabling CloudTrail
+  CreateCloudTrail: !Equals [!Ref EnableCloudTrail, 'true']
+  
+  # Condition for production environment (enhanced security)
+  IsProduction: !Equals [!Ref Environment, 'Production']
+
+Resources:
+  # KMS Key for S3 encryption (only created if KMS encryption is selected)
+  S3EncryptionKey:
+    Type: AWS::KMS::Key
+    Condition: UseKMSEncryption
+    Properties:
+      Description: !Sub 'KMS key for encrypting S3 bucket ${BucketName} objects'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow S3 service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+      KeyRotationStatus: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${BucketName}-encryption-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'S3-Bucket-Encryption'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # KMS Key Alias for easier management
+  S3EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: UseKMSEncryption
+    Properties:
+      AliasName: !Sub 'alias/${BucketName}-s3-key'
+      TargetKeyId: !Ref S3EncryptionKey
+
+  # S3 Bucket for storing access logs (if logging is enabled)
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateLoggingBucket
+    Properties:
+      BucketName: !Sub '${BucketName}-access-logs'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: false
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${BucketName}-access-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Access-Logs'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # SNS Topic for bucket notifications (if notifications are enabled)
+  BucketNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${BucketName}-notifications'
+      DisplayName: !Sub 'S3 Bucket Notifications - ${BucketName}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${BucketName}-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'S3-Notifications'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # SNS Subscription for email notifications
+  BucketNotificationsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotifications
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref BucketNotificationsTopic
+
+  # SNS Topic Policy to allow S3 to publish messages
+  BucketNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: CreateNotifications
+    Properties:
+      Topics:
+        - !Ref BucketNotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3Publish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref BucketNotificationsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${BucketName}'
+
+  # Main S3 Bucket with comprehensive security configuration
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      
+      # Versioning Configuration
+      VersioningConfiguration:
+        Status: !Ref EnableVersioning
+        # Note: MfaDelete can only be configured via CLI/API, not CloudFormation
+      
+      # Server-Side Encryption Configuration
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !Ref EncryptionType
+              KMSMasterKeyID: !If
+                - UseKMSEncryption
+                - !Ref S3EncryptionKey
+                - !Ref 'AWS::NoValue'
+            BucketKeyEnabled: !If
+              - EnableBucketKey
+              - true
+              - !If
+                - UseKMSEncryption
+                - false
+                - true  # Always enable for AES256
+      
+      # Public Access Block Configuration (security best practice)
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      
+      # Access Logging Configuration
+      LoggingConfiguration: !If
+        - CreateLoggingBucket
+        - DestinationBucketName: !Ref LoggingBucket
+          LogFilePrefix: 'access-logs/'
+        - !Ref 'AWS::NoValue'
+      
+      # Notification Configuration
+      NotificationConfiguration: !If
+        - CreateNotifications
+        - TopicConfigurations:
+            - Topic: !Ref BucketNotificationsTopic
+              Event: 's3:ObjectCreated:*'
+            - Topic: !Ref BucketNotificationsTopic
+              Event: 's3:ObjectRemoved:*'
+        - !Ref 'AWS::NoValue'
+      
+      # Lifecycle Configuration for cost optimization
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+          - Id: DeleteIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            NoncurrentVersionExpirationInDays: !If
+              - IsProduction
+              - 2555  # 7 years for production
+              - 365   # 1 year for non-production
+      
+      # CORS Configuration for web applications
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3000
+      
+      # Comprehensive Tagging
+      Tags:
+        - Key: Name
+          Value: !Ref BucketName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Infrastructure-Template-Demo'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+        - Key: CreatedBy
+          Value: 'Simple-Infrastructure-Templates-Recipe'
+        - Key: ComplianceLevel
+          Value: !If
+            - IsProduction
+            - 'High'
+            - 'Standard'
+        - Key: DataClassification
+          Value: !If
+            - IsProduction
+            - 'Confidential'
+            - 'Internal'
+        - Key: BackupRequired
+          Value: !If
+            - IsProduction
+            - 'true'
+            - 'false'
+        - Key: CostCenter
+          Value: 'Infrastructure'
+        - Key: Owner
+          Value: 'DevOps-Team'
+
+  # CloudTrail for S3 API and data event logging (if enabled)
+  S3CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: CreateCloudTrail
+    Properties:
+      TrailName: !Sub '${BucketName}-cloudtrail'
+      S3BucketName: !Ref CloudTrailLogsBucket
+      S3KeyPrefix: 'cloudtrail-logs/'
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::S3::Object'
+              Values:
+                - !Sub '${S3Bucket}/*'
+            - Type: 'AWS::S3::Bucket'
+              Values:
+                - !Ref S3Bucket
+      Tags:
+        - Key: Name
+          Value: !Sub '${BucketName}-cloudtrail'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'S3-Audit-Logging'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # S3 Bucket for CloudTrail logs
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateCloudTrail
+    Properties:
+      BucketName: !Sub '${BucketName}-cloudtrail-logs'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldCloudTrailLogs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${BucketName}-cloudtrail-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'CloudTrail-Logs'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # CloudTrail Logs Bucket Policy
+  CloudTrailLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateCloudTrail
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogsBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailLogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': 'bucket-owner-full-control'
+
+Outputs:
+  # Primary bucket information
+  BucketName:
+    Description: 'Name of the created S3 bucket'
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: 'ARN of the created S3 bucket'
+    Value: !GetAtt S3Bucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  BucketDomainName:
+    Description: 'Domain name of the S3 bucket'
+    Value: !GetAtt S3Bucket.RegionalDomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketDomainName'
+
+  BucketRegion:
+    Description: 'Region where the S3 bucket is deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketRegion'
+
+  # Security configuration outputs
+  EncryptionType:
+    Description: 'Encryption algorithm used for the S3 bucket'
+    Value: !Ref EncryptionType
+    Export:
+      Name: !Sub '${AWS::StackName}-EncryptionType'
+
+  KMSKeyId:
+    Condition: UseKMSEncryption
+    Description: 'KMS Key ID used for S3 bucket encryption'
+    Value: !Ref S3EncryptionKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+
+  KMSKeyAlias:
+    Condition: UseKMSEncryption
+    Description: 'KMS Key Alias for S3 bucket encryption'
+    Value: !Ref S3EncryptionKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyAlias'
+
+  # Versioning and compliance outputs
+  VersioningStatus:
+    Description: 'Versioning status of the S3 bucket'
+    Value: !Ref EnableVersioning
+    Export:
+      Name: !Sub '${AWS::StackName}-VersioningStatus'
+
+  Environment:
+    Description: 'Environment tag of the S3 bucket'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # Logging outputs
+  LoggingBucket:
+    Condition: CreateLoggingBucket
+    Description: 'Name of the S3 access logs bucket'
+    Value: !Ref LoggingBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LoggingBucket'
+
+  CloudTrailLogsBucket:
+    Condition: CreateCloudTrail
+    Description: 'Name of the CloudTrail logs bucket'
+    Value: !Ref CloudTrailLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailLogsBucket'
+
+  CloudTrailArn:
+    Condition: CreateCloudTrail
+    Description: 'ARN of the CloudTrail for S3 audit logging'
+    Value: !GetAtt S3CloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'
+
+  # Notification outputs
+  NotificationsTopic:
+    Condition: CreateNotifications
+    Description: 'SNS Topic ARN for S3 bucket notifications'
+    Value: !Ref BucketNotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationsTopic'
+
+  NotificationEmail:
+    Condition: CreateNotifications
+    Description: 'Email address subscribed to S3 bucket notifications'
+    Value: !Ref NotificationEmail
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationEmail'
+
+  # Template metadata
+  StackName:
+    Description: 'Name of the CloudFormation stack'
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  CreationTime:
+    Description: 'CloudFormation stack creation timestamp'
+    Value: !Ref 'AWS::StackId'
+    Export:
+      Name: !Sub '${AWS::StackName}-CreationTime'
+
+  TemplateVersion:
+    Description: 'Version of the CloudFormation template used'
+    Value: 'v1.0.0'
+    Export:
+      Name: !Sub '${AWS::StackName}-TemplateVersion'

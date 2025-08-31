@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: SimSpace Weaver, IoT Core, DynamoDB, Lambda
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: digital-twins, smart-cities, iot, simulation, urban-planning, spatial-computing
 recipe-generator-version: 1.3
@@ -204,8 +204,7 @@ echo "✅ AWS environment configured for smart city digital twin project"
    
    # Create sample IoT thing for testing
    aws iot create-thing \
-       --thing-name ${PROJECT_NAME}-traffic-sensor-001 \
-       --thing-type-name traffic-sensor
+       --thing-name ${PROJECT_NAME}-traffic-sensor-001
    
    # Add thing to group
    aws iot add-thing-to-thing-group \
@@ -280,7 +279,7 @@ EOF
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-lambda-role \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -388,7 +387,7 @@ EOF
    # Create stream processing Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-stream-processor \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-lambda-role \
        --handler stream_processor.lambda_handler \
        --zip-file fileb://stream_processor.zip \
@@ -666,7 +665,7 @@ EOF
    # Deploy simulation management function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-simulation-manager \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-lambda-role \
        --handler simulation_manager.lambda_handler \
        --zip-file fileb://simulation_manager.zip \
@@ -891,7 +890,7 @@ EOF
    # Deploy analytics function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-analytics \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-lambda-role \
        --handler analytics_processor.lambda_handler \
        --zip-file fileb://analytics_processor.zip \
@@ -1103,4 +1102,11 @@ Extend this smart city digital twin solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

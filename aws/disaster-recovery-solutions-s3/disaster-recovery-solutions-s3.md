@@ -4,18 +4,18 @@ id: 9f8965e5
 category: storage
 difficulty: 300
 subject: aws
-services: S3, CloudWatch, SNS, Lambda
+services: S3, CloudWatch, CloudTrail, IAM
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: disaster-recovery, s3, cross-region-replication, backup, automation
 recipe-generator-version: 1.3
 ---
 
-# S3 Disaster Recovery Solutions
+# S3 Disaster Recovery Solutions with Cross-Region Replication
 
 ## Problem
 
@@ -45,6 +45,7 @@ graph TB
         IAMROLE[IAM Replication Role]
         CT[CloudTrail]
         CWM[CloudWatch Metrics]
+        SNS[SNS Topic]
     end
     
     APP1 --> S3PRIMARY
@@ -57,16 +58,18 @@ graph TB
     S3REPLICA --> CWM
     CT --> S3PRIMARY
     CT --> S3REPLICA
+    CWM --> SNS
     
     style S3PRIMARY fill:#FF9900
     style S3REPLICA fill:#FF9900
     style IAMROLE fill:#FF4B4B
     style CWM fill:#146EB4
+    style SNS fill:#FF9900
 ```
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for S3, IAM, CloudWatch, and CloudTrail
+1. AWS account with appropriate permissions for S3, IAM, CloudWatch, CloudTrail, and SNS
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of S3 bucket policies and IAM roles
 4. Knowledge of AWS disaster recovery concepts and RTO/RPO requirements
@@ -93,15 +96,29 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
 export SOURCE_BUCKET="dr-source-bucket-${RANDOM_SUFFIX}"
 export REPLICA_BUCKET="dr-replica-bucket-${RANDOM_SUFFIX}"
 export REPLICATION_ROLE="s3-replication-role-${RANDOM_SUFFIX}"
+export CLOUDTRAIL_BUCKET="dr-cloudtrail-logs-${RANDOM_SUFFIX}"
+export SNS_TOPIC="s3-replication-alerts-${RANDOM_SUFFIX}"
+
+# Create dedicated CloudTrail bucket first
+aws s3 mb s3://${CLOUDTRAIL_BUCKET} --region ${PRIMARY_REGION}
 
 # Create CloudTrail for audit logging
 aws cloudtrail create-trail \
     --name "s3-dr-audit-trail" \
-    --s3-bucket-name "${SOURCE_BUCKET}" \
+    --s3-bucket-name "${CLOUDTRAIL_BUCKET}" \
     --include-global-service-events \
     --is-multi-region-trail \
     --enable-log-file-validation \
     --region ${PRIMARY_REGION}
+
+# Create SNS topic for alerts
+aws sns create-topic \
+    --name ${SNS_TOPIC} \
+    --region ${PRIMARY_REGION}
+
+export SNS_TOPIC_ARN=$(aws sns get-topic-attributes \
+    --topic-arn "arn:aws:sns:${PRIMARY_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC}" \
+    --query 'Attributes.TopicArn' --output text)
 
 echo "✅ Environment prepared with unique identifiers"
 ```
@@ -333,7 +350,7 @@ echo "✅ Environment prepared with unique identifiers"
        --threshold 900 \
        --comparison-operator GreaterThanThreshold \
        --evaluation-periods 2 \
-       --alarm-actions "arn:aws:sns:${PRIMARY_REGION}:${AWS_ACCOUNT_ID}:s3-alerts" \
+       --alarm-actions ${SNS_TOPIC_ARN} \
        --dimensions Name=SourceBucket,Value=${SOURCE_BUCKET} \
                    Name=DestinationBucket,Value=${REPLICA_BUCKET}
    
@@ -344,6 +361,10 @@ echo "✅ Environment prepared with unique identifiers"
            "widgets": [
                {
                    "type": "metric",
+                   "x": 0,
+                   "y": 0,
+                   "width": 12,
+                   "height": 6,
                    "properties": {
                        "metrics": [
                            ["AWS/S3", "ReplicationLatency", "SourceBucket", "'${SOURCE_BUCKET}'"],
@@ -441,7 +462,7 @@ echo "✅ Environment prepared with unique identifiers"
    echo "Starting DR failover to bucket: $REPLICA_BUCKET"
    
    # Update application configuration to point to replica bucket
-   sed -i "s/bucket_name=.*/bucket_name=$REPLICA_BUCKET/" $APPLICATION_CONFIG
+   sed -i.bak "s/bucket_name=.*/bucket_name=$REPLICA_BUCKET/" $APPLICATION_CONFIG
    
    # Verify bucket accessibility
    aws s3 ls s3://$REPLICA_BUCKET --region us-west-2 > /dev/null
@@ -453,7 +474,8 @@ echo "✅ Environment prepared with unique identifiers"
    fi
    
    # Log failover event
-   echo "$(date): DR failover completed to $REPLICA_BUCKET" >> /var/log/dr-events.log
+   mkdir -p /tmp/dr-logs
+   echo "$(date): DR failover completed to $REPLICA_BUCKET" >> /tmp/dr-logs/dr-events.log
    
    echo "✅ DR failover completed successfully"
    EOF
@@ -476,7 +498,7 @@ echo "✅ Environment prepared with unique identifiers"
    echo "Starting DR failback to bucket: $SOURCE_BUCKET"
    
    # Update application configuration to point back to source bucket
-   sed -i "s/bucket_name=.*/bucket_name=$SOURCE_BUCKET/" $APPLICATION_CONFIG
+   sed -i.bak "s/bucket_name=.*/bucket_name=$SOURCE_BUCKET/" $APPLICATION_CONFIG
    
    # Verify bucket accessibility
    aws s3 ls s3://$SOURCE_BUCKET --region us-east-1 > /dev/null
@@ -488,7 +510,8 @@ echo "✅ Environment prepared with unique identifiers"
    fi
    
    # Log failback event
-   echo "$(date): DR failback completed to $SOURCE_BUCKET" >> /var/log/dr-events.log
+   mkdir -p /tmp/dr-logs
+   echo "$(date): DR failback completed to $SOURCE_BUCKET" >> /tmp/dr-logs/dr-events.log
    
    echo "✅ DR failback completed successfully"
    EOF
@@ -626,7 +649,7 @@ echo "✅ Environment prepared with unique identifiers"
    echo "✅ IAM resources deleted"
    ```
 
-5. **Delete S3 Buckets**:
+5. **Delete S3 Buckets and Supporting Resources**:
 
    ```bash
    # Delete source bucket
@@ -641,10 +664,19 @@ echo "✅ Environment prepared with unique identifiers"
        --name "s3-dr-audit-trail" \
        --region ${PRIMARY_REGION}
    
+   # Delete CloudTrail bucket
+   aws s3 rb s3://${CLOUDTRAIL_BUCKET} --force \
+       --region ${PRIMARY_REGION}
+   
+   # Delete SNS topic
+   aws sns delete-topic \
+       --topic-arn ${SNS_TOPIC_ARN} \
+       --region ${PRIMARY_REGION}
+   
    # Clean up local files
    rm -f critical-data.txt standard-data.txt archive-data.txt
    rm -f test-replication.txt downloaded-from-replica.txt
-   rm -f app-config.txt
+   rm -f app-config.txt app-config.txt.bak
    rm -f replication-*.json lifecycle-policy.json
    rm -f dr-failover-script.sh dr-failback-script.sh
    
@@ -657,9 +689,9 @@ S3 Cross-Region Replication provides a robust foundation for disaster recovery b
 
 The implementation demonstrates several best practices for enterprise DR solutions. **Selective replication rules** allow organizations to prioritize critical data while optimizing costs - for example, financial records might replicate to Standard storage class while less critical data uses Standard-IA. **Lifecycle policies** further optimize costs by automatically transitioning older data to cheaper storage classes. **Monitoring and alerting** through CloudWatch ensures operational teams are immediately notified of replication failures or performance degradation.
 
-Security considerations are paramount in DR implementations. The IAM role follows the principle of least privilege, granting only the specific permissions needed for replication operations. **Encryption in transit** is automatic with S3 replication, and **encryption at rest** can be configured independently for source and destination buckets. **Audit logging** through CloudTrail provides comprehensive visibility into all replication-related activities for compliance purposes.
+Security considerations are paramount in DR implementations. The IAM role follows the principle of least privilege, granting only the specific permissions needed for replication operations. **Encryption in transit** is automatic with S3 replication, and **encryption at rest** can be configured independently for source and destination buckets using AWS KMS. **Audit logging** through CloudTrail provides comprehensive visibility into all replication-related activities for compliance purposes. For more details, see the [AWS Well-Architected Security Pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html).
 
-The disaster recovery procedures should be regularly tested and documented. Organizations should establish clear **RTO and RPO targets** based on business requirements, conduct quarterly DR drills, and maintain runbooks for both failover and failback scenarios. Consider implementing **two-way replication** for active-active architectures or **batch replication** for existing data that needs to be included in the DR scope.
+The disaster recovery procedures should be regularly tested and documented. Organizations should establish clear **RTO and RPO targets** based on business requirements, conduct quarterly DR drills, and maintain runbooks for both failover and failback scenarios. Consider implementing **two-way replication** for active-active architectures or **batch replication** for existing data that needs to be included in the DR scope. The [AWS Disaster Recovery white paper](https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-workloads-on-aws.html) provides comprehensive guidance on DR strategy patterns.
 
 > **Tip**: Enable S3 Replication Time Control (RTC) for mission-critical data that requires guaranteed replication within 15 minutes, backed by an SLA from AWS. Learn more about [S3 Replication Time Control](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication-time-control.html) and its compliance benefits for regulatory requirements.
 
@@ -667,16 +699,23 @@ The disaster recovery procedures should be regularly tested and documented. Orga
 
 Extend this disaster recovery solution by implementing these enhancements:
 
-1. **Multi-Region Active-Active Setup**: Configure bidirectional replication between multiple regions to support active-active disaster recovery with conflict resolution strategies.
+1. **Multi-Region Active-Active Setup**: Configure bidirectional replication between multiple regions to support active-active disaster recovery with conflict resolution strategies using S3 Cross-Region Replication.
 
-2. **Automated Failover with Route 53**: Integrate Route 53 health checks and DNS failover to automatically redirect traffic from primary to secondary regions during outages.
+2. **Automated Failover with Route 53**: Integrate Route 53 health checks and DNS failover to automatically redirect traffic from primary to secondary regions during outages, reducing manual intervention time.
 
-3. **Cross-Account Replication**: Implement replication to buckets in different AWS accounts for additional isolation and compliance requirements, including proper cross-account IAM policies.
+3. **Cross-Account Replication**: Implement replication to buckets in different AWS accounts for additional isolation and compliance requirements, including proper cross-account IAM policies and bucket policies.
 
-4. **Advanced Monitoring Dashboard**: Create a comprehensive CloudWatch dashboard that displays replication lag, failure rates, cost metrics, and automated remediation workflows using Systems Manager.
+4. **Advanced Monitoring Dashboard**: Create a comprehensive CloudWatch dashboard that displays replication lag, failure rates, cost metrics, and automated remediation workflows using AWS Systems Manager for proactive DR management.
 
-5. **Compliance Reporting**: Develop automated compliance reports that track replication SLAs, audit successful DR tests, and generate regulatory compliance documentation for financial services requirements.
+5. **Compliance Reporting**: Develop automated compliance reports using AWS Config that track replication SLAs, audit successful DR tests, and generate regulatory compliance documentation for financial services requirements.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

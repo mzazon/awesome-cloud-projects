@@ -1,0 +1,279 @@
+# QR Code Generator Infrastructure Manager Configuration
+# This configuration deploys a complete QR code generation service using:
+# - Cloud Run for serverless container hosting
+# - Cloud Storage for QR code image persistence
+# - IAM for secure service-to-service communication
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID where resources will be created"
+    
+  region:
+    type: string
+    description: "GCP region for Cloud Run service deployment"
+    default: "us-central1"
+    
+  service_name:
+    type: string
+    description: "Name for the Cloud Run service"
+    default: "qr-code-api"
+    
+  bucket_name:
+    type: string
+    description: "Name for the Cloud Storage bucket (must be globally unique)"
+    
+  container_image:
+    type: string
+    description: "Container image URL for the QR code generator application"
+    default: "gcr.io/cloudrun/hello"
+    
+  service_account_name:
+    type: string
+    description: "Custom service account name for Cloud Run service"
+    default: "qr-code-service-account"
+
+# Resource definitions following Infrastructure Manager best practices
+resources:
+  # Enable required Google Cloud APIs
+  # Cloud Run API for serverless container deployment
+  cloudrun_api:
+    type: gcp-types/serviceusage-v1:services
+    name: run-googleapis-com
+    properties:
+      name: projects/${var.project_id}/services/run.googleapis.com
+    metadata:
+      dependsOn: []
+    
+  # Cloud Storage API for object storage functionality
+  storage_api:
+    type: gcp-types/serviceusage-v1:services
+    name: storage-googleapis-com
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+    metadata:
+      dependsOn: []
+      
+  # Cloud Build API for container image building (if using source deployment)
+  cloudbuild_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudbuild-googleapis-com
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Custom Service Account for Cloud Run service
+  # Provides principle of least privilege access to Cloud Storage
+  qr_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ${var.service_account_name}
+      serviceAccount:
+        displayName: "QR Code Generator Service Account"
+        description: "Service account for QR code generation Cloud Run service with minimal required permissions"
+    metadata:
+      dependsOn:
+        - cloudrun_api
+        - storage_api
+
+  # Cloud Storage bucket for QR code image persistence
+  # Configured with Standard storage class for frequent access
+  qr_storage_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.bucket_name}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      # Enable uniform bucket-level access for simplified IAM
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Lifecycle management to optimize costs
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete QR codes older than 1 year
+              matchesStorageClass: ["STANDARD"]
+      # Security configuration
+      encryption:
+        defaultKmsKeyName: null  # Use Google-managed encryption
+      # CORS configuration for web access
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD"]
+          responseHeader: ["Content-Type"]
+          maxAgeSeconds: 3600
+    metadata:
+      dependsOn:
+        - storage_api
+
+  # IAM binding for service account to access Cloud Storage bucket
+  # Grants Storage Object Admin role for full object lifecycle management
+  storage_iam_binding:
+    type: gcp-types/storage-v1:buckets.iamMembers
+    properties:
+      bucket: ${var.bucket_name}
+      entity: serviceAccount:${var.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+      role: roles/storage.objectAdmin
+    metadata:
+      dependsOn:
+        - qr_storage_bucket
+        - qr_service_account
+
+  # IAM policy for public read access to QR code images
+  # Allows generated QR codes to be publicly accessible
+  bucket_public_access:
+    type: gcp-types/storage-v1:buckets.iamMembers
+    properties:
+      bucket: ${var.bucket_name}
+      entity: allUsers
+      role: roles/storage.objectViewer
+    metadata:
+      dependsOn:
+        - qr_storage_bucket
+
+  # Cloud Run service deployment
+  # Serverless container platform with automatic scaling
+  qr_cloudrun_service:
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      # Cloud Run service location specification
+      location: ${var.region}
+      parent: namespaces/${var.project_id}
+      # Service configuration following Cloud Run best practices
+      spec:
+        template:
+          metadata:
+            name: ${var.service_name}-${deployment.name}
+            annotations:
+              # Scaling configuration
+              autoscaling.knative.dev/maxScale: "10"
+              autoscaling.knative.dev/minScale: "0"
+              # CPU allocation (only during request processing)
+              run.googleapis.com/cpu-throttling: "true"
+              # Service account assignment
+              run.googleapis.com/service-account: ${var.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+          spec:
+            # Container configuration
+            containers:
+              - image: ${var.container_image}
+                ports:
+                  - containerPort: 8080
+                    protocol: TCP
+                # Resource limits for cost optimization
+                resources:
+                  limits:
+                    cpu: "1000m"      # 1 vCPU
+                    memory: "512Mi"   # 512 MB RAM
+                  requests:
+                    cpu: "100m"       # 0.1 vCPU minimum
+                    memory: "128Mi"   # 128 MB RAM minimum
+                # Environment variables for application configuration
+                env:
+                  - name: BUCKET_NAME
+                    value: ${var.bucket_name}
+                  - name: PROJECT_ID
+                    value: ${var.project_id}
+                  - name: PORT
+                    value: "8080"
+                # Health checks for service reliability
+                livenessProbe:
+                  httpGet:
+                    path: /
+                    port: 8080
+                  initialDelaySeconds: 30
+                  timeoutSeconds: 10
+                  periodSeconds: 30
+                readinessProbe:
+                  httpGet:
+                    path: /
+                    port: 8080
+                  initialDelaySeconds: 5
+                  timeoutSeconds: 5
+                  periodSeconds: 10
+            # Execution environment configuration
+            serviceAccountName: ${var.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+            containerConcurrency: 100  # Maximum concurrent requests per container
+            timeoutSeconds: 300        # Request timeout (5 minutes)
+        # Traffic configuration
+        traffic:
+          - percent: 100
+            latestRevision: true
+    metadata:
+      dependsOn:
+        - cloudrun_api
+        - qr_service_account
+        - qr_storage_bucket
+
+  # IAM policy to allow unauthenticated access to Cloud Run service
+  # Enables public API access for QR code generation
+  cloudrun_public_access:
+    type: gcp-types/run-v1:projects.locations.services.iamMembers
+    properties:
+      location: ${var.region}
+      servicesId: ${var.service_name}
+      member: allUsers
+      role: roles/run.invoker
+    metadata:
+      dependsOn:
+        - qr_cloudrun_service
+
+# Output values for verification and integration
+outputs:
+  # Cloud Run service URL for API access
+  service_url:
+    description: "URL of the deployed Cloud Run service"
+    value: $(ref.qr_cloudrun_service.status.url)
+    
+  # Cloud Storage bucket name for reference
+  bucket_name:
+    description: "Name of the created Cloud Storage bucket"
+    value: ${var.bucket_name}
+    
+  # Service account email for IAM reference
+  service_account_email:
+    description: "Email of the created service account"
+    value: ${var.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+    
+  # Bucket URL for direct access
+  bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: gs://${var.bucket_name}
+    
+  # Public bucket URL for web access
+  bucket_web_url:
+    description: "Public web URL for Cloud Storage bucket"
+    value: https://storage.googleapis.com/${var.bucket_name}
+
+# Metadata for Infrastructure Manager deployment
+metadata:
+  version: "1.0"
+  description: "QR Code Generator service with Cloud Run and Cloud Storage"
+  author: "Cloud Recipe Generator"
+  created: "2025-07-12"
+  
+# Configuration validation and deployment notes
+# 1. Ensure bucket_name is globally unique across all Google Cloud projects
+# 2. Update container_image variable to point to your built application image
+# 3. Verify project_id has necessary APIs enabled and billing configured
+# 4. Consider adjusting resource limits based on expected load patterns
+# 5. Review IAM permissions align with your organization's security policies
+
+# Deployment command example:
+# gcloud infra-manager deployments apply projects/${PROJECT_ID}/locations/${REGION}/deployments/${DEPLOYMENT_NAME} \
+#   --service-account=${SERVICE_ACCOUNT} \
+#   --local-source=. \
+#   --inputs-file=inputs.yaml
+
+# Sample inputs.yaml file content:
+# project_id: "your-project-id"
+# region: "us-central1"
+# service_name: "qr-code-api"
+# bucket_name: "qr-codes-unique-suffix-123"
+# container_image: "gcr.io/your-project/qr-generator:latest"
+# service_account_name: "qr-code-service-account"

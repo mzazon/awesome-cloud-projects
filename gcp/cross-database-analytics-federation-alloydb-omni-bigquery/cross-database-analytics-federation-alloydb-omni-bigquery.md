@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: AlloyDB Omni, BigQuery, Dataplex, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: analytics, federation, database, cross-platform, hybrid-cloud, data-governance
 recipe-generator-version: 1.3
@@ -210,13 +210,18 @@ echo "✅ Service account created: ${SERVICE_ACCOUNT}"
    export DB_PASSWORD="SecurePassword123!"
    
    gcloud sql instances create ${ALLOYDB_INSTANCE} \
-       --database-version=POSTGRES_14 \
+       --database-version=POSTGRES_15 \
        --cpu=2 \
        --memory=8GB \
        --region=${REGION} \
        --storage-size=20GB \
        --storage-type=SSD \
        --root-password=${DB_PASSWORD}
+   
+   # Wait for instance to be ready
+   gcloud sql instances wait ${ALLOYDB_INSTANCE} \
+       --for=operations \
+       --timeout=600
    
    # Create database for transactional data
    gcloud sql databases create transactions \
@@ -264,7 +269,7 @@ echo "✅ Service account created: ${SERVICE_ACCOUNT}"
        --properties_file=connection_config.json \
        ${CONNECTION_ID}
    
-   # Get connection details
+   # Get connection details for verification
    bq show --connection \
        --location=${REGION} \
        ${PROJECT_ID}.${REGION}.${CONNECTION_ID}
@@ -349,12 +354,13 @@ echo "✅ Service account created: ${SERVICE_ACCOUNT}"
            # Discovery logic for federated data sources
            project_id = request.get_json().get('project_id')
            connection_id = request.get_json().get('connection_id')
+           region = request.get_json().get('region', 'us-central1')
            
            # Discover AlloyDB Omni tables via federated query
            discover_query = f"""
            SELECT table_name, column_name, data_type
            FROM EXTERNAL_QUERY(
-               '{project_id}.us-central1.{connection_id}',
+               '{project_id}.{region}.{connection_id}',
                'SELECT table_name, column_name, data_type 
                 FROM information_schema.columns 
                 WHERE table_schema = ''public'''
@@ -394,7 +400,7 @@ echo "✅ Service account created: ${SERVICE_ACCOUNT}"
            }, 500
    EOF
    
-   # Create requirements file
+   # Create requirements file with current versions
    cat > requirements.txt << 'EOF'
    functions-framework==3.*
    google-cloud-bigquery==3.*
@@ -402,9 +408,9 @@ echo "✅ Service account created: ${SERVICE_ACCOUNT}"
    google-cloud-storage==2.*
    EOF
    
-   # Deploy Cloud Function
+   # Deploy Cloud Function with latest Python runtime
    gcloud functions deploy federation-metadata-sync \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-http \
        --allow-unauthenticated \
        --memory 256MB \
@@ -416,7 +422,7 @@ echo "✅ Service account created: ${SERVICE_ACCOUNT}"
    echo "✅ Cloud Functions deployed for metadata orchestration"
    ```
 
-   The Cloud Functions are now deployed and ready to orchestrate metadata synchronization and workflow automation across the federated analytics platform, providing intelligent governance and operational insights.
+   The Cloud Functions are now deployed with the latest Python runtime and ready to orchestrate metadata synchronization and workflow automation across the federated analytics platform, providing intelligent governance and operational insights.
 
 7. **Configure Dataplex for Unified Data Governance**:
 
@@ -474,12 +480,16 @@ echo "✅ Service account created: ${SERVICE_ACCOUNT}"
        c.customer_name,
        c.region,
        c.signup_date,
-       orders_summary.total_orders,
-       orders_summary.total_revenue,
-       orders_summary.avg_order_value,
+       COALESCE(orders_summary.total_orders, 0) as total_orders,
+       COALESCE(orders_summary.total_revenue, 0) as total_revenue,
+       COALESCE(orders_summary.avg_order_value, 0) as avg_order_value,
        orders_summary.last_order_date,
-       ROUND(orders_summary.total_revenue / 
-             DATE_DIFF(CURRENT_DATE(), c.signup_date, DAY), 2) as daily_clv
+       CASE 
+           WHEN orders_summary.total_revenue IS NOT NULL 
+           THEN ROUND(orders_summary.total_revenue / 
+                     GREATEST(DATE_DIFF(CURRENT_DATE(), c.signup_date, DAY), 1), 2) 
+           ELSE 0 
+       END as daily_clv
    FROM \`${PROJECT_ID}.cloud_analytics.customers\` c
    LEFT JOIN (
        SELECT 
@@ -494,7 +504,7 @@ echo "✅ Service account created: ${SERVICE_ACCOUNT}"
        )
        GROUP BY customer_id
    ) orders_summary ON c.customer_id = orders_summary.customer_id
-   ORDER BY total_revenue DESC NULLS LAST;
+   ORDER BY total_revenue DESC;
    EOF
    
    # Execute the federated query
@@ -575,7 +585,7 @@ echo "✅ Service account created: ${SERVICE_ACCOUNT}"
    # Test metadata synchronization function
    curl -X POST \
        -H "Content-Type: application/json" \
-       -d "{\"project_id\":\"${PROJECT_ID}\",\"connection_id\":\"${CONNECTION_ID}\"}" \
+       -d "{\"project_id\":\"${PROJECT_ID}\",\"connection_id\":\"${CONNECTION_ID}\",\"region\":\"${REGION}\"}" \
        $(gcloud functions describe federation-metadata-sync \
            --format="value(httpsTrigger.url)")
    ```
@@ -662,11 +672,11 @@ echo "✅ Service account created: ${SERVICE_ACCOUNT}"
 
 Cross-database analytics federation represents a paradigm shift from traditional ETL-heavy data integration approaches to real-time, query-time data federation. This architecture leverages AlloyDB Omni's enterprise-grade PostgreSQL capabilities for high-performance on-premises transactional workloads while utilizing BigQuery's serverless data warehouse for cloud-scale analytics. The federation approach eliminates the need for complex data movement pipelines, reducing latency from hours to seconds and significantly lowering operational overhead.
 
-BigQuery's federated query engine provides intelligent query optimization that pushes computation down to the source systems where possible, minimizing data transfer and maximizing performance. The EXTERNAL_QUERY function enables seamless SQL operations across distributed data sources while maintaining consistent security and governance controls through IAM and connection-level authentication. This approach is particularly valuable for organizations with hybrid cloud strategies that need to maintain sensitive operational data on-premises while leveraging cloud analytics capabilities.
+BigQuery's federated query engine provides intelligent query optimization that pushes computation down to the source systems where possible, minimizing data transfer and maximizing performance. The EXTERNAL_QUERY function enables seamless SQL operations across distributed data sources while maintaining consistent security and governance controls through IAM and connection-level authentication. This approach is particularly valuable for organizations with hybrid cloud strategies that need to maintain sensitive operational data on-premises while leveraging cloud analytics capabilities. For more details, see the [BigQuery Cloud SQL federated queries documentation](https://cloud.google.com/bigquery/docs/cloud-sql-federated-queries).
 
 Dataplex Universal Catalog enhances this architecture by providing unified data governance across the hybrid environment, automatically discovering data assets, tracking lineage, and enforcing quality policies. The catalog maintains comprehensive metadata about federated data sources, enabling data scientists and analysts to discover and understand available data without requiring deep knowledge of underlying system architectures. Cloud Functions orchestrate automated workflows for metadata synchronization, ensuring that governance policies remain current as data schemas evolve.
 
-The performance characteristics of federated queries depend heavily on network connectivity, data volume, and query complexity. For optimal performance in production environments, organizations should implement dedicated network connections like Cloud Interconnect or Partner Interconnect to ensure consistent, low-latency connectivity between on-premises AlloyDB Omni instances and Google Cloud services. Query design best practices include leveraging appropriate filtering and aggregation at the source system level to minimize data transfer across network boundaries.
+The performance characteristics of federated queries depend heavily on network connectivity, data volume, and query complexity. For optimal performance in production environments, organizations should implement dedicated network connections like Cloud Interconnect or Partner Interconnect to ensure consistent, low-latency connectivity between on-premises AlloyDB Omni instances and Google Cloud services. Query design best practices include leveraging appropriate filtering and aggregation at the source system level to minimize data transfer across network boundaries. See the [Google Cloud Architecture Framework](https://cloud.google.com/architecture) for additional guidance on hybrid cloud connectivity patterns.
 
 > **Tip**: For production deployments, implement connection pooling and query result caching to optimize federation performance, and consider using materialized views for frequently accessed federated data patterns.
 
@@ -686,4 +696,9 @@ Extend this federated analytics solution by implementing these advanced capabili
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

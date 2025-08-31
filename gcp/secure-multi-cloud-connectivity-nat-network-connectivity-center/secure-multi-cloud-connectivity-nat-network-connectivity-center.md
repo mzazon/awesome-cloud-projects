@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud NAT, Network Connectivity Center, Cloud Router, Cloud VPN
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: multi-cloud, network-security, hybrid-connectivity, nat-gateway, vpn
 recipe-generator-version: 1.3
@@ -215,21 +215,21 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
 
    ```bash
    # Create VPC spoke for production network
-   gcloud network-connectivity spokes create prod-spoke \
+   gcloud network-connectivity spokes linked-vpc-network create prod-spoke \
        --hub ${HUB_NAME} \
        --description "Production VPC spoke" \
        --vpc-network projects/${PROJECT_ID}/global/networks/${VPC_PROD_NAME} \
        --global
    
    # Create VPC spoke for development network
-   gcloud network-connectivity spokes create dev-spoke \
+   gcloud network-connectivity spokes linked-vpc-network create dev-spoke \
        --hub ${HUB_NAME} \
        --description "Development VPC spoke" \
        --vpc-network projects/${PROJECT_ID}/global/networks/${VPC_DEV_NAME} \
        --global
    
    # Create VPC spoke for shared services network
-   gcloud network-connectivity spokes create shared-spoke \
+   gcloud network-connectivity spokes linked-vpc-network create shared-spoke \
        --hub ${HUB_NAME} \
        --description "Shared services VPC spoke" \
        --vpc-network projects/${PROJECT_ID}/global/networks/${VPC_SHARED_NAME} \
@@ -302,7 +302,7 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
    Cloud NAT provides managed network address translation for resources without external IP addresses, enabling secure outbound internet connectivity while maintaining strict inbound access controls. This managed service eliminates the need for NAT instances while providing high availability, automatic scaling, and comprehensive logging capabilities essential for enterprise security and compliance requirements.
 
    ```bash
-   # Create Cloud NAT gateway
+   # Create Cloud NAT gateway for hub VPC
    gcloud compute routers nats create hub-nat-gateway \
        --router hub-router \
        --region ${REGION} \
@@ -436,7 +436,7 @@ echo "✅ Random suffix: ${RANDOM_SUFFIX}"
        --region ${REGION}
    
    # Create hybrid spoke for external connectivity
-   gcloud network-connectivity spokes create external-cloud-spoke \
+   gcloud network-connectivity spokes linked-vpn-tunnels create external-cloud-spoke \
        --hub ${HUB_NAME} \
        --description "Hybrid spoke for external cloud connectivity" \
        --vpn-tunnel projects/${PROJECT_ID}/regions/${REGION}/vpnTunnels/tunnel-to-external-cloud \
@@ -704,4 +704,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

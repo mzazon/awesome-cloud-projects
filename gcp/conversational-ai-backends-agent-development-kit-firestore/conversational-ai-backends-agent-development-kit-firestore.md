@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Agent Development Kit, Cloud Functions, Firestore, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: conversational-ai, chatbot, firestore, cloud-functions, agent-development-kit
 recipe-generator-version: 1.3
@@ -88,11 +88,10 @@ graph TB
    - Cloud Build API
 2. Google Cloud CLI (gcloud) installed and configured
 3. Python 3.10+ installed locally with pip
-4. Node.js 18+ for Cloud Functions development
-5. Basic understanding of conversational AI concepts and NoSQL databases
-6. Estimated cost: $50-100/month for moderate usage (varies by conversation volume and model usage)
+4. Basic understanding of conversational AI concepts and NoSQL databases
+5. Estimated cost: $50-100/month for moderate usage (varies by conversation volume and model usage)
 
-> **Note**: The Agent Development Kit is currently in preview and requires special access. Ensure you have the necessary permissions before proceeding.
+> **Note**: The Agent Development Kit is now generally available as the `google-adk` Python package. Ensure your Google Cloud project has the necessary APIs enabled before proceeding.
 
 ## Preparation
 
@@ -142,7 +141,7 @@ echo "✅ Required APIs enabled"
        --location=${REGION} \
        --type=firestore-native
    
-   # Set default database
+   # Set default database for subsequent operations
    gcloud config set firestore/database ${FIRESTORE_DATABASE}
    
    # Create composite indexes for efficient conversation queries
@@ -199,13 +198,11 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # Install Python dependencies for ADK
-   pip install google-cloud-aiplatform
+   pip install --upgrade pip
+   pip install google-adk
    pip install google-cloud-firestore
    pip install google-cloud-storage
-   pip install google-cloud-functions-framework
-   
-   # Install ADK (currently in preview)
-   pip install google-adk-agents
+   pip install functions-framework
    
    # Set up authentication for local development
    gcloud auth application-default login
@@ -226,14 +223,15 @@ echo "✅ Required APIs enabled"
    ```bash
    # Create main agent configuration
    cat > config/agent_config.py << 'EOF'
-   from google.adk.agents import Agent
+   from google.adk.core import Agent, MemoryStore
    from google.cloud import firestore
    from google.cloud import storage
    import json
    import datetime
+   from typing import Optional
    
    class ConversationAgent:
-       def __init__(self, project_id, region, database_id):
+       def __init__(self, project_id: str, region: str, database_id: str):
            self.project_id = project_id
            self.region = region
            self.firestore_client = firestore.Client(
@@ -246,14 +244,15 @@ echo "✅ Required APIs enabled"
            self.agent = Agent(
                name="intelligent_chat_agent",
                description="Advanced conversational AI agent with persistent memory",
-               model_name="gemini-pro",
+               model="gemini-1.5-pro",
                project_id=project_id,
-               location=region
+               location=region,
+               memory_store=MemoryStore()
            )
    
-       def process_conversation(self, user_id, message, session_id=None):
+       def process_conversation(self, user_id: str, message: str, session_id: Optional[str] = None) -> str:
            """Process user message and generate intelligent response"""
-           # Retrieve conversation history
+           # Retrieve conversation history from Firestore
            conversation_ref = self.firestore_client.collection('conversations').document(user_id)
            conversation_doc = conversation_ref.get()
            
@@ -270,10 +269,15 @@ echo "✅ Required APIs enabled"
            }
            conversation_history.append(user_message)
            
-           # Generate response using ADK
-           response = self.agent.generate_response(
-               message=message,
-               conversation_history=conversation_history[-10:]  # Last 10 messages for context
+           # Generate response using ADK with conversation context
+           context = "\n".join([
+               f"{msg['role']}: {msg['content']}" 
+               for msg in conversation_history[-10:]  # Last 10 messages for context
+           ])
+           
+           response = self.agent.run(
+               input_text=f"Context: {context}\nUser: {message}",
+               session_id=session_id or user_id
            )
            
            # Add assistant response to history
@@ -285,7 +289,7 @@ echo "✅ Required APIs enabled"
            }
            conversation_history.append(assistant_message)
            
-           # Store updated conversation
+           # Store updated conversation in Firestore
            conversation_ref.set({
                'messages': conversation_history,
                'last_updated': datetime.datetime.now(),
@@ -315,9 +319,9 @@ echo "✅ Required APIs enabled"
    import functions_framework
    from datetime import datetime
    import uuid
+   import sys
    
    # Import our conversation agent
-   import sys
    sys.path.append('../config')
    from agent_config import ConversationAgent
    
@@ -331,7 +335,7 @@ echo "✅ Required APIs enabled"
    @functions_framework.http
    def chat_processor(request):
        """HTTP Cloud Function for processing chat messages"""
-       # Handle CORS
+       # Handle CORS preflight requests
        if request.method == 'OPTIONS':
            headers = {
                'Access-Control-Allow-Origin': '*',
@@ -343,19 +347,20 @@ echo "✅ Required APIs enabled"
        headers = {'Access-Control-Allow-Origin': '*'}
        
        try:
-           # Validate request
+           # Validate request method
            if request.method != 'POST':
-               return jsonify({'error': 'Method not allowed'}), 405
+               return jsonify({'error': 'Method not allowed'}), 405, headers
            
+           # Parse and validate request data
            data = request.get_json()
            if not data or 'message' not in data or 'user_id' not in data:
-               return jsonify({'error': 'Missing required fields'}), 400
+               return jsonify({'error': 'Missing required fields: message, user_id'}), 400, headers
            
            user_id = data['user_id']
            message = data['message']
            session_id = data.get('session_id', str(uuid.uuid4()))
            
-           # Process conversation
+           # Process conversation with error handling
            response = agent.process_conversation(user_id, message, session_id)
            
            return jsonify({
@@ -379,7 +384,7 @@ echo "✅ Required APIs enabled"
        try:
            user_id = request.args.get('user_id')
            if not user_id:
-               return jsonify({'error': 'user_id parameter required'}), 400
+               return jsonify({'error': 'user_id parameter required'}), 400, headers
            
            # Retrieve conversation from Firestore
            firestore_client = firestore.Client(project=PROJECT_ID, database=DATABASE_ID)
@@ -408,10 +413,10 @@ echo "✅ Required APIs enabled"
    # Create requirements.txt for Cloud Functions
    cat > functions/requirements.txt << 'EOF'
    functions-framework==3.5.0
-   google-cloud-firestore==2.13.1
+   google-cloud-firestore==2.16.0
    google-cloud-storage==2.10.0
-   google-cloud-aiplatform==1.38.1
-   google-adk-agents==0.1.0
+   google-cloud-aiplatform==1.42.1
+   google-adk==1.4.2
    Flask==3.0.0
    EOF
    
@@ -428,26 +433,26 @@ echo "✅ Required APIs enabled"
    # Deploy main conversation processing function
    gcloud functions deploy ${FUNCTION_NAME} \
        --gen2 \
-       --runtime=python310 \
+       --runtime=python312 \
        --region=${REGION} \
        --source=functions \
        --entry-point=chat_processor \
        --trigger=http \
        --allow-unauthenticated \
-       --memory=1GB \
+       --memory=1GiB \
        --timeout=60s \
        --set-env-vars=PROJECT_ID=${PROJECT_ID},REGION=${REGION},FIRESTORE_DATABASE=${FIRESTORE_DATABASE}
    
    # Deploy conversation history function
    gcloud functions deploy ${FUNCTION_NAME}-history \
        --gen2 \
-       --runtime=python310 \
+       --runtime=python312 \
        --region=${REGION} \
        --source=functions \
        --entry-point=get_conversation_history \
        --trigger=http \
        --allow-unauthenticated \
-       --memory=512MB \
+       --memory=512MiB \
        --timeout=30s \
        --set-env-vars=PROJECT_ID=${PROJECT_ID},REGION=${REGION},FIRESTORE_DATABASE=${FIRESTORE_DATABASE}
    
@@ -477,42 +482,44 @@ echo "✅ Required APIs enabled"
    from google.cloud import firestore
    from datetime import datetime, timedelta
    import json
+   from typing import Dict, List, Any
    
    class ConversationContextManager:
-       def __init__(self, firestore_client):
+       def __init__(self, firestore_client: firestore.Client):
            self.firestore_client = firestore_client
            
-       def get_user_context(self, user_id):
+       def get_user_context(self, user_id: str) -> Dict[str, Any]:
            """Retrieve comprehensive user context"""
            user_ref = self.firestore_client.collection('user_contexts').document(user_id)
            user_doc = user_ref.get()
            
            if not user_doc.exists:
-               # Create new user context
+               # Create new user context with default values
                default_context = {
                    'user_id': user_id,
                    'preferences': {},
                    'conversation_topics': [],
                    'last_active': datetime.now(),
-                   'total_conversations': 0
+                   'total_conversations': 0,
+                   'created_at': datetime.now()
                }
                user_ref.set(default_context)
                return default_context
            
            return user_doc.to_dict()
        
-       def update_conversation_context(self, user_id, topic, sentiment, entities):
+       def update_conversation_context(self, user_id: str, topic: str, sentiment: str, entities: List[str]):
            """Update conversation context with new information"""
            user_ref = self.firestore_client.collection('user_contexts').document(user_id)
            
-           # Update user context
+           # Update user context with atomic operations
            user_ref.update({
                'conversation_topics': firestore.ArrayUnion([topic]),
                'last_active': datetime.now(),
                'total_conversations': firestore.Increment(1)
            })
            
-           # Store conversation analytics
+           # Store conversation analytics for insights
            analytics_ref = self.firestore_client.collection('conversation_analytics').document()
            analytics_ref.set({
                'user_id': user_id,
@@ -522,19 +529,29 @@ echo "✅ Required APIs enabled"
                'timestamp': datetime.now()
            })
        
-       def get_conversation_suggestions(self, user_id):
+       def get_conversation_suggestions(self, user_id: str) -> List[str]:
            """Generate conversation suggestions based on user context"""
            user_context = self.get_user_context(user_id)
            topics = user_context.get('conversation_topics', [])
            
-           # Generate suggestions based on conversation history
+           # Generate intelligent suggestions based on conversation history
            suggestions = []
-           if 'technology' in topics:
-               suggestions.append("Tell me about the latest tech trends")
-           if 'business' in topics:
-               suggestions.append("What are some business growth strategies?")
+           topic_set = set(topics)
            
-           return suggestions
+           if 'technology' in topic_set:
+               suggestions.append("What are the latest developments in AI technology?")
+           if 'business' in topic_set:
+               suggestions.append("Can you help me with business strategy planning?")
+           if 'health' in topic_set:
+               suggestions.append("What are some healthy lifestyle tips?")
+           if not suggestions:  # Default suggestions for new users
+               suggestions.extend([
+                   "How can I get started with our services?",
+                   "What are your most popular features?",
+                   "Can you help me solve a problem?"
+               ])
+           
+           return suggestions[:5]  # Return top 5 suggestions
    EOF
    
    echo "✅ Conversation context management system created"
@@ -553,74 +570,82 @@ echo "✅ Required APIs enabled"
    from google.cloud import firestore
    import time
    import json
+   from typing import Dict, Any
    
    class ConversationMonitoring:
-       def __init__(self, project_id):
+       def __init__(self, project_id: str):
            self.project_id = project_id
            self.monitoring_client = monitoring_v3.MetricServiceClient()
            self.project_name = f"projects/{project_id}"
            
-       def record_conversation_metrics(self, response_time, user_satisfaction, conversation_length):
+       def record_conversation_metrics(self, response_time: float, user_satisfaction: float, conversation_length: int):
            """Record custom metrics for conversation performance"""
            
-           # Create response time metric
-           series = monitoring_v3.TimeSeries()
-           series.metric.type = "custom.googleapis.com/conversation/response_time"
-           series.resource.type = "generic_node"
-           series.resource.labels["project_id"] = self.project_id
-           series.resource.labels["node_id"] = "conversation_agent"
-           
-           now = time.time()
-           seconds = int(now)
-           nanos = int((now - seconds) * 10 ** 9)
-           interval = monitoring_v3.TimeInterval(
-               {"end_time": {"seconds": seconds, "nanos": nanos}}
-           )
-           
-           point = monitoring_v3.Point({
-               "interval": interval,
-               "value": {"double_value": response_time},
-           })
-           series.points = [point]
-           
-           # Write the time series data
-           self.monitoring_client.create_time_series(
-               name=self.project_name, 
-               time_series=[series]
-           )
+           try:
+               # Create response time metric
+               series = monitoring_v3.TimeSeries()
+               series.metric.type = "custom.googleapis.com/conversation/response_time"
+               series.resource.type = "generic_node"
+               series.resource.labels["project_id"] = self.project_id
+               series.resource.labels["node_id"] = "conversation_agent"
+               
+               now = time.time()
+               seconds = int(now)
+               nanos = int((now - seconds) * 10 ** 9)
+               interval = monitoring_v3.TimeInterval(
+                   {"end_time": {"seconds": seconds, "nanos": nanos}}
+               )
+               
+               point = monitoring_v3.Point({
+                   "interval": interval,
+                   "value": {"double_value": response_time},
+               })
+               series.points = [point]
+               
+               # Write the time series data
+               self.monitoring_client.create_time_series(
+                   name=self.project_name, 
+                   time_series=[series]
+               )
+           except Exception as e:
+               print(f"Error recording metrics: {e}")
        
-       def analyze_conversation_patterns(self, user_id):
+       def analyze_conversation_patterns(self, user_id: str) -> Dict[str, Any]:
            """Analyze conversation patterns for insights"""
            firestore_client = firestore.Client(project=self.project_id)
            
-           # Query recent conversations
-           conversations = firestore_client.collection('conversations').where(
-               'user_id', '==', user_id
-           ).limit(50).stream()
-           
-           patterns = {
-               'avg_message_length': 0,
-               'common_topics': [],
-               'conversation_frequency': 0,
-               'user_engagement_score': 0
-           }
-           
-           # Analyze patterns (simplified example)
-           total_messages = 0
-           total_length = 0
-           
-           for conv in conversations:
-               messages = conv.to_dict().get('messages', [])
-               for msg in messages:
-                   if msg.get('role') == 'user':
-                       total_messages += 1
-                       total_length += len(msg.get('content', ''))
-           
-           if total_messages > 0:
-               patterns['avg_message_length'] = total_length / total_messages
-               patterns['user_engagement_score'] = min(total_messages / 10, 1.0)
-           
-           return patterns
+           # Query recent conversations with error handling
+           try:
+               conversations = firestore_client.collection('conversations').where(
+                   'user_id', '==', user_id
+               ).limit(50).stream()
+               
+               patterns = {
+                   'avg_message_length': 0,
+                   'common_topics': [],
+                   'conversation_frequency': 0,
+                   'user_engagement_score': 0
+               }
+               
+               # Analyze patterns with improved logic
+               total_messages = 0
+               total_length = 0
+               
+               for conv in conversations:
+                   messages = conv.to_dict().get('messages', [])
+                   for msg in messages:
+                       if msg.get('role') == 'user':
+                           total_messages += 1
+                           total_length += len(msg.get('content', ''))
+               
+               if total_messages > 0:
+                   patterns['avg_message_length'] = total_length / total_messages
+                   patterns['user_engagement_score'] = min(total_messages / 10, 1.0)
+               
+               return patterns
+           except Exception as e:
+               print(f"Error analyzing patterns: {e}")
+               return {'error': str(e)}
    EOF
    
    # Create Cloud Monitoring dashboard configuration
@@ -784,6 +809,7 @@ echo "✅ Required APIs enabled"
    gcloud projects delete ${PROJECT_ID} --quiet
    
    echo "✅ Google Cloud project deleted"
+   echo "Note: Project deletion may take several minutes to complete"
    ```
 
 ## Discussion
@@ -799,7 +825,7 @@ The monitoring and analytics capabilities built into this architecture provide v
 > **Tip**: Use conversation analytics to continuously improve your AI agent's performance by analyzing user interaction patterns and identifying areas for enhancement in conversation flow and response quality.
 
 **References:**
-- [Google Cloud Agent Development Kit Documentation](https://cloud.google.com/vertex-ai/generative-ai/docs/agent-development-kit)
+- [Google Cloud Agent Development Kit Documentation](https://google.github.io/adk-docs/)
 - [Firestore for Real-time Applications](https://cloud.google.com/firestore/docs/solutions)
 - [Cloud Functions for Serverless Computing](https://cloud.google.com/functions/docs/concepts/overview)
 - [Vertex AI Integration Patterns](https://cloud.google.com/vertex-ai/docs/start/introduction-unified-platform)
@@ -821,4 +847,9 @@ Extend this conversational AI backend by implementing these advanced features:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

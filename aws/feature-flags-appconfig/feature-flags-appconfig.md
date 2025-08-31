@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AppConfig, Lambda, CloudWatch
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: feature-flags, deployment, configuration, rollback, monitoring
 recipe-generator-version: 1.3
@@ -164,7 +164,7 @@ echo "Function: ${FUNCTION_NAME}"
        --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/appconfig-access-policy-${RANDOM_SUFFIX}
    
    # Wait for role propagation
-   sleep 10
+   sleep 15
    
    # Get role ARN
    ROLE_ARN=$(aws iam get-role \
@@ -205,7 +205,7 @@ echo "Function: ${FUNCTION_NAME}"
    aws cloudwatch put-metric-alarm \
        --alarm-name "lambda-error-rate-${RANDOM_SUFFIX}" \
        --alarm-description "Monitor Lambda function error rate" \
-       --metric-name Errors \
+       --metric-name Errors \    
        --namespace AWS/Lambda \
        --statistic Sum \
        --period 300 \
@@ -224,28 +224,7 @@ echo "Function: ${FUNCTION_NAME}"
 
    The alarm is configured to trigger when Lambda function errors exceed acceptable thresholds, providing automatic detection of configuration-related issues. This proactive monitoring enables rapid response to problems during feature flag deployments.
 
-4. **Create Service-Linked Role for AppConfig Monitoring**:
-
-   AppConfig requires service-linked roles to monitor CloudWatch alarms for automatic rollback functionality. This role enables AppConfig to access CloudWatch metrics and trigger rollbacks when application health deteriorates during configuration deployments.
-
-   ```bash
-   # Create service-linked role for AppConfig monitoring
-   aws iam create-service-linked-role \
-       --aws-service-name appconfig.amazonaws.com \
-       --description "Service-linked role for AppConfig monitoring" \
-       2>/dev/null || echo "Service-linked role already exists"
-   
-   # Get service-linked role ARN
-   SERVICE_ROLE_ARN=$(aws iam get-role \
-       --role-name AWSServiceRoleForAppConfig \
-       --query Role.Arn --output text)
-   
-   echo "✅ Service-linked role available: ${SERVICE_ROLE_ARN}"
-   ```
-
-   The service-linked role enables AppConfig to access CloudWatch metrics and perform automated rollbacks when monitoring conditions are met, providing a safety net for configuration deployments.
-
-5. **Create AppConfig Environment with Monitoring**:
+4. **Create AppConfig Environment with Monitoring**:
 
    The AppConfig environment represents the deployment target for feature flag configurations and includes critical monitoring capabilities. By integrating CloudWatch alarms during environment creation, we establish automatic rollback mechanisms that protect against malformed configurations or unexpected application behavior during feature deployments.
 
@@ -255,7 +234,7 @@ echo "Function: ${FUNCTION_NAME}"
        --application-id ${APP_ID} \
        --name ${ENVIRONMENT_NAME} \
        --description "Production environment with automated rollback" \
-       --monitors AlarmArn=${ALARM_ARN},AlarmRoleArn=${SERVICE_ROLE_ARN}
+       --monitors AlarmArn=${ALARM_ARN}
    
    # Get environment ID
    ENV_ID=$(aws appconfig list-environments \
@@ -268,7 +247,7 @@ echo "Function: ${FUNCTION_NAME}"
 
    The environment now includes sophisticated monitoring capabilities that enable automatic rollback when application metrics indicate problems. This proactive approach to configuration management ensures that feature flag changes don't negatively impact application performance or user experience.
 
-6. **Create Feature Flag Configuration Profile**:
+5. **Create Feature Flag Configuration Profile**:
 
    Feature flag configuration profiles define the structure and validation rules for feature flags within the application. This hosted configuration approach provides centralized management of feature states, attributes, and targeting rules while ensuring consistency across all application instances through AWS AppConfig's managed infrastructure.
 
@@ -292,7 +271,7 @@ echo "Function: ${FUNCTION_NAME}"
 
    The configuration profile establishes the foundation for feature flag management with built-in validation and type safety. This structured approach ensures that feature flag configurations follow consistent patterns and provide reliable behavior across all application environments.
 
-7. **Create Feature Flag Configuration Data**:
+6. **Create Feature Flag Configuration Data**:
 
    The feature flag configuration data defines the actual flags available to the application, including their default states, attributes, and targeting rules. This JSON-based configuration enables sophisticated feature management scenarios including percentage-based rollouts, user targeting, and attribute-based feature customization.
 
@@ -388,7 +367,7 @@ echo "Function: ${FUNCTION_NAME}"
 
    The feature flag configuration now includes multiple flags with different states and attributes, demonstrating various use cases from simple on/off toggles to complex attribute-driven features. This comprehensive setup enables sophisticated feature management scenarios while maintaining clear configuration structure.
 
-8. **Create Deployment Strategy for Gradual Rollout**:
+7. **Create Deployment Strategy for Gradual Rollout**:
 
    Deployment strategies control how feature flag changes are rolled out to production environments. This gradual deployment approach minimizes risk by slowly increasing the percentage of traffic receiving new configurations while providing monitoring points to detect issues early in the deployment process.
 
@@ -414,7 +393,7 @@ echo "Function: ${FUNCTION_NAME}"
 
    The deployment strategy now provides controlled rollout capabilities with built-in monitoring points. This safety mechanism ensures that feature flag changes are deployed gradually, allowing for early detection of issues and automatic rollback if problems arise during the deployment process.
 
-9. **Create Lambda Function with AppConfig Integration**:
+8. **Create Lambda Function with AppConfig Integration**:
 
    The Lambda function demonstrates how applications retrieve and use feature flag configurations from AppConfig. By integrating the AppConfig Lambda extension, the function gains efficient access to feature flags with local caching and automatic session management, reducing latency and API call costs.
 
@@ -527,7 +506,7 @@ echo "Function: ${FUNCTION_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
@@ -535,48 +514,48 @@ echo "Function: ${FUNCTION_NAME}"
        --memory-size 256 \
        --environment Variables="{APP_ID=${APP_ID},ENV_ID=${ENV_ID},PROFILE_ID=${PROFILE_ID}}"
    
-   # Add AppConfig Lambda extension layer
+   # Add latest AppConfig Lambda extension layer
    aws lambda update-function-configuration \
        --function-name ${FUNCTION_NAME} \
-       --layers arn:aws:lambda:${AWS_REGION}:027255383542:layer:AWS-AppConfig-Extension:82
+       --layers arn:aws:lambda:${AWS_REGION}:027255383542:layer:AWS-AppConfig-Extension:207
    
    echo "✅ Lambda function created with AppConfig integration"
    ```
 
    The Lambda function now demonstrates complete feature flag integration with sophisticated error handling and fallback behavior. This implementation showcases how applications can safely consume feature flags while maintaining resilience against configuration service issues through graceful degradation patterns.
 
-10. **Deploy Feature Flag Configuration**:
+9. **Deploy Feature Flag Configuration**:
 
-    The deployment process activates feature flag configurations using the gradual rollout strategy, enabling controlled release of new feature states. This deployment approach provides monitoring-based safeguards and automatic rollback capabilities, ensuring that configuration changes don't negatively impact application performance or user experience.
+   The deployment process activates feature flag configurations using the gradual rollout strategy, enabling controlled release of new feature states. This deployment approach provides monitoring-based safeguards and automatic rollback capabilities, ensuring that configuration changes don't negatively impact application performance or user experience.
 
-    ```bash
-    # Deploy feature flag configuration
-    aws appconfig start-deployment \
-        --application-id ${APP_ID} \
-        --environment-id ${ENV_ID} \
-        --deployment-strategy-id ${STRATEGY_ID} \
-        --configuration-profile-id ${PROFILE_ID} \
-        --configuration-version ${CONFIG_VERSION} \
-        --description "Initial deployment of feature flags"
-    
-    # Get deployment ID
-    DEPLOYMENT_ID=$(aws appconfig list-deployments \
-        --application-id ${APP_ID} \
-        --environment-id ${ENV_ID} \
-        --query "Items[0].DeploymentNumber" --output text)
-    
-    echo "✅ Feature flag deployment started: ${DEPLOYMENT_ID}"
-    echo "Monitor deployment progress in AWS Console or CLI"
-    
-    # Monitor deployment status
-    aws appconfig get-deployment \
-        --application-id ${APP_ID} \
-        --environment-id ${ENV_ID} \
-        --deployment-number ${DEPLOYMENT_ID} \
-        --query "State" --output text
-    ```
+   ```bash
+   # Deploy feature flag configuration
+   aws appconfig start-deployment \
+       --application-id ${APP_ID} \
+       --environment-id ${ENV_ID} \
+       --deployment-strategy-id ${STRATEGY_ID} \
+       --configuration-profile-id ${PROFILE_ID} \
+       --configuration-version ${CONFIG_VERSION} \
+       --description "Initial deployment of feature flags"
+   
+   # Get deployment ID
+   DEPLOYMENT_ID=$(aws appconfig list-deployments \
+       --application-id ${APP_ID} \
+       --environment-id ${ENV_ID} \
+       --query "Items[0].DeploymentNumber" --output text)
+   
+   echo "✅ Feature flag deployment started: ${DEPLOYMENT_ID}"
+   echo "Monitor deployment progress in AWS Console or CLI"
+   
+   # Monitor deployment status
+   aws appconfig get-deployment \
+       --application-id ${APP_ID} \
+       --environment-id ${ENV_ID} \
+       --deployment-number ${DEPLOYMENT_ID} \
+       --query "State" --output text
+   ```
 
-    The deployment is now active and will gradually roll out feature flag configurations over the specified duration. This controlled approach enables safe feature releases with continuous monitoring and automatic rollback capabilities if issues are detected during the deployment process.
+   The deployment is now active and will gradually roll out feature flag configurations over the specified duration. This controlled approach enables safe feature releases with continuous monitoring and automatic rollback capabilities if issues are detected during the deployment process.
 
 ## Validation & Testing
 
@@ -716,9 +695,9 @@ echo "Function: ${FUNCTION_NAME}"
    aws appconfig stop-deployment \
        --application-id ${APP_ID} \
        --environment-id ${ENV_ID} \
-       --deployment-number ${DEPLOYMENT_ID}
+       --deployment-number ${DEPLOYMENT_ID} 2>/dev/null || echo "No active deployment to stop"
    
-   echo "✅ Deployment stopped"
+   echo "✅ Deployment stopped (if active)"
    ```
 
 2. **Delete Lambda Function**:
@@ -830,4 +809,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

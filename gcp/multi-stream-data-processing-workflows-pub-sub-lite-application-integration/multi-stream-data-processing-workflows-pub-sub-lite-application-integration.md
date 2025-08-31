@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Pub/Sub Lite, Application Integration, Cloud Dataflow, BigQuery
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-streaming, real-time-analytics, workflow-orchestration, cost-optimization, partition-messaging
 recipe-generator-version: 1.3
@@ -154,28 +154,22 @@ echo "✅ APIs enabled and foundational resources created"
    gcloud pubsub lite-topics create ${LITE_TOPIC_1} \
        --location=${REGION} \
        --partitions=4 \
-       --publish-throughput-capacity=4 \
-       --subscribe-throughput-capacity=8 \
        --per-partition-bytes=30GiB \
-       --message-retention-duration=7d
+       --message-retention-period=7d
    
    # Application events - medium frequency, structured data
    gcloud pubsub lite-topics create ${LITE_TOPIC_2} \
        --location=${REGION} \
        --partitions=2 \
-       --publish-throughput-capacity=2 \
-       --subscribe-throughput-capacity=4 \
        --per-partition-bytes=50GiB \
-       --message-retention-duration=14d
+       --message-retention-period=14d
    
    # System logs - variable frequency, larger messages
    gcloud pubsub lite-topics create ${LITE_TOPIC_3} \
        --location=${REGION} \
        --partitions=3 \
-       --publish-throughput-capacity=3 \
-       --subscribe-throughput-capacity=6 \
        --per-partition-bytes=40GiB \
-       --message-retention-duration=30d
+       --message-retention-period=30d
    
    echo "✅ Pub/Sub Lite topics created with optimized partition configuration"
    ```
@@ -228,33 +222,35 @@ echo "✅ APIs enabled and foundational resources created"
    ```bash
    # Create partitioned and clustered tables for optimal query performance
    
-   # IoT sensor data table
+   # IoT sensor data table with time partitioning
    bq mk --table \
+       --time_partitioning_field=timestamp \
+       --time_partitioning_type=DAY \
+       --clustering_fields=device_id,sensor_type \
        ${PROJECT_ID}:${DATASET_NAME}.iot_sensor_data \
        timestamp:TIMESTAMP,device_id:STRING,sensor_type:STRING,value:FLOAT64,location:GEOGRAPHY,metadata:JSON
    
-   # Configure partitioning and clustering
-   bq query --use_legacy_sql=false \
-   "ALTER TABLE \`${PROJECT_ID}.${DATASET_NAME}.iot_sensor_data\`
-   SET OPTIONS (
-     partition_expiration_days = 365,
-     clustering_fields = ['device_id', 'sensor_type']
-   )"
+   # Configure partition expiration
+   bq update --time_partitioning_expiration=31536000 \
+       ${PROJECT_ID}:${DATASET_NAME}.iot_sensor_data
    
-   # Application events table
+   # Application events table with time partitioning
    bq mk --table \
+       --time_partitioning_field=event_timestamp \
+       --time_partitioning_type=DAY \
+       --clustering_fields=user_id,event_type \
        ${PROJECT_ID}:${DATASET_NAME}.application_events \
        event_timestamp:TIMESTAMP,user_id:STRING,event_type:STRING,session_id:STRING,properties:JSON,revenue:FLOAT64
    
-   bq query --use_legacy_sql=false \
-   "ALTER TABLE \`${PROJECT_ID}.${DATASET_NAME}.application_events\`
-   SET OPTIONS (
-     partition_expiration_days = 730,
-     clustering_fields = ['user_id', 'event_type']
-   )"
+   # Configure partition expiration (2 years)
+   bq update --time_partitioning_expiration=63072000 \
+       ${PROJECT_ID}:${DATASET_NAME}.application_events
    
    # System logs aggregation table
    bq mk --table \
+       --time_partitioning_field=log_timestamp \
+       --time_partitioning_type=HOUR \
+       --clustering_fields=service_name,log_level \
        ${PROJECT_ID}:${DATASET_NAME}.system_logs_summary \
        log_timestamp:TIMESTAMP,service_name:STRING,log_level:STRING,error_count:INT64,response_time_ms:FLOAT64,request_count:INT64
    
@@ -286,10 +282,9 @@ echo "✅ APIs enabled and foundational resources created"
        --member="serviceAccount:app-integration-sa-${RANDOM_SUFFIX}@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/storage.objectAdmin"
    
-   # Enable Application Integration API and create initial configuration
+   # Provision Application Integration region
    gcloud alpha integration regions provision \
-       --location=${REGION} \
-       --kms-config-project-id=${PROJECT_ID}
+       --location=${REGION}
    
    echo "✅ Application Integration environment configured with proper IAM permissions"
    ```
@@ -305,32 +300,9 @@ echo "✅ APIs enabled and foundational resources created"
    gsutil mkdir gs://${BUCKET_NAME}/dataflow-temp
    gsutil mkdir gs://${BUCKET_NAME}/dataflow-staging
    
-   # Create a basic Dataflow pipeline template for Pub/Sub Lite to BigQuery
-   cat > pubsub-lite-to-bigquery-template.json << 'EOF'
-   {
-     "name": "PubSubLiteToBigQuery",
-     "description": "Stream processing pipeline from Pub/Sub Lite to BigQuery",
-     "parameters": [
-       {
-         "name": "inputSubscription",
-         "label": "Pub/Sub Lite subscription path",
-         "helpText": "Pub/Sub Lite subscription to read from"
-       },
-       {
-         "name": "outputTable",
-         "label": "BigQuery output table",
-         "helpText": "BigQuery table to write results"
-       }
-     ]
-   }
-   EOF
-   
-   # Upload template configuration
-   gsutil cp pubsub-lite-to-bigquery-template.json gs://${BUCKET_NAME}/templates/
-   
-   # Launch Dataflow job for IoT data processing
-   gcloud dataflow jobs run iot-stream-processor-${RANDOM_SUFFIX} \
-       --gcs-location=gs://dataflow-templates-${REGION}/latest/PubSub_Lite_to_BigQuery \
+   # Launch Dataflow job for IoT data processing using Google-provided template
+   gcloud dataflow flex-template run iot-stream-processor-${RANDOM_SUFFIX} \
+       --template-file-gcs-location=gs://dataflow-templates-${REGION}/latest/flex/PubSub_Lite_to_BigQuery \
        --region=${REGION} \
        --parameters=inputSubscription=projects/${PROJECT_ID}/locations/${REGION}/subscriptions/${SUBSCRIPTION_PREFIX}-analytics-1,outputTable=${PROJECT_ID}:${DATASET_NAME}.iot_sensor_data \
        --max-workers=4 \
@@ -411,6 +383,7 @@ echo "✅ APIs enabled and foundational resources created"
    import json
    import time
    import random
+   import os
    from google.cloud import pubsublite
    from concurrent.futures import ThreadPoolExecutor
    
@@ -418,21 +391,26 @@ echo "✅ APIs enabled and foundational resources created"
        publisher = pubsublite.PublisherClient()
        for i in range(num_messages):
            data = {
-               "timestamp": int(time.time() * 1000),
+               "timestamp": int(time.time() * 1000000),  # Microseconds for TIMESTAMP
                "device_id": f"device_{random.randint(1, 100)}",
                "sensor_type": random.choice(["temperature", "humidity", "pressure"]),
                "value": round(random.uniform(10.0, 50.0), 2),
-               "location": "POINT(-122.4194 37.7749)"
+               "location": "POINT(-122.4194 37.7749)",
+               "metadata": {"batch": "test_batch_1"}
            }
            message = pubsublite.PubsubMessage(data=json.dumps(data).encode())
            publisher.publish(topic_path, message)
            time.sleep(0.1)
    
    if __name__ == "__main__":
-       topic_path = pubsublite.TopicPath(
-           "${PROJECT_ID}", "${REGION}", "${LITE_TOPIC_1}"
-       )
+       project_id = os.environ.get('PROJECT_ID')
+       region = os.environ.get('REGION')
+       topic_id = os.environ.get('LITE_TOPIC_1')
+       
+       topic_path = pubsublite.TopicPath(project_id, region, topic_id)
+       print(f"Publishing to topic: {topic_path}")
        publish_iot_data(topic_path)
+       print("Test data published successfully")
    EOF
    
    # Install required Python packages and run test
@@ -463,7 +441,7 @@ echo "✅ APIs enabled and foundational resources created"
    # Check topic configuration and status
    gcloud pubsub lite-topics describe ${LITE_TOPIC_1} \
        --location=${REGION} \
-       --format="table(name,partitions,throughputCapacity.publishMibPerSec,throughputCapacity.subscribeMibPerSec)"
+       --format="table(name,partitionConfig.count,partitionConfig.capacity.publishMibPerSec,partitionConfig.capacity.subscribeMibPerSec)"
    
    # Verify subscription status
    gcloud pubsub lite-subscriptions list \
@@ -477,9 +455,8 @@ echo "✅ APIs enabled and foundational resources created"
 
    ```bash
    # Monitor message flow through Pub/Sub Lite
-   gcloud pubsub lite-topics get-partition-metadata ${LITE_TOPIC_1} \
-       --location=${REGION} \
-       --partition=0
+   gcloud pubsub lite-topics get-partitions ${LITE_TOPIC_1} \
+       --location=${REGION}
    
    # Check subscription backlog
    gcloud pubsub lite-subscriptions describe ${SUBSCRIPTION_PREFIX}-analytics-1 \
@@ -527,7 +504,7 @@ echo "✅ APIs enabled and foundational resources created"
 1. **Stop Dataflow Pipeline and Clean Up Compute Resources**:
 
    ```bash
-   # Stop Dataflow jobs
+   # Stop Dataflow jobs gracefully
    JOB_ID=$(gcloud dataflow jobs list --region=${REGION} --filter="name:iot-stream-processor-${RANDOM_SUFFIX}" --format="value(id)" --limit=1)
    gcloud dataflow jobs cancel ${JOB_ID} --region=${REGION}
    
@@ -540,9 +517,9 @@ echo "✅ APIs enabled and foundational resources created"
 2. **Delete Pub/Sub Lite Resources**:
 
    ```bash
-   # Delete subscriptions first
+   # Delete subscriptions first (required before deleting topics)
    gcloud pubsub lite-subscriptions delete ${SUBSCRIPTION_PREFIX}-analytics-1 --location=${REGION} --quiet
-   gcloud pubsub lite-subscriptions delete ${SUBSCRIPTION_PREFIX}-analytics-2 --location=${REGION} --quiet
+   gcloud pubsub lite-subscriptions delete ${SUBSCRIPTION_PREFIX}-analytics-2 --location=${REGION} --quiet  
    gcloud pubsub lite-subscriptions delete ${SUBSCRIPTION_PREFIX}-analytics-3 --location=${REGION} --quiet
    gcloud pubsub lite-subscriptions delete ${SUBSCRIPTION_PREFIX}-workflow-1 --location=${REGION} --quiet
    gcloud pubsub lite-subscriptions delete ${SUBSCRIPTION_PREFIX}-workflow-2 --location=${REGION} --quiet
@@ -570,10 +547,18 @@ echo "✅ APIs enabled and foundational resources created"
 4. **Delete Service Accounts and IAM Bindings**:
 
    ```bash
-   # Remove IAM bindings
+   # Remove IAM bindings for each role
    gcloud projects remove-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:app-integration-sa-${RANDOM_SUFFIX}@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/pubsublite.editor"
+       
+   gcloud projects remove-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:app-integration-sa-${RANDOM_SUFFIX}@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/bigquery.dataEditor"
+       
+   gcloud projects remove-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:app-integration-sa-${RANDOM_SUFFIX}@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/storage.objectAdmin"
    
    # Delete service account
    gcloud iam service-accounts delete \
@@ -596,7 +581,7 @@ The combination of **Cloud Dataflow and BigQuery** provides both real-time strea
 
 > **Tip**: Monitor partition utilization metrics regularly to optimize throughput capacity reservations. Pub/Sub Lite allows you to adjust capacity settings without service interruption, enabling fine-tuning based on actual usage patterns. See the [Pub/Sub Lite monitoring guide](https://cloud.google.com/pubsub/lite/docs/monitoring) for detailed capacity planning strategies.
 
-For more detailed implementation guidance, consult the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) for data analytics best practices, the [Pub/Sub Lite documentation](https://cloud.google.com/pubsub/lite/docs) for advanced partition management strategies, the [Application Integration best practices guide](https://cloud.google.com/application-integration/docs/best-practices) for workflow optimization, the [Cloud Dataflow performance optimization guide](https://cloud.google.com/dataflow/docs/guides/deploying-a-pipeline#performance-and-cost-optimization) for stream processing tuning, and the [BigQuery best practices documentation](https://cloud.google.com/bigquery/docs/best-practices-performance-overview) for analytical query optimization.
+For detailed implementation guidance, consult the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) for data analytics best practices, the [Pub/Sub Lite documentation](https://cloud.google.com/pubsub/lite/docs) for advanced partition management strategies, the [Application Integration best practices guide](https://cloud.google.com/application-integration/docs/best-practices) for workflow optimization, the [Cloud Dataflow performance optimization guide](https://cloud.google.com/dataflow/docs/guides/deploying-a-pipeline#performance-and-cost-optimization) for stream processing tuning, and the [BigQuery best practices documentation](https://cloud.google.com/bigquery/docs/best-practices-performance-overview) for analytical query optimization.
 
 ## Challenge
 
@@ -614,4 +599,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

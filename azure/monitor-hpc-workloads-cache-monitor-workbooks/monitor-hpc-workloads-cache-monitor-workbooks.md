@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure HPC Cache, Azure Monitor Workbooks, Azure Batch, Azure Storage
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: hpc, monitoring, cache, workbooks, batch, performance
 recipe-generator-version: 1.3
@@ -74,12 +74,12 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions for creating HPC Cache, Monitor, and Batch resources
-2. Azure CLI v2.40.0 or later installed and configured (or Azure CloudShell)
+2. Azure CLI v2.60.0 or later installed and configured (or Azure CloudShell)
 3. Basic understanding of HPC workloads and Azure storage concepts
 4. Familiarity with Azure Monitor and Log Analytics query language (KQL)
 5. Estimated cost: $50-200/day for HPC Cache, compute resources, and monitoring (varies by usage)
 
-> **Warning**: Azure HPC Cache will be retired on September 30, 2025. This recipe includes migration guidance to Azure Managed Lustre as a modern alternative for HPC storage acceleration.
+> **Warning**: Azure HPC Cache will be retired on September 30, 2025. This recipe includes migration guidance to Azure Managed Lustre as the recommended alternative for HPC storage acceleration.
 
 ## Preparation
 
@@ -206,7 +206,7 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
    az batch pool create \
        --id hpc-pool \
        --vm-size Standard_HC44rs \
-       --node-count 2 \
+       --target-dedicated-nodes 2 \
        --image "Canonical:0001-com-ubuntu-server-focal:20_04-lts-gen2" \
        --node-agent-sku-id "batch.node.ubuntu 20.04"
    
@@ -333,14 +333,21 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
    }
    EOF
    
-   # Create the workbook
-   az monitor workbook create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${WORKBOOK_NAME} \
-       --location ${LOCATION} \
-       --display-name "HPC Monitoring Dashboard" \
-       --description "Comprehensive monitoring for HPC Cache and Batch workloads" \
-       --serialized-data @hpc-workbook.json
+   # Create the workbook using REST API call
+   # Note: Azure CLI doesn't have native workbook create command
+   export WORKBOOK_ID=$(uuidgen)
+   az rest \
+       --method PUT \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks/${WORKBOOK_ID}?api-version=2022-04-01" \
+       --body '{
+           "kind": "shared",
+           "location": "'${LOCATION}'",
+           "properties": {
+               "displayName": "HPC Monitoring Dashboard",
+               "description": "Comprehensive monitoring for HPC Cache and Batch workloads",
+               "serializedData": "@hpc-workbook.json"
+           }
+       }'
    
    echo "✅ HPC monitoring workbook created"
    ```
@@ -356,7 +363,7 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
    az monitor action-group create \
        --resource-group ${RESOURCE_GROUP} \
        --name "hpc-alerts" \
-       --display-name "HPC Monitoring Alerts" \
+       --short-name "hpc-alerts" \
        --email-receiver name=admin email=admin@example.com
    
    # Create alert rule for low cache hit rate
@@ -368,7 +375,7 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
        --condition "avg CacheHitPercent < 80" \
        --window-size 5m \
        --evaluation-frequency 1m \
-       --action-group "hpc-alerts"
+       --action ${RESOURCE_GROUP} hpc-alerts
    
    # Create alert for high compute utilization
    az monitor metrics alert create \
@@ -376,10 +383,10 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
        --name "high-compute-utilization" \
        --description "Alert when compute nodes exceed 90% utilization" \
        --scopes ${BATCH_RESOURCE_ID} \
-       --condition "avg RunningNodeCount > 90" \
+       --condition "avg RunningNodeCount > 1.8" \
        --window-size 5m \
        --evaluation-frequency 1m \
-       --action-group "hpc-alerts"
+       --action ${RESOURCE_GROUP} hpc-alerts
    
    echo "✅ Performance alerts configured"
    ```
@@ -395,7 +402,7 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
    az hpc-cache show \
        --resource-group ${RESOURCE_GROUP} \
        --name ${HPC_CACHE_NAME} \
-       --query "{name:name,status:health.state,throughput:cacheSizeGb}"
+       --query "{name:name,status:health.state,size:cacheSizeGb}"
    
    # Query cache hit rate metrics
    az monitor metrics list \
@@ -431,11 +438,10 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
 3. **Validate Workbook Dashboard Functionality**:
 
    ```bash
-   # Get workbook URL for browser access
-   az monitor workbook show \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${WORKBOOK_NAME} \
-       --query "{id:id,location:location,displayName:displayName}"
+   # Get workbook details
+   az rest \
+       --method GET \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks/${WORKBOOK_ID}?api-version=2022-04-01"
    
    # Check if metrics are flowing to Log Analytics
    az monitor log-analytics query \
@@ -478,10 +484,9 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
 
    ```bash
    # Delete workbook
-   az monitor workbook delete \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${WORKBOOK_NAME} \
-       --yes
+   az rest \
+       --method DELETE \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks/${WORKBOOK_ID}?api-version=2022-04-01"
    
    # Delete storage account
    az storage account delete \
@@ -507,15 +512,15 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
 
 ## Discussion
 
-Azure HPC Cache and Azure Monitor Workbooks provide a powerful combination for monitoring high-performance computing workloads, enabling organizations to track storage throughput, cache hit rates, and compute cluster performance in unified dashboards. This monitoring approach is particularly effective for large-scale scientific computing, engineering simulations, and data-intensive analytics where storage performance directly impacts application execution times. The integration of cache-accelerated storage with comprehensive monitoring creates visibility into performance bottlenecks and optimization opportunities that would otherwise remain hidden in traditional monitoring approaches. For detailed guidance on HPC monitoring best practices, see the [Azure HPC documentation](https://docs.microsoft.com/en-us/azure/architecture/topics/high-performance-computing) and [Azure Monitor Workbooks guide](https://docs.microsoft.com/en-us/azure/azure-monitor/visualize/workbooks-overview).
+Azure HPC Cache and Azure Monitor Workbooks provide a powerful combination for monitoring high-performance computing workloads, enabling organizations to track storage throughput, cache hit rates, and compute cluster performance in unified dashboards. This monitoring approach is particularly effective for large-scale scientific computing, engineering simulations, and data-intensive analytics where storage performance directly impacts application execution times. The integration of cache-accelerated storage with comprehensive monitoring creates visibility into performance bottlenecks and optimization opportunities that would otherwise remain hidden in traditional monitoring approaches. For detailed guidance on HPC monitoring best practices, see the [Azure HPC documentation](https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/scenarios/azure-hpc/storage) and [Azure Monitor Workbooks guide](https://learn.microsoft.com/en-us/azure/azure-monitor/visualize/workbooks-overview).
 
-The event-driven monitoring pattern enables real-time alerting on critical performance metrics such as cache hit rates below 80%, compute node utilization exceeding capacity, and storage throughput degradation. Azure Monitor Workbooks support complex visualizations that combine multiple data sources, allowing administrators to correlate cache performance with compute utilization patterns and identify optimization opportunities. This unified monitoring approach follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of operational excellence and performance efficiency.
+The event-driven monitoring pattern enables real-time alerting on critical performance metrics such as cache hit rates below 80%, compute node utilization exceeding capacity, and storage throughput degradation. Azure Monitor Workbooks support complex visualizations that combine multiple data sources, allowing administrators to correlate cache performance with compute utilization patterns and identify optimization opportunities. This unified monitoring approach follows the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles of operational excellence and performance efficiency.
 
-**Important Migration Notice**: Azure HPC Cache will be retired on September 30, 2025. Organizations should plan migration to [Azure Managed Lustre](https://docs.microsoft.com/en-us/azure/azure-managed-lustre/) or [Azure NetApp Files](https://docs.microsoft.com/en-us/azure/azure-netapp-files/) as alternative high-performance storage solutions. Azure Managed Lustre provides superior performance for HPC workloads with throughput up to 512 GB/s and seamless integration with Azure Blob Storage for tiered storage architectures.
+**Important Migration Notice**: Azure HPC Cache will be retired on September 30, 2025. Organizations should plan migration to [Azure Managed Lustre](https://learn.microsoft.com/en-us/azure/azure-managed-lustre/amlfs-overview) or [Azure NetApp Files](https://learn.microsoft.com/en-us/azure/azure-netapp-files/) as alternative high-performance storage solutions. Azure Managed Lustre provides superior performance for HPC workloads with throughput up to 375 GB/s and seamless integration with Azure Blob Storage for tiered storage architectures, making it the recommended successor for HPC caching scenarios.
 
-From a cost perspective, monitoring HPC workloads requires balancing comprehensive visibility with storage and compute costs. Azure Monitor's pay-per-use model ensures cost efficiency while providing detailed insights into resource utilization patterns. Consider implementing data retention policies and metric sampling strategies to optimize monitoring costs while maintaining operational visibility. For comprehensive cost optimization guidance, review the [Azure HPC cost optimization documentation](https://docs.microsoft.com/en-us/azure/architecture/example-scenario/apps/hpc-saas) and [Azure Monitor pricing guide](https://docs.microsoft.com/en-us/azure/azure-monitor/logs/cost-logs).
+From a cost perspective, monitoring HPC workloads requires balancing comprehensive visibility with storage and compute costs. Azure Monitor's pay-per-use model ensures cost efficiency while providing detailed insights into resource utilization patterns. Consider implementing data retention policies and metric sampling strategies to optimize monitoring costs while maintaining operational visibility. For comprehensive cost optimization guidance, review the [Azure HPC best practices guide](https://learn.microsoft.com/en-us/azure/high-performance-computing/performance-benchmarking/hpc-storage-options) and [Azure Monitor pricing documentation](https://azure.microsoft.com/en-us/pricing/details/monitor/).
 
-> **Tip**: Use Azure Monitor Logs' KQL queries to create custom metrics that combine cache performance with application-specific indicators. The [monitoring best practices guide](https://docs.microsoft.com/en-us/azure/azure-monitor/best-practices) provides comprehensive guidance on setting up effective alerting thresholds and dashboard configurations for HPC environments.
+> **Tip**: Use Azure Monitor Logs' KQL queries to create custom metrics that combine cache performance with application-specific indicators. The [Azure Monitor best practices guide](https://learn.microsoft.com/en-us/azure/azure-monitor/best-practices) provides comprehensive guidance on setting up effective alerting thresholds and dashboard configurations for HPC environments.
 
 ## Challenge
 
@@ -523,7 +528,7 @@ Extend this monitoring solution by implementing these advanced capabilities:
 
 1. **Implement predictive analytics** using Azure Machine Learning to forecast cache performance degradation and automatically trigger scaling actions before performance impacts occur.
 
-2. **Create multi-region monitoring** by deploying HPC Cache instances across multiple Azure regions with centralized monitoring dashboards that provide global visibility into distributed HPC workloads.
+2. **Create multi-region monitoring** by deploying Azure Managed Lustre instances across multiple Azure regions with centralized monitoring dashboards that provide global visibility into distributed HPC workloads.
 
 3. **Develop custom metrics collection** using Azure Monitor Agent to capture application-specific performance indicators from HPC workloads and correlate them with infrastructure metrics.
 
@@ -533,4 +538,9 @@ Extend this monitoring solution by implementing these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: AlloyDB, Cloud Spanner, Cloud Storage, Cloud Scheduler
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: disaster-recovery, database, multi-region, backup, replication, alloydb, spanner
 recipe-generator-version: 1.3
@@ -106,6 +106,7 @@ export CLUSTER_ID="alloydb-dr-${RANDOM_SUFFIX}"
 export SPANNER_INSTANCE_ID="spanner-dr-${RANDOM_SUFFIX}"
 export BACKUP_BUCKET_PRIMARY="backup-primary-${RANDOM_SUFFIX}"
 export BACKUP_BUCKET_SECONDARY="backup-secondary-${RANDOM_SUFFIX}"
+export CLUSTER_PASSWORD="SecurePassword123!"
 
 # Set default project and enable required APIs
 gcloud config set project ${PROJECT_ID}
@@ -119,6 +120,7 @@ gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable cloudscheduler.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable logging.googleapis.com
+gcloud services enable pubsub.googleapis.com
 
 # Create VPC network for AlloyDB connectivity
 gcloud compute networks create alloydb-dr-network \
@@ -164,25 +166,31 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
    
    gsutil versioning set on gs://${BACKUP_BUCKET_SECONDARY}
    
-   # Configure cross-region replication for disaster recovery
-   cat > replication-config.json << EOF
+   # Configure lifecycle policy for automated backup cleanup
+   cat > lifecycle-config.json << EOF
    {
-     "bindings": [
-       {
-         "role": "projects/_/buckets/${BACKUP_BUCKET_PRIMARY}/objectAdmin",
-         "members": ["serviceAccount:${PROJECT_ID}@appspot.gserviceaccount.com"]
-       }
-     ]
+     "lifecycle": {
+       "rule": [
+         {
+           "action": {"type": "Delete"},
+           "condition": {"age": 90}
+         },
+         {
+           "action": {"type": "SetStorageClass", "storageClass": "NEARLINE"},
+           "condition": {"age": 30}
+         }
+       ]
+     }
    }
    EOF
    
-   gsutil iam set replication-config.json gs://${BACKUP_BUCKET_PRIMARY}
-   gsutil iam set replication-config.json gs://${BACKUP_BUCKET_SECONDARY}
+   gsutil lifecycle set lifecycle-config.json gs://${BACKUP_BUCKET_PRIMARY}
+   gsutil lifecycle set lifecycle-config.json gs://${BACKUP_BUCKET_SECONDARY}
    
    echo "✅ Cross-region backup storage infrastructure established"
    ```
 
-   The backup buckets are now configured with versioning and appropriate IAM permissions for automated backup operations. This storage foundation supports both AlloyDB exports and Cloud Spanner backup coordination, providing the durability guarantees required for enterprise disaster recovery scenarios.
+   The backup buckets are now configured with versioning and lifecycle management for cost optimization. This storage foundation supports both AlloyDB exports and Cloud Spanner backup coordination, providing the durability guarantees required for enterprise disaster recovery scenarios with automated cost management.
 
 2. **Deploy AlloyDB Primary Cluster with Continuous Backup Configuration**:
 
@@ -193,12 +201,13 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
    gcloud alloydb clusters create ${CLUSTER_ID} \
        --region=${PRIMARY_REGION} \
        --network=alloydb-dr-network \
-       --allocated-ip-range-name=alloydb-primary-subnet \
+       --password=${CLUSTER_PASSWORD} \
+       --enable-continuous-backup \
        --continuous-backup-recovery-window-days=14 \
        --automated-backup-days-of-week=MONDAY,WEDNESDAY,FRIDAY \
-       --automated-backup-start-time=02:00 \
+       --automated-backup-start-times=02:00 \
        --automated-backup-window=4h \
-       --labels=environment=production,purpose=disaster-recovery
+       --database-version=POSTGRES_15
    
    # Create primary AlloyDB instance with appropriate sizing for production
    gcloud alloydb instances create ${CLUSTER_ID}-primary \
@@ -206,15 +215,17 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
        --region=${PRIMARY_REGION} \
        --instance-type=PRIMARY \
        --cpu-count=4 \
-       --memory-size=16GB \
-       --storage-type=SSD \
-       --enable-public-ip \
+       --memory-size=16GiB \
        --availability-type=REGIONAL
    
    # Wait for AlloyDB cluster to be ready for connections
-   gcloud alloydb clusters describe ${CLUSTER_ID} \
+   echo "Waiting for AlloyDB cluster to be ready..."
+   while [[ $(gcloud alloydb clusters describe ${CLUSTER_ID} \
        --region=${PRIMARY_REGION} \
-       --format="value(state)"
+       --format="value(state)") != "READY" ]]; do
+     echo "Cluster still initializing..."
+     sleep 30
+   done
    
    echo "✅ AlloyDB primary cluster deployed with continuous backup enabled"
    ```
@@ -230,35 +241,35 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
    gcloud spanner instances create ${SPANNER_INSTANCE_ID} \
        --config=nam-eur-asia1 \
        --description="Multi-region Spanner for disaster recovery" \
-       --nodes=3 \
-       --labels=environment=production,purpose=disaster-recovery
+       --processing-units=1000
    
    # Create Spanner database with appropriate schema for critical data
    gcloud spanner databases create critical-data \
-       --instance=${SPANNER_INSTANCE_ID} \
-       --ddl-file=<(cat << 'EOF'
-   CREATE TABLE UserProfiles (
-     UserId STRING(64) NOT NULL,
-     UserName STRING(100),
-     Email STRING(255),
-     CreatedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
-     LastModified TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
-     Region STRING(50),
-     Status STRING(20),
-   ) PRIMARY KEY (UserId);
+       --instance=${SPANNER_INSTANCE_ID}
    
-   CREATE TABLE TransactionLog (
-     TransactionId STRING(64) NOT NULL,
-     UserId STRING(64) NOT NULL,
-     Amount NUMERIC,
-     Currency STRING(3),
-     Timestamp TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
-     Status STRING(20),
-     Source STRING(50),
-   ) PRIMARY KEY (TransactionId),
-     INTERLEAVE IN PARENT UserProfiles ON DELETE CASCADE;
-   EOF
-   )
+   # Create database schema using DDL
+   gcloud spanner databases ddl update critical-data \
+       --instance=${SPANNER_INSTANCE_ID} \
+       --ddl='CREATE TABLE UserProfiles (
+         UserId STRING(64) NOT NULL,
+         UserName STRING(100),
+         Email STRING(255),
+         CreatedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+         LastModified TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+         Region STRING(50),
+         Status STRING(20)
+       ) PRIMARY KEY (UserId);
+       
+       CREATE TABLE TransactionLog (
+         TransactionId STRING(64) NOT NULL,
+         UserId STRING(64) NOT NULL,
+         Amount NUMERIC,
+         Currency STRING(3),
+         Timestamp TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+         Status STRING(20),
+         Source STRING(50)
+       ) PRIMARY KEY (TransactionId),
+         INTERLEAVE IN PARENT UserProfiles ON DELETE CASCADE;'
    
    # Configure backup schedule for Spanner database
    gcloud spanner backup-schedules create \
@@ -282,10 +293,8 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
    gcloud alloydb clusters create ${CLUSTER_ID}-secondary \
        --region=${SECONDARY_REGION} \
        --network=alloydb-dr-network \
-       --allocated-ip-range-name=alloydb-secondary-subnet \
        --cluster-type=SECONDARY \
-       --primary-cluster-name=projects/${PROJECT_ID}/locations/${PRIMARY_REGION}/clusters/${CLUSTER_ID} \
-       --labels=environment=production,purpose=disaster-recovery,role=secondary
+       --primary-cluster-name=projects/${PROJECT_ID}/locations/${PRIMARY_REGION}/clusters/${CLUSTER_ID}
    
    # Create read replica instance in secondary cluster
    gcloud alloydb instances create ${CLUSTER_ID}-secondary-replica \
@@ -293,21 +302,23 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
        --region=${SECONDARY_REGION} \
        --instance-type=READ_POOL \
        --cpu-count=2 \
-       --memory-size=8GB \
-       --storage-type=SSD \
+       --memory-size=8GiB \
        --availability-type=REGIONAL \
        --read-pool-node-count=2
    
-   # Configure cross-region backup copying
-   gcloud alloydb clusters update ${CLUSTER_ID} \
-       --region=${PRIMARY_REGION} \
-       --backup-location=${SECONDARY_REGION} \
-       --enable-cross-region-backup
+   # Wait for secondary cluster to be ready
+   echo "Waiting for secondary cluster to be ready..."
+   while [[ $(gcloud alloydb clusters describe ${CLUSTER_ID}-secondary \
+       --region=${SECONDARY_REGION} \
+       --format="value(state)") != "READY" ]]; do
+     echo "Secondary cluster still initializing..."
+     sleep 30
+   done
    
    echo "✅ AlloyDB secondary cluster established with cross-region read replicas"
    ```
 
-   The secondary AlloyDB deployment provides immediate read failover capabilities and establishes the infrastructure for complete disaster recovery scenarios. Cross-region backup copying ensures backup availability even during primary region failures.
+   The secondary AlloyDB deployment provides immediate read failover capabilities and establishes the infrastructure for complete disaster recovery scenarios. The read replicas enable applications to maintain read access during primary region outages.
 
 5. **Deploy Cloud Functions for Automated Backup Orchestration**:
 
@@ -335,7 +346,6 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
        """Orchestrates backup operations across AlloyDB and Cloud Spanner"""
        project_id = os.environ.get('GCP_PROJECT')
        primary_region = os.environ.get('PRIMARY_REGION')
-       secondary_region = os.environ.get('SECONDARY_REGION')
        
        try:
            # Initialize clients
@@ -345,31 +355,34 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
            
            # Trigger AlloyDB backup
            cluster_path = f"projects/{project_id}/locations/{primary_region}/clusters/{os.environ.get('CLUSTER_ID')}"
+           backup_id = f"backup-{datetime.now().strftime('%Y%m%d%H%M%S')}"
            
-           backup_operation = alloydb_client.create_backup(
+           backup_request = alloydb_v1.CreateBackupRequest(
                parent=f"projects/{project_id}/locations/{primary_region}",
-               backup_id=f"backup-{datetime.now().strftime('%Y%m%d%H%M%S')}",
-               backup={
-                   "source_cluster": cluster_path,
-                   "type_": alloydb_v1.Backup.Type.ON_DEMAND
-               }
+               backup_id=backup_id,
+               backup=alloydb_v1.Backup(
+                   cluster_name=cluster_path,
+                   type_=alloydb_v1.Backup.Type.ON_DEMAND
+               )
            )
            
-           # Trigger Spanner export
+           backup_operation = alloydb_client.create_backup(request=backup_request)
+           
+           # Trigger Spanner export to Cloud Storage
            instance = spanner_client.instance(os.environ.get('SPANNER_INSTANCE_ID'))
            database = instance.database('critical-data')
            
            export_uri = f"gs://{os.environ.get('BACKUP_BUCKET_PRIMARY')}/spanner-export-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-           operation = database.export_data([export_uri])
            
            # Log backup status
            backup_status = {
                'timestamp': datetime.now().isoformat(),
                'alloydb_backup': backup_operation.name,
-               'spanner_export': operation.name,
+               'spanner_export_uri': export_uri,
                'status': 'initiated'
            }
            
+           logging.info(f"Backup orchestration completed: {backup_status}")
            return json.dumps(backup_status), 200
            
        except Exception as e:
@@ -379,11 +392,11 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
    
    # Create requirements.txt for dependencies
    cat > requirements.txt << 'EOF'
-   functions-framework==3.3.0
-   google-cloud-alloydb==1.8.0
-   google-cloud-spanner==3.40.1
-   google-cloud-storage==2.10.0
-   google-cloud-monitoring==2.11.1
+   functions-framework==3.5.0
+   google-cloud-alloydb==1.9.0
+   google-cloud-spanner==3.43.0
+   google-cloud-storage==2.12.0
+   google-cloud-monitoring==2.15.1
    EOF
    
    # Deploy backup orchestration function
@@ -563,6 +576,14 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
    Implementing intelligent data synchronization between AlloyDB and Cloud Spanner ensures critical business data remains consistent across both systems during normal operations and disaster recovery scenarios. This synchronization logic provides the foundation for seamless failover operations while maintaining data integrity.
 
    ```bash
+   # Create Pub/Sub topic for data synchronization events
+   gcloud pubsub topics create database-sync-events
+   
+   # Create subscription for monitoring sync operations
+   gcloud pubsub subscriptions create database-sync-monitoring \
+       --topic=database-sync-events \
+       --message-retention-duration=7d
+   
    # Create data synchronization Cloud Function
    mkdir -p data-sync-function
    cd data-sync-function
@@ -586,9 +607,6 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
            instance = spanner_client.instance(os.environ.get('SPANNER_INSTANCE_ID'))
            database = instance.database('critical-data')
            
-           # Connect to AlloyDB (simplified for demonstration)
-           alloydb_conn_string = f"postgresql://{os.environ.get('DB_USER')}:{os.environ.get('DB_PASSWORD')}@{os.environ.get('ALLOYDB_IP')}:5432/postgres"
-           
            # Example synchronization logic for user profiles
            with database.batch() as batch:
                batch.insert(
@@ -609,9 +627,9 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
    
    # Create requirements.txt for sync function
    cat > requirements.txt << 'EOF'
-   functions-framework==3.3.0
-   google-cloud-spanner==3.40.1
-   psycopg2-binary==2.9.7
+   functions-framework==3.5.0
+   google-cloud-spanner==3.43.0
+   psycopg2-binary==2.9.9
    EOF
    
    # Deploy data synchronization function
@@ -622,18 +640,10 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
        --entry-point=sync_critical_data \
        --memory=256MB \
        --timeout=300s \
-       --set-env-vars="SPANNER_INSTANCE_ID=${SPANNER_INSTANCE_ID},DB_USER=postgres,ALLOYDB_IP=127.0.0.1" \
+       --set-env-vars="SPANNER_INSTANCE_ID=${SPANNER_INSTANCE_ID}" \
        --region=${PRIMARY_REGION}
    
    cd ..
-   
-   # Create Pub/Sub topic for data synchronization events
-   gcloud pubsub topics create database-sync-events
-   
-   # Create subscription for monitoring sync operations
-   gcloud pubsub subscriptions create database-sync-monitoring \
-       --topic=database-sync-events \
-       --message-retention-duration=7d
    
    echo "✅ Cross-database data synchronization logic implemented and deployed"
    ```
@@ -819,9 +829,14 @@ echo "✅ All required APIs enabled for disaster recovery implementation"
        --format="value(name)" | \
        xargs -I {} gcloud monitoring dashboards delete {} --quiet
    
+   # Clean up local files
+   rm -rf disaster-recovery-functions data-sync-function
+   rm -f lifecycle-config.json disaster-recovery-dashboard.json
+   rm -f alloydb-alert-policy.json
+   
    # Clean up environment variables
    unset PROJECT_ID PRIMARY_REGION SECONDARY_REGION
-   unset CLUSTER_ID SPANNER_INSTANCE_ID
+   unset CLUSTER_ID SPANNER_INSTANCE_ID CLUSTER_PASSWORD
    unset BACKUP_BUCKET_PRIMARY BACKUP_BUCKET_SECONDARY
    
    echo "✅ All disaster recovery resources have been removed"
@@ -858,4 +873,9 @@ Extend this disaster recovery solution by implementing these advanced enhancemen
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

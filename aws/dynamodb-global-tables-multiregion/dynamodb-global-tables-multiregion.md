@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: dynamodb,cloudwatch,iam,lambda
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: dynamodb,global-tables,multi-region,database,replication,high-availability,eventual-consistency
 recipe-generator-version: 1.3
@@ -98,6 +98,7 @@ graph TB
 
 ```bash
 # Set primary region and account information
+export AWS_REGION=$(aws configure get region)
 export PRIMARY_REGION="us-east-1"
 export SECONDARY_REGION="eu-west-1"
 export TERTIARY_REGION="ap-northeast-1"
@@ -129,19 +130,16 @@ aws iam create-role \
                 "Action": "sts:AssumeRole"
             }
         ]
-    }' \
-    --region ${PRIMARY_REGION}
+    }'
 
 # Attach necessary policies to the role
 aws iam attach-role-policy \
     --role-name ${IAM_ROLE_NAME} \
-    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole \
-    --region ${PRIMARY_REGION}
+    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
 aws iam attach-role-policy \
     --role-name ${IAM_ROLE_NAME} \
-    --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess \
-    --region ${PRIMARY_REGION}
+    --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
 
 # Wait for IAM role to be available
 sleep 30
@@ -232,6 +230,8 @@ echo "✅ Preparation complete - Primary region: ${PRIMARY_REGION}, Table: ${TAB
    ```
 
 4. **Create Lambda functions for testing global table operations**:
+
+   AWS Lambda provides serverless compute that automatically scales based on incoming requests, making it ideal for testing global table operations across multiple regions. The test functions demonstrate key DynamoDB operations including item creation, retrieval, and scanning, while tracking which region processed each operation. This serverless approach eliminates infrastructure management while providing consistent testing capabilities across all global table regions.
 
    ```bash
    # Create Lambda function code
@@ -324,13 +324,15 @@ echo "✅ Preparation complete - Primary region: ${PRIMARY_REGION}, Table: ${TAB
    echo "✅ Lambda function code prepared"
    ```
 
+   The Lambda function code is now packaged and ready for deployment. This function provides comprehensive testing capabilities for DynamoDB operations while tracking regional processing for verification of global table behavior.
+
 5. **Deploy Lambda functions in each region**:
 
    ```bash
    # Deploy Lambda function in primary region
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
        --handler global-table-processor.lambda_handler \
        --zip-file fileb:///tmp/global-table-processor.zip \
@@ -340,7 +342,7 @@ echo "✅ Preparation complete - Primary region: ${PRIMARY_REGION}, Table: ${TAB
    # Deploy Lambda function in secondary region
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
        --handler global-table-processor.lambda_handler \
        --zip-file fileb:///tmp/global-table-processor.zip \
@@ -350,7 +352,7 @@ echo "✅ Preparation complete - Primary region: ${PRIMARY_REGION}, Table: ${TAB
    # Deploy Lambda function in tertiary region
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
        --handler global-table-processor.lambda_handler \
        --zip-file fileb:///tmp/global-table-processor.zip \
@@ -460,7 +462,6 @@ echo "✅ Preparation complete - Primary region: ${PRIMARY_REGION}, Table: ${TAB
        --evaluation-periods 2 \
        --dimensions Name=TableName,Value=${TABLE_NAME} \
        --region ${PRIMARY_REGION}
-   
    
    echo "✅ CloudWatch monitoring configured for global table metrics"
    ```
@@ -765,18 +766,15 @@ echo "✅ Preparation complete - Primary region: ${PRIMARY_REGION}, Table: ${TAB
    # Detach policies from IAM role
    aws iam detach-role-policy \
        --role-name ${IAM_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole \
-       --region ${PRIMARY_REGION}
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
    aws iam detach-role-policy \
        --role-name ${IAM_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess \
-       --region ${PRIMARY_REGION}
+       --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
    
    # Delete IAM role
    aws iam delete-role \
-       --role-name ${IAM_ROLE_NAME} \
-       --region ${PRIMARY_REGION}
+       --role-name ${IAM_ROLE_NAME}
    
    # Clean up temporary files
    rm -f /tmp/global-table-processor.py \
@@ -791,13 +789,13 @@ echo "✅ Preparation complete - Primary region: ${PRIMARY_REGION}, Table: ${TAB
 
 ## Discussion
 
-DynamoDB Global Tables represent a sophisticated approach to multi-region data distribution that addresses critical challenges in global application architecture. The implementation leverages Amazon's managed replication infrastructure to provide seamless data synchronization across multiple AWS regions, enabling applications to achieve both low latency and high availability without the complexity of traditional database replication solutions.
+DynamoDB Global Tables represent a sophisticated approach to multi-region data distribution that addresses critical challenges in global application architecture. The implementation leverages Amazon's managed replication infrastructure to provide seamless data synchronization across multiple AWS regions, enabling applications to achieve both low latency and high availability without the complexity of traditional database replication solutions. This approach follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles for reliability and performance efficiency.
 
-The key architectural principle behind Global Tables is the multi-active approach, where each regional replica can independently handle both read and write operations. This design eliminates the single point of failure inherent in traditional master-slave replication models while providing eventual consistency through DynamoDB's last-writer-wins conflict resolution mechanism. The system automatically handles cross-region replication, typically achieving replication latencies under one second between regions, making it suitable for applications requiring near real-time data synchronization.
+The key architectural principle behind Global Tables is the multi-active approach, where each regional replica can independently handle both read and write operations. This design eliminates the single point of failure inherent in traditional master-slave replication models while providing eventual consistency through DynamoDB's last-writer-wins conflict resolution mechanism. The system automatically handles cross-region replication, typically achieving replication latencies under one second between regions, making it suitable for applications requiring near real-time data synchronization. This architecture supports the reliability pillar by implementing automatic failure recovery and distributed system resiliency.
 
 Global Tables excel in scenarios requiring geographic distribution of data for compliance, performance, or availability reasons. E-commerce platforms can maintain user profiles and shopping cart data across multiple regions to ensure consistent customer experiences regardless of their location. Financial services can leverage Global Tables to maintain account information and transaction history across regions while meeting regulatory requirements for data locality. The automatic conflict resolution ensures data consistency even during simultaneous updates from different regions, though applications should be designed to handle eventual consistency patterns appropriately.
 
-The monitoring and operational aspects of Global Tables integrate seamlessly with AWS CloudWatch, providing comprehensive visibility into replication performance, error rates, and regional health. The ReplicationLatency metric serves as a crucial indicator for application performance, while User Errors and System Errors metrics help identify potential issues before they impact applications. Organizations should establish monitoring thresholds and alerting strategies based on their specific latency and availability requirements.
+The monitoring and operational aspects of Global Tables integrate seamlessly with AWS CloudWatch, providing comprehensive visibility into replication performance, error rates, and regional health. The ReplicationLatency metric serves as a crucial indicator for application performance, while User Errors and System Errors metrics help identify potential issues before they impact applications. Organizations should establish monitoring thresholds and alerting strategies based on their specific latency and availability requirements, following the [AWS operational excellence best practices](https://docs.aws.amazon.com/wellarchitected/latest/operational-excellence-pillar/welcome.html).
 
 > **Tip**: Design your application to handle eventual consistency gracefully by implementing read-after-write consistency patterns when immediate consistency is required, and use consistent reads for critical operations within a single region. Review the [DynamoDB consistency model](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html) for comprehensive guidance on managing consistency in distributed systems.
 
@@ -817,4 +815,11 @@ Extend this solution by implementing these advanced enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

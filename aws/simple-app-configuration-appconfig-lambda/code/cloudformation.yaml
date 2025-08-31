@@ -1,0 +1,628 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple Application Configuration with AppConfig and Lambda - Deploy dynamic configuration management system using AWS AppConfig integrated with Lambda'
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: simple-config-app
+    Description: Name for the AppConfig application
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+    MinLength: 3
+    MaxLength: 64
+
+  EnvironmentName:
+    Type: String
+    Default: development
+    Description: Name for the AppConfig environment
+    AllowedValues:
+      - development
+      - staging
+      - production
+    ConstraintDescription: Must be one of development, staging, or production
+
+  LambdaFunctionName:
+    Type: String
+    Default: config-demo-function
+    Description: Name for the Lambda function
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+    MinLength: 3
+    MaxLength: 64
+
+  ConfigurationProfileName:
+    Type: String
+    Default: app-settings
+    Description: Name for the configuration profile
+    AllowedPattern: '^[a-zA-Z0-9-_\s]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, underscores, and spaces
+    MinLength: 3
+    MaxLength: 64
+
+  DeploymentStrategyName:
+    Type: String
+    Default: immediate-deployment
+    Description: Name for the deployment strategy
+    AllowedPattern: '^[a-zA-Z0-9-_\s]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, underscores, and spaces
+    MinLength: 3
+    MaxLength: 64
+
+  GrowthFactor:
+    Type: Number
+    Default: 100
+    Description: Percentage of targets to receive configuration at each interval
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  DeploymentDurationMinutes:
+    Type: Number
+    Default: 0
+    Description: Duration of deployment in minutes (0 for immediate)
+    MinValue: 0
+    MaxValue: 1440
+    ConstraintDescription: Must be between 0 and 1440 minutes (24 hours)
+
+  BakeTimeMinutes:
+    Type: Number
+    Default: 0
+    Description: Bake time in minutes after deployment completes
+    MinValue: 0
+    MaxValue: 1440
+    ConstraintDescription: Must be between 0 and 1440 minutes (24 hours)
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda function timeout in seconds
+    MinValue: 3
+    MaxValue: 900
+    ConstraintDescription: Must be between 3 and 900 seconds
+
+  ConfigurationData:
+    Type: String
+    Default: |
+      {
+        "database": {
+          "max_connections": 100,
+          "timeout_seconds": 30,
+          "retry_attempts": 3
+        },
+        "features": {
+          "enable_logging": true,
+          "enable_metrics": true,
+          "debug_mode": false
+        },
+        "api": {
+          "rate_limit": 1000,
+          "cache_ttl": 300
+        }
+      }
+    Description: Initial configuration data in JSON format
+    ConstraintDescription: Must be valid JSON format
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  IsProductionEnvironment: !Equals [!Ref EnvironmentName, 'production']
+  IsDevelopmentEnvironment: !Equals [!Ref EnvironmentName, 'development']
+  HasBakeTime: !Not [!Equals [!Ref BakeTimeMinutes, 0]]
+  HasDeploymentDuration: !Not [!Equals [!Ref DeploymentDurationMinutes, 0]]
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # ============================================================================
+  # IAM RESOURCES
+  # ============================================================================
+  
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${LambdaFunctionName}-execution-role-${AWS::StackName}'
+      Description: 'Execution role for Lambda function to access AppConfig and CloudWatch'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: AppConfigAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'appconfig:StartConfigurationSession'
+                  - 'appconfig:GetLatestConfiguration'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'appconfig:Application': !Ref AppConfigApplication
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}*'
+      Tags:
+        - Key: Project
+          Value: SimpleAppConfig
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # APPCONFIG RESOURCES
+  # ============================================================================
+  
+  # AppConfig Application
+  AppConfigApplication:
+    Type: 'AWS::AppConfig::Application'
+    Properties:
+      Name: !Sub '${ApplicationName}-${AWS::StackName}'
+      Description: !Sub 'Simple configuration management application for ${EnvironmentName} environment'
+      Tags:
+        - Key: Project
+          Value: SimpleAppConfig
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # AppConfig Environment
+  AppConfigEnvironment:
+    Type: 'AWS::AppConfig::Environment'
+    Properties:
+      Name: !Ref EnvironmentName
+      Description: !Sub '${EnvironmentName} environment for configuration management'
+      ApplicationId: !Ref AppConfigApplication
+      Monitors: !If
+        - IsProductionEnvironment
+        - - AlarmArn: !Ref ConfigurationAlarm
+            AlarmRoleArn: !GetAtt AppConfigMonitorRole.Arn
+        - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Project
+          Value: SimpleAppConfig
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Configuration Profile
+  AppConfigConfigurationProfile:
+    Type: 'AWS::AppConfig::ConfigurationProfile'
+    Properties:
+      ApplicationId: !Ref AppConfigApplication
+      Name: !Ref ConfigurationProfileName
+      Description: 'Application settings configuration profile for hosted configuration'
+      LocationUri: 'hosted'
+      Type: 'AWS.Freeform'
+      Tags:
+        - Key: Project
+          Value: SimpleAppConfig
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Hosted Configuration Version
+  AppConfigHostedConfigurationVersion:
+    Type: 'AWS::AppConfig::HostedConfigurationVersion'
+    Properties:
+      ApplicationId: !Ref AppConfigApplication
+      ConfigurationProfileId: !Ref AppConfigConfigurationProfile
+      ContentType: 'application/json'
+      Description: 'Initial configuration version with default application settings'
+      Content: !Ref ConfigurationData
+
+  # Deployment Strategy
+  AppConfigDeploymentStrategy:
+    Type: 'AWS::AppConfig::DeploymentStrategy'
+    Properties:
+      Name: !Sub '${DeploymentStrategyName}-${AWS::StackName}'
+      Description: !Sub 'Deployment strategy for ${EnvironmentName} environment'
+      DeploymentDurationInMinutes: !Ref DeploymentDurationMinutes
+      FinalBakeTimeInMinutes: !Ref BakeTimeMinutes
+      GrowthFactor: !Ref GrowthFactor
+      GrowthType: LINEAR
+      ReplicateTo: NONE
+      Tags:
+        - Key: Project
+          Value: SimpleAppConfig
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Initial Deployment
+  AppConfigDeployment:
+    Type: 'AWS::AppConfig::Deployment'
+    DependsOn:
+      - AppConfigHostedConfigurationVersion
+      - AppConfigDeploymentStrategy
+    Properties:
+      ApplicationId: !Ref AppConfigApplication
+      EnvironmentId: !Ref AppConfigEnvironment
+      ConfigurationProfileId: !Ref AppConfigConfigurationProfile
+      ConfigurationVersion: !Ref AppConfigHostedConfigurationVersion
+      DeploymentStrategyId: !Ref AppConfigDeploymentStrategy
+      Description: 'Initial deployment of application configuration'
+      Tags:
+        - Key: Project
+          Value: SimpleAppConfig
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # LAMBDA RESOURCES
+  # ============================================================================
+  
+  # Lambda Function
+  ConfigDemoLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: AppConfigDeployment
+    Properties:
+      FunctionName: !Sub '${LambdaFunctionName}-${AWS::StackName}'
+      Description: 'Demonstrates retrieval and usage of configuration from AWS AppConfig'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 128
+      Environment:
+        Variables:
+          APPCONFIG_APPLICATION_ID: !Ref AppConfigApplication
+          APPCONFIG_ENVIRONMENT_ID: !Ref AppConfigEnvironment
+          APPCONFIG_CONFIGURATION_PROFILE_ID: !Ref AppConfigConfigurationProfile
+          LOG_LEVEL: !If [IsDevelopmentEnvironment, 'DEBUG', 'INFO']
+      Layers:
+        - !Sub 'arn:aws:lambda:${AWS::Region}:027255383542:layer:AWS-AppConfig-Extension:207'
+      Code:
+        ZipFile: |
+          import json
+          import urllib3
+          import os
+          import logging
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              """
+              Lambda function handler that demonstrates AppConfig integration.
+              Retrieves configuration from AppConfig and uses it in application logic.
+              """
+              # AppConfig extension endpoint (local to Lambda execution environment)
+              appconfig_endpoint = 'http://localhost:2772'
+              
+              # AppConfig parameters from environment variables
+              application_id = os.environ.get('APPCONFIG_APPLICATION_ID')
+              environment_id = os.environ.get('APPCONFIG_ENVIRONMENT_ID')
+              configuration_profile_id = os.environ.get('APPCONFIG_CONFIGURATION_PROFILE_ID')
+              
+              logger.info(f"Starting configuration retrieval for app: {application_id}")
+              
+              try:
+                  # Create HTTP connection to AppConfig extension
+                  http = urllib3.PoolManager()
+                  
+                  # Retrieve configuration from AppConfig
+                  config_url = f"{appconfig_endpoint}/applications/{application_id}/environments/{environment_id}/configurations/{configuration_profile_id}"
+                  
+                  logger.debug(f"Requesting configuration from: {config_url}")
+                  response = http.request('GET', config_url)
+                  
+                  if response.status == 200:
+                      config_data = json.loads(response.data.decode('utf-8'))
+                      logger.info("Configuration retrieved successfully")
+                      
+                      # Extract configuration values with defaults
+                      database_config = config_data.get('database', {})
+                      features_config = config_data.get('features', {})
+                      api_config = config_data.get('api', {})
+                      
+                      max_connections = database_config.get('max_connections', 50)
+                      timeout_seconds = database_config.get('timeout_seconds', 30)
+                      retry_attempts = database_config.get('retry_attempts', 3)
+                      
+                      enable_logging = features_config.get('enable_logging', False)
+                      enable_metrics = features_config.get('enable_metrics', False)
+                      debug_mode = features_config.get('debug_mode', False)
+                      
+                      rate_limit = api_config.get('rate_limit', 500)
+                      cache_ttl = api_config.get('cache_ttl', 300)
+                      
+                      # Use configuration in application logic
+                      if enable_logging:
+                          logger.info(f"Configuration loaded - Max connections: {max_connections}, Rate limit: {rate_limit}")
+                      
+                      if debug_mode:
+                          logger.debug(f"Debug mode enabled. Full config: {config_data}")
+                      
+                      # Simulate application behavior based on configuration
+                      response_message = "Configuration loaded and applied successfully"
+                      if debug_mode:
+                          response_message += " (Debug mode active)"
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'X-Rate-Limit': str(rate_limit)
+                          },
+                          'body': json.dumps({
+                              'message': response_message,
+                              'timestamp': context.aws_request_id,
+                              'config_summary': {
+                                  'database': {
+                                      'max_connections': max_connections,
+                                      'timeout_seconds': timeout_seconds,
+                                      'retry_attempts': retry_attempts
+                                  },
+                                  'features': {
+                                      'logging_enabled': enable_logging,
+                                      'metrics_enabled': enable_metrics,
+                                      'debug_mode': debug_mode
+                                  },
+                                  'api': {
+                                      'rate_limit': rate_limit,
+                                      'cache_ttl': cache_ttl
+                                  }
+                              }
+                          }, indent=2)
+                      }
+                  else:
+                      logger.error(f"Failed to retrieve configuration: HTTP {response.status}")
+                      return {
+                          'statusCode': 502,
+                          'headers': {
+                              'Content-Type': 'application/json'
+                          },
+                          'body': json.dumps({
+                              'error': 'Configuration retrieval failed',
+                              'status_code': response.status,
+                              'timestamp': context.aws_request_id
+                          })
+                      }
+                      
+              except json.JSONDecodeError as e:
+                  logger.error(f"Invalid JSON in configuration: {str(e)}")
+                  return {
+                      'statusCode': 502,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'error': 'Invalid configuration format',
+                          'details': str(e),
+                          'timestamp': context.aws_request_id
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'timestamp': context.aws_request_id
+                      })
+                  }
+      Tags:
+        - Key: Project
+          Value: SimpleAppConfig
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda Log Group
+  LambdaLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionName}-${AWS::StackName}'
+      RetentionInDays: !If [IsProductionEnvironment, 30, 7]
+      Tags:
+        - Key: Project
+          Value: SimpleAppConfig
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # MONITORING RESOURCES (Production only)
+  # ============================================================================
+  
+  # AppConfig Monitor Role (for production environment)
+  AppConfigMonitorRole:
+    Type: 'AWS::IAM::Role'
+    Condition: IsProductionEnvironment
+    Properties:
+      RoleName: !Sub 'AppConfigMonitor-${AWS::StackName}'
+      Description: 'Role for AppConfig to stop deployments based on CloudWatch alarms'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appconfig.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CloudWatchAlarmAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:DescribeAlarms'
+                Resource: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*'
+      Tags:
+        - Key: Project
+          Value: SimpleAppConfig
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Alarm for Configuration Monitoring (Production only)
+  ConfigurationAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: IsProductionEnvironment
+    Properties:
+      AlarmName: !Sub 'AppConfig-${ApplicationName}-ErrorRate-${AWS::StackName}'
+      AlarmDescription: 'Monitor Lambda function error rate for configuration-related issues'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ConfigDemoLambdaFunction
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: SimpleAppConfig
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic for Alarm Notifications (Production only)
+  SNSAlarmTopic:
+    Type: 'AWS::SNS::Topic'
+    Condition: IsProductionEnvironment
+    Properties:
+      TopicName: !Sub 'AppConfig-Alarms-${AWS::StackName}'
+      DisplayName: 'AppConfig Configuration Alarms'
+      Tags:
+        - Key: Project
+          Value: SimpleAppConfig
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  AppConfigApplicationId:
+    Description: 'AppConfig Application ID'
+    Value: !Ref AppConfigApplication
+    Export:
+      Name: !Sub '${AWS::StackName}-AppConfigApplicationId'
+
+  AppConfigApplicationName:
+    Description: 'AppConfig Application Name'
+    Value: !Sub '${ApplicationName}-${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-AppConfigApplicationName'
+
+  AppConfigEnvironmentId:
+    Description: 'AppConfig Environment ID'
+    Value: !Ref AppConfigEnvironment
+    Export:
+      Name: !Sub '${AWS::StackName}-AppConfigEnvironmentId'
+
+  AppConfigConfigurationProfileId:
+    Description: 'AppConfig Configuration Profile ID'
+    Value: !Ref AppConfigConfigurationProfile
+    Export:
+      Name: !Sub '${AWS::StackName}-AppConfigConfigurationProfileId'
+
+  AppConfigDeploymentStrategyId:
+    Description: 'AppConfig Deployment Strategy ID'
+    Value: !Ref AppConfigDeploymentStrategy
+    Export:
+      Name: !Sub '${AWS::StackName}-AppConfigDeploymentStrategyId'
+
+  LambdaFunctionName:
+    Description: 'Lambda Function Name'
+    Value: !Ref ConfigDemoLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'Lambda Function ARN'
+    Value: !GetAtt ConfigDemoLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'Lambda Execution Role ARN'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  AppConfigConsoleUrl:
+    Description: 'URL to view AppConfig Application in AWS Console'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/systems-manager/appconfig/applications/${AppConfigApplication}'
+
+  LambdaConsoleUrl:
+    Description: 'URL to view Lambda Function in AWS Console'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${ConfigDemoLambdaFunction}'
+
+  TestLambdaCommand:
+    Description: 'AWS CLI command to test the Lambda function'
+    Value: !Sub 'aws lambda invoke --function-name ${ConfigDemoLambdaFunction} --payload "{}" response.json && cat response.json'
+
+  AppConfigRetrievalUrl:
+    Description: 'AppConfig retrieval URL (for reference)'
+    Value: !Sub 'http://localhost:2772/applications/${AppConfigApplication}/environments/${AppConfigEnvironment}/configurations/${AppConfigConfigurationProfile}'
+
+  ConfigurationUpdateCommand:
+    Description: 'Example command to update configuration'
+    Value: !Sub |
+      aws appconfig create-hosted-configuration-version \
+        --application-id ${AppConfigApplication} \
+        --configuration-profile-id ${AppConfigConfigurationProfile} \
+        --content-type "application/json" \
+        --content '{"database":{"max_connections":200},"features":{"enable_logging":true},"api":{"rate_limit":2000}}'
+
+  DeploymentCommand:
+    Description: 'Example command to deploy updated configuration'
+    Value: !Sub |
+      aws appconfig start-deployment \
+        --application-id ${AppConfigApplication} \
+        --environment-id ${AppConfigEnvironment} \
+        --deployment-strategy-id ${AppConfigDeploymentStrategy} \
+        --configuration-profile-id ${AppConfigConfigurationProfile} \
+        --configuration-version <version-number>
+
+  MonitoringDashboardUrl:
+    Description: 'CloudWatch Dashboard URL for monitoring (Production only)'
+    Condition: IsProductionEnvironment
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}'
+
+  AlarmTopicArn:
+    Description: 'SNS Topic ARN for configuration alarms (Production only)'
+    Condition: IsProductionEnvironment
+    Value: !Ref SNSAlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmTopicArn'

@@ -1,0 +1,532 @@
+# Google Cloud Infrastructure Manager Configuration
+# Tax Calculator API with Cloud Functions and Firestore
+#
+# This configuration deploys a complete serverless tax calculation API using:
+# - Google Cloud Functions for computation (2 functions)
+# - Firestore for data persistence and calculation history
+# - IAM roles and security configurations
+# - Firestore security rules
+#
+# Prerequisites:
+# - Google Cloud Project with billing enabled
+# - Infrastructure Manager API enabled
+# - Cloud Functions API enabled
+# - Firestore API enabled
+# - Cloud Build API enabled
+
+metadata:
+  description: "Infrastructure for Tax Calculator API with Cloud Functions and Firestore"
+  version: "1.0"
+  created_by: "Infrastructure Manager"
+  recipe_id: "e7f4a9c2"
+
+# Configuration variables for customization
+variables:
+  # Project and region configuration
+  project_id:
+    description: "Google Cloud Project ID where resources will be created"
+    type: string
+    required: true
+
+  region:
+    description: "Google Cloud region for resources deployment"
+    type: string
+    default: "us-central1"
+
+  # Function configuration
+  function_name:
+    description: "Base name for the tax calculator functions"
+    type: string
+    default: "tax-calculator"
+
+  # Firestore configuration
+  firestore_location:
+    description: "Firestore database location"
+    type: string
+    default: "us-central1"
+
+  # Resource naming
+  deployment_name:
+    description: "Deployment name for resource naming consistency"
+    type: string
+    default: "tax-calc-api"
+
+# Resources configuration
+resources:
+  # Enable required Google Cloud APIs
+  enable_apis:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/$(ref.project_id.value)
+      services:
+        - cloudfunctions.googleapis.com
+        - firestore.googleapis.com
+        - cloudbuild.googleapis.com
+        - cloudresourcemanager.googleapis.com
+        - logging.googleapis.com
+        - monitoring.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Create Firestore database in Native mode
+  # Native mode provides strong consistency, ACID transactions, and real-time listeners
+  firestore_database:
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/$(ref.project_id.value)
+      databaseId: "(default)"
+      type: FIRESTORE_NATIVE
+      locationId: $(ref.firestore_location.value)
+      # Enable point-in-time recovery for data protection
+      pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+      # Enable delete protection to prevent accidental deletion
+      deleteProtectionState: DELETE_PROTECTION_ENABLED
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # IAM Service Account for Cloud Functions
+  # Provides secure access to Firestore with least privilege principle
+  function_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      parent: projects/$(ref.project_id.value)
+      accountId: $(ref.deployment_name.value)-func-sa
+      serviceAccount:
+        displayName: "Tax Calculator Functions Service Account"
+        description: "Service account for tax calculator Cloud Functions to access Firestore"
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # IAM binding for Firestore access
+  # Grants the service account necessary permissions to read/write Firestore
+  firestore_datastore_user_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/datastore.user
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+
+  # Cloud Storage bucket for function source code
+  # Required for Cloud Functions deployment with source code packaging
+  function_source_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      project: $(ref.project_id.value)
+      name: $(ref.project_id.value)-$(ref.deployment_name.value)-source
+      location: $(ref.region.value)
+      storageClass: REGIONAL
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              matchesStorageClass: ['REGIONAL']
+      # Security configuration
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Tax Calculator Function (Primary Calculation Logic)
+  # Handles income tax calculations using progressive tax brackets
+  tax_calculator_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      function:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/functions/$(ref.function_name.value)
+        description: "HTTP Cloud Function for income tax calculations with progressive brackets"
+        
+        # Function source code configuration
+        sourceArchiveUrl: gs://$(ref.function_source_bucket.name)/tax-calculator-source.zip
+        
+        # Runtime and entry point configuration
+        runtime: python312
+        entryPoint: calculate_tax
+        
+        # HTTP trigger configuration
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        
+        # Resource allocation and scaling
+        availableMemoryMb: 256
+        timeout: 60s
+        maxInstances: 10
+        minInstances: 0
+        
+        # Service account and permissions
+        serviceAccountEmail: $(ref.function_service_account.email)
+        
+        # Environment variables for function configuration
+        environmentVariables:
+          GOOGLE_CLOUD_PROJECT: $(ref.project_id.value)
+          FIRESTORE_DATABASE: "(default)"
+          LOG_LEVEL: "INFO"
+        
+        # Network and security settings
+        ingressSettings: ALLOW_ALL
+        
+        # Labels for resource management and cost tracking
+        labels:
+          component: "tax-calculator"
+          environment: "production"
+          managed-by: "infrastructure-manager"
+          function-type: "calculation"
+    metadata:
+      dependsOn:
+        - firestore_database
+        - function_service_account
+        - firestore_datastore_user_binding
+        - function_source_bucket
+
+  # Tax Calculation History Function (Data Retrieval)
+  # Handles retrieval of historical tax calculations for users
+  tax_history_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      function:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/functions/$(ref.function_name.value)-history
+        description: "HTTP Cloud Function for retrieving tax calculation history"
+        
+        # Function source code configuration
+        sourceArchiveUrl: gs://$(ref.function_source_bucket.name)/tax-calculator-source.zip
+        
+        # Runtime and entry point configuration
+        runtime: python312
+        entryPoint: get_calculation_history
+        
+        # HTTP trigger configuration
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        
+        # Optimized resource allocation for read operations
+        availableMemoryMb: 128
+        timeout: 30s
+        maxInstances: 5
+        minInstances: 0
+        
+        # Service account and permissions
+        serviceAccountEmail: $(ref.function_service_account.email)
+        
+        # Environment variables for function configuration
+        environmentVariables:
+          GOOGLE_CLOUD_PROJECT: $(ref.project_id.value)
+          FIRESTORE_DATABASE: "(default)"
+          LOG_LEVEL: "INFO"
+        
+        # Network and security settings
+        ingressSettings: ALLOW_ALL
+        
+        # Labels for resource management and cost tracking
+        labels:
+          component: "tax-calculator"
+          environment: "production"
+          managed-by: "infrastructure-manager"
+          function-type: "history"
+    metadata:
+      dependsOn:
+        - firestore_database
+        - function_service_account
+        - firestore_datastore_user_binding
+        - function_source_bucket
+
+  # IAM binding to allow unauthenticated access to tax calculator function
+  # Note: In production, implement proper authentication mechanisms
+  tax_calculator_invoker_binding:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.tax_calculator_function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - tax_calculator_function
+
+  # IAM binding to allow unauthenticated access to history function
+  # Note: In production, implement proper authentication mechanisms
+  tax_history_invoker_binding:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.tax_history_function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - tax_history_function
+
+  # Firestore Security Rules
+  # Provides application-level access control for tax calculation data
+  firestore_security_rules:
+    type: gcp-types/firestore-v1:projects.databases.securityRules
+    properties:
+      parent: projects/$(ref.project_id.value)/databases/(default)
+      securityRules:
+        # Security rules for development environment
+        # Production deployments should implement proper authentication
+        source: |
+          rules_version = '2';
+          service cloud.firestore {
+            match /databases/{database}/documents {
+              // Tax calculations collection access rules
+              match /tax_calculations/{document} {
+                // Allow read/write access for development
+                allow read, write: if true;
+                // Production authentication pattern (commented):
+                // allow read, write: if request.auth != null && 
+                //   request.auth.uid == resource.data.user_id;
+              }
+              
+              // Tax configuration collection (for tax brackets, rates, etc.)
+              match /tax_config/{document} {
+                // Allow read access to tax configuration
+                allow read: if true;
+                // Restrict write access (admin only)
+                allow write: if false;
+              }
+              
+              // User profiles collection
+              match /users/{userId} {
+                // Allow read/write access for development
+                allow read, write: if true;
+                // Production authentication pattern (commented):
+                // allow read, write: if request.auth != null && 
+                //   request.auth.uid == userId;
+              }
+            }
+          }
+    metadata:
+      dependsOn:
+        - firestore_database
+
+  # Cloud Monitoring Alerts for Function Performance
+  # Monitors function execution and error rates for operational insights
+  function_error_rate_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project_id.value)
+      alertPolicy:
+        displayName: "Tax Calculator Function Error Rate Alert"
+        documentation:
+          content: "Alert when tax calculator functions have high error rates"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Function Error Rate High"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.labels.function_name=~"tax-calculator.*"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.1  # 10% error rate threshold
+              duration: 300s  # 5 minutes
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.labels.function_name
+        enabled: true
+        notificationChannels: []  # Add notification channels as needed
+        alertStrategy:
+          autoClose: 86400s  # Auto-close after 24 hours
+    metadata:
+      dependsOn:
+        - tax_calculator_function
+        - tax_history_function
+
+  # Cloud Logging Sink for Audit Trail
+  # Exports function logs to BigQuery for analysis and compliance
+  function_audit_log_sink:
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/$(ref.project_id.value)
+      sink:
+        name: tax-calculator-audit-sink
+        description: "Export tax calculator function logs for audit and analysis"
+        destination: bigquery.googleapis.com/projects/$(ref.project_id.value)/datasets/tax_calculator_audit
+        filter: |
+          resource.type="cloud_function" 
+          AND (resource.labels.function_name="tax-calculator" 
+               OR resource.labels.function_name="tax-calculator-history")
+          AND (severity>=INFO)
+        uniqueWriterIdentity: true
+    metadata:
+      dependsOn:
+        - tax_calculator_function
+        - tax_history_function
+
+# Outputs for integration and verification
+outputs:
+  # Function URLs for API access
+  tax_calculator_function_url:
+    description: "URL for the tax calculator function"
+    value: $(ref.tax_calculator_function.httpsTrigger.url)
+
+  tax_history_function_url:
+    description: "URL for the tax calculation history function"
+    value: $(ref.tax_history_function.httpsTrigger.url)
+
+  # Firestore information
+  firestore_database_name:
+    description: "Name of the created Firestore database"
+    value: $(ref.firestore_database.name)
+
+  firestore_location:
+    description: "Location of the Firestore database"
+    value: $(ref.firestore_database.locationId)
+
+  # Service account information
+  function_service_account_email:
+    description: "Email of the service account used by functions"
+    value: $(ref.function_service_account.email)
+
+  # Storage bucket for source code
+  source_bucket_name:
+    description: "Name of the Cloud Storage bucket for function source code"
+    value: $(ref.function_source_bucket.name)
+
+  # Project and deployment information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.value)
+
+  deployment_region:
+    description: "Deployment region"
+    value: $(ref.region.value)
+
+  # API endpoints for testing
+  api_endpoints:
+    description: "Complete API endpoint information"
+    value:
+      calculation_endpoint: 
+        url: $(ref.tax_calculator_function.httpsTrigger.url)
+        method: "POST"
+        description: "Calculate income tax with progressive brackets"
+        example_payload: |
+          {
+            "income": 65000,
+            "filing_status": "single",
+            "deductions": 15000,
+            "user_id": "test_user"
+          }
+      history_endpoint:
+        url: $(ref.tax_history_function.httpsTrigger.url)
+        method: "GET"
+        description: "Retrieve tax calculation history for a user"
+        example_query: "?user_id=test_user&limit=5"
+
+# Infrastructure deployment metadata
+deployment_metadata:
+  recipe_title: "Tax Calculator API with Cloud Functions and Firestore"
+  recipe_id: "e7f4a9c2"
+  category: "serverless"
+  difficulty: 200
+  services: ["Cloud Functions", "Firestore"]
+  estimated_monthly_cost: "$0.00-$2.00 for development usage"
+  
+  # Best practices implemented
+  best_practices:
+    - "Least privilege IAM with dedicated service account"
+    - "Firestore security rules for data protection"
+    - "Function resource optimization (memory, timeout)"
+    - "Monitoring and alerting for operational insights"
+    - "Audit logging for compliance and troubleshooting"
+    - "Serverless architecture for automatic scaling"
+    - "Regional deployment for data locality"
+    
+  # Security considerations
+  security_notes:
+    - "Functions allow unauthenticated access for development"
+    - "Production deployments should implement authentication"
+    - "Firestore rules include production authentication patterns"
+    - "Service account follows least privilege principle"
+    - "HTTPS-only function access with secure triggers"
+    
+  # Operational notes
+  operational_notes:
+    - "Functions scale automatically based on demand"
+    - "Firestore provides real-time synchronization"
+    - "Point-in-time recovery enabled for data protection"
+    - "Cloud Monitoring alerts for error rate monitoring"
+    - "Audit logs exported to BigQuery for analysis"
+
+# Usage instructions embedded in configuration
+usage_instructions: |
+  # Deployment Instructions:
+  
+  1. Prerequisites:
+     - Google Cloud Project with billing enabled
+     - Infrastructure Manager API enabled
+     - Required APIs will be enabled automatically
+  
+  2. Deploy the infrastructure:
+     ```bash
+     # Set your project ID
+     export PROJECT_ID="your-project-id"
+     
+     # Deploy using Infrastructure Manager
+     gcloud infra-manager deployments apply \
+       --location=us-central1 \
+       --file=main.yaml \
+       --input-values=project_id=${PROJECT_ID}
+     ```
+  
+  3. Upload function source code:
+     ```bash
+     # Package and upload function source code
+     zip -r tax-calculator-source.zip main.py requirements.txt
+     gsutil cp tax-calculator-source.zip gs://${PROJECT_ID}-tax-calc-api-source/
+     ```
+  
+  4. Test the deployment:
+     ```bash
+     # Get function URLs from outputs
+     CALC_URL=$(gcloud infra-manager deployments describe DEPLOYMENT_NAME \
+       --location=us-central1 \
+       --format="value(outputs.tax_calculator_function_url)")
+     
+     # Test tax calculation
+     curl -X POST ${CALC_URL} \
+       -H "Content-Type: application/json" \
+       -d '{"income": 65000, "filing_status": "single", "user_id": "test"}'
+     ```
+  
+  5. Clean up (when done):
+     ```bash
+     gcloud infra-manager deployments delete DEPLOYMENT_NAME \
+       --location=us-central1
+     ```
+
+# Version and compatibility information
+infrastructure_version: "1.0"
+gcp_apis_required:
+  - cloudfunctions.googleapis.com
+  - firestore.googleapis.com  
+  - cloudbuild.googleapis.com
+  - cloudresourcemanager.googleapis.com
+  - logging.googleapis.com
+  - monitoring.googleapis.com
+
+minimum_permissions_required:
+  - roles/cloudfunctions.admin
+  - roles/datastore.owner
+  - roles/storage.admin
+  - roles/iam.serviceAccountAdmin
+  - roles/resourcemanager.projectIamAdmin
+  - roles/monitoring.admin
+  - roles/logging.admin

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Cosmos DB for MongoDB, Azure Event Hubs, Azure Functions, Azure AI Document Intelligence
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: real-time, document-processing, event-driven, serverless, ai-extraction, nosql
 recipe-generator-version: 1.3
@@ -164,7 +164,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --kind MongoDB \
-       --server-version 4.2 \
+       --server-version 5.0 \
        --default-consistency-level Session \
        --enable-automatic-failover true
    
@@ -186,7 +186,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Cosmos DB MongoDB API configured with automatic failover"
    ```
 
-   The Cosmos DB account is configured with Session consistency for optimal balance between performance and data consistency. The collection uses document ID as the shard key, ensuring even distribution of documents across partitions for scalable storage and query performance.
+   The Cosmos DB account is configured with MongoDB server version 5.0 for the latest features and Session consistency for optimal balance between performance and data consistency. The collection uses document ID as the shard key, ensuring even distribution of documents across partitions for scalable storage and query performance.
 
 3. **Create Azure AI Document Intelligence Service**:
 
@@ -217,7 +217,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ AI Document Intelligence service deployed and configured"
    ```
 
-   The S0 pricing tier provides sufficient capacity for moderate document processing workloads with the ability to process multiple document types simultaneously. The service integrates seamlessly with Azure Functions through REST API calls.
+   The S0 pricing tier provides sufficient capacity for moderate document processing workloads with the ability to process multiple document types simultaneously. The service integrates seamlessly with Azure Functions through REST API calls using the latest Document Intelligence API version.
 
 4. **Deploy Azure Functions App with Event Hub Trigger**:
 
@@ -231,7 +231,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --storage-account ${STORAGE_ACCOUNT} \
        --consumption-plan-location ${LOCATION} \
        --runtime node \
-       --runtime-version 18 \
+       --runtime-version 20 \
        --functions-version 4
    
    # Get Event Hub connection string
@@ -261,7 +261,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Function App configured with Event Hub and Cosmos DB integration"
    ```
 
-   The Function App is configured with Node.js 18 runtime for optimal performance and modern JavaScript features. Application settings provide secure access to all integrated services without hardcoding credentials in the function code.
+   The Function App is configured with Node.js 20 runtime for optimal performance and modern JavaScript features. Application settings provide secure access to all integrated services without hardcoding credentials in the function code.
 
 5. **Create Document Processing Function**:
 
@@ -310,10 +310,10 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
                try {
                    context.log('Processing document:', message.documentId);
                    
-                   // Call AI Document Intelligence
+                   // Call AI Document Intelligence v4.0 API
                    const response = await axios.post(
-                       `${aiEndpoint}/formrecognizer/v2.1/layout/analyze`,
-                       { source: message.documentUrl },
+                       `${aiEndpoint}/documentintelligence/documentModels/prebuilt-layout:analyze?api-version=2024-11-30`,
+                       { urlSource: message.documentUrl },
                        {
                            headers: {
                                'Ocp-Apim-Subscription-Key': aiKey,
@@ -342,7 +342,9 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
                        const processedDoc = {
                            documentId: message.documentId,
                            originalUrl: message.documentUrl,
-                           extractedText: result.analyzeResult.readResults.map(r => r.lines.map(l => l.text).join(' ')).join('\n'),
+                           extractedText: result.analyzeResult.pages.map(p => 
+                               p.lines.map(l => l.content).join(' ')
+                           ).join('\n'),
                            processingDate: new Date(),
                            metadata: message.metadata || {},
                            aiAnalysis: result.analyzeResult
@@ -386,7 +388,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Document processing function deployed with AI integration"
    ```
 
-   The function implements asynchronous processing with proper error handling and connection management. It polls the AI Document Intelligence service for completion and stores comprehensive document analysis results in Cosmos DB with both extracted text and detailed AI analysis metadata.
+   The function implements asynchronous processing with proper error handling and connection management. It uses the latest Azure AI Document Intelligence v4.0 API (2024-11-30) with the new endpoint format and polls the service for completion. The function stores comprehensive document analysis results in Cosmos DB with both extracted text and detailed AI analysis metadata.
 
 6. **Create Change Feed Function for Downstream Processing**:
 
@@ -540,7 +542,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --query "[?name=='EventHubConnection'].name"
    ```
 
-   Expected output: State should be "Running" with Node.js 18 runtime.
+   Expected output: State should be "Running" with Node.js 20 runtime.
 
 4. **Send Test Document Event**:
 
@@ -561,7 +563,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    }
    EOF
    
-   # Send test message (requires Node.js script)
+   # Send test message
    node -e "
    const { EventHubProducerClient } = require('@azure/event-hubs');
    const client = new EventHubProducerClient('${EVENT_HUB_CONNECTION}', '${EVENT_HUB_NAME}');
@@ -606,6 +608,8 @@ The event-driven pattern enables natural decoupling between document ingestion, 
 
 From a cost perspective, the consumption-based pricing model for Azure Functions ensures you only pay for actual document processing time, making this solution highly cost-effective for variable workloads. The serverless approach eliminates infrastructure management overhead while providing enterprise-grade security, compliance, and monitoring capabilities. For detailed cost optimization strategies, review the [Azure Functions performance guide](https://docs.microsoft.com/en-us/azure/azure-functions/functions-scale) and [Cosmos DB cost optimization documentation](https://docs.microsoft.com/en-us/azure/cosmos-db/optimize-cost-throughput).
 
+The updated implementation uses Azure AI Document Intelligence v4.0 API (2024-11-30) with the new documentintelligence endpoint format and improved analysis capabilities. This latest version provides enhanced accuracy, support for more document types, and better performance for production workloads.
+
 > **Tip**: Use Azure Monitor and Application Insights to track processing metrics and optimize performance. The [monitoring documentation](https://docs.microsoft.com/en-us/azure/azure-functions/functions-monitoring) provides comprehensive guidance on setting up alerts, tracking custom metrics, and identifying optimization opportunities for production workloads.
 
 ## Challenge
@@ -624,4 +628,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

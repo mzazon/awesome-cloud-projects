@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Source Repositories, Artifact Registry, Cloud Build, Cloud Code
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ci-cd, code-quality, automation, static-analysis, artifact-management, source-control, build-pipeline
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Development teams struggle with maintaining consistent code quality across distr
 
 ## Solution
 
-Implement an intelligent automated code quality system using Cloud Source Repositories for secure version control, Cloud Build for AI-enhanced quality gates, and Artifact Registry for centralized artifact management. This solution creates an end-to-end pipeline that automatically scans code for quality issues, security vulnerabilities, and compliance violations while securely packaging and versioning artifacts for reliable deployment workflows.
+Implement an automated code quality system using Cloud Source Repositories for secure version control, Cloud Build for comprehensive quality gates, and Artifact Registry for centralized artifact management. This solution creates an end-to-end pipeline that automatically scans code for quality issues, security vulnerabilities, and compliance violations while securely packaging and versioning artifacts for reliable deployment workflows.
 
 ## Architecture Diagram
 
@@ -79,12 +79,12 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and Owner or Editor permissions
-2. Google Cloud CLI (gcloud) installed and configured (version 400.0.0 or later)
+2. Google Cloud CLI (gcloud) installed and configured (version 531.0.0 or later)
 3. Basic knowledge of Git version control and CI/CD concepts
 4. Understanding of containerization and application packaging
 5. Estimated cost: $15-25 for running all services during the 120-minute tutorial
 
-> **Note**: This recipe follows Google Cloud best practices and integrates with Google's AI-powered development tools for enhanced productivity.
+> **Note**: This recipe follows Google Cloud best practices and integrates with Google's development tools for enhanced productivity.
 
 ## Preparation
 
@@ -106,7 +106,7 @@ gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
 
-# Enable required APIs for the intelligent quality pipeline
+# Enable required APIs for the quality pipeline
 gcloud services enable sourcerepo.googleapis.com
 gcloud services enable artifactregistry.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
@@ -115,14 +115,14 @@ gcloud services enable containerscanning.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Region set to: ${REGION}"
-echo "✅ APIs enabled for intelligent code quality automation"
+echo "✅ APIs enabled for code quality automation"
 ```
 
 ## Steps
 
 1. **Create Cloud Source Repository for Version Control**:
 
-   Cloud Source Repositories provides secure, scalable Git hosting that integrates seamlessly with Google Cloud's developer tools. Creating a repository establishes the foundation for intelligent code quality automation with built-in integration to Cloud Build triggers and automated scanning capabilities.
+   Cloud Source Repositories provides secure, scalable Git hosting that integrates seamlessly with Google Cloud's developer tools. Creating a repository establishes the foundation for automated code quality validation with built-in integration to Cloud Build triggers and automated scanning capabilities.
 
    ```bash
    # Create the source repository
@@ -138,7 +138,7 @@ echo "✅ APIs enabled for intelligent code quality automation"
    echo "✅ Cloud Source Repository created and cloned: ${REPO_NAME}"
    ```
 
-   The repository is now ready for intelligent code quality automation with Google Cloud's integrated development workflow, providing secure version control that automatically triggers quality gates upon code commits.
+   The repository is now ready for automated code quality validation with Google Cloud's integrated development workflow, providing secure version control that automatically triggers quality gates upon code commits.
 
 2. **Configure Artifact Registry for Secure Package Management**:
 
@@ -167,7 +167,7 @@ echo "✅ APIs enabled for intelligent code quality automation"
 
 3. **Create Sample Application with Quality Standards**:
 
-   This step creates a sample Python application with comprehensive quality configurations including linting rules, security scanning configurations, and automated testing frameworks that demonstrate intelligent code quality automation capabilities.
+   This step creates a sample Python application with comprehensive quality configurations including linting rules, security scanning configurations, and automated testing frameworks that demonstrate automated code quality validation capabilities.
 
    ```bash
    # Create application structure
@@ -225,20 +225,20 @@ echo "✅ APIs enabled for intelligent code quality automation"
 
 4. **Configure Comprehensive Quality Validation Rules**:
 
-   This configuration establishes comprehensive code quality standards including static analysis, security scanning, dependency vulnerability checks, and code formatting rules that create intelligent quality gates for the development workflow.
+   This configuration establishes comprehensive code quality standards including static analysis, security scanning, dependency vulnerability checks, and code formatting rules that create quality gates for the development workflow.
 
    ```bash
-   # Create requirements file with security considerations
+   # Create requirements file with updated secure dependencies
    cat > requirements.txt << 'EOF'
-   flask==2.3.3
-   gunicorn==21.2.0
-   pytest==7.4.3
-   pytest-cov==4.1.0
-   flake8==6.1.0
-   bandit==1.7.5
-   safety==2.3.5
-   black==23.9.1
-   mypy==1.6.1
+   flask==3.1.1
+   gunicorn==23.0.0
+   pytest==8.2.2
+   pytest-cov==5.0.0
+   flake8==7.1.0
+   bandit==1.8.0
+   safety==3.2.4
+   black==24.4.2
+   mypy==1.10.1
    EOF
    
    # Create comprehensive testing configuration
@@ -305,7 +305,7 @@ echo "✅ APIs enabled for intelligent code quality automation"
    # Create secure Dockerfile with multi-stage build
    cat > Dockerfile << 'EOF'
    # Multi-stage build for security and efficiency
-   FROM python:3.11-slim as builder
+   FROM python:3.12-slim as builder
    
    # Create non-root user for security
    RUN groupadd -r appgroup && useradd -r -g appgroup appuser
@@ -313,12 +313,22 @@ echo "✅ APIs enabled for intelligent code quality automation"
    # Set working directory
    WORKDIR /app
    
+   # Install curl for health checks
+   RUN apt-get update && apt-get install -y --no-install-recommends \
+       curl && \
+       rm -rf /var/lib/apt/lists/*
+   
    # Copy requirements and install dependencies
    COPY requirements.txt .
    RUN pip install --no-cache-dir --user -r requirements.txt
    
    # Production stage
-   FROM python:3.11-slim as production
+   FROM python:3.12-slim as production
+   
+   # Install curl for health checks
+   RUN apt-get update && apt-get install -y --no-install-recommends \
+       curl && \
+       rm -rf /var/lib/apt/lists/*
    
    # Create non-root user for security
    RUN groupadd -r appgroup && useradd -r -g appgroup appuser
@@ -373,16 +383,16 @@ echo "✅ APIs enabled for intelligent code quality automation"
 
    The Docker configuration implements security best practices including minimal base images, non-root execution, and health checks that integrate with Google Cloud's container security scanning.
 
-6. **Configure Intelligent Cloud Build Pipeline**:
+6. **Configure Cloud Build Pipeline**:
 
-   This Cloud Build configuration creates an intelligent CI/CD pipeline with comprehensive quality gates including static analysis, security scanning, automated testing, and vulnerability assessment that automatically validates code quality before artifact creation.
+   This Cloud Build configuration creates a comprehensive CI/CD pipeline with quality gates including static analysis, security scanning, automated testing, and vulnerability assessment that automatically validates code quality before artifact creation.
 
    ```bash
    # Create comprehensive Cloud Build configuration
    cat > cloudbuild.yaml << 'EOF'
    steps:
    # Step 1: Install dependencies and prepare environment
-   - name: 'python:3.11-slim'
+   - name: 'python:3.12-slim'
      entrypoint: 'bash'
      args:
      - '-c'
@@ -392,68 +402,68 @@ echo "✅ APIs enabled for intelligent code quality automation"
        echo "✅ Dependencies installed successfully"
    
    # Step 2: Code formatting validation
-   - name: 'python:3.11-slim'
+   - name: 'python:3.12-slim'
      entrypoint: 'bash'
      args:
      - '-c'
      - |
        echo "🎨 Checking code formatting with Black..."
-       pip install black==23.9.1
+       pip install black==24.4.2
        black --check --diff src/ tests/
        echo "✅ Code formatting validation passed"
    
    # Step 3: Static code analysis
-   - name: 'python:3.11-slim'
+   - name: 'python:3.12-slim'
      entrypoint: 'bash'
      args:
      - '-c'
      - |
        echo "🔍 Running static code analysis with Flake8..."
-       pip install flake8==6.1.0
+       pip install flake8==7.1.0
        flake8 src/ tests/
        echo "✅ Static analysis completed successfully"
    
    # Step 4: Type checking
-   - name: 'python:3.11-slim'
+   - name: 'python:3.12-slim'
      entrypoint: 'bash'
      args:
      - '-c'
      - |
        echo "🔍 Running type checking with MyPy..."
-       pip install mypy==1.6.1
+       pip install mypy==1.10.1
        mypy src/ --ignore-missing-imports
        echo "✅ Type checking validation passed"
    
    # Step 5: Security vulnerability scanning
-   - name: 'python:3.11-slim'
+   - name: 'python:3.12-slim'
      entrypoint: 'bash'
      args:
      - '-c'
      - |
        echo "🔒 Running security analysis with Bandit..."
-       pip install bandit==1.7.5
+       pip install bandit==1.8.0
        bandit -r src/ -f json -o bandit-report.json
        echo "✅ Security analysis completed"
    
    # Step 6: Dependency vulnerability check
-   - name: 'python:3.11-slim'
+   - name: 'python:3.12-slim'
      entrypoint: 'bash'
      args:
      - '-c'
      - |
        echo "🛡️ Checking dependencies for vulnerabilities..."
-       pip install safety==2.3.5
+       pip install safety==3.2.4
        safety check --json
        echo "✅ Dependency security validation passed"
    
    # Step 7: Comprehensive test execution
-   - name: 'python:3.11-slim'
+   - name: 'python:3.12-slim'
      entrypoint: 'bash'
      args:
      - '-c'
      - |
        echo "🧪 Running comprehensive test suite..."
-       pip install pytest==7.4.3 pytest-cov==4.1.0
+       pip install pytest==8.2.2 pytest-cov==5.0.0
        python -m pytest tests/ --cov=src --cov-report=term --cov-report=html
        echo "✅ All tests passed with coverage validation"
    
@@ -474,7 +484,7 @@ echo "✅ APIs enabled for intelligent code quality automation"
      - '--all-tags'
      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REGISTRY_NAME}/quality-app'
    
-   # Configuration for intelligent pipeline
+   # Configuration for pipeline
    options:
      machineType: 'E2_HIGHCPU_8'
      logging: CLOUD_LOGGING_ONLY
@@ -493,14 +503,14 @@ echo "✅ APIs enabled for intelligent code quality automation"
        - 'htmlcov/**/*'
    EOF
    
-   echo "✅ Intelligent Cloud Build pipeline configuration created"
+   echo "✅ Cloud Build pipeline configuration created"
    ```
 
    The pipeline implements comprehensive quality gates with automated security scanning, test execution, and vulnerability assessment that ensures only high-quality, secure code proceeds to artifact creation.
 
 7. **Create Build Trigger for Automated Quality Enforcement**:
 
-   This build trigger configuration establishes automated quality enforcement that triggers intelligent pipeline execution on code commits, ensuring consistent quality validation across all development workflows with configurable quality gates and automated security scanning.
+   This build trigger configuration establishes automated quality enforcement that triggers pipeline execution on code commits, ensuring consistent quality validation across all development workflows with configurable quality gates and automated security scanning.
 
    ```bash
    # Create Cloud Storage bucket for build artifacts
@@ -509,13 +519,13 @@ echo "✅ APIs enabled for intelligent code quality automation"
        -l ${REGION} \
        gs://${PROJECT_ID}-build-artifacts
    
-   # Create intelligent build trigger
+   # Create build trigger
    gcloud builds triggers create cloud-source-repositories \
        --repo=${REPO_NAME} \
        --branch-pattern="^(main|develop|feature/.*)$" \
        --build-config=cloudbuild.yaml \
        --name=${BUILD_TRIGGER_NAME} \
-       --description="Intelligent quality pipeline with automated scanning" \
+       --description="Quality pipeline with automated scanning" \
        --substitutions="_REGION=${REGION},_REGISTRY_NAME=${REGISTRY_NAME}"
    
    echo "✅ Automated build trigger created for quality enforcement"
@@ -526,7 +536,7 @@ echo "✅ APIs enabled for intelligent code quality automation"
 
 8. **Commit Code and Trigger Quality Pipeline**:
 
-   This step demonstrates the complete intelligent quality automation workflow by committing code to trigger automated quality validation, security scanning, and artifact creation with comprehensive quality reporting and feedback mechanisms.
+   This step demonstrates the complete automated quality workflow by committing code to trigger automated quality validation, security scanning, and artifact creation with comprehensive quality reporting and feedback mechanisms.
 
    ```bash
    # Initialize Git repository with quality standards
@@ -538,7 +548,7 @@ echo "✅ APIs enabled for intelligent code quality automation"
    git add .
    
    # Create initial commit with quality validation
-   git commit -m "Initial commit: Implement intelligent code quality automation
+   git commit -m "Initial commit: Implement automated code quality pipeline
    
    Features:
    - Comprehensive static analysis and security scanning
@@ -547,29 +557,29 @@ echo "✅ APIs enabled for intelligent code quality automation"
    - Integrated vulnerability assessment
    - Multi-stage quality gates"
    
-   # Push to trigger intelligent quality pipeline
+   # Push to trigger quality pipeline
    git push origin main
    
-   echo "✅ Code committed and intelligent quality pipeline triggered"
+   echo "✅ Code committed and quality pipeline triggered"
    echo "📊 Quality validation includes: linting, security, tests, vulnerabilities"
    ```
 
-   The commit triggers the intelligent quality pipeline, demonstrating automated code validation, security scanning, and artifact creation with comprehensive quality reporting and immediate developer feedback.
+   The commit triggers the quality pipeline, demonstrating automated code validation, security scanning, and artifact creation with comprehensive quality reporting and immediate developer feedback.
 
 9. **Configure Advanced Security Scanning and Compliance**:
 
-   This configuration establishes advanced security scanning with Container Analysis API integration, automated vulnerability assessment, and compliance reporting that provides continuous security monitoring and policy enforcement for the intelligent quality automation system.
+   This configuration establishes advanced security scanning with Container Analysis API integration, automated vulnerability assessment, and compliance reporting that provides continuous security monitoring and policy enforcement for the quality automation system.
 
    ```bash
-   # Enable advanced security scanning
+   # Enable advanced security scanning (if not already enabled)
    gcloud services enable containeranalysis.googleapis.com
    gcloud services enable containerscanning.googleapis.com
    
-   # Create security policy for artifact registry
+   # Create security policy configuration
    cat > security-policy.yaml << 'EOF'
-   # Artifact Registry Security Policy
+   # Artifact Registry Security Policy Configuration
    apiVersion: v1
-   kind: Policy
+   kind: Configuration
    metadata:
      name: quality-security-policy
    spec:
@@ -584,7 +594,7 @@ echo "✅ APIs enabled for intelligent code quality automation"
        - security_best_practices
    EOF
    
-   # Configure continuous vulnerability scanning
+   # Configure vulnerability scanning
    gcloud container images scan \
        ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REGISTRY_NAME}/quality-app:latest \
        --location=${REGION}
@@ -654,7 +664,7 @@ echo "✅ APIs enabled for intelligent code quality automation"
 
 ## Validation & Testing
 
-1. **Verify Intelligent Quality Pipeline Execution**:
+1. **Verify Quality Pipeline Execution**:
 
    ```bash
    # Check build status and quality validation results
@@ -774,19 +784,19 @@ echo "✅ APIs enabled for intelligent code quality automation"
 
 ## Discussion
 
-This intelligent code quality automation solution demonstrates Google Cloud's comprehensive approach to modern DevOps practices by integrating source control, automated quality validation, security scanning, and artifact management into a seamless workflow. The solution leverages Cloud Source Repositories for secure Git hosting, Cloud Build for intelligent pipeline orchestration, and Artifact Registry for centralized artifact management with built-in vulnerability scanning. This architecture ensures consistent code quality enforcement while maintaining developer productivity and deployment reliability.
+This automated code quality solution demonstrates Google Cloud's comprehensive approach to modern DevOps practices by integrating source control, automated quality validation, security scanning, and artifact management into a seamless workflow. The solution leverages Cloud Source Repositories for secure Git hosting, Cloud Build for pipeline orchestration, and Artifact Registry for centralized artifact management with built-in vulnerability scanning. This architecture ensures consistent code quality enforcement while maintaining developer productivity and deployment reliability.
 
 The implementation showcases several key architectural patterns including multi-stage quality gates, security-first containerization, and automated compliance validation. The Cloud Build pipeline implements comprehensive quality checks including static analysis with Flake8, security scanning with Bandit, dependency vulnerability assessment with Safety, and automated testing with pytest. These quality gates operate as fail-fast mechanisms that prevent low-quality or insecure code from progressing through the deployment pipeline, while providing immediate feedback to developers for rapid iteration and improvement.
 
-The integration of Container Analysis API and advanced security scanning provides continuous vulnerability monitoring and compliance validation that extends beyond initial build-time checks. This approach aligns with Google Cloud's defense-in-depth security model, ensuring artifacts remain secure throughout their lifecycle. The solution also demonstrates cost optimization through efficient resource utilization, automated scaling based on build demands, and intelligent caching mechanisms that reduce build times and infrastructure costs.
+The integration of Container Analysis API and advanced security scanning provides continuous vulnerability monitoring and compliance validation that extends beyond initial build-time checks. This approach aligns with Google Cloud's defense-in-depth security model, ensuring artifacts remain secure throughout their lifecycle. The solution also demonstrates cost optimization through efficient resource utilization, automated scaling based on build demands, and intelligent caching mechanisms that reduce build times and infrastructure costs as outlined in [Google Cloud Build best practices](https://cloud.google.com/build/docs/best-practices).
 
-The monitoring and alerting capabilities provide comprehensive visibility into code quality trends, build performance metrics, and security posture across the development lifecycle. This data-driven approach enables teams to identify quality degradation patterns, optimize development workflows, and maintain high security standards while scaling development operations efficiently.
+The monitoring and alerting capabilities provide comprehensive visibility into code quality trends, build performance metrics, and security posture across the development lifecycle. This data-driven approach enables teams to identify quality degradation patterns, optimize development workflows, and maintain high security standards while scaling development operations efficiently. See the [Google Cloud Architecture Center](https://cloud.google.com/architecture) for additional guidance on implementing quality gates in production environments.
 
 > **Tip**: Integrate Cloud Code IDE plugins with this pipeline to provide real-time quality feedback during development, reducing the feedback loop and improving developer experience with intelligent code suggestions and automated quality validation.
 
 ## Challenge
 
-Extend this intelligent code quality automation solution by implementing these advanced enhancements:
+Extend this automated code quality solution by implementing these advanced enhancements:
 
 1. **AI-Enhanced Code Review Integration**: Implement Gemini Code Assist integration for automated code review comments, intelligent bug detection, and performance optimization suggestions that provide contextual feedback during the development process.
 
@@ -794,10 +804,15 @@ Extend this intelligent code quality automation solution by implementing these a
 
 3. **Progressive Deployment with Quality Gates**: Integrate with Cloud Deploy to create progressive deployment pipelines that automatically promote artifacts through environments based on quality metrics, performance benchmarks, and security validation results.
 
-4. **Intelligent Quality Metrics Dashboard**: Build a comprehensive dashboard using Cloud Monitoring and Looker that tracks quality trends, identifies problematic code patterns, and provides predictive analytics for development workflow optimization and technical debt management.
+4. **Quality Metrics Dashboard**: Build a comprehensive dashboard using Cloud Monitoring and Looker that tracks quality trends, identifies problematic code patterns, and provides predictive analytics for development workflow optimization and technical debt management.
 
 5. **Cross-Repository Quality Governance**: Implement organization-wide quality policies using Cloud Asset Inventory and Policy Controller that enforce consistent quality standards across multiple repositories, teams, and projects with centralized governance and compliance reporting.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Blueprints, Azure Policy, Azure Resource Manager, Azure Advisor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: governance, blueprints, policy, compliance, well-architected, automation, enterprise
 recipe-generator-version: 1.3
@@ -92,7 +92,8 @@ export RESOURCE_GROUP="rg-governance-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 export BLUEPRINT_NAME="enterprise-governance-blueprint"
-export MANAGEMENT_GROUP_ID=$(az account management-group list --query "[0].name" --output tsv)
+export MANAGEMENT_GROUP_ID=$(az account management-group list \
+    --query "[0].name" --output tsv)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -105,7 +106,8 @@ az account set --subscription ${SUBSCRIPTION_ID}
 az group create \
     --name ${RESOURCE_GROUP} \
     --location ${LOCATION} \
-    --tags purpose=governance environment=production framework=well-architected
+    --tags purpose=governance environment=production \
+           framework=well-architected
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
@@ -387,7 +389,8 @@ echo "✅ Log Analytics workspace created for governance monitoring"
        --name "governance-alerts" \
        --resource-group ${RESOURCE_GROUP} \
        --short-name "govAlert" \
-       --email-receiver name="governance-team" email-address="governance@company.com"
+       --email-receiver name="governance-team" \
+                       email-address="governance@company.com"
 
    # Configure Advisor alerts for high-impact recommendations
    az monitor activity-log alert create \
@@ -469,7 +472,7 @@ echo "✅ Log Analytics workspace created for governance monitoring"
      },
      "name": "Enterprise Governance Dashboard",
      "type": "Microsoft.Portal/dashboards",
-     "location": "INSERT_LOCATION",
+     "location": "${LOCATION}",
      "tags": {
        "hidden-title": "Enterprise Governance Dashboard"
      }
@@ -625,4 +628,9 @@ Extend this enterprise governance solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

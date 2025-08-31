@@ -1,0 +1,592 @@
+# Infrastructure Manager Configuration for Smart Content Classification
+# This configuration deploys a complete content classification system using Gemini and Cloud Storage
+# Based on recipe: Smart Content Classification with Gemini and Cloud Storage
+
+# Copyright 2025 - Infrastructure Manager Template
+# Recipe Version: 1.1
+# Last Updated: 2025-07-12
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: DeploymentTemplate
+metadata:
+  name: smart-content-classification
+  description: "AI-powered content classification system using Gemini 2.5 and Cloud Storage"
+  labels:
+    recipe-category: "ai"
+    recipe-difficulty: "200"
+    recipe-version: "1.1"
+
+spec:
+  # Input parameters for customizing the deployment
+  parameterSpecs:
+    - name: project_id
+      type: string
+      description: "Google Cloud Project ID where resources will be created"
+      required: true
+    
+    - name: region
+      type: string
+      description: "Google Cloud region for resource deployment"
+      default: "us-central1"
+      allowed:
+        - "us-central1"
+        - "us-east1"
+        - "us-west1"
+        - "europe-west1"
+        - "asia-southeast1"
+    
+    - name: zone
+      type: string
+      description: "Google Cloud zone for compute resources"
+      default: "us-central1-a"
+    
+    - name: resource_suffix
+      type: string
+      description: "Unique suffix for resource names to avoid conflicts"
+      default: ""
+      pattern: "^[a-z0-9]{0,8}$"
+    
+    - name: function_memory
+      type: integer
+      description: "Memory allocation for Cloud Function in MB"
+      default: 1024
+      allowed:
+        - 512
+        - 1024
+        - 2048
+        - 4096
+    
+    - name: function_timeout
+      type: integer
+      description: "Timeout for Cloud Function in seconds"
+      default: 540
+      minimum: 60
+      maximum: 3600
+    
+    - name: max_instances
+      type: integer
+      description: "Maximum instances for Cloud Function auto-scaling"
+      default: 10
+      minimum: 1
+      maximum: 100
+
+  # Resource definitions
+  resourceSpecs:
+    # Enable required APIs for the content classification system
+    - name: enable-apis
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/$(ref.project_id.value)/services/artifactregistry.googleapis.com
+        consumerId: projects/$(ref.project_id.value)
+      metadata:
+        dependsOn: []
+    
+    - name: enable-cloudbuild-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/$(ref.project_id.value)/services/cloudbuild.googleapis.com
+        consumerId: projects/$(ref.project_id.value)
+    
+    - name: enable-cloudfunctions-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/$(ref.project_id.value)/services/cloudfunctions.googleapis.com
+        consumerId: projects/$(ref.project_id.value)
+    
+    - name: enable-eventarc-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/$(ref.project_id.value)/services/eventarc.googleapis.com
+        consumerId: projects/$(ref.project_id.value)
+    
+    - name: enable-logging-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/$(ref.project_id.value)/services/logging.googleapis.com
+        consumerId: projects/$(ref.project_id.value)
+    
+    - name: enable-storage-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/$(ref.project_id.value)/services/storage.googleapis.com
+        consumerId: projects/$(ref.project_id.value)
+    
+    - name: enable-aiplatform-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/$(ref.project_id.value)/services/aiplatform.googleapis.com
+        consumerId: projects/$(ref.project_id.value)
+    
+    - name: enable-run-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/$(ref.project_id.value)/services/run.googleapis.com
+        consumerId: projects/$(ref.project_id.value)
+
+    # Service Account for Cloud Function with appropriate permissions
+    - name: content-classifier-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: content-classifier-sa$(ref.resource_suffix.value)
+        displayName: "Content Classifier Service Account"
+        description: "Service account for AI-powered content classification using Gemini 2.5"
+        project: $(ref.project_id.value)
+      metadata:
+        dependsOn:
+          - enable-apis
+
+    # IAM role bindings for the service account
+    - name: service-account-aiplatform-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.value)
+        role: roles/aiplatform.user
+        member: serviceAccount:$(ref.content-classifier-service-account.email)
+      metadata:
+        dependsOn:
+          - content-classifier-service-account
+
+    - name: service-account-storage-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.value)
+        role: roles/storage.admin
+        member: serviceAccount:$(ref.content-classifier-service-account.email)
+      metadata:
+        dependsOn:
+          - content-classifier-service-account
+
+    - name: service-account-logging-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.value)
+        role: roles/logging.logWriter
+        member: serviceAccount:$(ref.content-classifier-service-account.email)
+      metadata:
+        dependsOn:
+          - content-classifier-service-account
+
+    # Cloud Storage Buckets for the classification pipeline
+    
+    # Staging bucket for incoming files
+    - name: staging-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: staging-content$(ref.resource_suffix.value)-$(ref.project_id.value)
+        project: $(ref.project_id.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        versioning:
+          enabled: false
+        logging:
+          logBucket: $(ref.logging-bucket.name)
+          logObjectPrefix: "staging-access-logs/"
+        labels:
+          purpose: "content-classification-staging"
+          environment: "production"
+          managed-by: "infrastructure-manager"
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 7 # Delete files older than 7 days from staging
+      metadata:
+        dependsOn:
+          - enable-storage-api
+          - logging-bucket
+
+    # Classification buckets for organized content
+    - name: contracts-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: contracts$(ref.resource_suffix.value)-$(ref.project_id.value)
+        project: $(ref.project_id.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        logging:
+          logBucket: $(ref.logging-bucket.name)
+          logObjectPrefix: "contracts-access-logs/"
+        labels:
+          purpose: "content-classification-contracts"
+          environment: "production"
+          managed-by: "infrastructure-manager"
+        lifecycle:
+          rule:
+            - action:
+                type: SetStorageClass
+                storageClass: NEARLINE
+              condition:
+                age: 30 # Move to nearline after 30 days
+            - action:
+                type: SetStorageClass
+                storageClass: COLDLINE
+              condition:
+                age: 365 # Move to coldline after 1 year
+      metadata:
+        dependsOn:
+          - enable-storage-api
+          - logging-bucket
+
+    - name: invoices-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: invoices$(ref.resource_suffix.value)-$(ref.project_id.value)
+        project: $(ref.project_id.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        logging:
+          logBucket: $(ref.logging-bucket.name)
+          logObjectPrefix: "invoices-access-logs/"
+        labels:
+          purpose: "content-classification-invoices"
+          environment: "production"
+          managed-by: "infrastructure-manager"
+        lifecycle:
+          rule:
+            - action:
+                type: SetStorageClass
+                storageClass: NEARLINE
+              condition:
+                age: 90 # Move to nearline after 90 days
+            - action:
+                type: SetStorageClass
+                storageClass: COLDLINE
+              condition:
+                age: 2555 # Move to coldline after 7 years (compliance)
+      metadata:
+        dependsOn:
+          - enable-storage-api
+          - logging-bucket
+
+    - name: marketing-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: marketing$(ref.resource_suffix.value)-$(ref.project_id.value)
+        project: $(ref.project_id.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        logging:
+          logBucket: $(ref.logging-bucket.name)
+          logObjectPrefix: "marketing-access-logs/"
+        labels:
+          purpose: "content-classification-marketing"
+          environment: "production"
+          managed-by: "infrastructure-manager"
+        lifecycle:
+          rule:
+            - action:
+                type: SetStorageClass
+                storageClass: NEARLINE
+              condition:
+                age: 60 # Move to nearline after 60 days
+            - action:
+                type: SetStorageClass
+                storageClass: COLDLINE
+              condition:
+                age: 365 # Move to coldline after 1 year
+      metadata:
+        dependsOn:
+          - enable-storage-api
+          - logging-bucket
+
+    - name: miscellaneous-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: miscellaneous$(ref.resource_suffix.value)-$(ref.project_id.value)
+        project: $(ref.project_id.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        logging:
+          logBucket: $(ref.logging-bucket.name)
+          logObjectPrefix: "misc-access-logs/"
+        labels:
+          purpose: "content-classification-miscellaneous"
+          environment: "production"
+          managed-by: "infrastructure-manager"
+        lifecycle:
+          rule:
+            - action:
+                type: SetStorageClass
+                storageClass: NEARLINE
+              condition:
+                age: 30 # Move to nearline after 30 days
+            - action:
+                type: SetStorageClass
+                storageClass: COLDLINE
+              condition:
+                age: 365 # Move to coldline after 1 year
+      metadata:
+        dependsOn:
+          - enable-storage-api
+          - logging-bucket
+
+    # Logging bucket for access logs
+    - name: logging-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: classification-logs$(ref.resource_suffix.value)-$(ref.project_id.value)
+        project: $(ref.project_id.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        labels:
+          purpose: "access-logging"
+          environment: "production"
+          managed-by: "infrastructure-manager"
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 90 # Delete access logs after 90 days
+      metadata:
+        dependsOn:
+          - enable-storage-api
+
+    # Cloud Function Source Code Archive
+    - name: function-source-archive
+      type: gcp-types/storage-v1:objects
+      properties:
+        name: content-classifier-source.zip
+        bucket: $(ref.staging-bucket.name)
+        contentType: application/zip
+        # Note: In practice, you would upload the actual function source code
+        # This is a placeholder for the Infrastructure Manager template
+        metadata:
+          description: "Cloud Function source code for content classification"
+          version: "1.0"
+      metadata:
+        dependsOn:
+          - staging-bucket
+
+    # Cloud Function for Content Classification
+    - name: content-classifier-function
+      type: gcp-types/cloudfunctions-v1:projects.locations.functions
+      properties:
+        location: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+        function:
+          name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/functions/content-classifier$(ref.resource_suffix.value)
+          description: "AI-powered content classification using Gemini 2.5 and Cloud Storage"
+          sourceArchiveUrl: gs://$(ref.staging-bucket.name)/content-classifier-source.zip
+          entryPoint: content_classifier
+          runtime: python39
+          timeout: $(ref.function_timeout.value)s
+          availableMemoryMb: $(ref.function_memory.value)
+          maxInstances: $(ref.max_instances.value)
+          serviceAccountEmail: $(ref.content-classifier-service-account.email)
+          environmentVariables:
+            GCP_PROJECT: $(ref.project_id.value)
+            FUNCTION_REGION: $(ref.region.value)
+            CONTRACTS_BUCKET: $(ref.contracts-bucket.name)
+            INVOICES_BUCKET: $(ref.invoices-bucket.name)
+            MARKETING_BUCKET: $(ref.marketing-bucket.name)
+            MISC_BUCKET: $(ref.miscellaneous-bucket.name)
+          labels:
+            purpose: "content-classification"
+            ai-model: "gemini-2-5-pro"
+            environment: "production"
+            managed-by: "infrastructure-manager"
+          # Event trigger configuration
+          eventTrigger:
+            eventType: google.storage.object.finalize
+            resource: projects/_/buckets/$(ref.staging-bucket.name)
+            failurePolicy:
+              retry: {}
+      metadata:
+        dependsOn:
+          - enable-cloudfunctions-api
+          - enable-eventarc-api
+          - content-classifier-service-account
+          - service-account-aiplatform-binding
+          - service-account-storage-binding
+          - service-account-logging-binding
+          - staging-bucket
+          - contracts-bucket
+          - invoices-bucket
+          - marketing-bucket
+          - miscellaneous-bucket
+          - function-source-archive
+
+    # Cloud Monitoring Alert Policy for Function Errors
+    - name: function-error-alert-policy
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        parent: projects/$(ref.project_id.value)
+        alertPolicy:
+          displayName: "Content Classifier Function Errors"
+          documentation:
+            content: "Alert when content classification function encounters errors"
+            mimeType: "text/markdown"
+          conditions:
+            - displayName: "Function Error Rate"
+              conditionThreshold:
+                filter: |
+                  resource.type="cloud_function"
+                  resource.labels.function_name="content-classifier$(ref.resource_suffix.value)"
+                  metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                  metric.labels.status!="ok"
+                comparison: COMPARISON_GREATER_THAN
+                thresholdValue: 5
+                duration: 300s
+                aggregations:
+                  - alignmentPeriod: 300s
+                    perSeriesAligner: ALIGN_RATE
+                    crossSeriesReducer: REDUCE_SUM
+          enabled: true
+          notificationChannels: []
+          alertStrategy:
+            autoClose: 86400s # Auto-close after 24 hours
+      metadata:
+        dependsOn:
+          - content-classifier-function
+
+    # Cloud Logging Sink for Function Logs
+    - name: function-logs-sink
+      type: gcp-types/logging-v2:projects.sinks
+      properties:
+        parent: projects/$(ref.project_id.value)
+        sink:
+          name: content-classifier-logs$(ref.resource_suffix.value)
+          description: "Export content classification function logs to Cloud Storage"
+          destination: storage.googleapis.com/$(ref.logging-bucket.name)/function-logs
+          filter: |
+            resource.type="cloud_function"
+            resource.labels.function_name="content-classifier$(ref.resource_suffix.value)"
+          outputVersionFormat: V2
+      metadata:
+        dependsOn:
+          - enable-logging-api
+          - content-classifier-function
+          - logging-bucket
+
+  # Output values for reference and integration
+  outputs:
+    - name: project_id
+      description: "Google Cloud Project ID"
+      value: $(ref.project_id.value)
+    
+    - name: region
+      description: "Deployment region"
+      value: $(ref.region.value)
+    
+    - name: staging_bucket_name
+      description: "Name of the staging bucket for file uploads"
+      value: $(ref.staging-bucket.name)
+    
+    - name: staging_bucket_url
+      description: "GS URL of the staging bucket"
+      value: gs://$(ref.staging-bucket.name)
+    
+    - name: contracts_bucket_name
+      description: "Name of the contracts classification bucket"
+      value: $(ref.contracts-bucket.name)
+    
+    - name: contracts_bucket_url
+      description: "GS URL of the contracts bucket"
+      value: gs://$(ref.contracts-bucket.name)
+    
+    - name: invoices_bucket_name
+      description: "Name of the invoices classification bucket"
+      value: $(ref.invoices-bucket.name)
+    
+    - name: invoices_bucket_url
+      description: "GS URL of the invoices bucket"
+      value: gs://$(ref.invoices-bucket.name)
+    
+    - name: marketing_bucket_name
+      description: "Name of the marketing classification bucket"
+      value: $(ref.marketing-bucket.name)
+    
+    - name: marketing_bucket_url
+      description: "GS URL of the marketing bucket"
+      value: gs://$(ref.marketing-bucket.name)
+    
+    - name: miscellaneous_bucket_name
+      description: "Name of the miscellaneous classification bucket"
+      value: $(ref.miscellaneous-bucket.name)
+    
+    - name: miscellaneous_bucket_url
+      description: "GS URL of the miscellaneous bucket"
+      value: gs://$(ref.miscellaneous-bucket.name)
+    
+    - name: function_name
+      description: "Name of the content classification Cloud Function"
+      value: content-classifier$(ref.resource_suffix.value)
+    
+    - name: function_url
+      description: "Full resource name of the Cloud Function"
+      value: $(ref.content-classifier-function.name)
+    
+    - name: service_account_email
+      description: "Email of the service account used by the Cloud Function"
+      value: $(ref.content-classifier-service-account.email)
+    
+    - name: logging_bucket_name
+      description: "Name of the logging bucket for access logs"
+      value: $(ref.logging-bucket.name)
+    
+    - name: deployment_instructions
+      description: "Instructions for using the deployed infrastructure"
+      value: |
+        Content Classification System Deployed Successfully!
+        
+        Upload files to trigger classification:
+        gsutil cp your-file.txt gs://$(ref.staging-bucket.name)/
+        
+        Monitor function logs:
+        gcloud functions logs read content-classifier$(ref.resource_suffix.value) --region $(ref.region.value)
+        
+        Check classified files:
+        gsutil ls gs://$(ref.contracts-bucket.name)/
+        gsutil ls gs://$(ref.invoices-bucket.name)/
+        gsutil ls gs://$(ref.marketing-bucket.name)/
+        gsutil ls gs://$(ref.miscellaneous-bucket.name)/
+
+# Validation and constraints
+validation:
+  # Ensure project ID is valid
+  - condition: len(spec.parameterSpecs.project_id.value) > 0
+    message: "Project ID cannot be empty"
+  
+  # Ensure region and zone are compatible
+  - condition: |
+      (spec.parameterSpecs.region.value == "us-central1" && spec.parameterSpecs.zone.value.startsWith("us-central1")) ||
+      (spec.parameterSpecs.region.value == "us-east1" && spec.parameterSpecs.zone.value.startsWith("us-east1")) ||
+      (spec.parameterSpecs.region.value == "us-west1" && spec.parameterSpecs.zone.value.startsWith("us-west1")) ||
+      (spec.parameterSpecs.region.value == "europe-west1" && spec.parameterSpecs.zone.value.startsWith("europe-west1")) ||
+      (spec.parameterSpecs.region.value == "asia-southeast1" && spec.parameterSpecs.zone.value.startsWith("asia-southeast1"))
+    message: "Zone must be in the same region as specified"
+  
+  # Ensure function memory is appropriate for AI workloads
+  - condition: spec.parameterSpecs.function_memory.value >= 1024
+    message: "Function memory should be at least 1024MB for AI processing"
+  
+  # Ensure reasonable timeout for AI processing
+  - condition: spec.parameterSpecs.function_timeout.value >= 300
+    message: "Function timeout should be at least 300 seconds for AI processing"
+
+# Deployment metadata
+metadata:
+  annotations:
+    recipe-title: "Smart Content Classification with Gemini and Cloud Storage"
+    recipe-id: "a4b8c2f6"
+    recipe-category: "ai"
+    recipe-difficulty: "200"
+    recipe-version: "1.1"
+    infrastructure-manager-version: "1.0"
+    last-updated: "2025-07-12"
+    deployment-time-estimate: "10-15 minutes"
+    monthly-cost-estimate: "$15-25 for moderate usage"
+    supported-regions: "us-central1,us-east1,us-west1,europe-west1,asia-southeast1"
+    required-apis: "artifactregistry,cloudbuild,cloudfunctions,eventarc,logging,storage,aiplatform,run"
+    security-features: "least-privilege-iam,service-account-isolation,bucket-lifecycle-policies,access-logging"
+    monitoring-features: "cloud-logging,error-alerts,function-metrics,bucket-access-logs"
+    compliance-features: "audit-trails,data-retention-policies,access-controls"

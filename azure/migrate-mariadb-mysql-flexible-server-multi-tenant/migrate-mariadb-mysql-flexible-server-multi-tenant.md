@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Database for MariaDB, Azure Database for MySQL, Azure Monitor, Azure Application Insights
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database, migration, mariadb, mysql, flexible-server, multi-tenant, monitoring
 recipe-generator-version: 1.3
@@ -85,14 +85,14 @@ graph TB
 
 ```bash
 # Set environment variables for migration
-export RESOURCE_GROUP="rg-mariadb-migration"
+export RESOURCE_GROUP="rg-mariadb-migration-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 
-# Source MariaDB server details
+# Source MariaDB server details (replace with your existing server)
 export SOURCE_MARIADB_SERVER="mariadb-source-${RANDOM_SUFFIX}"
 export SOURCE_MARIADB_ADMIN="mariadbadmin"
 export SOURCE_MARIADB_PASSWORD="MariaDB123!"
@@ -101,7 +101,6 @@ export SOURCE_MARIADB_PASSWORD="MariaDB123!"
 export TARGET_MYSQL_SERVER="mysql-target-${RANDOM_SUFFIX}"
 export TARGET_MYSQL_ADMIN="mysqladmin"
 export TARGET_MYSQL_PASSWORD="MySQL123!"
-export TARGET_MYSQL_DB="mysql"
 
 # Migration and monitoring resources
 export STORAGE_ACCOUNT="migrationst${RANDOM_SUFFIX}"
@@ -250,8 +249,7 @@ echo "✅ Storage account created for migration artifacts"
        --source-server ${TARGET_MYSQL_SERVER} \
        --location ${LOCATION}
    
-   # Configure data-in replication from MariaDB to MySQL
-   # First, get MariaDB server configuration for replication
+   # Get MariaDB server configuration for replication setup
    SOURCE_MARIADB_FQDN=$(az mariadb server show \
        --name ${SOURCE_MARIADB_SERVER} \
        --resource-group ${RESOURCE_GROUP} \
@@ -266,7 +264,9 @@ echo "✅ Storage account created for migration artifacts"
        --value ON
    
    # Set up replication user on source MariaDB
-   mysql -h ${SOURCE_MARIADB_FQDN} -u ${SOURCE_MARIADB_ADMIN} -p${SOURCE_MARIADB_PASSWORD} << 'EOF'
+   mysql -h ${SOURCE_MARIADB_FQDN} \
+       -u ${SOURCE_MARIADB_ADMIN} \
+       -p${SOURCE_MARIADB_PASSWORD} << 'EOF'
    CREATE USER 'replication_user'@'%' IDENTIFIED BY 'ReplicationPass123!';
    GRANT REPLICATION SLAVE ON *.* TO 'replication_user'@'%';
    FLUSH PRIVILEGES;
@@ -330,9 +330,6 @@ echo "✅ Storage account created for migration artifacts"
    Application connection strings must be updated to point to the new MySQL Flexible Server while maintaining tenant-specific connection pooling and security configurations. This step ensures applications can seamlessly connect to the migrated databases with optimal performance settings.
 
    ```bash
-   # Update application configuration (example for connection string)
-   # Note: Replace with your actual application configuration method
-   
    # Create application configuration template
    cat > ~/migration-config.json << EOF
    {
@@ -355,7 +352,10 @@ echo "✅ Storage account created for migration artifacts"
    EOF
    
    # Test connection to new MySQL Flexible Server
-   mysql -h ${TARGET_MYSQL_FQDN} -u ${TARGET_MYSQL_ADMIN} -p${TARGET_MYSQL_PASSWORD} -e "SELECT VERSION(); SHOW DATABASES;"
+   mysql -h ${TARGET_MYSQL_FQDN} \
+       -u ${TARGET_MYSQL_ADMIN} \
+       -p${TARGET_MYSQL_PASSWORD} \
+       -e "SELECT VERSION(); SHOW DATABASES;"
    
    echo "✅ Application configuration updated and tested"
    ```
@@ -380,12 +380,6 @@ echo "✅ Storage account created for migration artifacts"
        --parameter-name innodb_buffer_pool_size \
        --value 1073741824
    
-   az mysql flexible-server parameter set \
-       --name ${TARGET_MYSQL_SERVER} \
-       --resource-group ${RESOURCE_GROUP} \
-       --parameter-name query_cache_size \
-       --value 67108864
-   
    # Enable slow query logging for performance monitoring
    az mysql flexible-server parameter set \
        --name ${TARGET_MYSQL_SERVER} \
@@ -402,7 +396,7 @@ echo "✅ Storage account created for migration artifacts"
    echo "✅ Performance optimization completed"
    ```
 
-   The MySQL Flexible Server is now optimized for multi-tenant workloads with enhanced buffer pool sizing, connection limits, and query caching. These optimizations provide improved performance and resource utilization compared to the previous MariaDB configuration.
+   The MySQL Flexible Server is now optimized for multi-tenant workloads with enhanced buffer pool sizing, connection limits, and query monitoring. These optimizations provide improved performance and resource utilization compared to the previous MariaDB configuration.
 
 8. **Set Up Automated Monitoring and Alerting**:
 
@@ -453,7 +447,9 @@ echo "✅ Storage account created for migration artifacts"
 
    ```bash
    # Compare record counts between source and target databases
-   mysql -h ${SOURCE_MARIADB_FQDN} -u ${SOURCE_MARIADB_ADMIN} -p${SOURCE_MARIADB_PASSWORD} -e "
+   mysql -h ${SOURCE_MARIADB_FQDN} \
+       -u ${SOURCE_MARIADB_ADMIN} \
+       -p${SOURCE_MARIADB_PASSWORD} -e "
    SELECT 
        SCHEMA_NAME as database_name,
        SUM(TABLE_ROWS) as total_rows
@@ -461,7 +457,9 @@ echo "✅ Storage account created for migration artifacts"
    WHERE TABLE_SCHEMA NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys')
    GROUP BY SCHEMA_NAME;"
    
-   mysql -h ${TARGET_MYSQL_FQDN} -u ${TARGET_MYSQL_ADMIN} -p${TARGET_MYSQL_PASSWORD} -e "
+   mysql -h ${TARGET_MYSQL_FQDN} \
+       -u ${TARGET_MYSQL_ADMIN} \
+       -p${TARGET_MYSQL_PASSWORD} -e "
    SELECT 
        SCHEMA_NAME as database_name,
        SUM(TABLE_ROWS) as total_rows
@@ -476,13 +474,18 @@ echo "✅ Storage account created for migration artifacts"
 
    ```bash
    # Test connection pool performance
-   mysql -h ${TARGET_MYSQL_FQDN} -u ${TARGET_MYSQL_ADMIN} -p${TARGET_MYSQL_PASSWORD} -e "
+   mysql -h ${TARGET_MYSQL_FQDN} \
+       -u ${TARGET_MYSQL_ADMIN} \
+       -p${TARGET_MYSQL_PASSWORD} -e "
    SHOW PROCESSLIST;
    SHOW STATUS LIKE 'Threads_connected';
    SHOW STATUS LIKE 'Threads_running';"
    
    # Validate SSL connections
-   mysql -h ${TARGET_MYSQL_FQDN} -u ${TARGET_MYSQL_ADMIN} -p${TARGET_MYSQL_PASSWORD} --ssl-mode=REQUIRED -e "
+   mysql -h ${TARGET_MYSQL_FQDN} \
+       -u ${TARGET_MYSQL_ADMIN} \
+       -p${TARGET_MYSQL_PASSWORD} \
+       --ssl-mode=REQUIRED -e "
    SHOW STATUS LIKE 'Ssl_cipher';"
    ```
 
@@ -549,26 +552,31 @@ echo "✅ Storage account created for migration artifacts"
 
 ## Discussion
 
-The migration from Azure Database for MariaDB to MySQL - Flexible Server represents a critical infrastructure upgrade that provides enhanced performance, cost optimization, and improved availability for multi-tenant applications. Azure Database for MySQL - Flexible Server offers significant advantages including zone-redundant high availability with 99.99% SLA, improved cost controls through burstable compute tiers, and enhanced security features such as advanced threat protection and transparent data encryption. For comprehensive migration guidance, see the [Azure Database for MariaDB migration documentation](https://learn.microsoft.com/en-us/azure/mariadb/migrate/whats-happening-to-mariadb).
+The migration from Azure Database for MariaDB to MySQL - Flexible Server represents a critical infrastructure upgrade that provides enhanced performance, cost optimization, and improved availability for multi-tenant applications. Azure Database for MySQL - Flexible Server offers significant advantages including zone-redundant high availability with 99.99% SLA, improved cost controls through burstable compute tiers, and enhanced security features such as advanced threat protection and transparent data encryption. The retirement announcement creates urgency but also provides an opportunity to modernize database infrastructure with better capabilities. For comprehensive migration guidance, see the [Azure Database for MariaDB migration documentation](https://learn.microsoft.com/en-us/azure/mariadb/migrate/whats-happening-to-mariadb).
 
-The multi-tenant architecture considerations during migration are particularly important as they impact tenant isolation, performance optimization, and data security. MySQL Flexible Server's enhanced parameter management allows for fine-grained control over connection pooling, buffer management, and query optimization that directly benefits multi-tenant workloads. The implementation of read replicas and data-in replication ensures minimal downtime during migration while maintaining data consistency across all tenant databases. For detailed performance optimization strategies, review the [MySQL Flexible Server performance best practices](https://learn.microsoft.com/en-us/azure/mysql/flexible-server/concept-performance-best-practices).
+The multi-tenant architecture considerations during migration are particularly important as they impact tenant isolation, performance optimization, and data security. MySQL Flexible Server's enhanced parameter management allows for fine-grained control over connection pooling, buffer management, and query optimization that directly benefits multi-tenant workloads. The implementation of read replicas and data-in replication ensures minimal downtime during migration while maintaining data consistency across all tenant databases. This approach follows Azure Well-Architected Framework principles for reliability and operational excellence. For detailed performance optimization strategies, review the [MySQL Flexible Server performance best practices](https://learn.microsoft.com/en-us/azure/mysql/flexible-server/concept-performance-best-practices).
 
-From a cost perspective, MySQL Flexible Server provides better optimization controls including support for burstable tier compute options, stop/start capabilities, and more granular scaling options compared to the retiring MariaDB service. The enhanced monitoring capabilities with Azure Monitor and Application Insights provide comprehensive visibility into tenant-specific performance patterns and resource utilization. Organizations can leverage these insights to optimize resource allocation and implement proactive scaling strategies. For cost optimization guidance, see the [Azure Database for MySQL cost optimization documentation](https://learn.microsoft.com/en-us/azure/well-architected/service-guides/azure-db-mysql-cost-optimization).
+From a cost perspective, MySQL Flexible Server provides better optimization controls including support for burstable tier compute options, stop/start capabilities, and more granular scaling options compared to the retiring MariaDB service. The enhanced monitoring capabilities with Azure Monitor and Application Insights provide comprehensive visibility into tenant-specific performance patterns and resource utilization. Organizations can leverage these insights to optimize resource allocation and implement proactive scaling strategies based on actual usage patterns. For cost optimization guidance, see the [Azure Database for MySQL cost optimization documentation](https://learn.microsoft.com/en-us/azure/well-architected/service-guides/azure-db-mysql-cost-optimization).
 
-The migration approach using MyDumper/MyLoader with data-in replication provides a robust foundation for large-scale multi-tenant database migrations while maintaining business continuity. The combination of automated monitoring, performance optimization, and high availability configuration ensures that the migrated environment exceeds the capabilities of the original MariaDB deployment. For additional migration tools and strategies, consider the [Quadrant Technologies MariaDB to MySQL migration solution](https://azuremarketplace.microsoft.com/en-us/marketplace/apps/quadranttechnologies1724273152029.mariatomysql?tab=Overview) available on the Azure Marketplace.
+The migration approach using MyDumper/MyLoader with data-in replication provides a robust foundation for large-scale multi-tenant database migrations while maintaining business continuity. This combination of offline and online migration techniques minimizes application downtime while ensuring data consistency. The automated monitoring, performance optimization, and high availability configuration ensures that the migrated environment exceeds the capabilities of the original MariaDB deployment. For organizations requiring specialized migration assistance, the [Quadrant Technologies MariaDB to MySQL migration solution](https://azuremarketplace.microsoft.com/en-us/marketplace/apps/quadranttechnologies1724273152029.mariatomysql?tab=Overview) provides additional support for complex scenarios.
 
-> **Tip**: Use Azure Database Migration Service for complex multi-tenant migrations that require advanced schema conversion and data validation capabilities. The service provides additional tools for handling tenant-specific configurations and custom migration logic.
+> **Tip**: Use Azure Database Migration Service for complex multi-tenant migrations that require advanced schema conversion and data validation capabilities. The service provides additional tools for handling tenant-specific configurations and custom migration logic while maintaining compatibility with existing applications.
 
 ## Challenge
 
 Extend this migration solution by implementing these enhancements:
 
-1. **Implement automated tenant-specific backup strategies** using Azure Backup and point-in-time recovery with tenant isolation capabilities
+1. **Implement automated tenant-specific backup strategies** using Azure Backup and point-in-time recovery with tenant isolation capabilities and automated retention policies
 2. **Deploy cross-region read replicas** for global multi-tenant applications with geo-distributed user bases and disaster recovery requirements
-3. **Integrate with Azure Active Directory** for enhanced security and single sign-on capabilities across all tenant applications
-4. **Implement advanced monitoring dashboards** using Azure Grafana and custom Log Analytics queries for tenant-specific performance metrics
-5. **Create automated scaling policies** using Azure Automation and Azure Functions to handle tenant-specific load patterns and resource optimization
+3. **Integrate with Azure Active Directory** for enhanced security and single sign-on capabilities across all tenant applications using managed identities
+4. **Implement advanced monitoring dashboards** using Azure Grafana and custom Log Analytics queries for tenant-specific performance metrics and usage analytics
+5. **Create automated scaling policies** using Azure Automation and Azure Functions to handle tenant-specific load patterns and resource optimization based on usage telemetry
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

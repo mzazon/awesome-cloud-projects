@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Data Manager for Agriculture, Azure AI Services, Azure Maps, Azure Stream Analytics
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: precision-agriculture, computer-vision, geospatial-analytics, iot-data, crop-monitoring
 recipe-generator-version: 1.3
@@ -140,20 +140,23 @@ echo "✅ Storage account created for agricultural data"
 
    ```bash
    # Create Azure Data Manager for Agriculture instance
-   az extension add --name datamgr-for-agriculture
-   
-   az datamgr-for-agriculture create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${ADMA_INSTANCE} \
-       --location ${LOCATION} \
-       --sku Standard \
-       --tags farm-type=mixed-crop season=2025
+   # Note: This service uses REST API as CLI extension is not available
+   az rest --method PUT \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.AgFoodPlatform/farmBeats/${ADMA_INSTANCE}?api-version=2023-06-01-preview" \
+       --body '{
+         "location": "'${LOCATION}'",
+         "properties": {},
+         "tags": {
+           "farm-type": "mixed-crop",
+           "season": "2025"
+         }
+       }'
    
    # Get the service endpoint
-   export ADMA_ENDPOINT=$(az datamgr-for-agriculture show \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${ADMA_INSTANCE} \
-       --query properties.instanceUri --output tsv)
+   export ADMA_ENDPOINT=$(az rest \
+       --method GET \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.AgFoodPlatform/farmBeats/${ADMA_INSTANCE}?api-version=2023-06-01-preview" \
+       --query "properties.instanceUri" --output tsv)
    
    echo "✅ Azure Data Manager for Agriculture deployed: ${ADMA_ENDPOINT}"
    ```
@@ -261,24 +264,35 @@ echo "✅ Storage account created for agricultural data"
        --events-out-of-order-max-delay 10 \
        --events-late-arrival-max-delay 5
    
-   # Configure IoT Hub as input source
+   # Get IoT Hub access key for Stream Analytics configuration
+   export IOT_HUB_KEY=$(az iot hub policy show \
+       --hub-name ${IOT_HUB_NAME} \
+       --name iothubowner \
+       --query primaryKey --output tsv)
+   
+   # Configure IoT Hub as input source using proper JSON format
    az stream-analytics input create \
        --resource-group ${RESOURCE_GROUP} \
        --job-name ${STREAM_JOB_NAME} \
        --name SensorInput \
-       --type Stream \
-       --datasource '{
-         "type": "Microsoft.Devices/IotHubs",
-         "properties": {
-           "iotHubNamespace": "'${IOT_HUB_NAME}'",
-           "sharedAccessPolicyName": "iothubowner",
-           "sharedAccessPolicyKey": "'$(az iot hub policy show --hub-name ${IOT_HUB_NAME} --name iothubowner --query primaryKey -o tsv)'",
-           "endpoint": "messages/events"
+       --properties '{
+         "type": "Stream",
+         "serialization": {
+           "type": "Json",
+           "properties": {
+             "encoding": "UTF8"
+           }
+         },
+         "datasource": {
+           "type": "Microsoft.Devices/IotHubs",
+           "properties": {
+             "iotHubNamespace": "'${IOT_HUB_NAME}'",
+             "sharedAccessPolicyName": "iothubowner",
+             "sharedAccessPolicyKey": "'${IOT_HUB_KEY}'",
+             "endpoint": "messages/events",
+             "consumerGroupName": "$Default"
+           }
          }
-       }' \
-       --serialization '{
-         "type": "Json",
-         "properties": {"encoding": "UTF8"}
        }'
    
    echo "✅ Stream Analytics job configured for real-time processing"
@@ -326,12 +340,17 @@ echo "✅ Storage account created for agricultural data"
    Azure Data Manager for Agriculture uses standardized agricultural data models to represent farms, fields, and boundaries. This configuration establishes the foundational entities that enable spatial analysis, crop rotation tracking, and field-specific management recommendations across the precision agriculture platform.
 
    ```bash
-   # Create a sample farm entity
+   # Create a sample farm entity using the correct API version
    export FARM_ID="demo-farm-$(date +%s)"
    
-   curl -X POST "${ADMA_ENDPOINT}/farmers/${FARM_ID}" \
+   # Get access token for Data Manager API calls
+   export ACCESS_TOKEN=$(az account get-access-token \
+       --resource https://farmbeats.azure.net \
+       --query accessToken --output tsv)
+   
+   curl -X PUT "${ADMA_ENDPOINT}/farmers/${FARM_ID}?api-version=2023-11-01-preview" \
        -H "Content-Type: application/json" \
-       -H "Authorization: Bearer $(az account get-access-token --query accessToken -o tsv)" \
+       -H "Authorization: Bearer ${ACCESS_TOKEN}" \
        -d '{
          "name": "Demo Precision Farm",
          "description": "Sample farm for precision agriculture analytics",
@@ -346,14 +365,16 @@ echo "✅ Storage account created for agricultural data"
    # Create a field boundary
    export FIELD_ID="field-north-40-$(date +%s)"
    
-   curl -X POST "${ADMA_ENDPOINT}/farmers/${FARM_ID}/fields/${FIELD_ID}" \
+   curl -X PUT "${ADMA_ENDPOINT}/farmers/${FARM_ID}/fields/${FIELD_ID}?api-version=2023-11-01-preview" \
        -H "Content-Type: application/json" \
-       -H "Authorization: Bearer $(az account get-access-token --query accessToken -o tsv)" \
+       -H "Authorization: Bearer ${ACCESS_TOKEN}" \
        -d '{
          "name": "North 40 Field",
          "farmerId": "'${FARM_ID}'",
-         "area": 40,
-         "cropType": "corn",
+         "area": {
+           "unit": "acres",
+           "value": 40
+         },
          "properties": {
            "soilType": "loam",
            "drainageClass": "well-drained",
@@ -404,15 +425,14 @@ echo "✅ Storage account created for agricultural data"
 1. **Verify Azure Data Manager for Agriculture Deployment**:
 
    ```bash
-   # Check Data Manager instance status
-   az datamgr-for-agriculture show \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${ADMA_INSTANCE} \
+   # Check Data Manager instance status using REST API
+   az rest --method GET \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.AgFoodPlatform/farmBeats/${ADMA_INSTANCE}?api-version=2023-06-01-preview" \
        --query "properties.provisioningState" --output table
    
    # Test Data Manager API connectivity
-   curl -X GET "${ADMA_ENDPOINT}/farmers" \
-       -H "Authorization: Bearer $(az account get-access-token --query accessToken -o tsv)" \
+   curl -X GET "${ADMA_ENDPOINT}/farmers?api-version=2023-11-01-preview" \
+       -H "Authorization: Bearer ${ACCESS_TOKEN}" \
        -H "Content-Type: application/json"
    ```
 
@@ -421,7 +441,7 @@ echo "✅ Storage account created for agricultural data"
 2. **Test IoT Hub Sensor Data Ingestion**:
 
    ```bash
-   # Send sample sensor data to IoT Hub
+   # Send sample sensor data to IoT Hub using device simulation
    az iot device simulate \
        --hub-name ${IOT_HUB_NAME} \
        --device-id soil-sensor-field-01 \
@@ -442,7 +462,7 @@ echo "✅ Storage account created for agricultural data"
 3. **Validate AI Services Computer Vision Setup**:
 
    ```bash
-   # Test AI Services connectivity
+   # Test AI Services connectivity with latest API version
    curl -X POST "${AI_SERVICES_ENDPOINT}/vision/v3.2/analyze?visualFeatures=Categories,Tags,Description" \
        -H "Ocp-Apim-Subscription-Key: ${AI_SERVICES_KEY}" \
        -H "Content-Type: application/json" \
@@ -494,11 +514,9 @@ echo "✅ Storage account created for agricultural data"
 2. **Remove Azure Data Manager for Agriculture Instance**:
 
    ```bash
-   # Delete Data Manager instance
-   az datamgr-for-agriculture delete \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${ADMA_INSTANCE} \
-       --yes
+   # Delete Data Manager instance using REST API
+   az rest --method DELETE \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.AgFoodPlatform/farmBeats/${ADMA_INSTANCE}?api-version=2023-06-01-preview"
    
    echo "✅ Azure Data Manager for Agriculture instance deleted"
    ```
@@ -518,7 +536,7 @@ echo "✅ Storage account created for agricultural data"
    # Clean up environment variables
    unset RESOURCE_GROUP LOCATION SUBSCRIPTION_ID RANDOM_SUFFIX
    unset ADMA_INSTANCE IOT_HUB_NAME STREAM_JOB_NAME STORAGE_ACCOUNT
-   unset AI_SERVICES_NAME MAPS_ACCOUNT FARM_ID FIELD_ID
+   unset AI_SERVICES_NAME MAPS_ACCOUNT FARM_ID FIELD_ID ACCESS_TOKEN
    ```
 
 ## Discussion
@@ -527,9 +545,9 @@ Azure Data Manager for Agriculture represents a significant advancement in agric
 
 The combination of real-time IoT data processing through Azure Stream Analytics and computer vision analysis through Azure AI Services creates a powerful foundation for precision agriculture applications. Stream Analytics processes continuous sensor data streams to detect critical conditions like drought stress or pest outbreaks, while AI Services analyzes drone and satellite imagery to identify crop health patterns and predict yield outcomes. This integration follows the [Azure IoT reference architecture](https://docs.microsoft.com/en-us/azure/architecture/reference-architectures/iot) principles for scalable, secure IoT solutions and supports the agricultural industry's growing adoption of data-driven farming practices.
 
-From a business perspective, precision agriculture platforms built on Azure enable farmers to optimize resource utilization, reduce environmental impact, and increase crop yields through data-driven decision making. The platform's geospatial capabilities through Azure Maps support field-specific management strategies, while the standardized data models facilitate integration with existing farm management systems and third-party agricultural software. For detailed implementation guidance, review the [Azure agriculture solution accelerators](https://docs.microsoft.com/en-us/azure/architecture/industries/agriculture/agriculture-digital-transformation) and [IoT for agriculture patterns](https://docs.microsoft.com/en-us/azure/architecture/example-scenario/iot/introduction-to-solutions).
+From a business perspective, precision agriculture platforms built on Azure enable farmers to optimize resource utilization, reduce environmental impact, and increase crop yields through data-driven decision making. The platform's geospatial capabilities through Azure Maps support field-specific management strategies, while the standardized data models facilitate integration with existing farm management systems and third-party agricultural software. The Azure Well-Architected Framework principles ensure this solution provides operational excellence, security, reliability, performance efficiency, and cost optimization for agricultural workloads. For detailed implementation guidance, review the [Azure agriculture solution accelerators](https://docs.microsoft.com/en-us/azure/architecture/industries/agriculture/agriculture-digital-transformation) and [IoT for agriculture patterns](https://docs.microsoft.com/en-us/azure/architecture/example-scenario/iot/introduction-to-solutions).
 
-> **Tip**: Use Azure Cost Management to monitor spending across agricultural workloads and implement automated scaling policies to optimize costs during seasonal variations in data processing requirements. The [Azure agricultural cost optimization guide](https://docs.microsoft.com/en-us/azure/cost-management-billing/costs/cost-optimization-agriculture) provides specific recommendations for managing costs in precision agriculture scenarios.
+> **Tip**: Use Azure Cost Management to monitor spending across agricultural workloads and implement automated scaling policies to optimize costs during seasonal variations in data processing requirements. Configure Azure Monitor alerts to track resource utilization and set up automatic scaling for seasonal peak loads during planting and harvest periods.
 
 ## Challenge
 
@@ -547,4 +565,9 @@ Extend this precision agriculture platform by implementing these advanced capabi
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

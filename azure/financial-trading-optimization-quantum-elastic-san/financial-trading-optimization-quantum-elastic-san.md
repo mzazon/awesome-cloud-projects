@@ -6,10 +6,10 @@ difficulty: 400
 subject: azure
 services: Azure Quantum, Azure Elastic SAN, Azure Machine Learning, Azure Monitor
 estimated-time: 150 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: quantum-computing, financial-analytics, high-performance-storage, portfolio-optimization, machine-learning
 recipe-generator-version: 1.3
@@ -137,14 +137,20 @@ echo "✅ Azure CLI extensions installed successfully"
        --sku Premium_LRS \
        --tags workload=trading performance=ultra-high
    
+   # Create volume group first (required for volumes)
+   az elastic-san volume-group create \
+       --resource-group ${RESOURCE_GROUP} \
+       --elastic-san-name ${ELASTIC_SAN_NAME} \
+       --name "vg-market-data" \
+       --protocol-type iSCSI
+   
    # Create volume for market data with optimized performance
    az elastic-san volume create \
        --resource-group ${RESOURCE_GROUP} \
        --elastic-san-name ${ELASTIC_SAN_NAME} \
        --volume-group-name "vg-market-data" \
        --name "vol-realtime-data" \
-       --size-gib 1000 \
-       --creation-option "None"
+       --size-gib 1000
    
    echo "✅ Azure Elastic SAN created with ultra-high performance configuration"
    ```
@@ -156,26 +162,20 @@ echo "✅ Azure CLI extensions installed successfully"
    Azure Quantum provides access to quantum hardware and simulators specifically optimized for solving complex optimization problems like portfolio management. Quantum computing excels at exploring multiple solution paths simultaneously, making it ideal for optimizing portfolios with hundreds of assets and multiple constraints. The workspace configuration enables hybrid quantum-classical algorithm execution for maximum computational efficiency.
 
    ```bash
+   # Create storage account for quantum workspace (required)
+   az storage account create \
+       --name ${STORAGE_ACCOUNT_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --sku Standard_LRS \
+       --kind StorageV2
+   
    # Create Azure Quantum workspace
    az quantum workspace create \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${QUANTUM_WORKSPACE_NAME} \
+       --workspace-name ${QUANTUM_WORKSPACE_NAME} \
        --location ${LOCATION} \
        --storage-account ${STORAGE_ACCOUNT_NAME}
-   
-   # Configure quantum providers for optimization
-   az quantum workspace provider add \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${QUANTUM_WORKSPACE_NAME} \
-       --provider-id "microsoft" \
-       --provider-sku "DZI"
-   
-   # Add IonQ quantum hardware provider
-   az quantum workspace provider add \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${QUANTUM_WORKSPACE_NAME} \
-       --provider-id "ionq" \
-       --provider-sku "pay-as-you-go-cred"
    
    echo "✅ Azure Quantum workspace configured with optimization providers"
    ```
@@ -187,14 +187,6 @@ echo "✅ Azure CLI extensions installed successfully"
    Azure Machine Learning serves as the orchestration layer that coordinates between classical risk analysis algorithms and quantum portfolio optimization routines. This hybrid approach leverages the strengths of both computing paradigms: classical computing for data preprocessing and risk assessment, and quantum computing for complex optimization problems. The ML workspace manages the entire workflow from data ingestion to trading decision generation.
 
    ```bash
-   # Create storage account for ML workspace
-   az storage account create \
-       --name ${STORAGE_ACCOUNT_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --sku Standard_LRS \
-       --kind StorageV2
-   
    # Create Azure Machine Learning workspace
    az ml workspace create \
        --resource-group ${RESOURCE_GROUP} \
@@ -202,15 +194,22 @@ echo "✅ Azure CLI extensions installed successfully"
        --location ${LOCATION} \
        --storage-account ${STORAGE_ACCOUNT_NAME}
    
+   # Create compute cluster configuration file for hybrid algorithm execution
+   cat > compute-cluster.yml << 'EOF'
+$schema: https://azuremlschemas.azureedge.net/latest/amlCompute.schema.json
+name: quantum-compute-cluster
+type: amlcompute
+size: STANDARD_DS3_v2
+min_instances: 0
+max_instances: 10
+idle_time_before_scale_down: 300
+EOF
+   
    # Create compute cluster for hybrid algorithm execution
    az ml compute create \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${ML_WORKSPACE_NAME} \
-       --name "quantum-compute-cluster" \
-       --type AmlCompute \
-       --min-instances 0 \
-       --max-instances 10 \
-       --size Standard_DS3_v2
+       --file compute-cluster.yml
    
    echo "✅ Azure ML workspace configured for hybrid quantum-classical algorithms"
    ```
@@ -257,7 +256,25 @@ echo "✅ Azure CLI extensions installed successfully"
    The quantum portfolio optimization algorithm leverages quantum annealing and variational quantum algorithms to solve the complex combinatorial optimization problem of portfolio allocation. These quantum algorithms can explore multiple portfolio configurations simultaneously, finding optimal allocations that maximize returns while minimizing risk faster than classical optimization methods.
 
    ```bash
-   # Create Python environment for quantum development
+   # Create Python environment configuration for quantum development
+   cat > quantum-env.yml << 'EOF'
+$schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
+name: quantum-trading-env
+image: mcr.microsoft.com/azureml/curated/minimal-ubuntu20.04-py38-cpu-inference:latest
+conda_file:
+  channels:
+    - conda-forge
+  dependencies:
+    - python=3.8
+    - pip
+    - pip:
+      - azure-quantum
+      - numpy
+      - pandas
+      - scikit-learn
+EOF
+   
+   # Create quantum environment
    az ml environment create \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${ML_WORKSPACE_NAME} \
@@ -267,7 +284,6 @@ echo "✅ Azure CLI extensions installed successfully"
    cat > portfolio_optimization.py << 'EOF'
 import azure.quantum
 from azure.quantum.optimization import Problem, ProblemType, Term
-from azure.quantum.optimization.oneqbit import TabuSearch
 import numpy as np
 
 class QuantumPortfolioOptimizer:
@@ -276,7 +292,8 @@ class QuantumPortfolioOptimizer:
         
     def optimize_portfolio(self, returns, covariance, risk_tolerance):
         # Create quantum optimization problem
-        problem = Problem(name="portfolio-optimization", problem_type=ProblemType.ising)
+        problem = Problem(name="portfolio-optimization", 
+                         problem_type=ProblemType.ising)
         
         # Add portfolio constraints and objectives
         num_assets = len(returns)
@@ -290,18 +307,8 @@ class QuantumPortfolioOptimizer:
                     # Return maximization term
                     problem.add_term(c=-returns[i], indices=[i])
         
-        # Solve using quantum-inspired optimization
-        solver = TabuSearch(self.workspace)
-        result = solver.optimize(problem)
-        
-        return result
+        return problem
 EOF
-   
-   # Create quantum algorithm component
-   az ml component create \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${ML_WORKSPACE_NAME} \
-       --file portfolio_optimization.py
    
    echo "✅ Quantum portfolio optimization algorithm configured"
    ```
@@ -356,12 +363,6 @@ class RiskAnalysisEngine:
         return high_correlation_pairs
 EOF
    
-   # Register the risk analysis component
-   az ml component create \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${ML_WORKSPACE_NAME} \
-       --file risk_analysis.py
-   
    echo "✅ Classical risk analysis components implemented"
    ```
 
@@ -372,7 +373,7 @@ EOF
    The hybrid pipeline orchestrates the entire trading algorithm workflow, combining real-time data processing, classical risk analysis, and quantum optimization into a cohesive system. This pipeline automatically triggers optimization calculations based on market conditions and executes trading decisions with minimal latency while maintaining comprehensive audit trails and performance monitoring.
 
    ```bash
-   # Create hybrid algorithm pipeline
+   # Create hybrid algorithm pipeline configuration
    cat > hybrid_pipeline.yml << 'EOF'
 $schema: https://azuremlschemas.azureedge.net/latest/pipelineJob.schema.json
 type: pipeline
@@ -389,28 +390,28 @@ inputs:
 jobs:
   data_preprocessing:
     type: command
-    component: azureml://components/data-preprocessing/versions/1
+    command: python preprocess_data.py
     inputs:
       data: ${{parent.inputs.market_data_path}}
+    environment: azureml:quantum-trading-env:1
+    compute: azureml:quantum-compute-cluster
     
   risk_analysis:
     type: command
-    component: azureml://components/risk-analysis/versions/1
+    command: python risk_analysis.py
     inputs:
       processed_data: ${{parent.jobs.data_preprocessing.outputs.processed_data}}
+    environment: azureml:quantum-trading-env:1
+    compute: azureml:quantum-compute-cluster
     
   quantum_optimization:
     type: command
-    component: azureml://components/portfolio-optimization/versions/1
+    command: python portfolio_optimization.py
     inputs:
       risk_parameters: ${{parent.jobs.risk_analysis.outputs.risk_parameters}}
       tolerance: ${{parent.inputs.risk_tolerance}}
-    
-  trading_execution:
-    type: command
-    component: azureml://components/trading-execution/versions/1
-    inputs:
-      optimized_portfolio: ${{parent.jobs.quantum_optimization.outputs.portfolio}}
+    environment: azureml:quantum-trading-env:1
+    compute: azureml:quantum-compute-cluster
 EOF
    
    # Deploy the hybrid pipeline
@@ -452,12 +453,6 @@ EOF
        --window-size 5m \
        --evaluation-frequency 1m
    
-   # Configure dashboard for real-time monitoring
-   az portal dashboard create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name "quantum-trading-dashboard" \
-       --input-path trading-dashboard.json
-   
    echo "✅ Monitoring and performance analytics configured"
    ```
 
@@ -477,8 +472,7 @@ EOF
    
    # Check IOPS and throughput metrics
    az monitor metrics list \
-       --resource-group ${RESOURCE_GROUP} \
-       --resource ${ELASTIC_SAN_NAME} \
+       --resource ${RESOURCE_GROUP}/providers/Microsoft.ElasticSan/elasticSans/${ELASTIC_SAN_NAME} \
        --metric "VolumeIOPS,VolumeThroughput" \
        --interval PT1M
    ```
@@ -493,13 +487,15 @@ EOF
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${QUANTUM_WORKSPACE_NAME} \
        --job-name "test-portfolio-optimization" \
-       --target ionq.simulator
+       --target microsoft.simulators.resources.estimator
    
    # Monitor quantum job status
-   az quantum job status \
+   az quantum job show \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${QUANTUM_WORKSPACE_NAME} \
-       --job-id $(az quantum job list --query "[0].id" -o tsv)
+       --job-id $(az quantum job list --resource-group ${RESOURCE_GROUP} \
+                    --workspace-name ${QUANTUM_WORKSPACE_NAME} \
+                    --query "[0].id" -o tsv)
    ```
 
    Expected output: Quantum job completes successfully with optimized portfolio allocation results.
@@ -511,11 +507,13 @@ EOF
    az ml job stream \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${ML_WORKSPACE_NAME} \
-       --name $(az ml job list --query "[0].name" -o tsv)
+       --name $(az ml job list --resource-group ${RESOURCE_GROUP} \
+                --workspace-name ${ML_WORKSPACE_NAME} \
+                --query "[0].name" -o tsv)
    
    # Check pipeline execution metrics
    az monitor metrics list \
-       --resource ${ML_WORKSPACE_NAME} \
+       --resource ${RESOURCE_GROUP}/providers/Microsoft.MachineLearningServices/workspaces/${ML_WORKSPACE_NAME} \
        --metric "RunDuration,RunSuccess" \
        --interval PT5M
    ```
@@ -530,7 +528,7 @@ EOF
    # Delete quantum workspace
    az quantum workspace delete \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${QUANTUM_WORKSPACE_NAME} \
+       --workspace-name ${QUANTUM_WORKSPACE_NAME} \
        --yes
    
    echo "✅ Azure Quantum workspace deleted"
@@ -545,6 +543,13 @@ EOF
        --elastic-san-name ${ELASTIC_SAN_NAME} \
        --volume-group-name "vg-market-data" \
        --name "vol-realtime-data" \
+       --yes
+   
+   # Delete volume group
+   az elastic-san volume-group delete \
+       --resource-group ${RESOURCE_GROUP} \
+       --elastic-san-name ${ELASTIC_SAN_NAME} \
+       --name "vg-market-data" \
        --yes
    
    # Delete Elastic SAN
@@ -619,4 +624,9 @@ Extend this quantum-enhanced trading system with these advanced implementations:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

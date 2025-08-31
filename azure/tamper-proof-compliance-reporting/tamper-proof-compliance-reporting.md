@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Confidential Ledger, Azure Logic Apps, Azure Monitor, Azure Blob Storage
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: compliance, security, automation, audit-trails, confidential-computing
 recipe-generator-version: 1.3
@@ -88,7 +88,7 @@ graph TB
 4. Familiarity with JSON and REST APIs
 5. Estimated cost: $150-200/month (based on moderate usage)
 
-> **Note**: Azure Confidential Ledger is now SOC 2 Type II compliant and generally available with pricing at ~$3/day per instance starting March 2025.
+> **Note**: Azure Confidential Ledger requires Owner permissions on the Azure subscription for initial creation. The service is generally available with pricing starting at approximately $3/day per instance.
 
 ## Preparation
 
@@ -123,12 +123,21 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Azure Confidential Ledger provides a tamper-proof, cryptographically verifiable data store running in hardware-backed secure enclaves. This ensures that audit logs cannot be modified even by privileged users or Microsoft, making it ideal for regulatory compliance scenarios where data integrity is paramount.
 
    ```bash
+   # Register the Confidential Ledger resource provider if needed
+   az provider register --namespace "microsoft.ConfidentialLedger"
+   
+   # Get your principal ID for ledger access
+   PRINCIPAL_ID=$(az ad signed-in-user show --query id --output tsv)
+   
    # Create Confidential Ledger instance
    az confidentialledger create \
        --name ${ACL_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --ledger-type Private
+       --ledger-type Private \
+       --aad-based-security-principals \
+       ledger-role-name="Administrator" \
+       principal-id="${PRINCIPAL_ID}"
    
    # Get the ledger endpoint
    LEDGER_ENDPOINT=$(az confidentialledger show \
@@ -180,7 +189,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --sku Standard_LRS \
-       --encryption-services blob \
+       --kind StorageV2 \
        --https-only true \
        --min-tls-version TLS1_2
    
@@ -194,6 +203,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    # Enable blob versioning for audit trail
    az storage account blob-service-properties update \
        --account-name ${STORAGE_ACCOUNT} \
+       --resource-group ${RESOURCE_GROUP} \
        --enable-versioning true
    
    echo "✅ Secure storage configured for compliance reports"
@@ -204,7 +214,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Azure Logic Apps provides the orchestration layer that automates the entire compliance reporting process. It connects monitoring alerts to ledger recording, report generation, and distribution, eliminating manual processes while ensuring consistent, timely compliance reporting.
 
    ```bash
-   # Create Logic App
+   # Create Logic App with system-assigned managed identity
    az logic workflow create \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -219,14 +229,19 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
          }
        }'
    
+   # Enable system-assigned managed identity
+   az logic workflow identity assign \
+       --name ${LOGIC_APP_NAME} \
+       --resource-group ${RESOURCE_GROUP}
+   
    # Get Logic App identity for RBAC
-   LOGIC_APP_IDENTITY=$(az logic workflow show \
+   LOGIC_APP_IDENTITY=$(az logic workflow identity show \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query identity.principalId \
+       --query principalId \
        --output tsv)
    
-   echo "✅ Logic App workflow created"
+   echo "✅ Logic App workflow created with managed identity"
    ```
 
 5. **Configure RBAC Permissions**:
@@ -260,26 +275,19 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Alert rules in Azure Monitor detect compliance violations in real-time by analyzing incoming event data against predefined criteria. These rules trigger the Logic Apps workflow, ensuring immediate response to compliance issues and maintaining continuous regulatory adherence.
 
    ```bash
-   # Create sample compliance alert rule
-   az monitor metrics alert create \
-       --name alert-compliance-violation \
-       --resource-group ${RESOURCE_GROUP} \
-       --scopes ${WORKSPACE_ID} \
-       --condition "avg Percentage CPU > 90" \
-       --window-size 5m \
-       --evaluation-frequency 1m \
-       --action ag-compliance \
-       --description "Compliance threshold violation detected"
-   
    # Create log-based alert for security events
    az monitor scheduled-query rule create \
        --name alert-security-events \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --action ag-compliance \
-       --condition 'count > 5' \
+       --condition "count > 5" \
+       --condition-query 'SecurityEvent | where EventID == 4625' \
        --data-source ${WORKSPACE_ID} \
-       --query 'SecurityEvent | where EventID == 4625'
+       --evaluation-frequency 5m \
+       --window-size 5m \
+       --severity 2 \
+       --description "Compliance threshold violation detected"
    
    echo "✅ Compliance monitoring alerts configured"
    ```
@@ -289,16 +297,29 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    The Logic App workflow orchestrates the complete compliance reporting lifecycle, from event detection to report generation. By integrating with multiple Azure services through managed connectors, it creates a seamless, automated compliance pipeline that scales with your organization's needs.
 
    ```bash
-   # Update Logic App with compliance workflow
-   WORKFLOW_DEFINITION=$(cat <<EOF
+   # Create workflow definition file
+   cat << 'EOF' > /tmp/workflow-definition.json
    {
      "definition": {
-       "\$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+       "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
        "contentVersion": "1.0.0.0",
        "triggers": {
          "When_Alert_Triggered": {
            "type": "Request",
-           "kind": "Http"
+           "kind": "Http",
+           "inputs": {
+             "schema": {
+               "type": "object",
+               "properties": {
+                 "data": {
+                   "type": "object"
+                 },
+                 "schemaId": {
+                   "type": "string"
+                 }
+               }
+             }
+           }
          }
        },
        "actions": {
@@ -306,12 +327,15 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
            "type": "Http",
            "inputs": {
              "method": "POST",
-             "uri": "${LEDGER_ENDPOINT}/app/transactions",
+             "uri": "https://LEDGER_ENDPOINT/app/transactions",
              "headers": {
                "Content-Type": "application/json"
              },
              "body": {
                "contents": "@{triggerBody()}"
+             },
+             "authentication": {
+               "type": "ManagedServiceIdentity"
              }
            }
          },
@@ -327,16 +351,18 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
            }
          },
          "Save_to_Blob": {
-           "type": "ApiConnection",
+           "type": "Http",
            "inputs": {
-             "host": {
-               "connection": {
-                 "name": "@parameters('\$connections')['azureblob']['connectionId']"
-               }
+             "method": "PUT",
+             "uri": "https://STORAGE_ACCOUNT.blob.core.windows.net/compliance-reports/report-@{utcNow('yyyy-MM-dd-HH-mm-ss')}.json",
+             "headers": {
+               "Content-Type": "application/json",
+               "x-ms-blob-type": "BlockBlob"
              },
-             "method": "post",
-             "path": "/v2/datasets/@{encodeURIComponent('${STORAGE_ACCOUNT}')}/files",
-             "body": "@{outputs('Generate_Report')}"
+             "body": "@{outputs('Generate_Report')}",
+             "authentication": {
+               "type": "ManagedServiceIdentity"
+             }
            },
            "runAfter": {
              "Generate_Report": ["Succeeded"]
@@ -345,14 +371,18 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        }
      }
    }
-EOF
-   )
+   EOF
    
-   # Update Logic App with workflow
-   az logic workflow update \
+   # Replace placeholders in workflow definition
+   sed -i "s/LEDGER_ENDPOINT/${LEDGER_ENDPOINT}/g" /tmp/workflow-definition.json
+   sed -i "s/STORAGE_ACCOUNT/${STORAGE_ACCOUNT}/g" /tmp/workflow-definition.json
+   
+   # Update Logic App with workflow definition
+   az logic workflow create \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --definition "${WORKFLOW_DEFINITION}"
+       --location ${LOCATION} \
+       --definition @/tmp/workflow-definition.json
    
    echo "✅ Compliance workflow automation configured"
    ```
@@ -385,13 +415,16 @@ EOF
        --output tsv)
    
    # Send test compliance event
-   curl -X POST ${TRIGGER_URL} \
+   curl -X POST "${TRIGGER_URL}" \
        -H "Content-Type: application/json" \
        -d '{
-         "alertType": "ComplianceViolation",
-         "severity": "High",
-         "description": "Test compliance event",
-         "timestamp": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"
+         "data": {
+           "alertType": "ComplianceViolation",
+           "severity": "High",
+           "description": "Test compliance event",
+           "timestamp": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"
+         },
+         "schemaId": "AzureMonitorMetricAlert"
        }'
    ```
 
@@ -402,6 +435,7 @@ EOF
    az storage blob list \
        --container-name compliance-reports \
        --account-name ${STORAGE_ACCOUNT} \
+       --auth-mode login \
        --output table
    ```
 
@@ -448,4 +482,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

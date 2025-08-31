@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: organizations, cost-explorer, budgets, lambda, sns
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-allocation, chargeback, budgets, billing, financial-governance
 recipe-generator-version: 1.3
 ---
 
 # Cost Allocation and Chargeback Systems
-
 
 ## Problem
 
@@ -49,6 +48,7 @@ graph TB
         SNS[SNS Topics]
         BUDGETS[AWS Budgets]
         S3[S3 Bucket]
+        EVENTS[EventBridge]
     end
     
     subgraph "Financial Systems"
@@ -74,6 +74,7 @@ graph TB
     S3 --> LAMBDA
     LAMBDA --> FINANCE
     LAMBDA --> APIS
+    EVENTS --> LAMBDA
     
     style MGMT fill:#FF9900
     style TAGS fill:#3F8624
@@ -112,8 +113,14 @@ export COST_BUCKET_NAME="cost-allocation-reports-${RANDOM_SUFFIX}"
 export SNS_TOPIC_NAME="cost-allocation-alerts-${RANDOM_SUFFIX}"
 export LAMBDA_FUNCTION_NAME="cost-allocation-processor-${RANDOM_SUFFIX}"
 
-# Create S3 bucket for cost reports
+# Create S3 bucket for cost reports with encryption enabled
 aws s3 mb s3://${COST_BUCKET_NAME} --region ${AWS_REGION}
+
+# Enable default encryption for the bucket
+aws s3api put-bucket-encryption \
+    --bucket ${COST_BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
 
 echo "✅ Environment prepared with bucket: ${COST_BUCKET_NAME}"
 ```
@@ -166,7 +173,7 @@ echo "✅ Environment prepared with bucket: ${COST_BUCKET_NAME}"
 
 2. **Create Cost and Usage Report**:
 
-   Cost and Usage Reports (CUR) provide the most detailed billing data available in AWS. These reports include resource-level information and support custom analysis with tools like Athena and Redshift for sophisticated cost allocation.
+   Cost and Usage Reports (CUR) provide the most detailed billing data available in AWS, offering resource-level information with support for custom analysis using tools like Amazon Athena and Amazon Redshift. The CUR data enables sophisticated cost allocation calculations and forms the foundation for accurate chargeback billing based on actual resource consumption patterns.
 
    ```bash
    # Create CUR report for detailed billing analysis
@@ -193,11 +200,11 @@ echo "✅ Environment prepared with bucket: ${COST_BUCKET_NAME}"
    echo "✅ Cost and Usage Report configured"
    ```
 
-   The CUR report includes additional schema elements for resource tracking and generates daily reports with Athena integration for SQL-based analysis. This enables detailed chargeback calculations based on actual resource usage.
+   The CUR report includes additional schema elements for resource tracking and generates daily reports with Athena integration for SQL-based analysis. This enables detailed chargeback calculations based on actual resource usage and supports advanced analytics for cost optimization initiatives.
 
 3. **Set Up SNS Topic for Notifications**:
 
-   SNS topics enable automated notifications when budget thresholds are exceeded. This proactive alerting helps departments stay within their allocated budgets and take corrective action before costs spiral out of control.
+   Amazon SNS provides reliable, scalable notification delivery for budget alerts and cost anomaly detection. The topic acts as a central communication hub, enabling automated notifications when budget thresholds are exceeded or unusual spending patterns are detected. This proactive alerting system helps departments maintain budget discipline and respond quickly to cost overruns.
 
    ```bash
    # Create SNS topic for cost alerts
@@ -205,7 +212,7 @@ echo "✅ Environment prepared with bucket: ${COST_BUCKET_NAME}"
        --name ${SNS_TOPIC_NAME} \
        --query TopicArn --output text)
    
-   # Create topic policy for budget notifications
+   # Create topic policy for budget notifications and cost anomaly detection
    aws sns set-topic-attributes \
        --topic-arn ${SNS_TOPIC_ARN} \
        --attribute-name Policy \
@@ -215,7 +222,7 @@ echo "✅ Environment prepared with bucket: ${COST_BUCKET_NAME}"
                {
                    "Effect": "Allow",
                    "Principal": {
-                       "Service": "budgets.amazonaws.com"
+                       "Service": ["budgets.amazonaws.com", "costalerts.amazonaws.com"]
                    },
                    "Action": "SNS:Publish",
                    "Resource": "'${SNS_TOPIC_ARN}'"
@@ -226,11 +233,11 @@ echo "✅ Environment prepared with bucket: ${COST_BUCKET_NAME}"
    echo "✅ SNS topic created: ${SNS_TOPIC_ARN}"
    ```
 
-   The topic policy grants AWS Budgets permission to publish notifications, enabling automated alerts when budget thresholds are breached. This ensures stakeholders receive timely cost overrun notifications.
+   The topic policy grants both AWS Budgets and Cost Anomaly Detection services permission to publish notifications, enabling comprehensive cost monitoring across multiple AWS services. This ensures stakeholders receive timely alerts for both budget threshold breaches and unexpected cost anomalies.
 
 4. **Create Department-Specific Budgets**:
 
-   Department-specific budgets track spending against allocated amounts and trigger alerts when thresholds are exceeded. These budgets use cost filters based on tagging to isolate spending by organizational units.
+   AWS Budgets provides proactive cost monitoring by tracking spending against predefined thresholds and automatically triggering alerts when limits are approached or exceeded. Department-specific budgets use cost filters based on resource tagging to isolate spending by organizational units, enabling accurate cost control and accountability at the department level.
 
    ```bash
    # Create budget for Engineering department
@@ -302,9 +309,11 @@ echo "✅ Environment prepared with bucket: ${COST_BUCKET_NAME}"
    echo "✅ Department budgets created with notifications"
    ```
 
+   These budgets monitor monthly spending for each department and trigger notifications when actual costs exceed 75-80% of the allocated budget. The early warning system enables proactive cost management and helps prevent unexpected budget overruns.
+
 5. **Create Cost Allocation Processing Lambda**:
 
-   Lambda functions provide serverless compute capabilities for automating cost allocation processes. This function will query the Cost Explorer API to retrieve department-specific cost data, process it into chargeback reports, and distribute the results to stakeholders. The serverless model ensures cost-effective execution that scales with your organization's needs while maintaining consistent processing schedules.
+   AWS Lambda provides serverless compute capabilities for automating cost allocation processes without the overhead of managing servers. The Lambda function will query the Cost Explorer API to retrieve department-specific cost data, process it into structured chargeback reports, and distribute summaries to stakeholders. This serverless approach ensures cost-effective execution that scales automatically with your organization's needs while maintaining consistent processing schedules.
 
    ```bash
    # Create IAM role for Lambda function
@@ -322,6 +331,9 @@ echo "✅ Environment prepared with bucket: ${COST_BUCKET_NAME}"
                }
            ]
        }'
+   
+   # Wait for role to be created
+   sleep 10
    
    # Attach necessary permissions
    aws iam attach-role-policy \
@@ -364,24 +376,27 @@ echo "✅ Environment prepared with bucket: ${COST_BUCKET_NAME}"
    echo "✅ Lambda IAM role created"
    ```
 
-   The IAM role follows the principle of least privilege, granting only the necessary permissions for Cost Explorer API access, S3 report storage, and SNS notifications. This security-first approach ensures automated cost processing while maintaining appropriate access controls.
+   The IAM role follows the principle of least privilege, granting only the necessary permissions for Cost Explorer API access, S3 report storage, and SNS notifications. This security-first approach ensures automated cost processing while maintaining appropriate access controls and limiting potential security exposure.
 
 6. **Deploy Cost Processing Lambda Function**:
 
-   This Lambda function implements the core cost allocation logic by querying AWS Cost Explorer API for department-specific spending data. It processes the raw cost data into structured chargeback reports and automatically distributes summaries via SNS notifications. The function handles error conditions gracefully and provides detailed logging for troubleshooting cost allocation issues.
+   This Lambda function implements the core cost allocation logic by querying the AWS Cost Explorer API for department-specific spending data and processing it into structured chargeback reports. The function automatically distributes cost summaries via SNS notifications and handles error conditions gracefully with comprehensive logging for troubleshooting cost allocation issues.
 
    ```bash
    # Create Lambda function code
    cat > /tmp/cost_processor.py << 'EOF'
 import json
 import boto3
-import csv
+import os
 from datetime import datetime, timedelta
 from decimal import Decimal
 
 def lambda_handler(event, context):
     ce_client = boto3.client('ce')
     sns_client = boto3.client('sns')
+    
+    # Get SNS topic ARN from environment variable
+    sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
     
     # Get cost data for the last 30 days
     end_date = datetime.now().strftime('%Y-%m-%d')
@@ -420,22 +435,23 @@ def lambda_handler(event, context):
             'total_cost': sum(department_costs.values())
         }
         
-        # Send notification with summary
-        message = f"""
+        # Send notification with summary if SNS topic is configured
+        if sns_topic_arn:
+            message = f"""
 Cost Allocation Report - {end_date}
 
 Department Breakdown:
 """
-        for dept, cost in department_costs.items():
-            message += f"• {dept}: ${cost:.2f}\n"
-        
-        message += f"\nTotal Cost: ${report['total_cost']:.2f}"
-        
-        sns_client.publish(
-            TopicArn=context.invoked_function_arn.replace(':function:', ':sns:').replace(context.function_name, 'cost-allocation-alerts'),
-            Subject='Monthly Cost Allocation Report',
-            Message=message
-        )
+            for dept, cost in department_costs.items():
+                message += f"• {dept}: ${cost:.2f}\n"
+            
+            message += f"\nTotal Cost: ${report['total_cost']:.2f}"
+            
+            sns_client.publish(
+                TopicArn=sns_topic_arn,
+                Subject='Monthly Cost Allocation Report',
+                Message=message
+            )
         
         return {
             'statusCode': 200,
@@ -453,35 +469,38 @@ EOF
    # Create deployment package
    cd /tmp && zip cost_processor.zip cost_processor.py
    
-   # Create Lambda function
+   # Get Lambda role ARN
    LAMBDA_ROLE_ARN=$(aws iam get-role \
        --role-name ${LAMBDA_FUNCTION_NAME}-role \
        --query Role.Arn --output text)
    
+   # Create Lambda function with current Python runtime
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler cost_processor.lambda_handler \
        --zip-file fileb://cost_processor.zip \
        --timeout 60 \
-       --memory-size 256
+       --memory-size 256 \
+       --environment Variables='{SNS_TOPIC_ARN='${SNS_TOPIC_ARN}'}'
    
    echo "✅ Cost processing Lambda function deployed"
    ```
 
-   The deployed function is now ready to process cost data on-demand or via scheduled execution. It integrates with the Cost Explorer API to provide accurate, real-time cost allocation based on your organization's tagging strategy and cost categories.
+   The deployed function is now ready to process cost data on-demand or via scheduled execution. It integrates with the Cost Explorer API to provide accurate, real-time cost allocation based on your organization's tagging strategy and cost categories, with improved error handling and environmental configuration.
 
 7. **Create Automated Cost Allocation Schedule**:
 
-   EventBridge (formerly CloudWatch Events) provides reliable, serverless scheduling for automated cost allocation processing. The monthly schedule ensures consistent chargeback report generation without manual intervention. This automation is crucial for maintaining accurate financial governance in large organizations where manual cost allocation would be time-intensive and error-prone.
+   Amazon EventBridge (formerly CloudWatch Events) provides reliable, serverless scheduling for automated cost allocation processing. The monthly schedule ensures consistent chargeback report generation without manual intervention, which is crucial for maintaining accurate financial governance in large organizations where manual cost allocation would be time-intensive and error-prone.
 
    ```bash
    # Create EventBridge rule for monthly cost processing
    aws events put-rule \
        --name cost-allocation-schedule \
        --schedule-expression "cron(0 9 1 * ? *)" \
-       --description "Monthly cost allocation processing"
+       --description "Monthly cost allocation processing" \
+       --state ENABLED
    
    # Add Lambda permission for EventBridge
    aws lambda add-permission \
@@ -494,33 +513,37 @@ EOF
    # Add Lambda target to EventBridge rule
    aws events put-targets \
        --rule cost-allocation-schedule \
-       --targets "Id"="1","Arn"="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}"
+       --targets '[{
+           "Id": "1",
+           "Arn": "arn:aws:lambda:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':function:'${LAMBDA_FUNCTION_NAME}'"
+       }]'
    
    echo "✅ Monthly cost allocation schedule created"
    ```
 
-   The automated schedule ensures cost allocation reports are generated consistently on the first day of each month, providing timely financial data for departmental budget reviews and chargeback processing.
+   The automated schedule ensures cost allocation reports are generated consistently on the first day of each month at 9:00 AM UTC, providing timely financial data for departmental budget reviews and chargeback processing. This automation eliminates manual effort and ensures consistent reporting.
 
 8. **Set Up Cost Anomaly Detection**:
 
-   AWS Cost Anomaly Detection uses machine learning to identify unusual spending patterns that may indicate cost optimization opportunities or unintended resource usage. By monitoring department-level spending, it provides early warning of budget overruns and helps identify cost spikes before they impact monthly budgets. This proactive approach to cost management complements reactive budget alerts.
+   AWS Cost Anomaly Detection uses machine learning to identify unusual spending patterns that may indicate cost optimization opportunities or unintended resource usage. By monitoring department-level spending, it provides early warning of budget overruns and helps identify cost spikes before they impact monthly budgets. This proactive approach to cost management complements reactive budget alerts with predictive insights.
 
    ```bash
    # Create cost anomaly detector for unusual spending
-   aws ce create-anomaly-detector \
+   ANOMALY_DETECTOR_ARN=$(aws ce create-anomaly-detector \
        --anomaly-detector '{
            "DetectorName": "DepartmentCostAnomalyDetector",
            "MonitorType": "DIMENSIONAL",
            "DimensionKey": "TAG",
            "MatchOptions": ["EQUALS"],
            "MonitorSpecification": "Department"
-       }'
+       }' \
+       --query AnomalyDetectorArn --output text)
    
    # Create anomaly subscription
    aws ce create-anomaly-subscription \
        --anomaly-subscription '{
            "SubscriptionName": "CostAnomalyAlerts",
-           "MonitorArnList": [],
+           "MonitorArnList": ["'${ANOMALY_DETECTOR_ARN}'"],
            "Subscribers": [
                {
                    "Address": "'${SNS_TOPIC_ARN}'",
@@ -534,11 +557,11 @@ EOF
    echo "✅ Cost anomaly detection configured"
    ```
 
-   The anomaly detection system will now monitor department-level spending patterns and alert stakeholders when unusual cost patterns are detected, enabling proactive cost management and rapid response to unexpected charges.
+   The anomaly detection system will now monitor department-level spending patterns and alert stakeholders when unusual cost patterns are detected, enabling proactive cost management and rapid response to unexpected charges. The machine learning models continuously improve their accuracy based on your organization's spending patterns.
 
 9. **Create Cost Allocation Dashboard Query**:
 
-   Cost Explorer API queries provide programmatic access to detailed cost and usage data for custom reporting and analysis. This example query demonstrates how to retrieve department-specific costs for dashboard visualization or integration with external financial systems. The API supports various grouping options, time periods, and filters for comprehensive cost analysis.
+   The Cost Explorer API provides programmatic access to detailed cost and usage data for custom reporting and analysis. This example query demonstrates how to retrieve department-specific costs for dashboard visualization or integration with external financial systems. The API supports various grouping options, time periods, and filters for comprehensive cost analysis and reporting.
 
    ```bash
    # Create a sample Cost Explorer query for department costs
@@ -553,11 +576,11 @@ EOF
    echo "✅ Cost allocation query example executed"
    ```
 
-   This query template can be adapted for various reporting needs, including real-time dashboards, historical trend analysis, and integration with business intelligence tools for comprehensive cost visibility.
+   This query template can be adapted for various reporting needs, including real-time dashboards, historical trend analysis, and integration with business intelligence tools for comprehensive cost visibility. The flexible API structure supports custom filtering and grouping for specific organizational requirements.
 
 10. **Test Cost Allocation System**:
 
-    Comprehensive testing ensures the cost allocation system functions correctly before deploying to production. This includes validating Lambda function execution, budget alert configurations, and notification delivery. Testing also verifies that cost data is being processed accurately and that all stakeholders receive appropriate notifications.
+    Comprehensive testing ensures the cost allocation system functions correctly before deploying to production. This includes validating Lambda function execution, budget alert configurations, and notification delivery. Testing also verifies that cost data is being processed accurately and that all stakeholders receive appropriate notifications through the configured channels.
 
     ```bash
     # Manually trigger Lambda function for testing
@@ -579,7 +602,7 @@ EOF
     echo "✅ Cost allocation system tested successfully"
     ```
 
-    The system is now fully operational and ready for production use. All components have been validated, including cost data processing, budget monitoring, and notification delivery mechanisms.
+    The system is now fully operational and ready for production use. All components have been validated, including cost data processing, budget monitoring, and notification delivery mechanisms. The testing confirms that the automated cost allocation pipeline is functioning as expected.
 
 ## Validation & Testing
 
@@ -624,6 +647,15 @@ EOF
        --topic-arn ${SNS_TOPIC_ARN} \
        --message "Test cost allocation notification" \
        --subject "Cost Allocation Test"
+   ```
+
+5. **Verify Cost Category Definitions**:
+
+   ```bash
+   # List created cost categories
+   aws ce list-cost-category-definitions \
+       --query 'CostCategoryReferences[*].[Name,EffectiveStart]' \
+       --output table
    ```
 
 ## Cleanup
@@ -684,7 +716,7 @@ EOF
    DETECTOR_ARN=$(aws ce get-anomaly-detectors \
        --query 'AnomalyDetectors[0].DetectorArn' --output text)
    
-   if [ "$DETECTOR_ARN" != "None" ]; then
+   if [ "$DETECTOR_ARN" != "None" ] && [ "$DETECTOR_ARN" != "null" ]; then
        aws ce delete-anomaly-detector \
            --detector-arn ${DETECTOR_ARN}
    fi
@@ -711,13 +743,13 @@ EOF
 
 ## Discussion
 
-Building an effective cost allocation and chargeback system requires a comprehensive approach that combines proper tagging strategies, automated reporting, and proactive monitoring. The solution presented here leverages AWS native billing services to create a robust financial governance framework that can scale with organizational growth.
+Building an effective cost allocation and chargeback system requires a comprehensive approach that combines proper tagging strategies, automated reporting, and proactive monitoring. The solution presented here leverages AWS native billing services to create a robust financial governance framework that can scale with organizational growth while maintaining accuracy and compliance with financial reporting requirements.
 
-The key architectural decision in this implementation is using AWS Organizations for consolidated billing while maintaining granular cost visibility through cost allocation tags. This approach provides the benefit of volume discounts while enabling accurate cost attribution to specific departments or projects. The Cost and Usage Reports (CUR) provide the foundational data layer, while Cost Explorer APIs enable real-time cost analysis and automated processing.
+The key architectural decision in this implementation is using AWS Organizations for consolidated billing while maintaining granular cost visibility through cost allocation tags. This approach provides the benefit of volume discounts and simplified billing while enabling accurate cost attribution to specific departments or projects. The Cost and Usage Reports (CUR) provide the foundational data layer with resource-level granularity, while Cost Explorer APIs enable real-time cost analysis and automated processing for immediate insights.
 
-The automation layer, built with Lambda and EventBridge, ensures that cost allocation processing occurs consistently without manual intervention. This is particularly important for large organizations where manual cost allocation would be time-intensive and error-prone. The SNS integration provides immediate notifications for budget thresholds and cost anomalies, enabling proactive cost management rather than reactive responses to unexpected charges.
+The automation layer, built with Lambda and EventBridge, ensures that cost allocation processing occurs consistently without manual intervention. This is particularly critical for large organizations where manual cost allocation would be time-intensive, error-prone, and difficult to scale. The SNS integration provides immediate notifications for budget thresholds and cost anomalies, enabling proactive cost management rather than reactive responses to unexpected charges. This proactive approach helps maintain budget discipline and enables rapid response to cost optimization opportunities.
 
-Cost allocation tags are the cornerstone of this system, and their consistent application across all AWS resources is critical for accurate chargeback calculations. Organizations should establish clear tagging governance policies and use tools like AWS Config to enforce tag compliance. The cost category definitions help standardize how costs are grouped and allocated, even when tagging is inconsistent across different teams or projects.
+Cost allocation tags are the cornerstone of this system, and their consistent application across all AWS resources is critical for accurate chargeback calculations. Organizations should establish clear tagging governance policies and use tools like AWS Config to enforce tag compliance across all resources. The cost category definitions help standardize how costs are grouped and allocated, even when tagging practices are inconsistent across different teams or projects, providing a normalization layer that improves reporting accuracy.
 
 > **Warning**: Cost and Usage Reports can take up to 24 hours to deliver initial data and may incur additional charges based on data volume. Monitor S3 storage costs and implement appropriate lifecycle policies as detailed in the [AWS Cost and Usage Reports User Guide](https://docs.aws.amazon.com/cur/latest/userguide/what-is-cur.html).
 
@@ -727,16 +759,23 @@ Cost allocation tags are the cornerstone of this system, and their consistent ap
 
 Extend this cost allocation system by implementing these enhancements:
 
-1. **Advanced Analytics Integration**: Connect the cost data to Amazon QuickSight for interactive cost dashboards and trend analysis, enabling department heads to visualize their spending patterns and identify optimization opportunities.
+1. **Advanced Analytics Integration**: Connect the cost data to Amazon QuickSight for interactive cost dashboards and trend analysis, enabling department heads to visualize their spending patterns and identify optimization opportunities through self-service analytics.
 
-2. **Multi-Cloud Cost Allocation**: Integrate costs from other cloud providers (Azure, GCP) using third-party tools or custom APIs to create a unified view of total cloud spending across all platforms.
+2. **Multi-Cloud Cost Allocation**: Integrate costs from other cloud providers (Azure, GCP) using third-party tools or custom APIs to create a unified view of total cloud spending across all platforms and enable comprehensive cost comparison.
 
-3. **Predictive Cost Modeling**: Implement machine learning models using Amazon SageMaker to predict future costs based on historical usage patterns, resource lifecycle, and seasonal trends.
+3. **Predictive Cost Modeling**: Implement machine learning models using Amazon SageMaker to predict future costs based on historical usage patterns, resource lifecycle, and seasonal trends, enabling proactive budget planning and resource optimization.
 
-4. **Automated Cost Optimization**: Build automated recommendations and actions based on cost allocation data, such as suggesting right-sizing opportunities or identifying unused resources within each department.
+4. **Automated Cost Optimization**: Build automated recommendations and actions based on cost allocation data, such as suggesting right-sizing opportunities or identifying unused resources within each department, with automatic implementation of approved optimizations.
 
-5. **Financial System Integration**: Create API integrations with enterprise financial systems (SAP, Oracle Financials) to automatically generate journal entries and invoices based on cost allocation data.
+5. **Financial System Integration**: Create API integrations with enterprise financial systems (SAP, Oracle Financials) to automatically generate journal entries and invoices based on cost allocation data, streamlining the complete chargeback process from data collection to billing.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

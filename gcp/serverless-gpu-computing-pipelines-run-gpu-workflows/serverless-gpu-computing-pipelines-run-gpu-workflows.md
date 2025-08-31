@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Run, Cloud Workflows, Cloud Storage, Vertex AI
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: serverless, gpu, machine-learning, workflows, automation, artificial-intelligence
 recipe-generator-version: 1.3
@@ -87,10 +87,11 @@ graph TB
    - Cloud Storage API
    - Vertex AI API
    - Cloud Build API
-2. gcloud CLI v450.0.0 or later with beta components installed
+   - Eventarc API
+2. gcloud CLI latest version (450.0.0+) with beta components installed
 3. Docker installed locally for container building
 4. Basic understanding of machine learning inference workflows
-5. Estimated cost: $0.50-$2.00 per hour during active pipeline execution (GPU usage: $0.233/sec per L4 GPU)
+5. Estimated cost: $0.50-$2.00 per hour during active pipeline execution (GPU usage: $0.71/hour per L4 GPU based on current pricing)
 
 > **Note**: Cloud Run GPU is available in us-central1, europe-west1, europe-west4, asia-southeast1, and asia-south1 regions. GPU quotas may apply for large-scale deployments.
 
@@ -159,15 +160,15 @@ echo "✅ Storage buckets created with prefix: ${SERVICE_PREFIX}"
        python3-pip \
        && rm -rf /var/lib/apt/lists/*
 
-   # Install ML libraries with GPU support
+   # Install ML libraries with GPU support (updated versions)
    RUN pip3 install --no-cache-dir \
-       torch==2.0.1 \
-       torchvision==0.15.2 \
-       transformers==4.30.0 \
-       accelerate==0.20.3 \
-       flask==2.3.2 \
+       torch==2.1.2 \
+       torchvision==0.16.2 \
+       transformers==4.36.0 \
+       accelerate==0.25.0 \
+       flask==3.0.0 \
        google-cloud-storage==2.10.0 \
-       pillow==10.0.0
+       pillow==10.1.0
 
    WORKDIR /app
    COPY . .
@@ -284,7 +285,7 @@ echo "✅ Storage buckets created with prefix: ${SERVICE_PREFIX}"
    echo "✅ GPU inference service deployed: ${GPU_SERVICE_URL}"
    ```
 
-   The GPU-enabled Cloud Run service is now active and ready to handle inference requests. With NVIDIA L4 GPU acceleration, this service can process machine learning workloads up to 10x faster than CPU-only alternatives while automatically scaling based on demand and billing only for actual usage.
+   The GPU-enabled Cloud Run service is now active and ready to handle inference requests. With NVIDIA L4 GPU acceleration, this service can process machine learning workloads significantly faster than CPU-only alternatives while automatically scaling based on demand and billing only for actual usage.
 
 3. **Create Data Preprocessing Service**:
 
@@ -300,11 +301,11 @@ echo "✅ Storage buckets created with prefix: ${SERVICE_PREFIX}"
    FROM python:3.11-slim
 
    RUN pip install --no-cache-dir \
-       flask==2.3.2 \
+       flask==3.0.0 \
        google-cloud-storage==2.10.0 \
-       pillow==10.0.0 \
-       pandas==2.0.3 \
-       numpy==1.24.3
+       pillow==10.1.0 \
+       pandas==2.1.4 \
+       numpy==1.26.2
 
    WORKDIR /app
    COPY . .
@@ -430,10 +431,10 @@ echo "✅ Storage buckets created with prefix: ${SERVICE_PREFIX}"
    FROM python:3.11-slim
 
    RUN pip install --no-cache-dir \
-       flask==2.3.2 \
+       flask==3.0.0 \
        google-cloud-storage==2.10.0 \
-       pandas==2.0.3 \
-       numpy==1.24.3
+       pandas==2.1.4 \
+       numpy==1.26.2
 
    WORKDIR /app
    COPY . .
@@ -856,7 +857,7 @@ This serverless GPU computing pipeline demonstrates the transformative potential
 
 The integration with Cloud Workflows provides enterprise-grade orchestration capabilities including comprehensive error handling, automatic retries, and detailed execution logging. This approach enables complex ML pipelines to run reliably at scale while maintaining full observability. The event-driven architecture using Eventarc creates truly reactive systems that respond instantly to new data availability, enabling real-time ML processing without manual intervention.
 
-Performance characteristics of this solution are particularly compelling for unpredictable workloads. Cloud Run GPU achieves cold start times under 5 seconds and can scale from zero to hundreds of instances within minutes, making it ideal for bursty ML inference patterns. The pay-per-second billing model ensures cost efficiency even for sporadic workloads, while the automatic scaling handles traffic spikes without capacity planning.
+Performance characteristics of this solution are particularly compelling for unpredictable workloads. Cloud Run GPU achieves cold start times under 5 seconds and can scale from zero to hundreds of instances within minutes, making it ideal for bursty ML inference patterns. The pay-per-second billing model ensures cost efficiency even for sporadic workloads, while the automatic scaling handles traffic spikes without capacity planning. Current pricing for NVIDIA L4 GPUs on Google Cloud is approximately $0.71 per hour, making it cost-effective for intermittent AI workloads.
 
 The architectural pattern demonstrated here can be extended to support various ML use cases including computer vision, natural language processing, and time series analysis. By separating preprocessing, inference, and post-processing into distinct services, teams can optimize each component independently and leverage different compute resources appropriately. This microservices approach also enables easier testing, deployment, and maintenance of complex ML systems.
 
@@ -880,4 +881,9 @@ Extend this serverless GPU computing pipeline by implementing these advanced cap
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

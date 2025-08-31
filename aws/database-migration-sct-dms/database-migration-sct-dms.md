@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: dms,sct,rds,ec2
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database-migration,dms,schema-conversion,migration-strategy
 recipe-generator-version: 1.3
 ---
 
 # Database Migration with Schema Conversion Tool
-
 
 ## Problem
 
@@ -125,6 +124,25 @@ aws ec2 attach-internet-gateway \
     --internet-gateway-id $IGW_ID \
     --vpc-id $VPC_ID
 
+# Create route table and add route to internet gateway
+export ROUTE_TABLE_ID=$(aws ec2 create-route-table \
+    --vpc-id $VPC_ID \
+    --query 'RouteTable.RouteTableId' --output text)
+
+aws ec2 create-route \
+    --route-table-id $ROUTE_TABLE_ID \
+    --destination-cidr-block 0.0.0.0/0 \
+    --gateway-id $IGW_ID
+
+# Associate route table with subnets
+aws ec2 associate-route-table \
+    --route-table-id $ROUTE_TABLE_ID \
+    --subnet-id $SUBNET_1_ID
+
+aws ec2 associate-route-table \
+    --route-table-id $ROUTE_TABLE_ID \
+    --subnet-id $SUBNET_2_ID
+
 echo "✅ VPC and networking components created successfully"
 ```
 
@@ -161,7 +179,7 @@ echo "✅ VPC and networking components created successfully"
        --replication-subnet-group-identifier $DMS_SUBNET_GROUP_ID \
        --publicly-accessible true \
        --multi-az false \
-       --engine-version "3.5.2" \
+       --engine-version "3.5.3" \
        --tags Key=Environment,Value=Migration \
               Key=Project,Value=DatabaseMigration
    
@@ -198,7 +216,7 @@ echo "✅ VPC and networking components created successfully"
        --db-instance-identifier $TARGET_DB_INSTANCE_ID \
        --db-instance-class db.t3.medium \
        --engine postgres \
-       --engine-version 14.9 \
+       --engine-version 15.8 \
        --master-username dbadmin \
        --master-user-password $TARGET_DB_PASSWORD \
        --allocated-storage 100 \
@@ -856,6 +874,10 @@ echo "✅ VPC and networking components created successfully"
    aws ec2 delete-internet-gateway \
        --internet-gateway-id $IGW_ID
    
+   # Delete route table
+   aws ec2 delete-route-table \
+       --route-table-id $ROUTE_TABLE_ID
+   
    # Delete subnets
    aws ec2 delete-subnet --subnet-id $SUBNET_1_ID
    aws ec2 delete-subnet --subnet-id $SUBNET_2_ID
@@ -878,19 +900,20 @@ echo "✅ VPC and networking components created successfully"
    unset DMS_REPLICATION_INSTANCE_ID DMS_SUBNET_GROUP_ID
    unset SOURCE_ENDPOINT_ID TARGET_ENDPOINT_ID MIGRATION_TASK_ID
    unset TARGET_DB_INSTANCE_ID TARGET_DB_PASSWORD CDC_TASK_ID
+   unset VPC_ID SUBNET_1_ID SUBNET_2_ID IGW_ID ROUTE_TABLE_ID
    
    echo "✅ Local files and environment variables cleaned up"
    ```
 
 ## Discussion
 
-AWS Database Migration Service combined with the Schema Conversion Tool provides a comprehensive solution for complex database migrations. DMS handles the heavy lifting of data replication while maintaining data consistency and minimizing downtime. The service supports both homogeneous migrations (same database engine) and heterogeneous migrations (different database engines), making it versatile for various modernization scenarios. According to AWS best practices, DMS can achieve up to 99.9% uptime during migrations when properly configured with CDC (https://docs.aws.amazon.com/dms/latest/userguide/CHAP_BestPractices.html).
+AWS Database Migration Service combined with the Schema Conversion Tool provides a comprehensive solution for complex database migrations. DMS handles the heavy lifting of data replication while maintaining data consistency and minimizing downtime. The service supports both homogeneous migrations (same database engine) and heterogeneous migrations (different database engines), making it versatile for various modernization scenarios. According to AWS documentation, DMS can achieve up to 99.9% uptime during migrations when properly configured with CDC, following AWS Well-Architected Framework principles for operational excellence and reliability (https://docs.aws.amazon.com/dms/latest/userguide/CHAP_BestPractices.html).
 
-The key to successful database migration lies in proper planning and validation. The Schema Conversion Tool performs critical assessment work by analyzing source database schemas and identifying conversion challenges before migration begins. This proactive approach helps prevent costly migration failures and ensures application compatibility post-migration. The tool generates detailed reports highlighting manual conversion requirements and provides converted code for stored procedures, functions, and triggers. The SCT assessment process typically identifies 80-90% of schema objects that can be automatically converted, with the remainder requiring manual intervention (https://docs.aws.amazon.com/SchemaConversionTool/latest/userguide/CHAP_Welcome.html).
+The key to successful database migration lies in proper planning and validation. The Schema Conversion Tool performs critical assessment work by analyzing source database schemas and identifying conversion challenges before migration begins. This proactive approach helps prevent costly migration failures and ensures application compatibility post-migration. The tool generates detailed reports highlighting manual conversion requirements and provides converted code for stored procedures, functions, and triggers. The SCT assessment process typically identifies 80-90% of schema objects that can be automatically converted, with the remainder requiring manual intervention based on complexity and database engine compatibility (https://docs.aws.amazon.com/SchemaConversionTool/latest/userguide/CHAP_Welcome.html).
 
-Continuous data capture (CDC) functionality enables near-zero downtime migrations by keeping source and target databases synchronized during the migration process. This approach allows businesses to validate data integrity, test applications, and perform cutover activities without extended outages. The combination of full load and CDC provides flexibility in migration timing and reduces business risk. CDC relies on database transaction logs to capture changes, which means proper log retention and backup strategies are crucial for successful ongoing replication (https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Task.CDC.html).
+Continuous data capture (CDC) functionality enables near-zero downtime migrations by keeping source and target databases synchronized during the migration process. This approach allows businesses to validate data integrity, test applications, and perform cutover activities without extended outages. The combination of full load and CDC provides flexibility in migration timing and reduces business risk. CDC relies on database transaction logs to capture changes, which means proper log retention and backup strategies are crucial for successful ongoing replication. The CDC feature works by reading source database logs and applying changes in near real-time to the target database (https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Task.CDC.html).
 
-Monitoring and validation are essential components of any migration strategy. CloudWatch integration provides real-time visibility into migration progress, performance metrics, and potential issues. Proper monitoring helps identify bottlenecks early and ensures optimal resource utilization throughout the migration process. Data validation scripts and automated testing help verify migration success and data integrity. The enhanced monitoring dashboard provides comprehensive insights into replication performance and helps optimize migration settings (https://docs.aws.amazon.com/dms/latest/userguide/enhanced-monitoring-dashboard.html).
+Monitoring and validation are essential components of any migration strategy. CloudWatch integration provides real-time visibility into migration progress, performance metrics, and potential issues. Proper monitoring helps identify bottlenecks early and ensures optimal resource utilization throughout the migration process. Data validation scripts and automated testing help verify migration success and data integrity. AWS DMS provides enhanced monitoring capabilities including detailed CloudWatch metrics for throughput, errors, and resource utilization, enabling proactive optimization of migration performance (https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Monitoring.html).
 
 > **Tip**: Always perform a complete dry-run migration in a test environment before executing production migrations to identify potential issues and validate your migration strategy.
 
@@ -900,14 +923,21 @@ Extend this solution by implementing these enhancements:
 
 1. **Implement Multi-Master Replication**: Set up bidirectional replication between source and target databases to enable gradual application cutover and rollback capabilities.
 
-2. **Add Automated Data Validation**: Create comprehensive data validation scripts that automatically compare row counts, checksums, and data samples between source and target databases.
+2. **Add Automated Data Validation**: Create comprehensive data validation scripts that automatically compare row counts, checksums, and data samples between source and target databases using DMS validation features.
 
-3. **Integrate with AWS Secrets Manager**: Replace hardcoded database credentials with AWS Secrets Manager integration for enhanced security and credential rotation.
+3. **Integrate with AWS Secrets Manager**: Replace hardcoded database credentials with AWS Secrets Manager integration for enhanced security and automatic credential rotation.
 
-4. **Create Migration Pipeline**: Build a complete CI/CD pipeline using AWS CodePipeline that automates schema conversion, data migration, and validation processes.
+4. **Create Migration Pipeline**: Build a complete CI/CD pipeline using AWS CodePipeline that automates schema conversion, data migration, and validation processes with approval gates.
 
-5. **Implement Cross-Region Disaster Recovery**: Extend the migration to include cross-region replication for disaster recovery scenarios using DMS and RDS read replicas.
+5. **Implement Cross-Region Disaster Recovery**: Extend the migration to include cross-region replication for disaster recovery scenarios using DMS and RDS read replicas with automated failover.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

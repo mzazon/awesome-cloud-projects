@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Functions, Cloud Scheduler, Cloud SQL, Google Workspace APIs
 estimated-time: 75 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: automation, productivity, workspace, serverless, integration
 recipe-generator-version: 1.3
@@ -121,7 +121,7 @@ gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable cloudscheduler.googleapis.com
 gcloud services enable sqladmin.googleapis.com
 gcloud services enable gmail.googleapis.com
-gcloud services enable calendar.googleapis.com
+gcloud services enable calendar-json.googleapis.com
 gcloud services enable drive.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
 gcloud services enable logging.googleapis.com
@@ -202,12 +202,12 @@ echo "✅ Required APIs enabled"
    
    # Create requirements.txt with updated dependencies
    cat > requirements.txt << 'EOF'
-google-auth==2.23.4
+google-auth==2.28.0
 google-auth-oauthlib==1.1.0
-google-api-python-client==2.108.0
-google-cloud-sql-connector==1.4.3
-pg8000==1.30.3
-functions-framework==3.5.0
+google-api-python-client==2.120.0
+google-cloud-sql-connector==1.6.0
+pg8000==1.30.5
+functions-framework==3.8.0
 EOF
    
    # Create main.py for email processing
@@ -1167,4 +1167,9 @@ Extend this productivity automation solution by implementing these advanced enha
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

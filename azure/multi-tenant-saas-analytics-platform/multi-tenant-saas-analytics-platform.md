@@ -4,12 +4,12 @@ id: 4b8f2a6d
 category: analytics
 difficulty: 200
 subject: azure
-services: Azure Application Insights, Azure Data Explorer, Azure Cost Management
+services: Application Insights, Data Explorer, Cost Management
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: multi-tenant, saas, performance-monitoring, cost-analysis, application-insights, data-explorer
 recipe-generator-version: 1.3
@@ -65,7 +65,7 @@ graph TB
 ## Prerequisites
 
 1. Azure account with appropriate permissions for Application Insights, Data Explorer, and Cost Management
-2. Azure CLI v2.0 or later installed and configured
+2. Azure CLI v2.50 or later installed and configured (cloud shell available)
 3. Multi-tenant SaaS application with existing tenant identification mechanisms
 4. Basic knowledge of Kusto Query Language (KQL) for advanced analytics
 5. Estimated cost: $50-150/month depending on data volume and retention settings
@@ -88,7 +88,7 @@ export APP_INSIGHTS_NAME="ai-saas-analytics-${RANDOM_SUFFIX}"
 export LOG_ANALYTICS_NAME="la-saas-analytics-${RANDOM_SUFFIX}"
 export DATA_EXPLORER_CLUSTER="adx-saas-${RANDOM_SUFFIX}"
 export DATA_EXPLORER_DATABASE="SaaSAnalytics"
-export COST_ALERT_NAME="cost-alert-saas-${RANDOM_SUFFIX}"
+export BUDGET_NAME="saas-analytics-budget"
 
 # Create resource group with proper tagging
 az group create \
@@ -116,7 +116,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --sku pergb2018 \
        --tags solution=multi-tenant-monitoring
    
-   # Get workspace ID and key for Application Insights integration
+   # Get workspace ID for Application Insights integration
    WORKSPACE_ID=$(az monitor log-analytics workspace show \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${LOG_ANALYTICS_NAME} \
@@ -138,7 +138,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --app ${APP_INSIGHTS_NAME} \
        --location ${LOCATION} \
        --kind web \
-       --workspace ${WORKSPACE_ID} \
+       --workspace ${LOG_ANALYTICS_NAME} \
        --tags solution=multi-tenant-monitoring tenant-enabled=true
    
    # Get Application Insights instrumentation key
@@ -168,7 +168,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --cluster-name ${DATA_EXPLORER_CLUSTER} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --sku name=Standard_D11_v2 tier=Standard \
+       --sku name="Standard_D11_v2" tier="Standard" \
        --capacity 2 \
        --tags solution=multi-tenant-monitoring analytics=enabled
    
@@ -194,16 +194,19 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --database-name ${DATA_EXPLORER_DATABASE} \
        --resource-group ${RESOURCE_GROUP} \
        --read-write-database location=${LOCATION} \
-           hot-cache-period=P30D soft-delete-period=P365D
+           hot-cache-period="P30D" soft-delete-period="P365D"
    
-   # Create data connection from Application Insights to Data Explorer
+   # Get Log Analytics workspace resource ID
+   WORKSPACE_RESOURCE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${LOG_ANALYTICS_NAME}"
+   
+   # Create data connection from Log Analytics to Data Explorer
    az kusto data-connection create \
        --cluster-name ${DATA_EXPLORER_CLUSTER} \
        --database-name ${DATA_EXPLORER_DATABASE} \
        --data-connection-name "AppInsightsConnection" \
        --resource-group ${RESOURCE_GROUP} \
-       --kind LogAnalytics \
-       --log-analytics-workspace-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${LOG_ANALYTICS_NAME}"
+       --kind "LogAnalytics" \
+       --log-analytics-workspace-resource-id ${WORKSPACE_RESOURCE_ID}
    
    echo "✅ Data Explorer database and connection created"
    ```
@@ -215,19 +218,23 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Azure Cost Management provides cost attribution and budgeting capabilities essential for multi-tenant SaaS applications. This step creates cost monitoring infrastructure that tracks resource consumption and provides alerts when spending thresholds are exceeded.
 
    ```bash
+   # Calculate first day of current month for budget start date
+   START_DATE=$(date -u +%Y-%m-01)
+   
    # Create budget for SaaS analytics resources
    az consumption budget create \
        --resource-group ${RESOURCE_GROUP} \
-       --budget-name "saas-analytics-budget" \
+       --budget-name ${BUDGET_NAME} \
        --amount 200 \
-       --time-grain Monthly \
-       --time-period start-date=$(date -u +%Y-%m-01T00:00:00Z) \
-       --category Cost \
-       --filter "ResourceGroupName eq '${RESOURCE_GROUP}'"
+       --time-grain monthly \
+       --start-date ${START_DATE} \
+       --end-date 2026-12-31 \
+       --category cost \
+       --resource-group-filter ${RESOURCE_GROUP}
    
-   # Create cost alert for budget threshold
+   # Create action group for cost alerts
    az monitor action-group create \
-       --name "cost-alert-group" \
+       --name "cost-alert-group-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
        --short-name "CostAlert" \
        --email-receiver name=admin email=admin@company.com
@@ -235,7 +242,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ Cost management budget and alerts configured"
    ```
 
-   The budget monitors monthly spending with automated alerts at 80% and 100% thresholds. This cost governance enables proactive management of analytics infrastructure expenses and supports tenant-specific cost attribution analysis.
+   The budget monitors monthly spending with automated alerts at threshold breaches. This cost governance enables proactive management of analytics infrastructure expenses and supports tenant-specific cost attribution analysis.
 
 6. **Create Custom Tables and Functions in Data Explorer**:
 
@@ -301,13 +308,12 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    az monitor app-insights component update \
        --resource-group ${RESOURCE_GROUP} \
        --app ${APP_INSIGHTS_NAME} \
-       --sampling-percentage 100 \
        --retention-in-days 90
    
    echo "✅ Telemetry enrichment configured for tenant tracking"
    ```
 
-   The telemetry configuration enables 100% sampling with tenant-specific custom properties. This ensures comprehensive data collection for accurate performance and cost analysis across all tenant workloads.
+   The telemetry configuration enables comprehensive data collection with tenant-specific custom properties. This ensures accurate performance and cost analysis across all tenant workloads with proper metadata enrichment.
 
 8. **Create Performance and Cost Analytics Queries**:
 
@@ -380,7 +386,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    # Check budget configuration
    az consumption budget show \
        --resource-group ${RESOURCE_GROUP} \
-       --budget-name "saas-analytics-budget" \
+       --budget-name ${BUDGET_NAME} \
        --output table
    ```
 
@@ -420,13 +426,14 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 3. **Remove cost management and resource group**:
 
    ```bash
-   # Delete budget and action group
+   # Delete budget
    az consumption budget delete \
        --resource-group ${RESOURCE_GROUP} \
-       --budget-name "saas-analytics-budget"
+       --budget-name ${BUDGET_NAME}
    
+   # Delete action group
    az monitor action-group delete \
-       --name "cost-alert-group" \
+       --name "cost-alert-group-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP}
    
    # Delete resource group and all remaining resources
@@ -449,7 +456,7 @@ From an architectural perspective, this solution follows Azure Well-Architected 
 
 The multi-tenant approach requires careful consideration of data isolation, tenant identification, and query performance optimization. The solution includes custom telemetry enrichment to ensure accurate tenant attribution and provides flexible query capabilities for different analytical scenarios. Performance monitoring capabilities include request tracking, dependency analysis, and failure detection, while cost analytics enable understanding of per-tenant infrastructure utilization and associated expenses.
 
-> **Tip**: Use Azure Monitor Workbooks to create interactive dashboards that combine Application Insights telemetry with Data Explorer analytics for comprehensive multi-tenant monitoring. The [Azure Monitor Workbooks documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/platform/workbooks-overview) provides guidance on creating custom visualizations and alerts for SaaS applications.
+> **Tip**: Use Azure Monitor Workbooks to create interactive dashboards that combine Application Insights telemetry with Data Explorer analytics for comprehensive multi-tenant monitoring. The [Azure Monitor Workbooks documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/visualize/workbooks-overview) provides guidance on creating custom visualizations and alerts for SaaS applications.
 
 ## Challenge
 
@@ -463,4 +470,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

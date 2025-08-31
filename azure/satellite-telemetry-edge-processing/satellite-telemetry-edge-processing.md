@@ -6,10 +6,10 @@ difficulty: 400
 subject: azure
 services: Azure Orbital, Azure Local, Azure Event Grid, Azure IoT Hub
 estimated-time: 150 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: satellite, edge-computing, iot, orbital, azure-local, real-time-processing
 recipe-generator-version: 1.3
@@ -78,7 +78,7 @@ graph TB
 
 ## Prerequisites
 
-1. Azure subscription with appropriate permissions for Orbital, IoT Hub, and Local services
+1. Azure subscription with appropriate permissions for Orbital, IoT Hub, and Azure Local services
 2. Azure CLI v2.60.0 or later installed and configured (or Azure CloudShell)
 3. Basic understanding of satellite communications and edge computing concepts
 4. Satellite registration with NORAD ID and Two-Line Element (TLE) data
@@ -232,7 +232,7 @@ echo "✅ Azure providers registered successfully"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --norad-id "12345" \
-       --title "Earth Observation Satellite" \
+       --title-line "Earth Observation Satellite" \
        --tle-line1 "1 25544U 98067A   08264.51782528 -.00002182  00000-0 -11606-4 0  2927" \
        --tle-line2 "2 25544  51.6416 247.4627 0006703 130.5360 325.0288 15.72125391563537" \
        --tags mission=earth-observation \
@@ -284,10 +284,9 @@ echo "✅ Azure providers registered successfully"
    
    # Register Azure Local resource (requires pre-deployed hardware)
    az stack-hci cluster create \
-       --name ${AZURE_LOCAL_NAME} \
+       --cluster-name ${AZURE_LOCAL_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --cluster-type HyperConverged \
        --tags deployment=edge-processing \
               workload=satellite-analytics
    
@@ -370,6 +369,10 @@ echo "✅ Azure providers registered successfully"
    Azure Local runs containerized satellite processing workloads that perform real-time analysis of orbital data streams. This edge deployment reduces latency for time-sensitive applications like collision avoidance and provides local processing capabilities when connectivity to Azure cloud is limited during remote operations.
 
    ```bash
+   # Create namespace for orbital workloads
+   kubectl create namespace orbital \
+       --kubeconfig ~/.kube/azure-local-config
+   
    # Create Kubernetes deployment for satellite processing
    cat <<EOF > satellite-processor.yaml
    apiVersion: apps/v1
@@ -419,22 +422,23 @@ echo "✅ Azure providers registered successfully"
 
     ```bash
     # Schedule satellite contact for data collection
-    az orbital contact create \
-        --name "contact-$(date +%Y%m%d-%H%M)" \
+    az orbital spacecraft contact create \
+        --contact-name "contact-$(date +%Y%m%d-%H%M)" \
         --resource-group ${RESOURCE_GROUP} \
-        --location ${LOCATION} \
         --spacecraft-name ${SPACECRAFT_NAME} \
         --contact-profile "earth-obs-profile" \
         --ground-station-name "Microsoft_Quincy" \
-        --start-time "2025-07-12T14:30:00Z" \
-        --end-time "2025-07-12T14:45:00Z" \
+        --reservation-start-time "2025-07-12T14:30:00Z" \
+        --reservation-end-time "2025-07-12T14:45:00Z" \
         --tags contact=scheduled \
                priority=routine
     
     # List available ground stations for contact scheduling
-    az orbital available-ground-station list \
+    az orbital spacecraft list-available-contact \
         --spacecraft-name ${SPACECRAFT_NAME} \
         --resource-group ${RESOURCE_GROUP} \
+        --contact-profile "earth-obs-profile" \
+        --ground-station-name "Microsoft_Quincy" \
         --start-time "2025-07-12T12:00:00Z" \
         --end-time "2025-07-12T18:00:00Z"
     
@@ -485,15 +489,6 @@ echo "✅ Azure providers registered successfully"
     Azure Dashboard and Power BI provide real-time visualization of satellite operations, orbital tracking, and data processing metrics. This mission control interface enables operators to monitor satellite health, track data collection progress, and respond to operational events while maintaining situational awareness of constellation status.
 
     ```bash
-    # Create resource for Power BI integration
-    az resource create \
-        --resource-group ${RESOURCE_GROUP} \
-        --name "orbital-dashboard" \
-        --resource-type "Microsoft.PowerBI/workspaceCollections" \
-        --location ${LOCATION} \
-        --properties '{"sku":{"name":"S1","tier":"Standard"}}' \
-        --tags dashboard=mission-control
-    
     # Configure data source connections for dashboard
     cat <<EOF > dashboard-config.json
     {
@@ -512,6 +507,14 @@ echo "✅ Azure providers registered successfully"
         "refreshInterval": "PT5M"
     }
     EOF
+    
+    # Create Azure Dashboard for mission control
+    az portal dashboard create \
+        --resource-group ${RESOURCE_GROUP} \
+        --name "orbital-mission-control" \
+        --location ${LOCATION} \
+        --input-path dashboard-config.json \
+        --tags dashboard=mission-control
     
     echo "✅ Mission control dashboard configured for real-time orbital operations"
     ```
@@ -571,7 +574,7 @@ echo "✅ Azure providers registered successfully"
    ```bash
    # Check Azure Local cluster status
    az stack-hci cluster show \
-       --name ${AZURE_LOCAL_NAME} \
+       --cluster-name ${AZURE_LOCAL_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query "status"
    
@@ -614,13 +617,15 @@ echo "✅ Azure providers registered successfully"
 
    ```bash
    # Cancel any scheduled contacts
-   az orbital contact list \
+   az orbital spacecraft contact list \
        --resource-group ${RESOURCE_GROUP} \
+       --spacecraft-name ${SPACECRAFT_NAME} \
        --query "[?status=='Scheduled'].name" \
        --output tsv | while read contact; do
-       az orbital contact delete \
-           --name "$contact" \
+       az orbital spacecraft contact delete \
+           --contact-name "$contact" \
            --resource-group ${RESOURCE_GROUP} \
+           --spacecraft-name ${SPACECRAFT_NAME} \
            --yes
    done
    
@@ -632,6 +637,9 @@ echo "✅ Azure providers registered successfully"
    ```bash
    # Remove Kubernetes workloads
    kubectl delete deployment satellite-processor -n orbital \
+       --kubeconfig ~/.kube/azure-local-config
+   
+   kubectl delete namespace orbital \
        --kubeconfig ~/.kube/azure-local-config
    
    # Disconnect Azure Arc
@@ -711,4 +719,9 @@ Extend this solution by implementing these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

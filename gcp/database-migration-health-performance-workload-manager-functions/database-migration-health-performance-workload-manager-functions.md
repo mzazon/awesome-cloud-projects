@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Workload Manager, Database Migration Service, Cloud Functions, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database-migration, monitoring, automation, workload-manager, cloud-functions
 recipe-generator-version: 1.3
@@ -313,17 +313,17 @@ def create_custom_metrics(project_id, metrics):
         logging.warning(f"Failed to create custom metric: {str(e)}")
 EOF
    
-   # Create requirements file
+   # Create requirements file with latest versions
    cat > requirements.txt << 'EOF'
-google-cloud-monitoring==2.15.1
-google-cloud-pubsub==2.18.1
-google-cloud-dms==1.7.0
-functions-framework==3.4.0
+google-cloud-monitoring==2.27.2
+google-cloud-pubsub==2.28.1
+google-cloud-dms==1.8.1
+functions-framework==3.8.3
 EOF
    
    # Deploy the function
    gcloud functions deploy migration-monitor \
-       --runtime=python311 \
+       --runtime=python312 \
        --trigger=http \
        --entry-point=monitor_migration \
        --memory=256MB \
@@ -502,15 +502,15 @@ EOF
    
    # Create requirements file for data validator
    cat > requirements.txt << 'EOF'
-google-cloud-pubsub==2.18.1
-google-cloud-monitoring==2.15.1
-PyMySQL==1.1.0
-functions-framework==3.4.0
+google-cloud-pubsub==2.28.1
+google-cloud-monitoring==2.27.2
+PyMySQL==1.1.1
+functions-framework==3.8.3
 EOF
    
    # Deploy the data validation function
    gcloud functions deploy data-validator \
-       --runtime=python311 \
+       --runtime=python312 \
        --trigger=topic=validation-results \
        --entry-point=validate_migration_data \
        --memory=512MB \
@@ -528,63 +528,31 @@ EOF
    Cloud Workload Manager provides rule-based validation services that continuously evaluate your migrated workloads against custom health criteria and best practices. This managed service enables proactive monitoring of database performance, configuration compliance, and operational health without requiring manual intervention or custom monitoring infrastructure.
 
    ```bash
-   # Create workload configuration for database monitoring
-   cat > workload-config.yaml << 'EOF'
-resources:
-  - name: "database-migration-health-check"
-    type: "gcp:workloadmanager:Evaluation"
-    properties:
-      name: "database-migration-health"
-      description: "Health monitoring for database migration workload"
-      location: "us-central1"
-      labels:
-        environment: "migration"
-        purpose: "health-monitoring"
-      
-      workload:
-        discoveredWorkload:
-          workloadUri: "projects/{PROJECT_ID}/locations/{REGION}/instances/{MIGRATION_NAME}-target"
-          workloadType: "DATABASE"
-      
-      rules:
-        - description: "Database connection health check"
-          displayName: "Connection Health"
-          errorMessage: "Database connection failed"
-          primaryCategory: "OPERATIONAL_EFFICIENCY"
-          severity: "HIGH"
-          uri: "https://cloud.google.com/sql/docs/mysql/diagnose-issues"
-          
-        - description: "Replication lag monitoring"
-          displayName: "Replication Performance"
-          errorMessage: "High replication lag detected"
-          primaryCategory: "PERFORMANCE"
-          severity: "MEDIUM"
-          uri: "https://cloud.google.com/sql/docs/mysql/replication"
-          
-        - description: "Storage utilization check"
-          displayName: "Storage Health"
-          errorMessage: "Storage utilization above threshold"
-          primaryCategory: "COST_OPTIMIZATION"
-          severity: "LOW"
-          uri: "https://cloud.google.com/sql/docs/mysql/storage"
-EOF
+   # Note: Workload Manager evaluations are created through the console
+   # The CLI commands shown below demonstrate the conceptual approach
+   # In practice, use the Google Cloud Console for evaluation creation
    
-   # Replace placeholders in workload config
-   sed -i "s/{PROJECT_ID}/${PROJECT_ID}/g" workload-config.yaml
-   sed -i "s/{REGION}/${REGION}/g" workload-config.yaml
-   sed -i "s/{MIGRATION_NAME}/${MIGRATION_NAME}/g" workload-config.yaml
-   
-   # Deploy workload monitoring using gcloud CLI
-   gcloud workload-manager evaluations create ${WORKLOAD_NAME} \
-       --location=${REGION} \
-       --workload-type=DATABASE \
-       --workload-uri="projects/${PROJECT_ID}/locations/${REGION}/instances/${MIGRATION_NAME}-target" \
-       --labels=environment=migration,purpose=health-monitoring
-   
-   echo "✅ Cloud Workload Manager evaluation created"
+   echo "Creating workload evaluation via console..."
+   echo "Navigate to: https://console.cloud.google.com/workloads"
+   echo ""
+   echo "Evaluation Configuration:"
+   echo "- Name: ${WORKLOAD_NAME}"
+   echo "- Description: Health monitoring for database migration workload"
+   echo "- Workload Type: DATABASE"
+   echo "- Target Resource: Cloud SQL instance ${MIGRATION_NAME}-target"
+   echo "- Location: ${REGION}"
+   echo ""
+   echo "Select the following best practices:"
+   echo "- Database connection health checks"
+   echo "- Replication lag monitoring"
+   echo "- Storage utilization monitoring"
+   echo "- Security configuration validation"
+   echo ""
+   echo "✅ Please create the workload evaluation manually in the console"
+   echo "✅ Use the configuration details above for consistency"
    ```
 
-   Cloud Workload Manager is now actively monitoring your database migration workload, providing continuous validation against Google Cloud best practices and custom health rules. This managed monitoring service ensures operational excellence while reducing the overhead of manual health checks.
+   Cloud Workload Manager requires console-based configuration for evaluations. The evaluation will continuously monitor your database migration workload, providing validation against Google Cloud best practices and custom health rules once configured through the Google Cloud Console.
 
 7. **Deploy Alert Management Cloud Function**:
 
@@ -691,14 +659,14 @@ EOF
    
    # Create requirements file for alert manager
    cat > requirements.txt << 'EOF'
-google-cloud-pubsub==2.18.1
-requests==2.31.0
-functions-framework==3.4.0
+google-cloud-pubsub==2.28.1
+requests==2.32.3
+functions-framework==3.8.3
 EOF
    
    # Deploy the alert management function
    gcloud functions deploy alert-manager \
-       --runtime=python311 \
+       --runtime=python312 \
        --trigger=topic=alert-notifications \
        --entry-point=manage_alerts \
        --memory=256MB \
@@ -841,17 +809,13 @@ EOF
 3. **Verify Workload Manager Evaluation**:
 
    ```bash
-   # Check workload evaluation status
-   gcloud workload-manager evaluations list \
-     --location=${REGION} \
-     --format="table(name,state,createTime)"
-   
-   # Get evaluation details
-   gcloud workload-manager evaluations describe ${WORKLOAD_NAME} \
-     --location=${REGION}
+   # Check if Workload Manager evaluations exist (requires console setup)
+   echo "Checking workload evaluations..."
+   echo "Navigate to: https://console.cloud.google.com/workloads"
+   echo "Verify your evaluation '${WORKLOAD_NAME}' is listed and active"
    ```
 
-   Expected output: Evaluation should show "ACTIVE" state and display the configured health monitoring rules.
+   Expected output: The evaluation should show "ACTIVE" state and display the configured health monitoring rules in the console.
 
 4. **Test Custom Metrics in Cloud Monitoring**:
 
@@ -880,12 +844,13 @@ EOF
 2. **Remove Workload Manager Resources**:
 
    ```bash
-   # Delete workload evaluation
-   gcloud workload-manager evaluations delete ${WORKLOAD_NAME} \
-     --location=${REGION} \
-     --quiet
+   # Delete workload evaluation (requires console action)
+   echo "Please delete the workload evaluation manually:"
+   echo "1. Navigate to: https://console.cloud.google.com/workloads"
+   echo "2. Select the evaluation: ${WORKLOAD_NAME}"
+   echo "3. Click 'Delete' and confirm"
    
-   echo "✅ Workload Manager evaluation deleted"
+   echo "✅ Please complete workload evaluation cleanup manually"
    ```
 
 3. **Remove Cloud SQL Instance**:
@@ -921,7 +886,7 @@ EOF
    
    # Clean up local files
    rm -rf migration-functions/
-   rm -f workload-config.yaml dashboard-config.json
+   rm -f dashboard-config.json
    
    echo "✅ Storage and configuration files removed"
    echo "Note: Custom monitoring dashboards may need manual deletion from Console"
@@ -962,4 +927,9 @@ Extend this monitoring solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

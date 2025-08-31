@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: IAM, Cloud Build, Artifact Registry, Cloud Run
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: workload-identity-federation, github-actions, cicd, security, keyless-authentication
 recipe-generator-version: 1.3
@@ -105,6 +105,8 @@ export CLOUD_RUN_SERVICE="demo-app-${RANDOM_SUFFIX}"
 # Create the Google Cloud project
 gcloud projects create ${PROJECT_ID} --name="WIF Demo Project"
 gcloud config set project ${PROJECT_ID}
+gcloud config set compute/region ${REGION}
+gcloud config set compute/zone ${ZONE}
 
 # Enable required APIs
 gcloud services enable iam.googleapis.com \
@@ -283,8 +285,8 @@ EOF
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-Flask==2.3.3
-gunicorn==21.2.0
+Flask==3.0.3
+gunicorn==22.0.0
 EOF
    
    # Create Dockerfile
@@ -561,4 +563,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

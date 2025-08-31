@@ -6,17 +6,16 @@ difficulty: 400
 subject: aws
 services: RDS, Route 53, CloudWatch, Lambda
 estimated-time: 240 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-25
 passed-qa: null
 tags: rds, multi-az, cross-region, failover, database, high-availability
 recipe-generator-version: 1.3
 ---
 
 # RDS Multi-Region Failover Strategy
-
 
 ## Problem
 
@@ -85,7 +84,7 @@ graph TB
 1. AWS account with RDS, Route 53, and CloudWatch permissions in two regions
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of RDS Multi-AZ concepts and cross-region replication
-4. VPC setup in both primary and secondary regions
+4. VPC setup in both primary and secondary regions with existing subnets
 5. Estimated cost: $800-1,200/month for db.r5.xlarge instances with backup storage
 
 > **Note**: This configuration uses production-grade instance types and will incur significant costs. Consider using smaller instances for testing. See [Amazon RDS Pricing](https://aws.amazon.com/rds/pricing/) for detailed cost calculations.
@@ -109,20 +108,45 @@ export DB_INSTANCE_ID="financial-db-${RANDOM_SUFFIX}"
 export DB_REPLICA_ID="financial-db-replica-${RANDOM_SUFFIX}"
 export DB_SUBNET_GROUP="financial-subnet-group-${RANDOM_SUFFIX}"
 export DB_PARAMETER_GROUP="financial-param-group-${RANDOM_SUFFIX}"
-export DB_MASTER_PASSWORD="FinancialDB2024!"
+
+# Use AWS Secrets Manager for secure password management
+aws secretsmanager create-secret \
+    --region $PRIMARY_REGION \
+    --name "rds-master-password-${RANDOM_SUFFIX}" \
+    --description "Master password for RDS instance" \
+    --secret-string '{"username":"dbadmin","password":"FinancialDB2024!"}'
+
+export DB_SECRET_ARN=$(aws secretsmanager describe-secret \
+    --region $PRIMARY_REGION \
+    --secret-id "rds-master-password-${RANDOM_SUFFIX}" \
+    --query ARN --output text)
+
+# Note: Replace these subnet IDs with your actual subnet IDs
+# Get existing subnet IDs in your VPC
+echo "Please replace the subnet IDs below with your actual subnet IDs:"
+echo "PRIMARY_SUBNET_1=$(aws ec2 describe-subnets --region $PRIMARY_REGION --query 'Subnets[0].SubnetId' --output text)"
+echo "PRIMARY_SUBNET_2=$(aws ec2 describe-subnets --region $PRIMARY_REGION --query 'Subnets[1].SubnetId' --output text)"
+echo "SECONDARY_SUBNET_1=$(aws ec2 describe-subnets --region $SECONDARY_REGION --query 'Subnets[0].SubnetId' --output text)"
+echo "SECONDARY_SUBNET_2=$(aws ec2 describe-subnets --region $SECONDARY_REGION --query 'Subnets[1].SubnetId' --output text)"
+
+# Set your actual subnet IDs here
+export PRIMARY_SUBNET_1="subnet-12345678"  # Replace with actual subnet ID
+export PRIMARY_SUBNET_2="subnet-87654321"  # Replace with actual subnet ID
+export SECONDARY_SUBNET_1="subnet-abcd1234"  # Replace with actual subnet ID
+export SECONDARY_SUBNET_2="subnet-4321dcba"  # Replace with actual subnet ID
 
 # Create DB subnet groups in both regions
 aws rds create-db-subnet-group \
     --region $PRIMARY_REGION \
     --db-subnet-group-name $DB_SUBNET_GROUP \
     --db-subnet-group-description "Financial DB subnet group" \
-    --subnet-ids subnet-12345678 subnet-87654321
+    --subnet-ids $PRIMARY_SUBNET_1 $PRIMARY_SUBNET_2
 
 aws rds create-db-subnet-group \
     --region $SECONDARY_REGION \
     --db-subnet-group-name $DB_SUBNET_GROUP \
     --db-subnet-group-description "Financial DB subnet group" \
-    --subnet-ids subnet-abcd1234 subnet-4321dcba
+    --subnet-ids $SECONDARY_SUBNET_1 $SECONDARY_SUBNET_2
 
 echo "✅ Environment variables and subnet groups configured"
 ```
@@ -134,11 +158,11 @@ echo "✅ Environment variables and subnet groups configured"
    Database parameter groups enable fine-tuned control over PostgreSQL engine configuration, providing essential customization for high-availability workloads. Unlike default parameter groups, custom parameter groups allow modification of critical settings like logging levels, checkpoint timing, and connection management that directly impact failover performance and disaster recovery capabilities.
 
    ```bash
-   # Create parameter group for PostgreSQL 15
+   # Create parameter group for PostgreSQL 16 (latest supported version)
    aws rds create-db-parameter-group \
        --region $PRIMARY_REGION \
        --db-parameter-group-name $DB_PARAMETER_GROUP \
-       --db-parameter-group-family postgres15 \
+       --db-parameter-group-family postgres16 \
        --description "Financial DB optimized parameters"
    
    # Configure key parameters for high availability
@@ -166,9 +190,10 @@ echo "✅ Environment variables and subnet groups configured"
        --db-instance-identifier $DB_INSTANCE_ID \
        --db-instance-class db.r5.xlarge \
        --engine postgres \
-       --engine-version 15.4 \
+       --engine-version 16.4 \
        --master-username dbadmin \
-       --master-user-password $DB_MASTER_PASSWORD \
+       --manage-master-user-password \
+       --master-user-secret-kms-key-id alias/aws/rds \
        --allocated-storage 500 \
        --storage-type gp3 \
        --storage-encrypted \
@@ -193,7 +218,7 @@ echo "✅ Environment variables and subnet groups configured"
    echo "✅ Primary Multi-AZ RDS instance created successfully"
    ```
 
-   The Multi-AZ RDS instance now provides the foundation for enterprise-grade availability with automatic failover capabilities, 30-day backup retention (meeting most compliance requirements), and Performance Insights monitoring. The synchronous replication ensures financial transaction integrity while the automated backup schedule during low-traffic hours minimizes performance impact.
+   The Multi-AZ RDS instance now provides the foundation for enterprise-grade availability with automatic failover capabilities, 30-day backup retention (meeting most compliance requirements), and Performance Insights monitoring. The managed master user password feature with AWS KMS encryption ensures secure credential management while the automated backup schedule during low-traffic hours minimizes performance impact.
 
 3. **Create Cross-Region Read Replica**:
 
@@ -284,18 +309,27 @@ echo "✅ Environment variables and subnet groups configured"
        --query 'DBInstances[0].Endpoint.Address' \
        --output text)
    
-   # Create health check for primary database
+   # Create health check for primary database (TCP port 5432)
    PRIMARY_HEALTH_CHECK=$(aws route53 create-health-check \
        --caller-reference "primary-db-$(date +%s)" \
        --health-check-config \
-           Type=CALCULATED,ChildHealthChecks=["health-check-id-1","health-check-id-2"],HealthThreshold=1 \
+           Type=TCP,ResourcePath=/,FullyQualifiedDomainName=$PRIMARY_ENDPOINT,Port=5432,RequestInterval=30,FailureThreshold=3 \
+       --query 'HealthCheck.Id' --output text)
+   
+   # Create health check for replica database
+   REPLICA_HEALTH_CHECK=$(aws route53 create-health-check \
+       --caller-reference "replica-db-$(date +%s)" \
+       --health-check-config \
+           Type=TCP,ResourcePath=/,FullyQualifiedDomainName=$REPLICA_ENDPOINT,Port=5432,RequestInterval=30,FailureThreshold=3 \
        --query 'HealthCheck.Id' --output text)
    
    # Create hosted zone for database DNS
    HOSTED_ZONE_ID=$(aws route53 create-hosted-zone \
        --name "financial-db.internal" \
        --caller-reference "db-zone-$(date +%s)" \
-       --query 'HostedZone.Id' --output text)
+       --hosted-zone-config PrivateZone=true \
+       --vpc VPCRegion=$PRIMARY_REGION,VPCId=vpc-12345678 \
+       --query 'HostedZone.Id' --output text | cut -d'/' -f3)
    
    # Create primary DNS record with failover
    aws route53 change-resource-record-sets \
@@ -327,7 +361,8 @@ echo "✅ Environment variables and subnet groups configured"
              "SetIdentifier": "secondary",
              "Failover": "SECONDARY",
              "TTL": 60,
-             "ResourceRecords": [{"Value": "'$REPLICA_ENDPOINT'"}]
+             "ResourceRecords": [{"Value": "'$REPLICA_ENDPOINT'"}],
+             "HealthCheckId": "'$REPLICA_HEALTH_CHECK'"
            }
          }]
        }'
@@ -335,7 +370,7 @@ echo "✅ Environment variables and subnet groups configured"
    echo "✅ Route 53 health checks and DNS failover configured"
    ```
 
-   The DNS failover configuration establishes automatic traffic management with 60-second TTL for rapid failover response. Applications connecting to db.financial-db.internal will automatically receive the healthy database endpoint, enabling transparent disaster recovery without application code changes or manual DNS updates.
+   The DNS failover configuration establishes automatic traffic management with 60-second TTL for rapid failover response. Applications connecting to db.financial-db.internal will automatically receive the healthy database endpoint, enabling transparent disaster recovery without application code changes or manual DNS updates. The TCP health checks directly test database connectivity on port 5432.
 
 6. **Configure Automated Backup Strategy**:
 
@@ -377,6 +412,8 @@ echo "✅ Environment variables and subnet groups configured"
        --region $PRIMARY_REGION \
        --db-instance-identifier $DB_INSTANCE_ID
    
+   ping -c 3 db.financial-db.internal || echo "DNS propagation in progress"
+   
    echo "✅ Multi-AZ failover test completed successfully"
    ```
 
@@ -413,6 +450,13 @@ echo "✅ Environment variables and subnet groups configured"
    aws iam attach-role-policy \
        --role-name rds-promotion-role \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   aws iam attach-role-policy \
+       --role-name rds-promotion-role \
+       --policy-arn arn:aws:iam::aws:policy/AmazonRoute53FullAccess
+   
+   # Clean up temporary file
+   rm promotion-trust-policy.json
    
    echo "✅ Cross-region promotion capabilities configured"
    ```
@@ -453,10 +497,10 @@ echo "✅ Environment variables and subnet groups configured"
 
    ```bash
    # Test DNS resolution
-   nslookup db.financial-db.internal 8.8.8.8
+   nslookup db.financial-db.internal
    
    # Test with dig for more details
-   dig @8.8.8.8 db.financial-db.internal CNAME
+   dig db.financial-db.internal CNAME
    ```
 
 4. **Verify Backup Replication**:
@@ -467,6 +511,18 @@ echo "✅ Environment variables and subnet groups configured"
        --region $SECONDARY_REGION \
        --query 'DBInstanceAutomatedBackups[0].[DBInstanceIdentifier,Status,Region]' \
        --output table
+   ```
+
+5. **Test Health Check Status**:
+
+   ```bash
+   # Check health check status
+   aws route53 get-health-check \
+       --health-check-id $PRIMARY_HEALTH_CHECK \
+       --query 'HealthCheck.Config'
+   
+   aws route53 get-health-check-status \
+       --health-check-id $PRIMARY_HEALTH_CHECK
    ```
 
 ## Cleanup
@@ -508,13 +564,35 @@ echo "✅ Environment variables and subnet groups configured"
              "SetIdentifier": "primary",
              "Failover": "PRIMARY",
              "TTL": 60,
-             "ResourceRecords": [{"Value": "'$PRIMARY_ENDPOINT'"}]
+             "ResourceRecords": [{"Value": "'$PRIMARY_ENDPOINT'"}],
+             "HealthCheckId": "'$PRIMARY_HEALTH_CHECK'"
            }
          }]
        }'
    
+   aws route53 change-resource-record-sets \
+       --hosted-zone-id $HOSTED_ZONE_ID \
+       --change-batch '{
+         "Changes": [{
+           "Action": "DELETE",
+           "ResourceRecordSet": {
+             "Name": "db.financial-db.internal",
+             "Type": "CNAME",
+             "SetIdentifier": "secondary",
+             "Failover": "SECONDARY",
+             "TTL": 60,
+             "ResourceRecords": [{"Value": "'$REPLICA_ENDPOINT'"}],
+             "HealthCheckId": "'$REPLICA_HEALTH_CHECK'"
+           }
+         }]
+       }'
+   
+   # Delete health checks
+   aws route53 delete-health-check --health-check-id $PRIMARY_HEALTH_CHECK
+   aws route53 delete-health-check --health-check-id $REPLICA_HEALTH_CHECK
+   
    # Delete hosted zone
-   aws route53 delete-hosted-zone --id $HOSTED_ZONE_ID
+   aws route53 delete-hosted-zone --id /hostedzone/$HOSTED_ZONE_ID
    
    echo "✅ Cleaned up Route 53 resources"
    ```
@@ -552,7 +630,21 @@ echo "✅ Environment variables and subnet groups configured"
        --role-name rds-promotion-role \
        --policy-arn arn:aws:iam::aws:policy/AmazonRDSFullAccess
    
+   aws iam detach-role-policy \
+       --role-name rds-promotion-role \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   aws iam detach-role-policy \
+       --role-name rds-promotion-role \
+       --policy-arn arn:aws:iam::aws:policy/AmazonRoute53FullAccess
+   
    aws iam delete-role --role-name rds-promotion-role
+   
+   # Delete secrets manager secret
+   aws secretsmanager delete-secret \
+       --region $PRIMARY_REGION \
+       --secret-id "rds-master-password-${RANDOM_SUFFIX}" \
+       --force-delete-without-recovery
    
    echo "✅ All supporting resources cleaned up"
    ```
@@ -561,28 +653,35 @@ echo "✅ Environment variables and subnet groups configured"
 
 This advanced RDS Multi-AZ architecture with cross-region failover provides enterprise-grade database availability through multiple layers of redundancy. The synchronous Multi-AZ replication within the primary region ensures zero data loss during local failures, while the asynchronous cross-region replica provides disaster recovery capabilities for regional outages. This design aligns with the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_planning_for_recovery_disaster_recovery.html) reliability pillar for disaster recovery planning.
 
-The Route 53 health check integration enables automated DNS failover, reducing the Recovery Time Objective (RTO) from manual intervention times (potentially hours) to DNS propagation times (typically 1-2 minutes). The CloudWatch monitoring provides proactive alerting for database health issues, enabling teams to address problems before they impact applications.
+The Route 53 health check integration enables automated DNS failover, reducing the Recovery Time Objective (RTO) from manual intervention times (potentially hours) to DNS propagation times (typically 1-2 minutes). The TCP-based health checks directly test database connectivity on PostgreSQL's default port 5432, providing more accurate health assessment than HTTP-based checks. The CloudWatch monitoring provides proactive alerting for database health issues, enabling teams to address problems before they impact applications.
 
-The cross-region backup replication ensures point-in-time recovery capabilities are maintained even during regional disasters. This is particularly crucial for financial services applications where regulatory requirements mandate specific backup retention periods and geographic distribution of backup data. The [RDS Multi-AZ deployment architecture](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZSingleStandby.html) provides additional technical details on synchronous replication mechanisms.
+The cross-region backup replication ensures point-in-time recovery capabilities are maintained even during regional disasters. This is particularly crucial for financial services applications where regulatory requirements mandate specific backup retention periods and geographic distribution of backup data. The use of AWS Secrets Manager for credential management follows security best practices by eliminating hardcoded passwords and enabling automatic credential rotation. The [RDS Multi-AZ deployment architecture](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZSingleStandby.html) provides additional technical details on synchronous replication mechanisms.
 
-Performance Insights and enhanced monitoring provide deep visibility into database performance across both regions, enabling optimization and troubleshooting. The parameter group optimizations ensure the database is tuned for high-availability workloads with appropriate logging and checkpoint configurations.
+Performance Insights and enhanced monitoring provide deep visibility into database performance across both regions, enabling optimization and troubleshooting. The parameter group optimizations ensure the database is tuned for high-availability workloads with appropriate logging and checkpoint configurations. The private hosted zone configuration ensures database DNS resolution remains internal to your VPC infrastructure, maintaining security boundaries.
 
-> **Tip**: Implement application-level connection pooling and retry logic to handle brief connectivity interruptions during Multi-AZ failovers. See [Amazon RDS Best Practices](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_BestPractices.html) for detailed guidance on application resilience patterns.
+> **Tip**: Implement application-level connection pooling and retry logic to handle brief connectivity interruptions during Multi-AZ failovers. Consider using PgBouncer or similar connection poolers to minimize connection overhead. See [Amazon RDS Best Practices](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_BestPractices.html) for detailed guidance on application resilience patterns.
 
 ## Challenge
 
 Extend this solution by implementing these advanced capabilities:
 
-1. **Automated Promotion Pipeline**: Create a Lambda function that automatically promotes the read replica to primary during regional disasters, triggered by CloudWatch alarms and Route 53 health check failures.
+1. **Automated Promotion Pipeline**: Create a Lambda function that automatically promotes the read replica to primary during regional disasters, triggered by CloudWatch alarms and Route 53 health check failures, including automatic DNS record updates.
 
-2. **Blue-Green Deployments**: Implement RDS Blue-Green deployment capabilities for zero-downtime database upgrades and schema changes across the multi-region setup.
+2. **Blue-Green Deployments**: Implement RDS Blue-Green deployment capabilities for zero-downtime database upgrades and schema changes across the multi-region setup, utilizing the new AWS RDS Blue/Green deployment feature.
 
-3. **Application-Aware Monitoring**: Integrate custom CloudWatch metrics from your applications to create more sophisticated health checks that verify end-to-end connectivity and query performance.
+3. **Application-Aware Monitoring**: Integrate custom CloudWatch metrics from your applications to create more sophisticated health checks that verify end-to-end connectivity, query performance, and business logic validation.
 
-4. **Cross-Region VPC Peering**: Set up VPC peering between regions to enable private connectivity for replication traffic, reducing costs and improving security.
+4. **Cross-Region VPC Peering**: Set up VPC peering between regions to enable private connectivity for replication traffic, reducing costs and improving security by avoiding internet-based replication.
 
-5. **Automated Backup Testing**: Create a Lambda function that regularly tests backup restoration in an isolated environment to verify backup integrity and restoration procedures.
+5. **Automated Backup Testing**: Create a Lambda function that regularly tests backup restoration in an isolated environment to verify backup integrity and restoration procedures, ensuring your disaster recovery capabilities remain functional.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

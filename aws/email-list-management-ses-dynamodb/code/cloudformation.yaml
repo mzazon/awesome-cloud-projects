@@ -1,0 +1,935 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Email List Management with SES and DynamoDB - A serverless email marketing system with subscriber management and newsletter capabilities'
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Email Configuration"
+        Parameters:
+          - SenderEmail
+          - VerifyEmailOnDeploy
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - NewsletterTimeout
+          - NewsletterMemorySize
+    ParameterLabels:
+      SenderEmail:
+        default: "Sender Email Address"
+      VerifyEmailOnDeploy:
+        default: "Verify Email Address"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+      Environment:
+        default: "Environment Name"
+      LambdaRuntime:
+        default: "Lambda Runtime Version"
+      NewsletterTimeout:
+        default: "Newsletter Function Timeout"
+      NewsletterMemorySize:
+        default: "Newsletter Function Memory"
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  SenderEmail:
+    Type: String
+    Description: 'Email address for sending newsletters (must be verified in SES)'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address format'
+    
+  VerifyEmailOnDeploy:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Whether to automatically verify the sender email address in SES'
+    
+  ResourcePrefix:
+    Type: String
+    Default: 'email-list'
+    Description: 'Prefix for all resource names'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    MinLength: 3
+    MaxLength: 20
+    ConstraintDescription: 'Must contain only letters, numbers, and hyphens (3-20 characters)'
+    
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging'
+    
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.12'
+    AllowedValues: ['python3.12', 'python3.11', 'python3.10']
+    Description: 'Lambda runtime version'
+    
+  NewsletterTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Newsletter Lambda function timeout in seconds (60-900)'
+    
+  NewsletterMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+    Description: 'Newsletter Lambda function memory size in MB'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  ShouldVerifyEmail: !Equals [!Ref VerifyEmailOnDeploy, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ==========================================================================
+  # DynamoDB TABLE
+  # ==========================================================================
+  SubscribersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-subscribers-${Environment}'
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Purpose
+          Value: EmailListManagement
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+      DeletionProtectionEnabled: !If [IsProduction, true, false]
+
+  # ==========================================================================
+  # SES EMAIL VERIFICATION
+  # ==========================================================================
+  SESEmailVerification:
+    Type: AWS::SES::EmailIdentity
+    Condition: ShouldVerifyEmail
+    Properties:
+      EmailIdentity: !Ref SenderEmail
+      MailFromAttributes:
+        MailFromDomain: !Sub 'mail.${SenderEmail}'
+        BehaviorOnMXFailure: UseDefaultValue
+      DkimAttributes:
+        SigningEnabled: true
+      FeedbackAttributes:
+        EmailForwarding: false
+
+  # ==========================================================================
+  # IAM ROLE FOR LAMBDA FUNCTIONS
+  # ==========================================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: !GetAtt SubscribersTable.Arn
+        - PolicyName: SESAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                  - ses:GetIdentityVerificationAttributes
+                Resource: 
+                  - !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${SenderEmail}'
+                  - !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Purpose
+          Value: EmailListManagement
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ==========================================================================
+  # LAMBDA FUNCTION: SUBSCRIBE
+  # ==========================================================================
+  SubscribeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-subscribe-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SubscribersTable
+          ENVIRONMENT: !Ref Environment
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+          from botocore.exceptions import ClientError
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse request body
+                  if 'body' in event:
+                      if isinstance(event['body'], str):
+                          body = json.loads(event['body'])
+                      else:
+                          body = event['body']
+                  else:
+                      body = event
+                  
+                  email = body.get('email', '').lower().strip()
+                  name = body.get('name', 'Subscriber')
+                  
+                  # Validate email format
+                  if not email or '@' not in email or '.' not in email.split('@')[1]:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'error': 'Valid email address is required',
+                              'details': 'Email must contain @ symbol and valid domain'
+                          })
+                      }
+                  
+                  # Add subscriber to DynamoDB with conditional check
+                  response = table.put_item(
+                      Item={
+                          'email': email,
+                          'name': name,
+                          'subscribed_date': datetime.datetime.now().isoformat(),
+                          'status': 'active',
+                          'subscription_source': 'api',
+                          'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                      },
+                      ConditionExpression='attribute_not_exists(email)'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'message': f'Successfully subscribed {email}',
+                          'email': email,
+                          'name': name,
+                          'status': 'active'
+                      })
+                  }
+                  
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                      return {
+                          'statusCode': 409,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'error': 'Email already subscribed',
+                              'email': email
+                          })
+                      }
+                  else:
+                      print(f"DynamoDB Error: {str(e)}")
+                      return {
+                          'statusCode': 500,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'error': 'Database error occurred',
+                              'details': 'Please try again later'
+                          })
+                      }
+              except Exception as e:
+                  print(f"Unexpected Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'details': 'An unexpected error occurred'
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: EmailListManagement
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ==========================================================================
+  # LAMBDA FUNCTION: UNSUBSCRIBE
+  # ==========================================================================
+  UnsubscribeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-unsubscribe-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SubscribersTable
+          ENVIRONMENT: !Ref Environment
+      ReservedConcurrencyLimit: !If [IsProduction, 50, 5]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+          from botocore.exceptions import ClientError
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse request body
+                  if 'body' in event:
+                      if isinstance(event['body'], str):
+                          body = json.loads(event['body'])
+                      else:
+                          body = event['body']
+                  else:
+                      body = event
+                  
+                  email = body.get('email', '').lower().strip()
+                  
+                  # Validate email format
+                  if not email or '@' not in email:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'error': 'Valid email address is required'
+                          })
+                      }
+                  
+                  # Update subscriber status to inactive
+                  response = table.update_item(
+                      Key={'email': email},
+                      UpdateExpression='SET #status = :status, unsubscribed_date = :date',
+                      ExpressionAttributeNames={'#status': 'status'},
+                      ExpressionAttributeValues={
+                          ':status': 'inactive',
+                          ':date': datetime.datetime.now().isoformat()
+                      },
+                      ConditionExpression='attribute_exists(email)',
+                      ReturnValues='ALL_NEW'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'message': f'Successfully unsubscribed {email}',
+                          'email': email,
+                          'status': 'inactive'
+                      })
+                  }
+                  
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                      return {
+                          'statusCode': 404,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'error': 'Email not found in subscription list',
+                              'email': email
+                          })
+                      }
+                  else:
+                      print(f"DynamoDB Error: {str(e)}")
+                      return {
+                          'statusCode': 500,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'error': 'Database error occurred'
+                          })
+                      }
+              except Exception as e:
+                  print(f"Unexpected Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error'
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: EmailListManagement
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ==========================================================================
+  # LAMBDA FUNCTION: SEND NEWSLETTER
+  # ==========================================================================
+  NewsletterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-newsletter-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref NewsletterTimeout
+      MemorySize: !Ref NewsletterMemorySize
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SubscribersTable
+          SENDER_EMAIL: !Ref SenderEmail
+          ENVIRONMENT: !Ref Environment
+      ReservedConcurrencyLimit: !If [IsProduction, 10, 2]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import html
+          from botocore.exceptions import ClientError
+          
+          dynamodb = boto3.resource('dynamodb')
+          ses = boto3.client('ses')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse request body
+                  if 'body' in event:
+                      if isinstance(event['body'], str):
+                          body = json.loads(event['body'])
+                      else:
+                          body = event['body']
+                  else:
+                      body = event
+                  
+                  subject = body.get('subject', 'Newsletter Update')
+                  message = body.get('message', 'Thank you for subscribing!')
+                  sender_email = os.environ['SENDER_EMAIL']
+                  
+                  # Validate inputs
+                  if not subject.strip() or not message.strip():
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'error': 'Subject and message are required'
+                          })
+                      }
+                  
+                  # Get all active subscribers with pagination
+                  subscribers = []
+                  scan_kwargs = {
+                      'FilterExpression': '#status = :status',
+                      'ExpressionAttributeNames': {'#status': 'status'},
+                      'ExpressionAttributeValues': {':status': 'active'}
+                  }
+                  
+                  done = False
+                  start_key = None
+                  
+                  while not done:
+                      if start_key:
+                          scan_kwargs['ExclusiveStartKey'] = start_key
+                      response = table.scan(**scan_kwargs)
+                      subscribers.extend(response.get('Items', []))
+                      start_key = response.get('LastEvaluatedKey', None)
+                      done = start_key is None
+                  
+                  if not subscribers:
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'message': 'No active subscribers found',
+                              'sent_count': 0,
+                              'failed_count': 0,
+                              'total_subscribers': 0
+                          })
+                      }
+                  
+                  sent_count = 0
+                  failed_count = 0
+                  failed_emails = []
+                  
+                  # Send emails to all subscribers
+                  for subscriber in subscribers:
+                      try:
+                          subscriber_name = subscriber.get('name', 'Subscriber')
+                          subscriber_email = subscriber['email']
+                          
+                          # Create personalized HTML email
+                          html_message = f"""
+                          <html>
+                          <head>
+                              <style>
+                                  body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+                                  .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+                                  .header {{ background-color: #f8f9fa; padding: 20px; text-align: center; }}
+                                  .content {{ padding: 20px; }}
+                                  .footer {{ background-color: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; }}
+                                  .unsubscribe {{ color: #666; text-decoration: none; }}
+                              </style>
+                          </head>
+                          <body>
+                              <div class="container">
+                                  <div class="header">
+                                      <h1>Newsletter</h1>
+                                  </div>
+                                  <div class="content">
+                                      <h2>Hello {html.escape(subscriber_name)},</h2>
+                                      <p>{html.escape(message).replace(chr(10), '<br>')}</p>
+                                  </div>
+                                  <div class="footer">
+                                      <p>Best regards,<br>Your Newsletter Team</p>
+                                      <p><a href="#" class="unsubscribe">Unsubscribe</a></p>
+                                  </div>
+                              </div>
+                          </body>
+                          </html>
+                          """
+                          
+                          # Create plain text version
+                          text_message = f"Hello {subscriber_name},\n\n{message}\n\nBest regards,\nYour Newsletter Team\n\nTo unsubscribe, reply with 'UNSUBSCRIBE'"
+                          
+                          # Send email using SES
+                          ses.send_email(
+                              Source=sender_email,
+                              Destination={'ToAddresses': [subscriber_email]},
+                              Message={
+                                  'Subject': {'Data': subject, 'Charset': 'UTF-8'},
+                                  'Body': {
+                                      'Text': {'Data': text_message, 'Charset': 'UTF-8'},
+                                      'Html': {'Data': html_message, 'Charset': 'UTF-8'}
+                                  }
+                              }
+                          )
+                          sent_count += 1
+                          
+                      except ClientError as e:
+                          print(f"Failed to send to {subscriber_email}: {e}")
+                          failed_count += 1
+                          failed_emails.append(subscriber_email)
+                      except Exception as e:
+                          print(f"Unexpected error sending to {subscriber_email}: {e}")
+                          failed_count += 1
+                          failed_emails.append(subscriber_email)
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'message': f'Newsletter sent to {sent_count} subscribers',
+                          'sent_count': sent_count,
+                          'failed_count': failed_count,
+                          'total_subscribers': len(subscribers),
+                          'failed_emails': failed_emails if failed_count > 0 else []
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': 'Failed to send newsletter',
+                          'details': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: EmailListManagement
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ==========================================================================
+  # LAMBDA FUNCTION: LIST SUBSCRIBERS
+  # ==========================================================================
+  ListFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-list-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SubscribersTable
+          ENVIRONMENT: !Ref Environment
+      ReservedConcurrencyLimit: !If [IsProduction, 20, 5]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from decimal import Decimal
+          from botocore.exceptions import ClientError
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          def decimal_default(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse query parameters for filtering
+                  query_params = event.get('queryStringParameters') or {}
+                  status_filter = query_params.get('status', 'all')
+                  limit = int(query_params.get('limit', 100))
+                  
+                  # Validate parameters
+                  if limit > 1000:
+                      limit = 1000
+                  
+                  # Scan table with optional filtering
+                  scan_kwargs = {
+                      'Limit': limit
+                  }
+                  
+                  if status_filter != 'all':
+                      scan_kwargs['FilterExpression'] = '#status = :status'
+                      scan_kwargs['ExpressionAttributeNames'] = {'#status': 'status'}
+                      scan_kwargs['ExpressionAttributeValues'] = {':status': status_filter}
+                  
+                  subscribers = []
+                  response = table.scan(**scan_kwargs)
+                  subscribers.extend(response.get('Items', []))
+                  
+                  # Handle pagination if needed
+                  last_key = response.get('LastEvaluatedKey')
+                  
+                  # Convert Decimal types for JSON serialization
+                  for subscriber in subscribers:
+                      for key, value in subscriber.items():
+                          if isinstance(value, Decimal):
+                              subscriber[key] = float(value)
+                  
+                  # Generate summary statistics
+                  total_count = len(subscribers)
+                  active_count = sum(1 for s in subscribers if s.get('status') == 'active')
+                  inactive_count = total_count - active_count
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'subscribers': subscribers,
+                          'summary': {
+                              'total_count': total_count,
+                              'active_count': active_count,
+                              'inactive_count': inactive_count,
+                              'has_more': last_key is not None
+                          },
+                          'pagination': {
+                              'last_evaluated_key': last_key,
+                              'limit': limit
+                          } if last_key else None
+                      }, default=decimal_default)
+                  }
+                  
+              except ValueError as e:
+                  return {
+                      'statusCode': 400,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': 'Invalid parameters',
+                          'details': str(e)
+                      })
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': 'Failed to retrieve subscribers',
+                          'details': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: EmailListManagement
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ==========================================================================
+  # CLOUDWATCH LOG GROUPS
+  # ==========================================================================
+  SubscribeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SubscribeFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Purpose
+          Value: EmailListManagement
+        - Key: Environment
+          Value: !Ref Environment
+
+  UnsubscribeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${UnsubscribeFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Purpose
+          Value: EmailListManagement
+        - Key: Environment
+          Value: !Ref Environment
+
+  NewsletterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NewsletterFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Purpose
+          Value: EmailListManagement
+        - Key: Environment
+          Value: !Ref Environment
+
+  ListLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ListFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Purpose
+          Value: EmailListManagement
+        - Key: Environment
+          Value: !Ref Environment
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  # DynamoDB Table Information
+  SubscribersTableName:
+    Description: 'Name of the DynamoDB table storing subscriber information'
+    Value: !Ref SubscribersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-SubscribersTable'
+
+  SubscribersTableArn:
+    Description: 'ARN of the DynamoDB subscribers table'
+    Value: !GetAtt SubscribersTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SubscribersTableArn'
+
+  # Lambda Function Information
+  SubscribeFunctionName:
+    Description: 'Name of the subscriber registration Lambda function'
+    Value: !Ref SubscribeFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-SubscribeFunction'
+
+  SubscribeFunctionArn:
+    Description: 'ARN of the subscriber registration Lambda function'
+    Value: !GetAtt SubscribeFunction.Arn
+
+  UnsubscribeFunctionName:
+    Description: 'Name of the unsubscribe Lambda function'
+    Value: !Ref UnsubscribeFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-UnsubscribeFunction'
+
+  UnsubscribeFunctionArn:
+    Description: 'ARN of the unsubscribe Lambda function'
+    Value: !GetAtt UnsubscribeFunction.Arn
+
+  NewsletterFunctionName:
+    Description: 'Name of the newsletter sending Lambda function'
+    Value: !Ref NewsletterFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-NewsletterFunction'
+
+  NewsletterFunctionArn:
+    Description: 'ARN of the newsletter sending Lambda function'
+    Value: !GetAtt NewsletterFunction.Arn
+
+  ListFunctionName:
+    Description: 'Name of the subscriber listing Lambda function'
+    Value: !Ref ListFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ListFunction'
+
+  ListFunctionArn:
+    Description: 'ARN of the subscriber listing Lambda function'
+    Value: !GetAtt ListFunction.Arn
+
+  # IAM Role Information
+  LambdaExecutionRoleName:
+    Description: 'Name of the IAM role used by Lambda functions'
+    Value: !Ref LambdaExecutionRole
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRole'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the IAM role used by Lambda functions'
+    Value: !GetAtt LambdaExecutionRole.Arn
+
+  # SES Information
+  SenderEmailAddress:
+    Description: 'Email address configured for sending newsletters'
+    Value: !Ref SenderEmail
+
+  SESEmailIdentity:
+    Condition: ShouldVerifyEmail
+    Description: 'SES Email Identity for the sender email'
+    Value: !Ref SESEmailVerification
+
+  # Testing Commands
+  TestSubscribeCommand:
+    Description: 'AWS CLI command to test subscriber registration'
+    Value: !Sub |
+      aws lambda invoke --function-name ${SubscribeFunction} --payload '{"email":"test@example.com","name":"Test User"}' response.json
+
+  TestNewsletterCommand:
+    Description: 'AWS CLI command to test newsletter sending'
+    Value: !Sub |
+      aws lambda invoke --function-name ${NewsletterFunction} --payload '{"subject":"Test Newsletter","message":"This is a test message"}' response.json
+
+  TestListCommand:
+    Description: 'AWS CLI command to test subscriber listing'
+    Value: !Sub |
+      aws lambda invoke --function-name ${ListFunction} --payload '{}' response.json
+
+  # Dashboard and Monitoring
+  CloudWatchDashboardUrl:
+    Description: 'URL to CloudWatch dashboard for monitoring (create manually)'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:'
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for low-volume usage (USD)'
+    Value: '$0.10 - $2.00 (varies by usage, Free Tier eligible)'

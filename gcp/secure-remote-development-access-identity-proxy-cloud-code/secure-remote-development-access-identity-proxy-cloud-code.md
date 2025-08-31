@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Identity-Aware Proxy, Cloud Code, Artifact Registry, Compute Engine
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, remote-development, zero-trust, cloud-identity, container-security
 recipe-generator-version: 1.3
@@ -166,22 +166,22 @@ echo "✅ Artifact Registry repository created: ${REPO_NAME}"
    Identity-Aware Proxy requires OAuth 2.0 consent configuration to authenticate users and enforce access policies. The OAuth consent screen provides user authentication flow and defines the application identity that users will authorize when accessing protected resources through IAP.
 
    ```bash
-   # Set OAuth consent screen (must be done through Console initially)
+   # Note: OAuth consent screen must be configured through Console
    echo "⚠️  OAuth consent screen configuration required"
    echo "Navigate to: https://console.cloud.google.com/apis/credentials/consent"
    echo "Set User Type: Internal (for organization) or External"
    echo "Application name: Secure Development Environment"
-   echo "User support email: your-email@domain.com"
-   echo "Developer contact: your-email@domain.com"
+   echo "User support email: $(gcloud config get-value account)"
+   echo "Developer contact: $(gcloud config get-value account)"
    
-   # Create OAuth 2.0 client ID for IAP
+   # After console setup, create OAuth brand programmatically
    gcloud iap oauth-brands create \
        --application_title="Secure Development Environment" \
        --support_email="$(gcloud config get-value account)"
    
-   # Get the OAuth brand name for client creation
+   # Get the OAuth brand name for reference
    BRAND_NAME=$(gcloud iap oauth-brands list \
-       --format="value(name)")
+       --format="value(name)" | head -n1)
    
    echo "✅ OAuth brand created: ${BRAND_NAME}"
    echo "Note: Complete OAuth consent screen setup in Cloud Console"
@@ -194,7 +194,7 @@ echo "✅ Artifact Registry repository created: ${REPO_NAME}"
    Enabling IAP for SSH access creates secure, authenticated tunnels to Compute Engine instances without requiring public IP addresses or traditional SSH key management. This approach provides identity-based access control with comprehensive audit logging and integration with organizational identity providers.
 
    ```bash
-   # Enable IAP for SSH access to the development VM
+   # Grant IAP tunnel access to the current user
    gcloud compute instances add-iam-policy-binding ${VM_NAME} \
        --zone=${ZONE} \
        --member="user:$(gcloud config get-value account)" \
@@ -240,6 +240,7 @@ echo "✅ Artifact Registry repository created: ${REPO_NAME}"
    
    # Install Google Cloud CLI
    curl https://sdk.cloud.google.com | bash
+   source ~/.bashrc
    
    # Install development tools
    sudo apt-get install -y git vim curl wget unzip \
@@ -283,7 +284,7 @@ WORKDIR /app
 RUN pip install flask
 COPY . .
 EXPOSE 8080
-CMD ['python', 'app.py']
+CMD [\"python\", \"app.py\"]
 EOF
    
    cat > app.py << 'EOF'
@@ -325,16 +326,19 @@ EOF
 
    ```bash
    # Create access level for development environment access
-   gcloud access-context-manager policies create \
-       --title="Secure Development Policy" \
-       --organization="$(gcloud organizations list --format='value(name)' --limit=1)"
+   # Note: Requires organization-level Access Context Manager
+   ORG_ID=$(gcloud organizations list --format='value(name)' --limit=1)
    
-   # Get policy ID for access level creation
-   POLICY_ID=$(gcloud access-context-manager policies list \
-       --format="value(name)" | head -n1)
-   
-   # Create basic access level (requires valid organization)
-   if [ ! -z "${POLICY_ID}" ]; then
+   if [ ! -z "${ORG_ID}" ]; then
+       gcloud access-context-manager policies create \
+           --title="Secure Development Policy" \
+           --organization="${ORG_ID}"
+       
+       # Get policy ID for access level creation
+       POLICY_ID=$(gcloud access-context-manager policies list \
+           --format="value(name)" | head -n1)
+       
+       # Create basic access level with device security requirements
        gcloud access-context-manager levels create dev-access \
            --policy=${POLICY_ID} \
            --title="Development Environment Access" \
@@ -348,7 +352,7 @@ EOF
    fi
    
    # Configure IAP access policy for the VM
-   gcloud compute instances set-iam-policy ${VM_NAME} /dev/stdin <<EOF
+   cat > vm-iam-policy.yaml << EOF
 bindings:
 - members:
   - user:$(gcloud config get-value account)
@@ -359,6 +363,9 @@ bindings:
 etag: ""
 version: 1
 EOF
+   
+   gcloud compute instances set-iam-policy ${VM_NAME} \
+       --zone=${ZONE} vm-iam-policy.yaml
    
    echo "✅ IAP access policies configured"
    ```
@@ -417,30 +424,18 @@ EOF
    Comprehensive audit logging and monitoring provide visibility into access patterns, security events, and operational activities within the secure development environment. This observability framework enables security teams to monitor access compliance and detect potential security threats or policy violations.
 
    ```bash
-   # Enable audit logs for IAP and Compute Engine
-   cat > audit-policy.yaml << EOF
-auditConfigs:
-- service: iap.googleapis.com
-  auditLogConfigs:
-  - logType: ADMIN_READ
-  - logType: DATA_READ
-  - logType: DATA_WRITE
-- service: compute.googleapis.com
-  auditLogConfigs:
-  - logType: ADMIN_READ
-  - logType: DATA_WRITE
-    exemptedMembers:
-    - serviceAccount:service-account@example.com
-EOF
+   # Create BigQuery dataset for audit logs (optional)
+   bq mk --dataset \
+       --description "Security audit logs dataset" \
+       ${PROJECT_ID}:security_audit
    
-   # Apply audit configuration
+   # Create logging sink for IAP and Compute Engine audit logs
    gcloud logging sinks create iap-audit-sink \
        bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/security_audit \
        --log-filter='protoPayload.serviceName="iap.googleapis.com" OR protoPayload.serviceName="compute.googleapis.com"'
    
    # Create monitoring dashboard for IAP access
-   gcloud monitoring dashboards create \
-       --config-from-file=<(cat << EOF
+   cat > iap-dashboard.json << EOF
 {
   "displayName": "IAP Security Dashboard",
   "gridLayout": {
@@ -467,7 +462,9 @@ EOF
   }
 }
 EOF
-)
+   
+   gcloud monitoring dashboards create \
+       --config-from-file=iap-dashboard.json
    
    echo "✅ Audit logging and monitoring configured"
    ```
@@ -484,7 +481,7 @@ EOF
        --zone=${ZONE} \
        --tunnel-through-iap \
        --command="curl -H 'Metadata-Flavor: Google' \
-       http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/external-ip"
+       http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/external-ip || echo 'No external IP (expected)'"
    ```
 
    Expected output: No external IP address returned, confirming secure access
@@ -496,10 +493,11 @@ EOF
    gcloud artifacts docker images scan ${IMAGE_URI} \
        --location=${REGION}
    
-   # List scan results
+   # List scan results (may take a few minutes after push)
    gcloud artifacts docker images list-vulnerabilities ${IMAGE_URI} \
        --location=${REGION} \
-       --format="table(vulnerability.cvssScore,vulnerability.severity)"
+       --format="table(vulnerability.cvssScore,vulnerability.severity)" \
+       --limit=10
    ```
 
    Expected output: Vulnerability scan results with severity ratings
@@ -574,14 +572,29 @@ EOF
    echo "✅ IAM policies cleaned up"
    ```
 
-4. **Disable APIs and Remove Project Resources**:
+4. **Remove Monitoring and Logging Resources**:
+
+   ```bash
+   # Delete logging sink
+   gcloud logging sinks delete iap-audit-sink --quiet
+   
+   # Delete BigQuery dataset (optional)
+   bq rm -r -f ${PROJECT_ID}:security_audit
+   
+   # Remove local configuration files
+   rm -f vm-iam-policy.yaml iap-dashboard.json
+   
+   echo "✅ Monitoring and logging resources cleaned up"
+   ```
+
+5. **Disable APIs and Remove Project Resources**:
 
    ```bash
    # Disable APIs to prevent charges
    gcloud services disable iap.googleapis.com \
        compute.googleapis.com \
        artifactregistry.googleapis.com \
-       cloudbuild.googleapis.com
+       cloudbuild.googleapis.com --quiet
    
    # Delete project (if created specifically for recipe)
    gcloud projects delete ${PROJECT_ID} --quiet
@@ -598,7 +611,7 @@ The integration between Cloud Code and Artifact Registry creates a secure develo
 
 Context-aware access policies provide additional security layers by evaluating device security status, location, and other contextual signals before granting access. This dynamic approach to access control adapts to changing risk levels and supports compliance requirements for regulated industries. The solution scales from individual developers to large development teams while maintaining consistent security controls and operational visibility across all access patterns.
 
-The architecture supports hybrid and multi-cloud development scenarios where developers need secure access to cloud resources from various locations and devices. By leveraging Google Cloud's global infrastructure and identity services, organizations can provide consistent security controls regardless of developer location while maintaining compliance with data residency and privacy requirements.
+The architecture supports hybrid and multi-cloud development scenarios where developers need secure access to cloud resources from various locations and devices. By leveraging Google Cloud's global infrastructure and identity services, organizations can provide consistent security controls regardless of developer location while maintaining compliance with data residency and privacy requirements. For comprehensive security guidance, refer to the [Google Cloud Architecture Center](https://cloud.google.com/architecture) and [Google Cloud Security Command Center documentation](https://cloud.google.com/security-command-center/docs).
 
 > **Tip**: Implement regular access reviews and automated policy compliance checks using Cloud Asset Inventory and Security Command Center to maintain security posture over time. Consider integrating with organizational identity providers through Cloud Identity or third-party SAML providers for centralized identity management.
 
@@ -614,4 +627,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

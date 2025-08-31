@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: BigQuery, Looker Studio, Cloud Scheduler, Vertex AI
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-storytelling, analytics, visualization, ai-insights, automation
 recipe-generator-version: 1.3
@@ -69,28 +69,29 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and appropriate permissions
-2. gcloud CLI v2 installed and configured (or Google Cloud Shell)
+2. gcloud CLI installed and configured (or Google Cloud Shell)
 3. Basic understanding of BigQuery, data analysis, and business intelligence concepts
 4. Familiarity with SQL queries and data visualization principles
 5. Estimated cost: $10-20 for BigQuery queries, Vertex AI usage, and Looker Studio Pro features during testing
 
-> **Note**: This recipe uses BigQuery's public datasets and Vertex AI Gemini models. Ensure your project has the necessary APIs enabled and quota for AI model usage.
+> **Note**: This recipe uses BigQuery's Data Canvas and Vertex AI Gemini models. Ensure your project has the necessary APIs enabled and quota for AI model usage.
 
 ## Preparation
 
 ```bash
-# Set environment variables for the project
+# Set environment variables for GCP resources
 export PROJECT_ID=$(gcloud config get-value project)
 export REGION="us-central1"
 export DATASET_NAME="retail_analytics_$(date +%s)"
 export FUNCTION_NAME="data-storytelling-automation"
 
-# Generate unique identifiers for resources
+# Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 export JOB_NAME="storytelling-job-${RANDOM_SUFFIX}"
 export BUCKET_NAME="${PROJECT_ID}-storytelling-${RANDOM_SUFFIX}"
 
-# Set default region for gcloud operations
+# Set default project and region
+gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
 
 # Enable required Google Cloud APIs
@@ -186,7 +187,7 @@ echo "✅ APIs enabled successfully"
        --member="serviceAccount:vertex-ai-storytelling@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/aiplatform.user"
    
-   # Test Vertex AI connection with sample query
+   # Test Vertex AI connection with available models
    gcloud ai models list \
        --region=${REGION} \
        --filter="displayName:gemini"
@@ -254,13 +255,13 @@ echo "✅ APIs enabled successfully"
    mkdir -p /tmp/storytelling-function
    cd /tmp/storytelling-function
    
-   # Create requirements file for Python dependencies
+   # Create requirements file for Python dependencies with latest versions
    cat > requirements.txt << 'EOF'
-   google-cloud-bigquery==3.11.4
-   google-cloud-aiplatform==1.38.1
-   google-cloud-storage==2.10.0
-   pandas==2.0.3
-   numpy==1.24.3
+   google-cloud-bigquery==3.27.0
+   google-cloud-aiplatform==1.69.0
+   google-cloud-storage==2.18.2
+   pandas==2.2.2
+   numpy==1.26.4
    EOF
    
    # Create main function code with comprehensive storytelling logic
@@ -355,9 +356,9 @@ EOF
    Deploying the Cloud Function creates a scalable, serverless endpoint that can execute our data storytelling pipeline on demand or via scheduled triggers. This deployment establishes the automation foundation that enables continuous insight generation without manual intervention.
 
    ```bash
-   # Deploy Cloud Function with appropriate configuration
+   # Deploy Cloud Function with appropriate configuration using latest runtime
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime=python39 \
+       --runtime=python312 \
        --trigger=http \
        --allow-unauthenticated \
        --region=${REGION} \
@@ -433,8 +434,8 @@ EOF
         FROM \`${PROJECT_ID}.${DATASET_NAME}.sales_data\`
         GROUP BY category, customer_segment, region, sales_date"
    
-   # Grant Looker Studio service account access to BigQuery
-   bq show --format=prettyjson ${PROJECT_ID}:${DATASET_NAME}
+   # Verify materialized view creation
+   bq show --format=prettyjson ${PROJECT_ID}:${DATASET_NAME}.dashboard_data
    
    # Create sample aggregation for dashboard
    bq query --use_legacy_sql=false \
@@ -559,6 +560,8 @@ The serverless architecture using Cloud Functions and Cloud Scheduler ensures th
 
 The use of materialized views optimizes dashboard performance by pre-computing analytical results, while the automated scheduling ensures that stakeholders receive timely insights aligned with business rhythms. This architecture follows [Google Cloud's Well-Architected Framework](https://cloud.google.com/architecture/framework) principles by emphasizing operational excellence, security, reliability, and cost optimization through serverless technologies.
 
+BigQuery Data Canvas introduces revolutionary capabilities for natural language data exploration, allowing business users to interact with complex datasets using conversational queries. This feature democratizes data access by eliminating the need for deep SQL knowledge while maintaining the power and scalability of BigQuery's analytical engine.
+
 > **Tip**: Consider implementing data governance policies using [BigQuery's column-level security](https://cloud.google.com/bigquery/docs/column-level-security) and row-level security features to ensure sensitive business data remains protected while enabling broad access to insights and visualizations.
 
 ## Challenge
@@ -577,4 +580,9 @@ Extend this data storytelling solution with these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: ECS, ALB, CodeDeploy, CloudWatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: blue-green, deployment, ecs, containers
 recipe-generator-version: 1.3
 ---
 
 # Blue-Green Deployments for ECS Applications
-
 
 ## Problem
 
@@ -133,13 +132,32 @@ SUBNET_2_ID=$(aws ec2 create-subnet \
     --availability-zone ${AWS_REGION}b \
     --query 'Subnet.SubnetId' --output text)
 
-# Create Internet Gateway and route table
+# Create Internet Gateway and attach to VPC
 IGW_ID=$(aws ec2 create-internet-gateway \
     --query 'InternetGateway.InternetGatewayId' --output text)
 
 aws ec2 attach-internet-gateway \
     --vpc-id $VPC_ID \
     --internet-gateway-id $IGW_ID
+
+# Create route table and add route to internet gateway
+ROUTE_TABLE_ID=$(aws ec2 create-route-table \
+    --vpc-id $VPC_ID \
+    --query 'RouteTable.RouteTableId' --output text)
+
+aws ec2 create-route \
+    --route-table-id $ROUTE_TABLE_ID \
+    --destination-cidr-block 0.0.0.0/0 \
+    --gateway-id $IGW_ID
+
+# Associate subnets with route table
+aws ec2 associate-route-table \
+    --subnet-id $SUBNET_1_ID \
+    --route-table-id $ROUTE_TABLE_ID
+
+aws ec2 associate-route-table \
+    --subnet-id $SUBNET_2_ID \
+    --route-table-id $ROUTE_TABLE_ID
 
 # Create security group
 SECURITY_GROUP_ID=$(aws ec2 create-security-group \
@@ -311,6 +329,11 @@ EOF
        --role-name "ecsTaskExecutionRole-${RANDOM_SUFFIX}" \
        --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
    
+   # Create CloudWatch log group
+   aws logs create-log-group \
+       --log-group-name "/ecs/bluegreen-task-${RANDOM_SUFFIX}" \
+       --region $AWS_REGION
+   
    # Create task definition
    cat > task-definition.json << EOF
 {
@@ -343,11 +366,6 @@ EOF
     ]
 }
 EOF
-   
-   # Create CloudWatch log group
-   aws logs create-log-group \
-       --log-group-name "/ecs/bluegreen-task-${RANDOM_SUFFIX}" \
-       --region $AWS_REGION
    
    # Register task definition
    TASK_DEF_ARN=$(aws ecs register-task-definition \
@@ -499,6 +517,10 @@ EOF
    The AppSpec file defines the deployment configuration and lifecycle hooks for CodeDeploy, specifying how the new version should be deployed and validated. Lifecycle hooks provide integration points for custom validation logic, monitoring setup, and automated testing during deployment phases. This declarative approach ensures consistent deployment behavior while enabling sophisticated validation and rollback logic based on application-specific requirements.
 
    ```bash
+   # Create S3 bucket for deployment artifacts
+   DEPLOYMENT_BUCKET="bluegreen-deployments-${RANDOM_SUFFIX}"
+   aws s3 mb s3://$DEPLOYMENT_BUCKET --region $AWS_REGION
+   
    # Create AppSpec file for CodeDeploy
    cat > appspec.yaml << EOF
 version: 0.0
@@ -516,17 +538,7 @@ Resources:
             Subnets: ["${SUBNET_1_ID}", "${SUBNET_2_ID}"]
             SecurityGroups: ["${SECURITY_GROUP_ID}"]
             AssignPublicIp: "ENABLED"
-Hooks:
-  - BeforeInstall: "LambdaFunctionToValidateService"
-  - AfterInstall: "LambdaFunctionToValidateService"
-  - AfterAllowTestTraffic: "LambdaFunctionToValidateTestTraffic"
-  - BeforeAllowTraffic: "LambdaFunctionToValidateReadiness"
-  - AfterAllowTraffic: "LambdaFunctionToValidateTraffic"
 EOF
-   
-   # Create S3 bucket for deployment artifacts
-   DEPLOYMENT_BUCKET="bluegreen-deployments-${RANDOM_SUFFIX}"
-   aws s3 mb s3://$DEPLOYMENT_BUCKET --region $AWS_REGION
    
    # Upload AppSpec file to S3
    aws s3 cp appspec.yaml s3://$DEPLOYMENT_BUCKET/appspec.yaml
@@ -800,6 +812,14 @@ EOF
        --role-name "CodeDeployServiceRole-${RANDOM_SUFFIX}"
    
    # Delete VPC resources
+   aws ec2 disassociate-route-table \
+       --association-id $(aws ec2 describe-route-tables \
+       --route-table-ids $ROUTE_TABLE_ID \
+       --query 'RouteTables[0].Associations[?Main==`false`].RouteTableAssociationId' \
+       --output text | head -1)
+   
+   aws ec2 delete-route-table --route-table-id $ROUTE_TABLE_ID
+   
    aws ec2 delete-security-group \
        --group-id $SECURITY_GROUP_ID
    
@@ -845,4 +865,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

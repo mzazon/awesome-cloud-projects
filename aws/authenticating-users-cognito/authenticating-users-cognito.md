@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: cognito,iam,ses,sns
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: cognito,iam,ses,sns
 recipe-generator-version: 1.3
@@ -87,7 +87,7 @@ graph TB
 4. Domain name for custom authentication pages (optional)
 5. Estimated cost: $10-20/month for moderate usage (first 50,000 MAUs free)
 
-> **Note**: Amazon Cognito pricing is based on Monthly Active Users (MAUs). The first 50,000 MAUs are free each month.
+> **Note**: Amazon Cognito pricing is based on Monthly Active Users (MAUs). The first 50,000 MAUs are free each month, making it cost-effective for small to medium applications.
 
 ## Preparation
 
@@ -410,15 +410,18 @@ echo "Domain Prefix: $DOMAIN_PREFIX"
 
    Test users are now provisioned with appropriate group memberships and temporary passwords. The message suppression prevents automatic emails during testing, while the group assignments demonstrate how JWT tokens will include group claims that applications can use for authorization decisions.
 
-9. **Configure Custom Attributes and Lambda Triggers**:
+9. **Configure Custom Attributes**:
 
-   Custom attributes extend the user profile schema to support business-specific data requirements without maintaining a separate user database. These attributes can store subscription tiers, preferences, or metadata that applications need for personalization and business logic. Combined with Lambda triggers, custom attributes enable sophisticated user management workflows.
+   Custom attributes extend the user profile schema to support business-specific data requirements without maintaining a separate user database. These attributes can store subscription tiers, preferences, or metadata that applications need for personalization and business logic. The custom attributes are included in ID tokens for seamless application access.
 
    ```bash
    # Add custom attributes for business logic
    aws cognito-idp add-custom-attributes \
        --user-pool-id "$USER_POOL_ID" \
-       --custom-attributes Name="customer_tier",AttributeDataType="String",DeveloperOnlyAttribute=false,Required=false,StringAttributeConstraints="{MinLength=1,MaxLength=20}" Name="last_login",AttributeDataType="DateTime",DeveloperOnlyAttribute=false,Required=false Name="subscription_status",AttributeDataType="String",DeveloperOnlyAttribute=false,Required=false,StringAttributeConstraints="{MinLength=1,MaxLength=50}"
+       --custom-attributes \
+           Name="customer_tier",AttributeDataType="String",DeveloperOnlyAttribute=false,Required=false,StringAttributeConstraints="{MinLength=1,MaxLength=20}" \
+           Name="last_login",AttributeDataType="DateTime",DeveloperOnlyAttribute=false,Required=false \
+           Name="subscription_status",AttributeDataType="String",DeveloperOnlyAttribute=false,Required=false,StringAttributeConstraints="{MinLength=1,MaxLength=50}"
    
    echo "✅ Added custom attributes for business logic"
    ```
@@ -570,15 +573,15 @@ echo "Domain Prefix: $DOMAIN_PREFIX"
 
 ## Discussion
 
-Amazon Cognito User Pools provides a comprehensive authentication solution that eliminates the complexity of building secure user management systems from scratch. The implementation demonstrates several key architectural decisions that enhance security and user experience.
+Amazon Cognito User Pools provides a comprehensive authentication solution that eliminates the complexity of building secure user management systems from scratch. The implementation demonstrates several key architectural decisions that enhance security and user experience while following AWS Well-Architected Framework principles.
 
 The password policy configuration enforces strong authentication credentials with minimum length requirements, character complexity, and limited temporary password validity. Multi-factor authentication support through both software tokens (TOTP) and SMS provides layered security, while the device tracking capabilities help detect suspicious sign-in attempts from new devices. The advanced security features, including adaptive authentication and compromised credential detection, automatically respond to potential threats without requiring manual intervention.
 
-Social identity provider integration enables users to sign in with existing accounts from Google, Facebook, or enterprise SAML providers, reducing registration friction while maintaining security. The OAuth 2.0 and OpenID Connect compliance ensures compatibility with modern web and mobile applications, while the hosted UI provides a customizable authentication experience that reduces development effort.
+Social identity provider integration enables users to sign in with existing accounts from Google, Facebook, or enterprise SAML providers, reducing registration friction while maintaining security. The OAuth 2.0 and OpenID Connect compliance ensures compatibility with modern web and mobile applications, while the hosted UI provides a customizable authentication experience that reduces development effort. According to the [AWS Cognito User Pools documentation](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools.html), user pools can scale to hundreds of millions of users with consistent performance and availability.
 
-The user group implementation supports role-based access control, allowing applications to implement fine-grained permissions based on user membership. Custom attributes enable storing business-specific user data directly within the user pool, eliminating the need for separate user profile databases. According to the [AWS Cognito documentation](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools.html), user pools can scale to hundreds of millions of users with consistent performance.
+The user group implementation supports role-based access control, allowing applications to implement fine-grained permissions based on user membership. Custom attributes enable storing business-specific user data directly within the user pool, eliminating the need for separate user profile databases while maintaining data integrity and security compliance.
 
-> **Tip**: Use Lambda triggers to customize authentication flows, automatically assign users to groups based on email domains, or integrate with external systems during sign-up and sign-in processes.
+> **Tip**: Use Lambda triggers to customize authentication flows, automatically assign users to groups based on email domains, or integrate with external systems during sign-up and sign-in processes. The [AWS Cognito Lambda triggers documentation](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-working-with-lambda-triggers.html) provides comprehensive guidance for extending Cognito functionality.
 
 ## Challenge
 
@@ -592,4 +595,11 @@ Extend this authentication solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

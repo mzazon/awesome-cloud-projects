@@ -1,21 +1,21 @@
 ---
-title: Architecting Intelligent Retail Inventory Optimization with Fleet Engine and Cloud Optimization AI
+title: Architecting Intelligent Retail Inventory Optimization with Fleet Engine and Route Optimization API
 id: f7a8b2c1
 category: analytics
 difficulty: 400
 subject: gcp
-services: Fleet Engine, Cloud Optimization AI, Cloud Run, BigQuery
+services: Maps Platform, Route Optimization API, Cloud Run, BigQuery
 estimated-time: 150 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: retail, inventory, optimization, ai, fleet-management, demand-forecasting, supply-chain
 recipe-generator-version: 1.3
 ---
 
-# Architecting Intelligent Retail Inventory Optimization with Fleet Engine and Cloud Optimization AI
+# Architecting Intelligent Retail Inventory Optimization with Fleet Engine and Route Optimization API
 
 ## Problem
 
@@ -23,7 +23,7 @@ Modern retail chains struggle with inventory imbalances across multiple store lo
 
 ## Solution
 
-Build an intelligent retail inventory management system that combines Google Cloud's Fleet Engine for delivery route optimization with Cloud Optimization AI for demand forecasting and stock placement decisions. The solution uses BigQuery for data analytics and Cloud Run for scalable microservices, enabling real-time inventory redistribution across store locations based on predictive analytics and delivery efficiency. This integrated approach optimizes both inventory allocation and logistics operations to maximize sales while minimizing operational costs.
+Build an intelligent retail inventory management system that combines Google Maps Platform's Fleet Engine for real-time fleet tracking with the Route Optimization API for delivery route optimization and demand forecasting decisions. The solution uses BigQuery for data analytics and Cloud Run for scalable microservices, enabling real-time inventory redistribution across store locations based on predictive analytics and delivery efficiency. This integrated approach optimizes both inventory allocation and logistics operations to maximize sales while minimizing operational costs.
 
 ## Architecture Diagram
 
@@ -44,12 +44,12 @@ graph TB
         
         subgraph "AI Services"
             VAI[Vertex AI Forecasting]
-            OPT[Cloud Optimization AI]
+            BQML[BigQuery ML]
         end
         
         subgraph "Fleet Management"
             FE[Fleet Engine]
-            ROUTE[Route Optimization API]
+            RO[Route Optimization API]
         end
         
         subgraph "Application Layer"
@@ -76,16 +76,15 @@ graph TB
     GPS-->FE
     
     DS-->BQ
-    BQ-->VAI
+    BQ-->BQML
     BQ-->CR1
     
-    VAI-->CR2
-    CR2-->OPT
-    OPT-->CR3
+    BQML-->CR2
+    CR2-->RO
+    RO-->CR3
     
     CR3-->FE
-    FE-->ROUTE
-    ROUTE-->FLEET
+    FE-->FLEET
     
     FLEET-->STORES
     WH-->FLEET
@@ -95,9 +94,9 @@ graph TB
     CR3-->MON
     
     style BQ fill:#4285F4
-    style VAI fill:#34A853
+    style BQML fill:#34A853
     style FE fill:#EA4335
-    style OPT fill:#FBBC04
+    style RO fill:#FBBC04
     style CR1 fill:#FF6D01
     style CR2 fill:#FF6D01
     style CR3 fill:#FF6D01
@@ -108,8 +107,8 @@ graph TB
 1. Google Cloud Project with billing enabled and the following APIs:
    - BigQuery API
    - Vertex AI API
-   - Cloud Optimization API
-   - Fleet Engine API
+   - Maps Platform Fleet Engine API (requires special access)
+   - Maps Platform Route Optimization API
    - Cloud Run API
    - Cloud Storage API
    - Cloud Monitoring API
@@ -144,7 +143,7 @@ gcloud config set compute/zone ${ZONE}
 # Enable required APIs
 gcloud services enable bigquery.googleapis.com
 gcloud services enable aiplatform.googleapis.com
-gcloud services enable optimization.googleapis.com
+gcloud services enable routeoptimization.googleapis.com
 gcloud services enable fleetengine.googleapis.com
 gcloud services enable run.googleapis.com
 gcloud services enable storage.googleapis.com
@@ -167,7 +166,7 @@ gcloud projects add-iam-policy-binding ${PROJECT_ID} \
 
 gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="serviceAccount:${SERVICE_ACCOUNT}" \
-    --role="roles/optimization.admin"
+    --role="roles/routeoptimization.admin"
 
 gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="serviceAccount:${SERVICE_ACCOUNT}" \
@@ -252,9 +251,9 @@ echo "✅ APIs enabled and service account created"
 
    The storage infrastructure is now ready with automated lifecycle management, providing cost-effective data retention while maintaining performance for active operations. This foundation supports the entire data pipeline from ingestion through machine learning model deployment.
 
-3. **Deploy Vertex AI Demand Forecasting Pipeline**:
+3. **Deploy BigQuery ML Demand Forecasting Pipeline**:
 
-   Vertex AI provides managed machine learning services with AutoML capabilities specifically designed for time series forecasting. The demand forecasting model analyzes historical sales patterns, seasonal trends, and external factors to predict future demand across all store locations and product categories.
+   BigQuery ML provides integrated machine learning capabilities with ARIMA_PLUS models specifically designed for time series forecasting. The demand forecasting model analyzes historical sales patterns, seasonal trends, and external factors to predict future demand across all store locations and product categories.
 
    ```bash
    # Create sample training data for demand forecasting
@@ -262,8 +261,14 @@ echo "✅ APIs enabled and service account created"
    store_id,product_id,date,sales_quantity,weather_condition,promotion_active,competitor_price,season
    store_001,prod_123,2024-01-01,45,sunny,false,19.99,winter
    store_001,prod_123,2024-01-02,52,cloudy,true,18.99,winter
+   store_001,prod_123,2024-01-03,48,rainy,false,19.99,winter
+   store_001,prod_123,2024-01-04,55,sunny,true,18.50,winter
+   store_001,prod_123,2024-01-05,42,cloudy,false,20.25,winter
    store_002,prod_123,2024-01-01,38,rainy,false,20.50,winter
    store_002,prod_123,2024-01-02,41,sunny,true,19.25,winter
+   store_002,prod_123,2024-01-03,39,cloudy,false,20.50,winter
+   store_002,prod_123,2024-01-04,44,sunny,true,19.00,winter
+   store_002,prod_123,2024-01-05,36,rainy,false,20.75,winter
    EOF
    
    # Upload training data to Cloud Storage
@@ -296,63 +301,65 @@ echo "✅ APIs enabled and service account created"
    FROM \`${PROJECT_ID}.${DATASET_NAME}.demand_training_data\`
    EOF
    
-   echo "✅ Vertex AI demand forecasting model created and training initiated"
+   echo "✅ BigQuery ML demand forecasting model created and training initiated"
    ```
 
    The demand forecasting pipeline now leverages BigQuery ML's ARIMA_PLUS model for automated time series analysis, providing 30-day demand predictions with confidence intervals. This AI-powered forecasting enables proactive inventory management based on predicted demand patterns rather than reactive restocking.
 
-4. **Deploy Cloud Optimization AI for Inventory Allocation**:
+4. **Configure Route Optimization API for Inventory Allocation**:
 
-   Cloud Optimization AI solves complex combinatorial optimization problems, determining optimal inventory allocation across stores while considering capacity constraints, transportation costs, and demand forecasts. The optimization engine balances multiple objectives including customer satisfaction, operational efficiency, and cost minimization.
+   The Google Maps Platform Route Optimization API solves complex combinatorial optimization problems, determining optimal inventory allocation across stores while considering capacity constraints, transportation costs, and demand forecasts. The optimization engine balances multiple objectives including customer satisfaction, operational efficiency, and cost minimization.
 
    ```bash
    # Create optimization service configuration
    cat > optimization_config.py << 'EOF'
    import json
    import os
-   from google.cloud import optimization_v1
+   import requests
+   from google.auth.transport.requests import Request
+   from google.oauth2 import service_account
    
    def create_inventory_optimization_request():
        """Create optimization request for inventory allocation"""
        
        PROJECT_ID = os.environ.get('PROJECT_ID')
-       REGION = os.environ.get('REGION')
        
-       # Define the optimization model
+       # Define the optimization model for Route Optimization API
        model = {
-           "displayName": "Retail Inventory Optimization",
-           "shipments": [
-               {
-                   "deliveries": [
-                       {
-                           "arrivalLocation": {"latitude": 40.7128, "longitude": -74.0060},
-                           "duration": "300s",
-                           "demands": [{"type": "weight", "value": "100"}]
-                       }
-                   ],
-                   "pickups": [
-                       {
-                           "arrivalLocation": {"latitude": 40.7589, "longitude": -73.9851},
-                           "duration": "200s",
-                           "demands": [{"type": "weight", "value": "100"}]
-                       }
-                   ]
-               }
-           ],
-           "vehicles": [
-               {
-                   "startLocation": {"latitude": 40.7589, "longitude": -73.9851},
-                   "endLocation": {"latitude": 40.7589, "longitude": -73.9851},
-                   "capacities": [{"type": "weight", "value": "1000"}],
-                   "costPerKilometer": 0.5,
-                   "costPerHour": 20.0
-               }
-           ],
-           "globalStartTime": "2024-01-01T08:00:00Z",
-           "globalEndTime": "2024-01-01T18:00:00Z"
+           "model": {
+               "shipments": [
+                   {
+                       "deliveries": [
+                           {
+                               "arrivalLocation": {"latitude": 40.7128, "longitude": -74.0060},
+                               "duration": "300s",
+                               "demands": [{"type": "weight", "value": "100"}]
+                           }
+                       ],
+                       "pickups": [
+                           {
+                               "arrivalLocation": {"latitude": 40.7589, "longitude": -73.9851},
+                               "duration": "200s",
+                               "demands": [{"type": "weight", "value": "100"}]
+                           }
+                       ]
+                   }
+               ],
+               "vehicles": [
+                   {
+                       "startLocation": {"latitude": 40.7589, "longitude": -73.9851},
+                       "endLocation": {"latitude": 40.7589, "longitude": -73.9851},
+                       "capacities": [{"type": "weight", "value": "1000"}],
+                       "costPerKilometer": 0.5,
+                       "costPerHour": 20.0
+                   }
+               ],
+               "globalStartTime": "2024-01-01T08:00:00Z",
+               "globalEndTime": "2024-01-01T18:00:00Z"
+           }
        }
        
-       return {"parent": f"projects/{PROJECT_ID}/locations/{REGION}", "model": model}
+       return model
    
    if __name__ == "__main__":
        config = create_inventory_optimization_request()
@@ -362,11 +369,10 @@ echo "✅ APIs enabled and service account created"
    # Upload optimization configuration
    gsutil cp optimization_config.py gs://${BUCKET_NAME}/processed-data/
    
-   # Create optimization request using gcloud CLI
+   # Create optimization request JSON for Route Optimization API
    cat > optimization_request.json << EOF
    {
      "model": {
-       "displayName": "Retail Inventory Optimization",
        "globalStartTime": "$(date -u -d '+1 hour' '+%Y-%m-%dT%H:00:00Z')",
        "globalEndTime": "$(date -u -d '+9 hours' '+%Y-%m-%dT%H:00:00Z')",
        "shipments": [
@@ -392,14 +398,14 @@ echo "✅ APIs enabled and service account created"
    }
    EOF
    
-   echo "✅ Cloud Optimization AI configuration prepared for inventory allocation"
+   echo "✅ Route Optimization API configuration prepared for inventory allocation"
    ```
 
    The optimization configuration establishes the mathematical framework for solving inventory allocation problems, incorporating real-world constraints like vehicle capacity, delivery time windows, and operational costs. This foundation enables automated decision-making for complex multi-store inventory redistribution scenarios.
 
-5. **Configure Fleet Engine for Delivery Route Optimization**:
+5. **Configure Fleet Engine for Real-Time Fleet Management**:
 
-   Fleet Engine provides real-time fleet management and route optimization capabilities, enabling dynamic adjustment of delivery routes based on traffic conditions, vehicle availability, and priority levels. The integration with optimization results ensures efficient execution of inventory redistribution plans.
+   Fleet Engine provides real-time fleet management capabilities, enabling dynamic tracking of delivery vehicles and coordination with route optimization results. The integration ensures efficient execution of inventory redistribution plans with real-time visibility into fleet operations.
 
    ```bash
    # Create Fleet Engine provider configuration
@@ -453,7 +459,7 @@ echo "✅ APIs enabled and service account created"
    echo "📋 Upload fleet_config.json through Cloud Console Fleet Engine setup"
    ```
 
-   The Fleet Engine configuration establishes the foundation for real-time fleet management, defining vehicle capabilities, service areas, and operational parameters. This setup enables dynamic route optimization that adapts to changing conditions and optimization recommendations.
+   The Fleet Engine configuration establishes the foundation for real-time fleet management, defining vehicle capabilities, service areas, and operational parameters. This setup enables dynamic fleet tracking that integrates with route optimization recommendations for coordinated inventory redistribution operations.
 
 6. **Deploy Cloud Run Analytics Service**:
 
@@ -465,7 +471,6 @@ echo "✅ APIs enabled and service account created"
    cat > analytics-service/main.py << 'EOF'
    from flask import Flask, request, jsonify
    from google.cloud import bigquery
-   from google.cloud import aiplatform
    import os
    import json
    import logging
@@ -475,7 +480,6 @@ echo "✅ APIs enabled and service account created"
    
    # Initialize clients
    bq_client = bigquery.Client()
-   ai_client = aiplatform.gapic.PredictionServiceClient()
    
    PROJECT_ID = os.environ.get('PROJECT_ID')
    DATASET_NAME = os.environ.get('DATASET_NAME')
@@ -572,8 +576,7 @@ echo "✅ APIs enabled and service account created"
    # Create requirements file
    cat > analytics-service/requirements.txt << 'EOF'
    Flask==3.0.0
-   google-cloud-bigquery==3.12.0
-   google-cloud-aiplatform==1.45.0
+   google-cloud-bigquery==3.25.0
    gunicorn==21.2.0
    EOF
    
@@ -614,28 +617,28 @@ echo "✅ APIs enabled and service account created"
 
    The analytics service provides RESTful APIs for demand forecasting and inventory analysis, leveraging BigQuery ML for real-time predictions and serverless scaling for variable workloads. This microservice architecture enables independent scaling and maintenance of different system components.
 
-7. **Deploy Optimization Coordinator Service**:
+7. **Deploy Route Optimization Coordinator Service**:
 
-   The optimization coordinator service integrates all system components, orchestrating the flow from demand forecasting through optimization to fleet routing. This service ensures data consistency and coordinates complex multi-step optimization workflows across different Google Cloud services.
+   The optimization coordinator service integrates all system components, orchestrating the flow from demand forecasting through route optimization to fleet coordination. This service ensures data consistency and coordinates complex multi-step optimization workflows across different Google Cloud services.
 
    ```bash
    # Create optimization coordinator service
    mkdir -p optimizer-service
    cat > optimizer-service/main.py << 'EOF'
    from flask import Flask, request, jsonify
-   from google.cloud import optimization_v1
    from google.cloud import storage
    import requests
    import os
    import json
    import logging
    from datetime import datetime, timedelta
+   from google.auth.transport.requests import Request
+   from google.oauth2 import service_account
    
    app = Flask(__name__)
    logging.basicConfig(level=logging.INFO)
    
    # Initialize clients
-   optimization_client = optimization_v1.FleetRoutingClient()
    storage_client = storage.Client()
    
    PROJECT_ID = os.environ.get('PROJECT_ID')
@@ -673,15 +676,7 @@ echo "✅ APIs enabled and service account created"
            # Step 2: Create optimization model based on forecasts
            optimization_model = create_optimization_model(forecasts, optimization_params)
            
-           # Step 3: Solve optimization problem
-           parent = f"projects/{PROJECT_ID}/locations/{REGION}"
-           request_obj = optimization_v1.OptimizeToursRequest(
-               parent=parent,
-               model=optimization_model,
-               solving_mode=optimization_v1.OptimizeToursRequest.SolvingMode.DEFAULT_SOLVE
-           )
-           
-           # Note: This is a placeholder - actual optimization requires proper Fleet Routing setup
+           # Step 3: Call Route Optimization API (placeholder implementation)
            optimization_result = {
                "status": "optimized",
                "routes": [],
@@ -705,9 +700,8 @@ echo "✅ APIs enabled and service account created"
    def create_optimization_model(forecasts, params):
        """Create optimization model from demand forecasts"""
        
-       # Base optimization model structure
+       # Base optimization model structure for Route Optimization API
        model = {
-           "displayName": "Inventory Redistribution Optimization",
            "globalStartTime": (datetime.now() + timedelta(hours=1)).isoformat() + "Z",
            "globalEndTime": (datetime.now() + timedelta(hours=9)).isoformat() + "Z",
            "shipments": [],
@@ -760,8 +754,8 @@ echo "✅ APIs enabled and service account created"
    # Create requirements file
    cat > optimizer-service/requirements.txt << 'EOF'
    Flask==3.0.0
-   google-cloud-optimization==1.6.0
-   google-cloud-storage==2.13.0
+   google-cloud-storage==2.18.0
+   google-auth==2.29.0
    requests==2.31.0
    gunicorn==21.2.0
    EOF
@@ -802,7 +796,7 @@ echo "✅ APIs enabled and service account created"
    echo "✅ Optimization coordinator service deployed: ${OPTIMIZER_URL}"
    ```
 
-   The optimization coordinator service orchestrates complex workflows between demand forecasting, inventory optimization, and fleet routing. This centralized coordination ensures data consistency and enables sophisticated multi-objective optimization across the entire retail supply chain.
+   The optimization coordinator service orchestrates complex workflows between demand forecasting, route optimization, and fleet coordination. This centralized coordination ensures data consistency and enables sophisticated multi-objective optimization across the entire retail supply chain.
 
 8. **Configure Cloud Monitoring and Alerting**:
 
@@ -1035,7 +1029,7 @@ echo "✅ APIs enabled and service account created"
    
    gcloud projects remove-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:${SERVICE_ACCOUNT}" \
-       --role="roles/optimization.admin"
+       --role="roles/routeoptimization.admin"
    
    gcloud projects remove-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:${SERVICE_ACCOUNT}" \
@@ -1067,32 +1061,37 @@ echo "✅ APIs enabled and service account created"
 
 ## Discussion
 
-This intelligent retail inventory optimization system demonstrates the power of combining Google Cloud's advanced AI and optimization services to solve complex supply chain challenges. The architecture leverages BigQuery ML for scalable demand forecasting, providing automated time series analysis that adapts to seasonal patterns and market trends. The integration of Cloud Optimization AI enables sophisticated multi-objective optimization that balances customer satisfaction, operational efficiency, and cost constraints simultaneously.
+This intelligent retail inventory optimization system demonstrates the power of combining Google Cloud's advanced AI and route optimization services to solve complex supply chain challenges. The architecture leverages BigQuery ML's ARIMA_PLUS models for scalable demand forecasting, providing automated time series analysis that adapts to seasonal patterns and market trends. The integration of Google Maps Platform's Route Optimization API enables sophisticated multi-objective optimization that balances customer satisfaction, operational efficiency, and cost constraints simultaneously.
 
 The serverless Cloud Run microservices architecture provides several key advantages for retail operations. First, the pay-per-use pricing model aligns costs with actual demand fluctuations, making the solution economically viable for retailers of all sizes. Second, the automatic scaling capabilities ensure consistent performance during peak periods like holiday seasons or promotional events. Third, the loosely coupled service design enables independent updates and maintenance of different system components without disrupting ongoing operations.
 
-Fleet Engine integration adds real-world logistics constraints to the optimization process, ensuring that theoretical optimal solutions remain practically executable. The system considers actual vehicle capacities, driver schedules, traffic conditions, and delivery time windows when generating redistribution plans. This realistic approach prevents the common disconnect between optimization theory and operational reality that often undermines traditional inventory management systems.
+Fleet Engine integration adds real-world logistics visibility to the optimization process, enabling real-time tracking of delivery vehicles and coordination with route optimization results. The system provides actual fleet status, vehicle locations, and delivery progress while ensuring that theoretical optimal solutions remain practically executable. This realistic approach prevents the common disconnect between optimization theory and operational reality that often undermines traditional inventory management systems.
 
-The solution's predictive analytics capabilities transform reactive inventory management into proactive demand planning. By analyzing historical sales patterns, external market factors, and seasonal trends, the system can identify potential stockouts or overstock situations weeks in advance. This early warning capability enables retailers to implement gradual redistribution strategies that minimize disruption while optimizing customer satisfaction and operational costs.
+The solution's predictive analytics capabilities transform reactive inventory management into proactive demand planning. By analyzing historical sales patterns using BigQuery ML's time series forecasting capabilities, the system can identify potential stockouts or overstock situations weeks in advance. This early warning capability enables retailers to implement gradual redistribution strategies that minimize disruption while optimizing customer satisfaction and operational costs.
 
-> **Tip**: Monitor forecast accuracy metrics continuously and retrain models monthly with fresh data to maintain prediction quality as market conditions evolve.
+> **Tip**: Monitor forecast accuracy metrics continuously and retrain BigQuery ML models monthly with fresh data to maintain prediction quality as market conditions evolve.
 
 ## Challenge
 
 Extend this solution by implementing these advanced enhancements:
 
-1. **Multi-Modal Transportation Optimization**: Integrate different transportation modes (truck, rail, air) with varying cost structures and delivery timeframes to optimize long-distance redistribution between regional distribution centers.
+1. **Multi-Modal Transportation Optimization**: Integrate different transportation modes (truck, rail, air) with varying cost structures and delivery timeframes using the Route Optimization API's advanced constraints to optimize long-distance redistribution between regional distribution centers.
 
-2. **Real-Time Demand Signal Integration**: Connect to external data sources like weather APIs, social media sentiment, and competitor pricing to enhance demand forecasting accuracy and enable dynamic inventory adjustment.
+2. **Real-Time Demand Signal Integration**: Connect to external data sources like Google Cloud Weather API, Cloud Natural Language for social media sentiment, and external pricing APIs to enhance BigQuery ML forecasting accuracy and enable dynamic inventory adjustment.
 
-3. **Sustainability Optimization**: Add carbon footprint optimization objectives to balance environmental impact with operational efficiency, incorporating electric vehicle routing and consolidated delivery strategies.
+3. **Sustainability Optimization**: Add carbon footprint optimization objectives to the Route Optimization API requests to balance environmental impact with operational efficiency, incorporating electric vehicle routing and consolidated delivery strategies.
 
-4. **Dynamic Pricing Integration**: Connect the inventory optimization system with dynamic pricing algorithms to automatically adjust product prices based on inventory levels and demand forecasts, maximizing revenue while managing stock levels.
+4. **Dynamic Pricing Integration**: Connect the inventory optimization system with Cloud Functions-based dynamic pricing algorithms to automatically adjust product prices based on BigQuery inventory levels and ML demand forecasts, maximizing revenue while managing stock levels.
 
-5. **Cross-Channel Inventory Orchestration**: Extend the system to manage inventory across multiple sales channels (physical stores, e-commerce, mobile apps) with unified visibility and automated rebalancing between channels based on demand patterns.
+5. **Cross-Channel Inventory Orchestration**: Extend the system to manage inventory across multiple sales channels (physical stores, e-commerce, mobile apps) with unified BigQuery analytics and automated rebalancing between channels based on demand patterns.
 
-For implementation guidance, refer to [Google Cloud Fleet Routing API documentation](https://cloud.google.com/optimization/docs/fleet-routing), [Vertex AI Forecasting best practices](https://cloud.google.com/vertex-ai/docs/tabular-data/forecasting/overview), [BigQuery ML time series analysis](https://cloud.google.com/bigquery-ml/docs/arima-single-time-series-forecasting-tutorial), [Cloud Run microservices patterns](https://cloud.google.com/run/docs/architecture), and [Google Cloud Retail AI solutions](https://cloud.google.com/solutions/retail).
+For implementation guidance, refer to [Google Maps Platform Route Optimization API documentation](https://developers.google.com/maps/documentation/route-optimization), [BigQuery ML time series forecasting](https://cloud.google.com/bigquery/docs/arima-single-time-series-forecasting-tutorial), [Fleet Engine documentation](https://developers.google.com/maps/documentation/mobility/fleet-engine/essentials), [Cloud Run microservices patterns](https://cloud.google.com/run/docs/architecture), and [Google Cloud Retail AI solutions](https://cloud.google.com/solutions/retail).
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

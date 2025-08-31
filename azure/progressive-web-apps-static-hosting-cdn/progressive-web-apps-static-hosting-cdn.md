@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Static Web Apps, Azure CDN, Azure Application Insights
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: progressive-web-apps, pwa, static-web-apps, cdn, offline-capability, performance-monitoring, serverless
 recipe-generator-version: 1.3
@@ -447,8 +447,9 @@ echo "✅ Local project structure created"
    </svg>
    EOF
 
-   # Create simple HTML-based icons (for demo purposes)
-   echo '<div style="width:192px;height:192px;background:#0078d4;display:flex;align-items:center;justify-content:center;color:white;font-size:48px;font-family:Arial;">PWA</div>' > temp-icon.html
+   # For production PWA, replace with actual PNG icons at 192x192 and 512x512
+   # You can use online tools to convert SVG to PNG or create proper icons
+   echo "Note: Replace with actual PNG icons for production deployment"
 
    echo "✅ Responsive styling and PWA assets created"
    ```
@@ -532,7 +533,7 @@ echo "✅ Local project structure created"
 
 5. **Configure Static Web App with GitHub Integration**:
 
-   Azure Static Web Apps provides automatic CI/CD integration with GitHub, enabling seamless deployments whenever code changes are pushed. This configuration sets up the static web app with proper build settings for PWA optimization and serverless API integration.
+   Azure Static Web Apps provides automatic CI/CD integration with GitHub when configured with a repository, enabling seamless deployments whenever code changes are pushed. For this demo, we create the basic Static Web App resource that can be configured with GitHub integration later through the Azure portal or by using the SWA CLI for deployment.
 
    ```bash
    # Initialize Git repository (if not already done)
@@ -540,17 +541,15 @@ echo "✅ Local project structure created"
    git add .
    git commit -m "Initial PWA setup with Azure Static Web Apps"
 
-   # Create Azure Static Web App with CLI
+   # Note: You'll need to set these variables for your GitHub repository
+   # export GITHUB_USERNAME="your-github-username"
+   # export REPO_NAME="your-repository-name"
+   
+   # Create Azure Static Web App (basic creation without GitHub integration)
    az staticwebapp create \
        --name ${SWA_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --source "https://github.com/${GITHUB_USERNAME}/${REPO_NAME}" \
-       --branch "main" \
-       --app-location "src" \
-       --api-location "src/api" \
-       --output-location "src" \
-       --login-with-github
+       --location ${LOCATION}
 
    # Get the Static Web App URL
    SWA_URL=$(az staticwebapp show \
@@ -559,10 +558,10 @@ echo "✅ Local project structure created"
        --query defaultHostname --output tsv)
 
    echo "✅ Static Web App created: https://${SWA_URL}"
-   echo "GitHub Actions workflow automatically configured for CI/CD"
+   echo "Configure GitHub Actions or use SWA CLI for deployment"
    ```
 
-   The Static Web App is now configured with automatic deployments from your GitHub repository. Azure automatically creates a GitHub Actions workflow that builds and deploys your PWA whenever you push changes, ensuring consistent and reliable deployments with zero-downtime updates.
+   The Static Web App resource is now created and ready for deployment. You can deploy your PWA using the Azure Static Web Apps CLI (swa deploy) or configure GitHub Actions integration through the Azure portal. This approach provides flexibility in how you manage your deployment workflow while maintaining the same scalability and performance benefits.
 
 6. **Create Application Insights for Performance Monitoring**:
 
@@ -622,19 +621,11 @@ echo "✅ Local project structure created"
            "application/json" \
            "image/svg+xml"
 
-   # Configure caching rules for PWA assets
-   az cdn endpoint rule add \
-       --name "cdn-${SWA_NAME}" \
-       --profile-name ${CDN_PROFILE} \
-       --resource-group ${RESOURCE_GROUP} \
-       --order 1 \
-       --rule-name "CachePWAAssets" \
-       --match-variable RequestPath \
-       --operator BeginsWith \
-       --match-values "/images/" "/css/" "/js/" \
-       --action-name CacheExpiration \
-       --cache-behavior Override \
-       --cache-duration 1.00:00:00
+   # Note: CDN Rules Engine for caching configuration requires Premium tier
+   # For Standard_Microsoft tier, use default caching behavior
+   # To configure custom caching rules, upgrade to Premium tier or use query string parameters
+   
+   echo "CDN configured with default caching - upgrade to Premium tier for custom rules"
 
    # Get CDN endpoint URL
    CDN_URL=$(az cdn endpoint show \
@@ -647,7 +638,7 @@ echo "✅ Local project structure created"
    echo "CDN URL: https://${CDN_URL}"
    ```
 
-   The CDN is now configured to serve your PWA from edge locations worldwide, dramatically improving load times for global users. Caching rules are optimized for PWA assets, ensuring service workers and critical resources are efficiently distributed while maintaining proper cache invalidation strategies.
+   The CDN is now configured to serve your PWA from edge locations worldwide, dramatically improving load times for global users. The Standard_Microsoft tier provides excellent performance with default caching policies. For advanced caching customization, consider upgrading to Premium tier for Rules Engine capabilities.
 
 8. **Integrate Application Insights into PWA**:
 
@@ -810,23 +801,23 @@ echo "✅ Local project structure created"
    </html>
    EOF
 
-   # Commit and push changes to trigger deployment
-   git add .
-   git commit -m "Complete PWA implementation with monitoring and CDN"
-   git push origin main
-
-   # Wait for deployment to complete
-   echo "⏳ Waiting for deployment to complete..."
-   sleep 60
+   # For deployment, use the Azure Static Web Apps CLI or configure GitHub Actions
+   # Option 1: Direct deployment using SWA CLI (requires @azure/static-web-apps-cli)
+   # npm install -g @azure/static-web-apps-cli
+   # swa deploy ./src --env production --deployment-token <your-deployment-token>
+   
+   # Option 2: Configure GitHub Actions through Azure portal
+   echo "Deploy using SWA CLI or configure GitHub Actions integration"
+   echo "SWA CLI deployment: npm install -g @azure/static-web-apps-cli && swa deploy ./src"
 
    # Get final URLs and status
-   echo "✅ PWA Deployment Complete!"
+   echo "✅ PWA Setup Complete!"
    echo "Static Web App URL: https://${SWA_URL}"
    echo "CDN URL: https://${CDN_URL}"
    echo "Application Insights: ${AI_NAME}"
    ```
 
-   Your Progressive Web App is now fully deployed with global CDN distribution, comprehensive monitoring, and all PWA features enabled. The automatic deployment pipeline ensures consistent updates, while Azure's infrastructure provides scalability and reliability for your PWA across global markets.
+   Your Progressive Web App infrastructure is now ready for deployment with global CDN distribution and comprehensive monitoring enabled. Once deployed, the PWA will benefit from Azure's global infrastructure for optimal scalability and reliability across global markets. Use the SWA CLI or GitHub Actions for automated deployment workflows.
 
 ## Validation & Testing
 
@@ -868,13 +859,14 @@ echo "✅ Local project structure created"
 
    Expected output: Recent request data showing PWA page views and API calls.
 
-4. **Test PWA Features in Browser**:
+4. **Test PWA Features in Browser** (after deployment):
 
    - Open https://${SWA_URL} in Chrome/Edge
    - Open Developer Tools > Application > Service Workers
    - Verify service worker is registered and active
    - Test offline functionality by going offline in DevTools
    - Check for install prompt on supported devices
+   - Validate Application Insights data collection in Azure portal
 
 ## Cleanup
 
@@ -906,13 +898,13 @@ echo "✅ Local project structure created"
 
 ## Discussion
 
-Progressive Web Apps represent the convergence of web and mobile app development, providing native app-like experiences through web technologies. Azure Static Web Apps serves as an ideal hosting platform for PWAs, offering automatic HTTPS, global distribution, and integrated CI/CD pipelines that eliminate infrastructure management overhead. The combination with Azure CDN ensures optimal performance across global markets through intelligent edge caching and compression. For comprehensive guidance on PWA development, see the [Progressive Web Apps documentation](https://docs.microsoft.com/en-us/microsoft-edge/progressive-web-apps-chromium/) and [Azure Static Web Apps best practices](https://docs.microsoft.com/en-us/azure/static-web-apps/front-end-frameworks).
+Progressive Web Apps represent the convergence of web and mobile app development, providing native app-like experiences through web technologies. Azure Static Web Apps serves as an ideal hosting platform for PWAs, offering automatic HTTPS, global distribution, and integrated CI/CD pipelines that eliminate infrastructure management overhead. The combination with Azure CDN ensures optimal performance across global markets through intelligent edge caching and compression. For comprehensive guidance on PWA development, see the [Progressive Web Apps documentation](https://learn.microsoft.com/en-us/microsoft-edge/progressive-web-apps-chromium/) and [Azure Static Web Apps best practices](https://learn.microsoft.com/en-us/azure/static-web-apps/front-end-frameworks).
 
-The integration of Azure Application Insights provides unprecedented visibility into PWA performance metrics, including service worker effectiveness, offline usage patterns, and user engagement analytics. This monitoring capability is crucial for optimizing PWA experiences based on real-world usage data. The serverless API integration demonstrates how modern PWAs can leverage backend functionality without traditional server management, following cloud-native architectural patterns outlined in the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/).
+The integration of Azure Application Insights provides unprecedented visibility into PWA performance metrics, including service worker effectiveness, offline usage patterns, and user engagement analytics. This monitoring capability is crucial for optimizing PWA experiences based on real-world usage data. The serverless API integration demonstrates how modern PWAs can leverage backend functionality without traditional server management, following cloud-native architectural patterns outlined in the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/).
 
 From a business perspective, PWAs delivered through Azure's global infrastructure offer significant advantages in user acquisition and retention. The installability feature increases user engagement, while offline capabilities ensure consistent experiences regardless of network conditions. Azure CDN's global presence reduces latency, directly impacting conversion rates and user satisfaction. Cost optimization is achieved through Azure Static Web Apps' generous free tier and CDN's pay-per-use pricing model, making this architecture suitable for startups to enterprise applications.
 
-> **Tip**: Use Azure Application Insights' Real User Monitoring (RUM) to identify performance bottlenecks specific to PWA features like service worker caching and offline scenarios. The [Application Insights documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/app/javascript) provides detailed guidance on PWA-specific monitoring configurations and custom event tracking.
+> **Tip**: Use Azure Application Insights' Real User Monitoring (RUM) to identify performance bottlenecks specific to PWA features like service worker caching and offline scenarios. The [Application Insights documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/app/javascript) provides detailed guidance on PWA-specific monitoring configurations and custom event tracking.
 
 ## Challenge
 
@@ -930,4 +922,9 @@ Extend this PWA solution by implementing these advanced features:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

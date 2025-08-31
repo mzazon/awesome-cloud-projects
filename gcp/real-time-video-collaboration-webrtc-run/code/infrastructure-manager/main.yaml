@@ -1,0 +1,479 @@
+# Infrastructure Manager Configuration for Real-time Video Collaboration with WebRTC and Cloud Run
+# This configuration deploys a complete video collaboration platform using:
+# - Cloud Run for hosting the WebRTC signaling server
+# - Firestore for real-time room management and data synchronization
+# - Identity-Aware Proxy for secure authentication
+# - Cloud Build for container deployment
+# - Required APIs and IAM permissions
+
+imports: []
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:serviceusage.services.batchEnable
+    properties:
+      parent: projects/$(ref.project-info.projectId)
+      serviceIds:
+        - run.googleapis.com
+        - firestore.googleapis.com
+        - iap.googleapis.com
+        - cloudbuild.googleapis.com
+        - containerregistry.googleapis.com
+        - compute.googleapis.com
+
+  # Get current project information
+  - name: project-info
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(ref.project-id.projectId)
+
+  # Generate unique suffix for resource naming
+  - name: random-suffix
+    type: gcp-types/cloudresourcemanager-v1:Project
+    properties:
+      projectId: $(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  # Create Firestore database for room management and real-time synchronization
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/$(ref.project-info.projectId)
+      databaseId: video-rooms-$(ref.deployment-suffix.text)
+      database:
+        name: projects/$(ref.project-info.projectId)/databases/video-rooms-$(ref.deployment-suffix.text)
+        locationId: $(ref.region.value)
+        type: FIRESTORE_NATIVE
+        concurrencyMode: OPTIMISTIC
+        appEngineIntegrationMode: DISABLED
+        pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_DISABLED
+        deleteProtectionState: DELETE_PROTECTION_DISABLED
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - deployment-suffix
+
+  # Create Cloud Build trigger for automatic container builds
+  - name: webrtc-signaling-build-config
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      parent: projects/$(ref.project-info.projectId)
+      trigger:
+        name: webrtc-signaling-build-$(ref.deployment-suffix.text)
+        description: Build trigger for WebRTC signaling server container
+        disabled: false
+        substitutions:
+          _SERVICE_NAME: webrtc-signaling-$(ref.deployment-suffix.text)
+          _REGION: $(ref.region.value)
+          _FIRESTORE_DATABASE: video-rooms-$(ref.deployment-suffix.text)
+        build:
+          steps:
+            # Build the Docker image
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - build
+                - --tag
+                - gcr.io/$(ref.project-info.projectId)/webrtc-signaling:latest
+                - --tag
+                - gcr.io/$(ref.project-info.projectId)/webrtc-signaling:$(SHORT_SHA)
+                - .
+            # Push the Docker image to Container Registry
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - push
+                - gcr.io/$(ref.project-info.projectId)/webrtc-signaling:latest
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - push
+                - gcr.io/$(ref.project-info.projectId)/webrtc-signaling:$(SHORT_SHA)
+            # Deploy to Cloud Run
+            - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+              entrypoint: gcloud
+              args:
+                - run
+                - deploy
+                - ${_SERVICE_NAME}
+                - --image
+                - gcr.io/$(ref.project-info.projectId)/webrtc-signaling:$(SHORT_SHA)
+                - --region
+                - ${_REGION}
+                - --platform
+                - managed
+                - --allow-unauthenticated
+                - --memory
+                - 512Mi
+                - --cpu
+                - "1"
+                - --min-instances
+                - "0"
+                - --max-instances
+                - "10"
+                - --port
+                - "8080"
+                - --set-env-vars
+                - FIRESTORE_DATABASE=${_FIRESTORE_DATABASE}
+                - --timeout
+                - 300s
+                - --concurrency
+                - 80
+                - --execution-environment
+                - gen2
+          options:
+            logging: CLOUD_LOGGING_ONLY
+            machineType: E2_STANDARD_2
+            substitutionOption: ALLOW_LOOSE
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - deployment-suffix
+
+  # Create Cloud Run service for WebRTC signaling server
+  - name: webrtc-signaling-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(ref.project-info.projectId)
+      location: $(ref.region.value)
+      body:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: webrtc-signaling-$(ref.deployment-suffix.text)
+          namespace: $(ref.project-info.projectId)
+          labels:
+            cloud.googleapis.com/location: $(ref.region.value)
+          annotations:
+            # Enable CPU allocation during request processing only
+            run.googleapis.com/cpu-throttling: "true"
+            # Enable second generation execution environment
+            run.googleapis.com/execution-environment: gen2
+            # Set ingress to allow all traffic (will be restricted by IAP)
+            run.googleapis.com/ingress: all
+            # Enable binary authorization
+            run.googleapis.com/binary-authorization: default
+        spec:
+          template:
+            metadata:
+              annotations:
+                # Configure autoscaling
+                autoscaling.knative.dev/minScale: "0"
+                autoscaling.knative.dev/maxScale: "10"
+                # Configure resource allocation
+                run.googleapis.com/memory: 512Mi
+                run.googleapis.com/cpu: "1"
+                # Enable Cloud SQL connections if needed in future
+                run.googleapis.com/cloudsql-instances: ""
+                # Configure VPC connector if needed for private services
+                run.googleapis.com/vpc-access-connector: ""
+                # Set execution environment
+                run.googleapis.com/execution-environment: gen2
+            spec:
+              # Configure request timeout and concurrency
+              timeoutSeconds: 300
+              containerConcurrency: 80
+              serviceAccountName: $(ref.cloud-run-service-account.email)
+              containers:
+                - name: webrtc-signaling
+                  # Placeholder image - will be updated by Cloud Build
+                  image: gcr.io/cloudrun/hello
+                  ports:
+                    - name: http1
+                      containerPort: 8080
+                      protocol: TCP
+                  env:
+                    - name: FIRESTORE_DATABASE
+                      value: video-rooms-$(ref.deployment-suffix.text)
+                    - name: NODE_ENV
+                      value: production
+                    - name: GOOGLE_CLOUD_PROJECT
+                      value: $(ref.project-info.projectId)
+                  resources:
+                    limits:
+                      cpu: "1"
+                      memory: 512Mi
+                    requests:
+                      cpu: "0.1"
+                      memory: 128Mi
+                  # Configure startup and liveness probes
+                  startupProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    timeoutSeconds: 5
+                    periodSeconds: 10
+                    failureThreshold: 3
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    timeoutSeconds: 5
+                    periodSeconds: 30
+                    failureThreshold: 3
+          traffic:
+            - percent: 100
+              latestRevision: true
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - cloud-run-service-account
+        - firestore-database
+        - deployment-suffix
+
+  # Create service account for Cloud Run service
+  - name: cloud-run-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/$(ref.project-info.projectId)
+      accountId: webrtc-signaling-$(ref.deployment-suffix.text)
+      serviceAccount:
+        displayName: WebRTC Signaling Server Service Account
+        description: Service account for WebRTC signaling server running on Cloud Run
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - deployment-suffix
+
+  # Grant Firestore access to Cloud Run service account
+  - name: firestore-access-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/datastore.user
+      member: serviceAccount:$(ref.cloud-run-service-account.email)
+    metadata:
+      dependsOn:
+        - cloud-run-service-account
+        - firestore-database
+
+  # Grant Cloud Run invoker role to service account for internal communications
+  - name: cloud-run-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/run.invoker
+      member: serviceAccount:$(ref.cloud-run-service-account.email)
+    metadata:
+      dependsOn:
+        - cloud-run-service-account
+
+  # Create IAM policy binding for IAP HTTPS Resource Accessor role
+  # This allows specified users to access the application through IAP
+  - name: iap-accessor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/iap.httpsResourceAccessor
+      member: user:$(ref.user-email.value)
+    metadata:
+      dependsOn:
+        - enable-run-api
+
+  # Create IAM policy binding for Security Admin (required for IAP configuration)
+  - name: security-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/iap.settingsAdmin
+      member: user:$(ref.user-email.value)
+    metadata:
+      dependsOn:
+        - enable-run-api
+
+  # Create a Cloud Scheduler job for periodic room cleanup (optional enhancement)
+  - name: room-cleanup-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project-info.projectId)/locations/$(ref.region.value)
+      job:
+        name: projects/$(ref.project-info.projectId)/locations/$(ref.region.value)/jobs/room-cleanup-$(ref.deployment-suffix.text)
+        description: Periodic cleanup of inactive video collaboration rooms
+        schedule: "0 2 * * *"  # Daily at 2 AM
+        timeZone: UTC
+        httpTarget:
+          uri: $(ref.webrtc-signaling-service.status.url)/cleanup
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: eyJhY3Rpb24iOiJjbGVhbnVwIn0=  # Base64 encoded '{"action":"cleanup"}'
+          oidcToken:
+            serviceAccountEmail: $(ref.cloud-run-service-account.email)
+            audience: $(ref.webrtc-signaling-service.status.url)
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 300s
+          minBackoffDuration: 5s
+          maxBackoffDuration: 60s
+          maxDoublings: 5
+        attemptDeadline: 180s
+    metadata:
+      dependsOn:
+        - webrtc-signaling-service
+        - cloud-run-service-account
+
+  # Configure Cloud Monitoring alerting for service health
+  - name: service-health-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/$(ref.project-info.projectId)
+      alertPolicy:
+        displayName: WebRTC Signaling Service Health Alert
+        documentation:
+          content: Alert when WebRTC signaling service experiences high error rates or becomes unavailable
+          mimeType: text/markdown
+        conditions:
+          - displayName: Cloud Run Service Error Rate
+            conditionThreshold:
+              filter: resource.type="cloud_run_revision" AND resource.labels.service_name="webrtc-signaling-$(ref.deployment-suffix.text)"
+              comparison: COMPARISON_GT
+              thresholdValue: 0.05  # Alert if error rate > 5%
+              duration: 300s  # For 5 minutes
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.labels.service_name
+        enabled: true
+        combiner: OR
+        alertStrategy:
+          autoClose: 86400s  # Auto-close after 24 hours
+    metadata:
+      dependsOn:
+        - webrtc-signaling-service
+
+# Variables section for customizable deployment parameters
+variables:
+  # Project ID where resources will be created
+  - name: project-id
+    description: Google Cloud Project ID for deployment
+    type: string
+    default: $(env.PROJECT_ID)
+
+  # Primary region for resource deployment
+  - name: region
+    description: Google Cloud region for resource deployment
+    type: string
+    default: us-central1
+    allowedValues:
+      - us-central1
+      - us-east1
+      - us-west1
+      - europe-west1
+      - europe-west2
+      - asia-east1
+      - asia-northeast1
+      - asia-southeast1
+
+  # User email for IAP access configuration
+  - name: user-email
+    description: Email address for IAP access (replace with your email)
+    type: string
+    default: user@example.com
+
+  # Deployment suffix for unique resource naming
+  - name: deployment-suffix
+    description: Unique suffix for resource names
+    type: string
+    default: $(randInt(100000,999999))
+
+  # Maximum number of Cloud Run instances
+  - name: max-instances
+    description: Maximum number of Cloud Run instances for auto-scaling
+    type: integer
+    default: 10
+    minimum: 1
+    maximum: 100
+
+  # Memory allocation for Cloud Run service
+  - name: memory-limit
+    description: Memory limit for Cloud Run service
+    type: string
+    default: 512Mi
+    allowedValues:
+      - 256Mi
+      - 512Mi
+      - 1Gi
+      - 2Gi
+
+  # CPU allocation for Cloud Run service
+  - name: cpu-limit
+    description: CPU limit for Cloud Run service
+    type: string
+    default: "1"
+    allowedValues:
+      - "0.5"
+      - "1"
+      - "2"
+      - "4"
+
+# Outputs section providing important information after deployment
+outputs:
+  # Cloud Run service URL for accessing the application
+  - name: service-url
+    description: URL of the deployed WebRTC signaling service
+    value: $(ref.webrtc-signaling-service.status.url)
+
+  # Firestore database name for application configuration
+  - name: firestore-database
+    description: Name of the Firestore database for room management
+    value: video-rooms-$(ref.deployment-suffix.text)
+
+  # Project ID for reference
+  - name: project-id
+    description: Google Cloud Project ID used for deployment
+    value: $(ref.project-info.projectId)
+
+  # Region where resources are deployed
+  - name: deployment-region
+    description: Google Cloud region where resources are deployed
+    value: $(ref.region.value)
+
+  # Service account email for additional configurations
+  - name: service-account-email
+    description: Email of the service account used by Cloud Run
+    value: $(ref.cloud-run-service-account.email)
+
+  # Instructions for completing the setup
+  - name: setup-instructions
+    description: Next steps to complete the deployment
+    value: |
+      Deployment completed successfully! To finish the setup:
+      
+      1. Configure OAuth consent screen:
+         https://console.cloud.google.com/apis/credentials/consent?project=$(ref.project-info.projectId)
+      
+      2. Create OAuth 2.0 client credentials:
+         https://console.cloud.google.com/apis/credentials?project=$(ref.project-info.projectId)
+      
+      3. Enable Identity-Aware Proxy:
+         https://console.cloud.google.com/security/iap?project=$(ref.project-info.projectId)
+      
+      4. Access your video collaboration platform:
+         $(ref.webrtc-signaling-service.status.url)
+      
+      For detailed instructions, refer to the recipe documentation.
+
+# Metadata for Infrastructure Manager deployment tracking
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for Real-time Video Collaboration with WebRTC and Cloud Run"
+  author: "Cloud Recipe Generator"
+  created: "2025-07-12"
+  recipe-id: "a7b8c9d0"
+  estimated-cost: "$5-15 per month for development usage"
+  security-considerations:
+    - "IAP provides zero-trust authentication"
+    - "Service accounts follow least privilege principle"
+    - "Firestore access restricted to application service account"
+    - "Cloud Run service uses second-generation execution environment"
+    - "Container registry access controlled through IAM"
+  performance-features:
+    - "Auto-scaling from 0 to configurable maximum instances"
+    - "CPU allocation only during request processing"
+    - "WebRTC enables peer-to-peer communication for reduced server load"
+    - "Firestore provides real-time synchronization with global distribution"
+    - "Cloud Run global load balancing for optimal latency"

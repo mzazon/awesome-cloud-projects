@@ -6,17 +6,16 @@ difficulty: 400
 subject: aws
 services: elastic-disaster-recovery,lambda,cloudwatch,systems-manager
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: disaster-recovery,automation
 recipe-generator-version: 1.3
 ---
 
 # Cross-Region Disaster Recovery Automation
-
 
 ## Problem
 
@@ -146,6 +145,7 @@ echo "DR Region: ${DR_REGION}"
        --data-plane-routing PRIVATE_IP \
        --default-large-staging-disk-type GP3 \
        --ebs-encryption DEFAULT \
+       --pit-policy '[{"interval":10,"retentionDuration":60,"units":"MINUTE"}]' \
        --replication-server-instance-type m5.large \
        --replication-servers-security-groups-ids $(aws ec2 describe-security-groups \
            --filters Name=group-name,Values=default \
@@ -212,7 +212,9 @@ echo "DR Region: ${DR_REGION}"
                    "ssm:*",
                    "lambda:*",
                    "logs:*",
-                   "cloudwatch:*"
+                   "cloudwatch:*",
+                   "events:*",
+                   "states:*"
                ],
                "Resource": "*"
            }
@@ -226,10 +228,12 @@ echo "DR Region: ${DR_REGION}"
        --policy-document file://dr-automation-policy.json \
        --region ${PRIMARY_REGION}
    
+   echo "✅ Automation role created with necessary permissions"
+   ```
+
    The automation role is now configured with the necessary permissions to orchestrate disaster recovery operations across multiple AWS services. This role enables secure, automated failover without manual intervention while maintaining strict access controls.
 
    > **Note**: Follow the [principle of least privilege](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege) when configuring IAM permissions for production environments.
-   ```
 
 3. **Set Up DR Region Infrastructure**:
 
@@ -458,7 +462,7 @@ echo "DR Region: ${DR_REGION}"
    
    FAILOVER_LAMBDA=$(aws lambda create-function \
        --function-name "dr-automated-failover-${DR_PROJECT_ID}" \
-       --runtime python3.9 \
+       --runtime python3.11 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AUTOMATION_ROLE_NAME} \
        --handler automated-failover.lambda_handler \
        --zip-file fileb://automated-failover.zip \
@@ -611,8 +615,10 @@ echo "DR Region: ${DR_REGION}"
        --alarm-actions ${DR_SNS_TOPIC} \
        --region ${PRIMARY_REGION}
    
-   The CloudWatch monitoring infrastructure now provides automated failure detection and alerting capabilities. These alarms enable proactive response to degradation patterns while maintaining operational stability through carefully tuned thresholds.
+   echo "✅ CloudWatch monitoring infrastructure configured"
    ```
+
+   The CloudWatch monitoring infrastructure now provides automated failure detection and alerting capabilities. These alarms enable proactive response to degradation patterns while maintaining operational stability through carefully tuned thresholds.
 
 8. **Create DR Testing Automation**:
 
@@ -686,7 +692,7 @@ echo "DR Region: ${DR_REGION}"
    
    TESTING_LAMBDA=$(aws lambda create-function \
        --function-name "dr-testing-${DR_PROJECT_ID}" \
-       --runtime python3.9 \
+       --runtime python3.11 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AUTOMATION_ROLE_NAME} \
        --handler dr-testing.lambda_handler \
        --zip-file fileb://dr-testing.zip \
@@ -835,7 +841,7 @@ echo "DR Region: ${DR_REGION}"
     
     FAILBACK_LAMBDA=$(aws lambda create-function \
         --function-name "dr-automated-failback-${DR_PROJECT_ID}" \
-        --runtime python3.9 \
+        --runtime python3.11 \
         --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AUTOMATION_ROLE_NAME} \
         --handler automated-failback.lambda_handler \
         --zip-file fileb://automated-failback.zip \
@@ -1017,28 +1023,35 @@ echo "DR Region: ${DR_REGION}"
 
 AWS Elastic Disaster Recovery provides enterprise-grade disaster recovery capabilities that address the complexity and cost challenges of traditional DR solutions. The service's continuous replication model ensures minimal data loss with RPOs measured in seconds, while automated launch capabilities enable RTOs of minutes rather than hours.
 
-The integration of DRS with AWS automation services creates a powerful orchestration framework that reduces human intervention during crisis situations. Step Functions provide visual workflow management and error handling, while Lambda functions enable custom business logic for specific recovery scenarios. This automation approach significantly reduces the risk of human error during high-stress recovery situations.
+The integration of DRS with AWS automation services creates a powerful orchestration framework that reduces human intervention during crisis situations. Step Functions provide visual workflow management and error handling, while Lambda functions enable custom business logic for specific recovery scenarios. This automation approach significantly reduces the risk of human error during high-stress recovery situations, following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles for operational excellence.
 
-Cross-region failover capabilities provide protection against regional disasters and ensure business continuity even during widespread infrastructure failures. The automated DNS failover using Route 53 health checks ensures that users are seamlessly redirected to DR resources without manual intervention.
+Cross-region failover capabilities provide protection against regional disasters and ensure business continuity even during widespread infrastructure failures. The automated DNS failover using Route 53 health checks ensures that users are seamlessly redirected to DR resources without manual intervention. This approach aligns with [AWS disaster recovery strategies](https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-options-in-the-cloud.html) and best practices for multi-region architectures.
 
-The staged replication model is particularly cost-effective, using low-cost storage and minimal compute resources during normal operations. Compute costs are only incurred when instances are launched for testing or actual recovery, making DRS suitable for organizations with budget constraints that previously prevented comprehensive DR implementations.
+The staged replication model is particularly cost-effective, using low-cost storage and minimal compute resources during normal operations. Compute costs are only incurred when instances are launched for testing or actual recovery, making DRS suitable for organizations with budget constraints that previously prevented comprehensive DR implementations. This cost optimization strategy supports the AWS Well-Architected Framework's cost optimization pillar while maintaining robust disaster recovery capabilities.
 
-> **Tip**: Regularly test failover procedures during planned maintenance windows to validate automation and ensure team familiarity with recovery processes.
+> **Tip**: Regularly test failover procedures during planned maintenance windows to validate automation and ensure team familiarity with recovery processes. Use [AWS Config](https://docs.aws.amazon.com/config/latest/developerguide/getting-started.html) to monitor compliance with your disaster recovery configuration standards.
 
 ## Challenge
 
 Extend this disaster recovery solution by implementing these enhancements:
 
-1. **Multi-Tier Application Recovery**: Develop intelligent dependency mapping that automatically sequences recovery based on application tiers and ensures proper startup order for complex, interdependent systems.
+1. **Multi-Tier Application Recovery**: Develop intelligent dependency mapping that automatically sequences recovery based on application tiers and ensures proper startup order for complex, interdependent systems using AWS Systems Manager automation documents.
 
-2. **Geo-Distributed DR**: Implement multiple DR regions with intelligent selection based on proximity, capacity, and cost factors, enabling optimal recovery site selection during different disaster scenarios.
+2. **Geo-Distributed DR**: Implement multiple DR regions with intelligent selection based on proximity, capacity, and cost factors, enabling optimal recovery site selection during different disaster scenarios using AWS Global Accelerator.
 
-3. **Application-Aware Recovery**: Create custom health checks and validation procedures that verify application functionality post-recovery, including database consistency checks and service dependency validation.
+3. **Application-Aware Recovery**: Create custom health checks and validation procedures that verify application functionality post-recovery, including database consistency checks and service dependency validation using AWS X-Ray tracing.
 
-4. **Cost-Optimized Resource Sizing**: Develop machine learning models that analyze historical performance data to automatically optimize recovery instance sizing, balancing performance requirements with cost constraints.
+4. **Cost-Optimized Resource Sizing**: Develop machine learning models using Amazon SageMaker that analyze historical performance data to automatically optimize recovery instance sizing, balancing performance requirements with cost constraints.
 
-5. **Compliance-Driven Recovery**: Implement automated compliance validation that ensures recovered systems meet regulatory requirements (HIPAA, PCI-DSS, SOX) before being placed into production use.
+5. **Compliance-Driven Recovery**: Implement automated compliance validation using AWS Config Rules that ensures recovered systems meet regulatory requirements (HIPAA, PCI-DSS, SOX) before being placed into production use.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

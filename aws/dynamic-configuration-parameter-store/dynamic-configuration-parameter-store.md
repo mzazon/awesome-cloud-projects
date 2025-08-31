@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: Systems Manager Parameter Store, Lambda, CloudWatch, EventBridge
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: serverless, configuration, parameter-store, lambda, caching, automation
 recipe-generator-version: 1.3
@@ -254,7 +254,12 @@ echo "✅ Function name: ${FUNCTION_NAME}"
            port = os.environ.get('PARAMETERS_SECRETS_EXTENSION_HTTP_PORT', '2773')
            url = f'http://localhost:{port}/systemsmanager/parameters/get/?name={parameter_name}'
            
-           response = http.request('GET', url)
+           # Add required header for authentication
+           headers = {
+               'X-Aws-Parameters-Secrets-Token': os.environ.get('AWS_SESSION_TOKEN')
+           }
+           
+           response = http.request('GET', url, headers=headers)
            
            if response.status == 200:
                data = json.loads(response.data.decode('utf-8'))
@@ -366,20 +371,32 @@ echo "✅ Function name: ${FUNCTION_NAME}"
    # Get the Parameters and Secrets Extension layer ARN for your region
    case ${AWS_REGION} in
        us-east-1)
-           EXTENSION_ARN="arn:aws:lambda:us-east-1:177933569100:layer:AWS-Parameters-and-Secrets-Lambda-Extension:11"
+           EXTENSION_ARN="arn:aws:lambda:us-east-1:177933569100:layer:AWS-Parameters-and-Secrets-Lambda-Extension:18"
+           ;;
+       us-east-2)
+           EXTENSION_ARN="arn:aws:lambda:us-east-2:590474943231:layer:AWS-Parameters-and-Secrets-Lambda-Extension:22"
+           ;;
+       us-west-1)
+           EXTENSION_ARN="arn:aws:lambda:us-west-1:997803712105:layer:AWS-Parameters-and-Secrets-Lambda-Extension:18"
            ;;
        us-west-2)
-           EXTENSION_ARN="arn:aws:lambda:us-west-2:177933569100:layer:AWS-Parameters-and-Secrets-Lambda-Extension:11"
+           EXTENSION_ARN="arn:aws:lambda:us-west-2:345057560386:layer:AWS-Parameters-and-Secrets-Lambda-Extension:18"
            ;;
        eu-west-1)
-           EXTENSION_ARN="arn:aws:lambda:eu-west-1:177933569100:layer:AWS-Parameters-and-Secrets-Lambda-Extension:11"
+           EXTENSION_ARN="arn:aws:lambda:eu-west-1:015030872274:layer:AWS-Parameters-and-Secrets-Lambda-Extension:18"
+           ;;
+       eu-central-1)
+           EXTENSION_ARN="arn:aws:lambda:eu-central-1:187925254637:layer:AWS-Parameters-and-Secrets-Lambda-Extension:18"
            ;;
        ap-southeast-1)
-           EXTENSION_ARN="arn:aws:lambda:ap-southeast-1:177933569100:layer:AWS-Parameters-and-Secrets-Lambda-Extension:11"
+           EXTENSION_ARN="arn:aws:lambda:ap-southeast-1:044395824272:layer:AWS-Parameters-and-Secrets-Lambda-Extension:18"
+           ;;
+       ap-northeast-1)
+           EXTENSION_ARN="arn:aws:lambda:ap-northeast-1:133490724326:layer:AWS-Parameters-and-Secrets-Lambda-Extension:18"
            ;;
        *)
            echo "Please verify the Parameters and Secrets Extension ARN for ${AWS_REGION}"
-           EXTENSION_ARN="arn:aws:lambda:${AWS_REGION}:177933569100:layer:AWS-Parameters-and-Secrets-Lambda-Extension:11"
+           EXTENSION_ARN="arn:aws:lambda:${AWS_REGION}:177933569100:layer:AWS-Parameters-and-Secrets-Lambda-Extension:18"
            ;;
    esac
    
@@ -390,7 +407,7 @@ echo "✅ Function name: ${FUNCTION_NAME}"
    # Create Lambda function with extension layer
    aws lambda create-function \
        --function-name ${FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${ROLE_NAME}" \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://function.zip \
@@ -400,6 +417,7 @@ echo "✅ Function name: ${FUNCTION_NAME}"
        --environment Variables="{PARAMETER_PREFIX=${PARAMETER_PREFIX},SSM_PARAMETER_STORE_TTL=300}"
    
    echo "✅ Lambda function deployed with Parameters Extension"
+   echo "✅ Extension layer ARN: ${EXTENSION_ARN}"
    ```
 
 6. **Create EventBridge Rule for Parameter Change Events**:
@@ -532,8 +550,8 @@ echo "✅ Function name: ${FUNCTION_NAME}"
    EOF
    
    # Replace placeholders and create dashboard
-   sed -i "s/FUNCTION_NAME/${FUNCTION_NAME}/g" dashboard.json
-   sed -i "s/AWS_REGION/${AWS_REGION}/g" dashboard.json
+   sed -i.bak "s/FUNCTION_NAME/${FUNCTION_NAME}/g" dashboard.json
+   sed -i.bak "s/AWS_REGION/${AWS_REGION}/g" dashboard.json
    
    aws cloudwatch put-dashboard \
        --dashboard-name "ConfigManager-${RANDOM_SUFFIX}" \
@@ -690,7 +708,7 @@ echo "✅ Function name: ${FUNCTION_NAME}"
    # Clean up local files
    rm -f function.zip lambda_function.py trust-policy.json \
          parameter-store-policy.json dashboard.json response.json \
-         response-cached.json
+         response-cached.json dashboard.json.bak
    
    echo "✅ Parameter Store parameters and local files deleted"
    ```
@@ -703,7 +721,7 @@ The EventBridge integration enables real-time configuration updates by automatic
 
 The monitoring and alerting capabilities through CloudWatch provide comprehensive observability into the configuration management system's health and performance. Custom metrics track configuration retrieval success rates, while standard Lambda metrics monitor function performance and error rates. This monitoring approach supports the reliability pillar by enabling proactive identification of issues before they impact application functionality.
 
-Cost optimization is achieved through the intelligent caching mechanism provided by the Parameters Extension, which reduces the number of API calls to Parameter Store. The serverless architecture ensures you only pay for actual configuration retrieval operations, while the monitoring setup helps identify opportunities for further optimization. For production deployments, consider implementing parameter versioning and gradual rollout strategies to minimize risk during configuration changes.
+Cost optimization is achieved through the intelligent caching mechanism provided by the Parameters Extension, which reduces the number of API calls to Parameter Store by up to 99%. The serverless architecture ensures you only pay for actual configuration retrieval operations, while the monitoring setup helps identify opportunities for further optimization. For production deployments, consider implementing parameter versioning and gradual rollout strategies to minimize risk during configuration changes.
 
 > **Tip**: Configure different TTL values for different parameter types - use shorter TTL for frequently changing feature flags and longer TTL for stable infrastructure settings to optimize both performance and cost.
 
@@ -730,4 +748,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

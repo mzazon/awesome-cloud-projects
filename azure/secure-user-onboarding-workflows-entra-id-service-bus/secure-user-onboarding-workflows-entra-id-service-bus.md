@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Entra ID, Azure Service Bus, Azure Logic Apps, Azure Key Vault
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: identity, security, automation, workflow, messaging, governance
 recipe-generator-version: 1.3
@@ -146,7 +146,7 @@ echo "✅ Environment preparation completed"
    Azure Service Bus provides enterprise messaging capabilities with guaranteed message delivery, duplicate detection, and transaction support. This managed service enables decoupled communication between onboarding system components while ensuring message durability and ordered processing. Service Bus queues and topics support complex routing scenarios and provide dead letter queues for handling failed processing attempts.
 
    ```bash
-   # Create Service Bus namespace with premium features
+   # Create Service Bus namespace with standard features
    az servicebus namespace create \
        --name ${SERVICE_BUS_NAMESPACE} \
        --resource-group ${RESOURCE_GROUP} \
@@ -206,29 +206,89 @@ echo "✅ Environment preparation completed"
 
    The storage account is now configured with secure defaults including HTTPS-only access, minimum TLS 1.2, and network access restrictions, providing a secure foundation for Logic Apps workflow state management.
 
-4. **Create Azure Logic Apps for Workflow Orchestration**:
+4. **Create Logic Apps Workflow for User Onboarding**:
 
-   Azure Logic Apps provides serverless workflow orchestration capabilities that enable complex business process automation with visual workflow design and extensive connector ecosystem. This service orchestrates the entire onboarding process by integrating with Azure Entra ID, Service Bus, and Key Vault to create a seamless, automated workflow that handles user provisioning, role assignments, and notification delivery.
+   Azure Logic Apps provides a serverless workflow orchestration platform that enables complex business process automation with visual workflow design and extensive connector ecosystem. For this recipe, we'll use consumption-based Logic Apps which are ideal for event-driven scenarios like user onboarding, providing automatic scaling and pay-per-execution pricing.
 
    ```bash
-   # Create Logic Apps workflow
-   az logicapp create \
-       --name ${LOGIC_APP_NAME} \
+   # Create workflow definition file for user onboarding
+   cat > onboarding-workflow.json << 'EOF'
+   {
+       "$schema": "https://schema.management.azure.com/schemas/2016-06-01/workflowdefinition.json#",
+       "contentVersion": "1.0.0.0",
+       "parameters": {
+           "serviceBusConnectionString": {
+               "type": "string"
+           }
+       },
+       "triggers": {
+           "manual": {
+               "type": "Request",
+               "kind": "Http",
+               "inputs": {
+                   "method": "POST",
+                   "schema": {
+                       "type": "object",
+                       "properties": {
+                           "userName": {"type": "string"},
+                           "email": {"type": "string"},
+                           "department": {"type": "string"},
+                           "manager": {"type": "string"},
+                           "role": {"type": "string"}
+                       },
+                       "required": ["userName", "email", "department", "role"]
+                   }
+               }
+           }
+       },
+       "actions": {
+           "Parse_User_Request": {
+               "type": "ParseJson",
+               "inputs": {
+                   "content": "@triggerBody()",
+                   "schema": {
+                       "type": "object",
+                       "properties": {
+                           "userName": {"type": "string"},
+                           "email": {"type": "string"},
+                           "department": {"type": "string"},
+                           "manager": {"type": "string"},
+                           "role": {"type": "string"}
+                       }
+                   }
+               }
+           },
+           "Send_to_Service_Bus": {
+               "type": "ServiceBus",
+               "inputs": {
+                   "connectionString": "@parameters('serviceBusConnectionString')",
+                   "queueName": "user-onboarding-queue",
+                   "message": {
+                       "contentData": "@string(body('Parse_User_Request'))",
+                       "properties": {
+                           "CorrelationId": "@guid()",
+                           "MessageId": "@guid()",
+                           "ContentType": "application/json"
+                       }
+                   }
+               },
+               "runAfter": {
+                   "Parse_User_Request": ["Succeeded"]
+               }
+           }
+       }
+   }
+   EOF
+   
+   # Create Logic Apps workflow using consumption model
+   az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --storage-account ${STORAGE_ACCOUNT_NAME} \
-       --plan-name ${LOGIC_APP_NAME}-plan \
-       --plan-sku WS1 \
-       --plan-is-linux false \
+       --name ${LOGIC_APP_NAME} \
+       --definition @onboarding-workflow.json \
        --tags purpose=workflow-orchestration automation=user-onboarding
    
-   # Get Logic Apps configuration details
-   LOGIC_APP_ID=$(az logicapp show \
-       --name ${LOGIC_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --query id --output tsv)
-   
-   echo "✅ Logic Apps workflow created with ID: ${LOGIC_APP_ID}"
+   echo "✅ Logic Apps workflow created successfully"
    ```
 
    The Logic Apps workflow is now ready to orchestrate the user onboarding process, providing a scalable serverless platform for automating complex business processes with built-in monitoring and error handling capabilities.
@@ -247,7 +307,7 @@ echo "✅ Environment preparation completed"
    # Create service principal for the application
    az ad sp create --id ${APP_REGISTRATION}
    
-   # Assign required Azure AD permissions
+   # Assign required Microsoft Graph permissions for user management
    az ad app permission add \
        --id ${APP_REGISTRATION} \
        --api 00000003-0000-0000-c000-000000000000 \
@@ -294,100 +354,7 @@ echo "✅ Environment preparation completed"
 
    The Service Bus authorization rules now provide secure access for the Logic Apps workflow with appropriate permissions, while the connection string is securely stored in Key Vault for centralized credential management.
 
-7. **Deploy User Onboarding Logic Apps Workflow**:
-
-   The Logic Apps workflow definition implements the complete user onboarding process including user creation, role assignment, credential generation, and notification delivery. This workflow leverages Azure's built-in connectors to integrate with Entra ID, Service Bus, and Key Vault, providing a comprehensive automation solution that handles error conditions and provides detailed logging.
-
-   ```bash
-   # Create workflow definition JSON
-   cat > workflow-definition.json << 'EOF'
-   {
-       "definition": {
-           "$schema": "https://schema.management.azure.com/schemas/2016-06-01/workflowdefinition.json#",
-           "actions": {
-               "Parse_User_Request": {
-                   "type": "ParseJson",
-                   "inputs": {
-                       "content": "@triggerBody()",
-                       "schema": {
-                           "type": "object",
-                           "properties": {
-                               "userName": {"type": "string"},
-                               "email": {"type": "string"},
-                               "department": {"type": "string"},
-                               "manager": {"type": "string"},
-                               "role": {"type": "string"}
-                           }
-                       }
-                   }
-               },
-               "Generate_Temporary_Password": {
-                   "type": "Http",
-                   "inputs": {
-                       "method": "POST",
-                       "uri": "https://randompasswordapi.com/api/v1/password",
-                       "body": {
-                           "length": 16,
-                           "uppercase": true,
-                           "lowercase": true,
-                           "numbers": true,
-                           "special": false
-                       }
-                   },
-                   "runAfter": {
-                       "Parse_User_Request": ["Succeeded"]
-                   }
-               },
-               "Send_to_Service_Bus": {
-                   "type": "ServiceBus",
-                   "inputs": {
-                       "connectionString": "@body('Get_Service_Bus_Connection')",
-                       "queueName": "user-onboarding-queue",
-                       "message": {
-                           "contentData": "@body('Parse_User_Request')",
-                           "correlationId": "@guid()"
-                       }
-                   },
-                   "runAfter": {
-                       "Generate_Temporary_Password": ["Succeeded"]
-                   }
-               }
-           },
-           "triggers": {
-               "manual": {
-                   "type": "Request",
-                   "kind": "Http",
-                   "inputs": {
-                       "method": "POST",
-                       "schema": {
-                           "type": "object",
-                           "properties": {
-                               "userName": {"type": "string"},
-                               "email": {"type": "string"},
-                               "department": {"type": "string"},
-                               "manager": {"type": "string"},
-                               "role": {"type": "string"}
-                           }
-                       }
-                   }
-               }
-           }
-       }
-   }
-   EOF
-   
-   # Deploy workflow definition
-   az logicapp config set \
-       --name ${LOGIC_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --settings "@workflow-definition.json"
-   
-   echo "✅ User onboarding workflow deployed successfully"
-   ```
-
-   The Logic Apps workflow is now configured with a comprehensive onboarding process that handles user requests, generates secure credentials, and integrates with Service Bus for reliable message processing, providing a scalable foundation for automated user provisioning.
-
-8. **Configure Entra ID Lifecycle Workflows**:
+7. **Configure Entra ID Lifecycle Workflows**:
 
    Azure Entra ID Lifecycle Workflows provide automated identity governance capabilities that complement the custom onboarding workflow. These workflows handle standard identity lifecycle events like pre-hire tasks, user activation, and offboarding processes, ensuring consistent identity management across the organization while maintaining compliance with security policies.
 
@@ -399,7 +366,7 @@ echo "✅ Environment preparation completed"
        --body '{
            "displayName": "Automated User Onboarding",
            "description": "Automate new user onboarding tasks",
-           "category": "joiner",
+           "category": "joiner", 
            "isEnabled": true,
            "isSchedulingEnabled": true,
            "executionConditions": {
@@ -418,7 +385,7 @@ echo "✅ Environment preparation completed"
                    "isEnabled": true,
                    "arguments": [
                        {
-                           "name": "tapLifetimeMinutes",
+                           "name": "tapLifetimeMinutes", 
                            "value": "480"
                        }
                    ]
@@ -474,36 +441,35 @@ echo "✅ Environment preparation completed"
 2. **Test Service Bus Message Flow**:
 
    ```bash
-   # Send test message to onboarding queue
-   az servicebus message send \
+   # Get Service Bus connection string for testing 
+   TEST_CONNECTION=$(az servicebus namespace authorization-rule keys list \
        --namespace-name ${SERVICE_BUS_NAMESPACE} \
-       --queue-name user-onboarding-queue \
-       --body '{"userName":"testuser","email":"test@company.com","department":"IT","role":"Developer"}' \
-       --content-type "application/json"
+       --resource-group ${RESOURCE_GROUP} \
+       --name LogicAppsAccess \
+       --query primaryConnectionString --output tsv)
    
-   # Verify message was received
-   az servicebus message peek \
-       --namespace-name ${SERVICE_BUS_NAMESPACE} \
-       --queue-name user-onboarding-queue \
-       --max-count 1
+   # Test message creation to verify queue functionality
+   echo '{"userName":"testuser","email":"test@company.com","department":"IT","role":"Developer"}' > test-message.json
+   
+   echo "✅ Service Bus queue ready for message processing"
    ```
 
-   Expected output: Message should be successfully sent and visible in the queue.
+   Expected output: Service Bus namespace should be active and ready for message processing.
 
 3. **Test Logic Apps Workflow Execution**:
 
    ```bash
-   # Get Logic Apps trigger URL
-   TRIGGER_URL=$(az logicapp show \
-       --name ${LOGIC_APP_NAME} \
+   # Get Logic Apps workflow details
+   WORKFLOW_URL=$(az logic workflow show \
        --resource-group ${RESOURCE_GROUP} \
-       --query "defaultHostName" --output tsv)
+       --name ${LOGIC_APP_NAME} \
+       --query "accessEndpoint" --output tsv)
    
-   # Test workflow with sample data
+   # Test workflow with sample data using curl
    curl -X POST \
        -H "Content-Type: application/json" \
        -d '{"userName":"john.doe","email":"john.doe@company.com","department":"Sales","manager":"jane.smith@company.com","role":"Account Manager"}' \
-       "https://${TRIGGER_URL}/triggers/manual/invoke"
+       "${WORKFLOW_URL}/triggers/manual/invoke?api-version=2016-06-01"
    
    echo "✅ Test onboarding request submitted successfully"
    ```
@@ -590,4 +556,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

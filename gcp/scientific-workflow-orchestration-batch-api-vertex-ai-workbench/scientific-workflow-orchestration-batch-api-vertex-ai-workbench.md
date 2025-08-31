@@ -3,13 +3,13 @@ title: Scientific Workflow Orchestration with Cloud Batch API and Vertex AI Work
 id: b4e7c8f9
 category: analytics
 difficulty: 400
-subject: gcp
+subject: gcp  
 services: Cloud Batch, Vertex AI Workbench, Cloud Storage, BigQuery
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: genomics, machine-learning, bioinformatics, scientific-computing, data-analysis, workflow-orchestration
 recipe-generator-version: 1.3
@@ -183,25 +183,26 @@ echo "✅ Dataset name: ${DATASET_NAME}"
    Vertex AI Workbench provides a managed Jupyter environment optimized for machine learning workflows in genomics research. The integration with Google Cloud services enables seamless access to genomic datasets stored in BigQuery and Cloud Storage while providing access to powerful ML frameworks and pre-trained models for variant interpretation and drug discovery applications.
 
    ```bash
-   # Create Vertex AI Workbench instance
-   gcloud notebooks instances create ${WORKBENCH_NAME} \
+   # Create Vertex AI Workbench instance using current gcloud command
+   gcloud workbench instances create ${WORKBENCH_NAME} \
        --location=${ZONE} \
-       --environment=tf-2-11-cu113-notebooks \
+       --vm-image-project=cloud-notebooks-managed \
+       --vm-image-family=workbench-instances \
        --machine-type=n1-standard-4 \
        --boot-disk-size=100GB \
        --boot-disk-type=pd-standard \
        --data-disk-size=200GB \
        --data-disk-type=pd-ssd \
        --install-gpu-driver \
-       --metadata="bigquery-dataset=${DATASET_NAME},storage-bucket=${BUCKET_NAME}"
+       --metadata=bigquery-dataset=${DATASET_NAME},storage-bucket=${BUCKET_NAME}
    
    # Wait for instance to be ready
-   gcloud notebooks instances describe ${WORKBENCH_NAME} \
+   gcloud workbench instances describe ${WORKBENCH_NAME} \
        --location=${ZONE} \
        --format="value(state)"
    
    echo "✅ Vertex AI Workbench instance created: ${WORKBENCH_NAME}"
-   echo "Access URL: https://console.cloud.google.com/ai-platform/notebooks/instances?project=${PROJECT_ID}"
+   echo "Access via: https://console.cloud.google.com/vertex-ai/workbench/instances?project=${PROJECT_ID}"
    ```
 
    The Workbench environment now provides researchers with a collaborative platform for developing machine learning models that can interpret genomic variants, predict drug responses, and identify potential therapeutic targets. The GPU-enabled configuration supports deep learning models for complex genomic analysis tasks.
@@ -285,7 +286,7 @@ echo "✅ Dataset name: ${DATASET_NAME}"
 
 5. **Configure Cloud Batch Job for Parallel Genomic Processing**:
 
-   Cloud Batch orchestrates the parallel execution of genomic workflows across multiple compute instances, providing the scalability needed for processing large cohorts of genomic samples. The job configuration optimizes resource allocation and ensures efficient data processing while maintaining cost control through preemptible instances and automatic scaling.
+   Cloud Batch orchestrates the parallel execution of genomic workflows across multiple compute instances, providing the scalability needed for processing large cohorts of genomic samples. The job configuration optimizes resource allocation and ensures efficient data processing while maintaining cost control through preemptible instances and automatic scaling based on workload demands.
 
    ```bash
    # Create Batch job configuration
@@ -299,9 +300,8 @@ echo "✅ Dataset name: ${DATASET_NAME}"
              "commands": [
                "/bin/bash",
                "-c",
-               "pip install google-cloud-bigquery google-cloud-storage pandas && python3 /mnt/disks/share/genomic_pipeline.py"
-             ],
-             "volumes": ["/mnt/disks/share:/mnt/disks/share"]
+               "pip install google-cloud-bigquery google-cloud-storage pandas && gsutil cp gs://${BUCKET_NAME}/scripts/genomic_pipeline.py . && python3 genomic_pipeline.py"
+             ]
            }
          }],
          "computeResource": {
@@ -637,12 +637,12 @@ echo "✅ Dataset name: ${DATASET_NAME}"
 
    ```bash
    # Check Workbench instance status
-   gcloud notebooks instances describe ${WORKBENCH_NAME} \
+   gcloud workbench instances describe ${WORKBENCH_NAME} \
        --location=${ZONE} \
        --format="value(state)"
    
    # Get access URL
-   echo "Workbench URL: https://${WORKBENCH_NAME}.googleusercontent.com/"
+   echo "Workbench URL: https://console.cloud.google.com/vertex-ai/workbench/instances?project=${PROJECT_ID}"
    ```
 
    Expected output: `ACTIVE` status with accessible Jupyter environment.
@@ -669,7 +669,7 @@ echo "✅ Dataset name: ${DATASET_NAME}"
 
    ```bash
    # Delete Workbench instance
-   gcloud notebooks instances delete ${WORKBENCH_NAME} \
+   gcloud workbench instances delete ${WORKBENCH_NAME} \
        --location=${ZONE} \
        --quiet
    
@@ -717,19 +717,19 @@ echo "✅ Dataset name: ${DATASET_NAME}"
 
 ## Discussion
 
-This intelligent scientific workflow orchestration system demonstrates the power of cloud-native bioinformatics for accelerating genomic research and drug discovery. By combining Google Cloud Batch API for scalable computational biology workflows with Vertex AI Workbench for interactive machine learning analysis, researchers can process large-scale genomic datasets with unprecedented efficiency and analytical depth.
+This intelligent scientific workflow orchestration system demonstrates the power of cloud-native bioinformatics for accelerating genomic research and drug discovery. By combining Google Cloud Batch API for scalable computational biology workflows with Vertex AI Workbench for interactive machine learning analysis, researchers can process large-scale genomic datasets with unprecedented efficiency and analytical depth. The architecture follows [Google Cloud's best practices for scientific computing](https://cloud.google.com/architecture/scientific-computing) and incorporates security controls aligned with healthcare data compliance requirements.
 
-The architecture leverages Google Cloud's serverless and managed services to eliminate the infrastructure complexity typically associated with genomics workflows. Cloud Batch API, as the successor to the deprecated Cloud Life Sciences API, provides enhanced capabilities for container orchestration and parallel processing, making it ideal for computationally intensive bioinformatics pipelines. The integration with Vertex AI Workbench enables researchers to seamlessly transition from data processing to machine learning analysis within a unified cloud environment.
+The architecture leverages Google Cloud's serverless and managed services to eliminate the infrastructure complexity typically associated with genomics workflows. Cloud Batch API, as the successor to the deprecated Cloud Life Sciences API, provides enhanced capabilities for container orchestration and parallel processing, making it ideal for computationally intensive bioinformatics pipelines. The integration with Vertex AI Workbench enables researchers to seamlessly transition from data processing to machine learning analysis within a unified cloud environment that supports collaborative research workflows.
 
-The solution addresses critical challenges in modern genomics research, including the need to process terabytes of sequencing data, apply advanced AI models for variant interpretation, and generate actionable insights for therapeutic development. The cloud-native approach enables research teams to scale their computational resources dynamically, reducing processing times from weeks to hours while maintaining cost efficiency through pay-per-use pricing models.
+The solution addresses critical challenges in modern genomics research, including the need to process terabytes of sequencing data, apply advanced AI models for variant interpretation, and generate actionable insights for therapeutic development. The cloud-native approach enables research teams to scale their computational resources dynamically, reducing processing times from weeks to hours while maintaining cost efficiency through pay-per-use pricing models and automatic resource scaling based on workload demands.
 
-Security and compliance considerations are fundamental to genomics research, and this architecture incorporates Google Cloud's enterprise-grade security features, including encryption at rest and in transit, IAM-based access controls, and audit logging. These capabilities are essential for handling sensitive genomic data while meeting regulatory requirements such as HIPAA and GDPR compliance.
+Security and compliance considerations are fundamental to genomics research, and this architecture incorporates Google Cloud's enterprise-grade security features, including encryption at rest and in transit, IAM-based access controls, and comprehensive audit logging through [Cloud Audit Logs](https://cloud.google.com/logging/docs/audit). These capabilities are essential for handling sensitive genomic data while meeting regulatory requirements such as HIPAA and GDPR compliance in pharmaceutical research environments.
 
-> **Tip**: Consider implementing workflow orchestration tools like Cloud Workflows or Apache Airflow for more complex multi-step genomic pipelines that require conditional logic and error handling.
+> **Tip**: Consider implementing workflow orchestration tools like [Cloud Workflows](https://cloud.google.com/workflows) or Apache Airflow for more complex multi-step genomic pipelines that require conditional logic, error handling, and integration with external systems.
 
-The integration of BigQuery as the analytical data warehouse provides researchers with SQL-based access to genomic variants while supporting complex analytical queries at scale. This approach enables population-scale genomic studies and facilitates collaborative research by providing standardized data access patterns. The machine learning capabilities demonstrated in Vertex AI Workbench can be extended to implement state-of-the-art deep learning models for genomic sequence analysis, protein structure prediction, and drug-target interaction modeling.
+The integration of BigQuery as the analytical data warehouse provides researchers with SQL-based access to genomic variants while supporting complex analytical queries at scale. This approach enables population-scale genomic studies and facilitates collaborative research by providing standardized data access patterns following [genomics best practices](https://cloud.google.com/life-sciences/docs/resources/public-datasets). The machine learning capabilities demonstrated in Vertex AI Workbench can be extended to implement state-of-the-art deep learning models for genomic sequence analysis, protein structure prediction, and drug-target interaction modeling using frameworks like TensorFlow and PyTorch.
 
-For organizations transitioning from on-premises HPC infrastructure, this cloud-native approach offers significant advantages in terms of scalability, cost optimization, and access to cutting-edge AI capabilities. The workflow can be easily adapted to different genomic analysis pipelines, including whole-genome sequencing, RNA-seq analysis, and single-cell genomics, making it a versatile platform for diverse research applications.
+For organizations transitioning from on-premises HPC infrastructure, this cloud-native approach offers significant advantages in terms of scalability, cost optimization, and access to cutting-edge AI capabilities. The workflow can be easily adapted to different genomic analysis pipelines, including whole-genome sequencing, RNA-seq analysis, and single-cell genomics, making it a versatile platform for diverse research applications while maintaining compliance with regulatory standards.
 
 ## Challenge
 
@@ -747,4 +747,9 @@ Extend this intelligent scientific workflow orchestration system by implementing
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

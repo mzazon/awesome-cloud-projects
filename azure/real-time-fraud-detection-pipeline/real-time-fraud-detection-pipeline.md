@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Stream Analytics, Azure Machine Learning, Azure Event Hubs, Azure Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: fraud-detection, real-time-analytics, stream-processing, machine-learning, anomaly-detection, financial-services
 recipe-generator-version: 1.3
@@ -70,11 +70,12 @@ graph TB
 
 1. Azure subscription with appropriate permissions for creating Stream Analytics jobs, Event Hubs, and Machine Learning workspaces
 2. Azure CLI v2.60.0 or later installed and configured (or Azure Cloud Shell)
-3. Basic understanding of stream processing concepts and fraud detection patterns
-4. Sample transaction data or ability to generate synthetic transaction streams
-5. Estimated cost: $50-100 per day for development workloads (varies by throughput and ML compute usage)
+3. Azure Functions Core Tools v4.x installed for local function development and deployment
+4. Basic understanding of stream processing concepts and fraud detection patterns
+5. Sample transaction data or ability to generate synthetic transaction streams
+6. Estimated cost: $50-100 per day for development workloads (varies by throughput and ML compute usage)
 
-> **Note**: Azure AI Anomaly Detector has been retired as of October 2026. This recipe uses Azure Machine Learning as the modern alternative for implementing custom anomaly detection models with greater flexibility and control.
+> **Note**: This recipe uses Azure Machine Learning as the modern alternative for implementing custom anomaly detection models with greater flexibility and control over traditional rule-based systems.
 
 ## Preparation
 
@@ -154,7 +155,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 2. **Create Azure Machine Learning Workspace for Fraud Detection Models**:
 
-   Azure Machine Learning provides a comprehensive platform for building, training, and deploying fraud detection models. Unlike the retired Azure AI Anomaly Detector, Azure ML offers full control over model architecture, training data, and deployment strategies. This enables organizations to create custom fraud detection algorithms tailored to their specific transaction patterns and risk profiles.
+   Azure Machine Learning provides a comprehensive platform for building, training, and deploying fraud detection models. This enables organizations to create custom fraud detection algorithms tailored to their specific transaction patterns and risk profiles, offering superior flexibility compared to generic solutions.
 
    ```bash
    # Create Azure Machine Learning workspace
@@ -260,12 +261,14 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Create Stream Analytics job
    az stream-analytics job create \
-       --name ${STREAM_ANALYTICS_JOB} \
+       --job-name ${STREAM_ANALYTICS_JOB} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --sku Standard \
-       --streaming-units 3 \
-       --output-start-mode JobStartTime
+       --output-error-policy Drop \
+       --out-of-order-policy Drop \
+       --order-max-delay 5 \
+       --arrival-max-delay 16 \
+       --data-locale "en-US"
 
    # Get Event Hub connection string
    EVENT_HUB_CONNECTION_STRING=$(az eventhubs eventhub authorization-rule keys list \
@@ -290,21 +293,23 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    az stream-analytics input create \
        --job-name ${STREAM_ANALYTICS_JOB} \
        --resource-group ${RESOURCE_GROUP} \
-       --name TransactionInput \
-       --type Stream \
-       --datasource '{
-           "type": "Microsoft.ServiceBus/EventHub",
-           "properties": {
-               "eventHubName": "'${EVENT_HUB_NAME}'",
-               "serviceBusNamespace": "'${EVENT_HUB_NAMESPACE}'",
-               "sharedAccessPolicyName": "StreamAnalyticsAccess",
-               "sharedAccessPolicyKey": "'"$(az eventhubs eventhub authorization-rule keys list --name StreamAnalyticsAccess --namespace-name ${EVENT_HUB_NAMESPACE} --eventhub-name ${EVENT_HUB_NAME} --resource-group ${RESOURCE_GROUP} --query primaryKey --output tsv)"'"
-           }
-       }' \
-       --serialization '{
-           "type": "Json",
-           "properties": {
-               "encoding": "UTF8"
+       --input-name TransactionInput \
+       --properties '{
+           "type": "Stream",
+           "datasource": {
+               "type": "Microsoft.ServiceBus/EventHub",
+               "properties": {
+                   "eventHubName": "'${EVENT_HUB_NAME}'",
+                   "serviceBusNamespace": "'${EVENT_HUB_NAMESPACE}'",
+                   "sharedAccessPolicyName": "StreamAnalyticsAccess",
+                   "sharedAccessPolicyKey": "'"$(az eventhubs eventhub authorization-rule keys list --name StreamAnalyticsAccess --namespace-name ${EVENT_HUB_NAMESPACE} --eventhub-name ${EVENT_HUB_NAME} --resource-group ${RESOURCE_GROUP} --query primaryKey --output tsv)"'"
+               }
+           },
+           "serialization": {
+               "type": "Json",
+               "properties": {
+                   "encoding": "UTF8"
+               }
            }
        }'
 
@@ -312,7 +317,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    az stream-analytics output create \
        --job-name ${STREAM_ANALYTICS_JOB} \
        --resource-group ${RESOURCE_GROUP} \
-       --name TransactionOutput \
+       --output-name TransactionOutput \
        --datasource '{
            "type": "Microsoft.Storage/DocumentDB",
            "properties": {
@@ -328,7 +333,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    az stream-analytics output create \
        --job-name ${STREAM_ANALYTICS_JOB} \
        --resource-group ${RESOURCE_GROUP} \
-       --name AlertOutput \
+       --output-name AlertOutput \
        --datasource '{
            "type": "Microsoft.Web/sites/functions",
            "properties": {
@@ -349,10 +354,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    Azure Machine Learning enables deployment of sophisticated fraud detection models as real-time endpoints. These models can analyze transaction patterns, user behavior, and historical fraud data to generate accurate fraud scores. The containerized deployment approach ensures consistent model performance and easy updates as fraud patterns evolve.
 
    ```bash
-   # Create a simple fraud detection model deployment
-   # In production, this would be a trained model from your ML workspace
-   
-   # Create model endpoint
+   # Create model endpoint for fraud detection
    az ml online-endpoint create \
        --name fraud-detection-endpoint \
        --workspace-name ${ML_WORKSPACE} \
@@ -369,7 +371,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 8. **Create Stream Analytics Query for Fraud Detection**:
 
-   The Stream Analytics query implements the core fraud detection logic, combining real-time transaction analysis with machine learning insights. This query identifies suspicious patterns including unusual transaction amounts, frequency anomalies, and geographic inconsistencies. The windowed aggregations enable detection of rapid-fire attack patterns while maintaining processing efficiency.
+   The Stream Analytics query implements the core fraud detection logic, combining real-time transaction analysis with pattern recognition algorithms. This query identifies suspicious patterns including unusual transaction amounts, frequency anomalies, and velocity-based attacks. The windowed aggregations enable detection of rapid-fire attack patterns while maintaining processing efficiency.
 
    ```bash
    # Create fraud detection query
@@ -444,7 +446,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --resource-group ${RESOURCE_GROUP} \
        --name FraudDetectionTransformation \
        --streaming-units 3 \
-       --query "$(cat fraud-detection-query.sql)"
+       --saql "$(cat fraud-detection-query.sql)"
 
    echo "✅ Fraud detection query deployed to Stream Analytics"
    ```
@@ -456,9 +458,35 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    The Azure Function handles fraud alerts by implementing business logic for alert triage, notification dispatch, and automated response actions. This serverless component ensures immediate response to high-risk transactions while maintaining detailed audit logs for compliance and investigation purposes.
 
    ```bash
-   # Create fraud alert processing function
+   # Create fraud alert processing function project
    mkdir -p fraud-alert-function
    cd fraud-alert-function
+
+   # Initialize Functions project
+   func init . --javascript
+
+   # Create the ProcessFraudAlert function
+   func new --name ProcessFraudAlert --template "HTTP trigger"
+
+   # Create function configuration
+   cat > ProcessFraudAlert/function.json << 'EOF'
+   {
+     "bindings": [
+       {
+         "authLevel": "function",
+         "type": "httpTrigger",
+         "direction": "in",
+         "name": "req",
+         "methods": ["post"]
+       },
+       {
+         "type": "http",
+         "direction": "out",
+         "name": "res"
+       }
+     ]
+   }
+   EOF
 
    # Create function code
    cat > ProcessFraudAlert/index.js << 'EOF'
@@ -507,7 +535,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    };
    EOF
 
-   # Create package.json
+   # Update package.json with dependencies
    cat > package.json << 'EOF'
    {
        "name": "fraud-alert-processor",
@@ -518,7 +546,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    }
    EOF
 
-   # Deploy function
+   # Deploy function to Azure
    func azure functionapp publish ${FUNCTION_APP}
    
    cd ..
@@ -534,7 +562,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
     ```bash
     # Start Stream Analytics job
     az stream-analytics job start \
-        --name ${STREAM_ANALYTICS_JOB} \
+        --job-name ${STREAM_ANALYTICS_JOB} \
         --resource-group ${RESOURCE_GROUP} \
         --output-start-mode JobStartTime
 
@@ -546,21 +574,20 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
         "amount": 50.00,
         "merchantId": "merchant-456",
         "location": "New York",
-        "timestamp": "2025-07-12T10:30:00Z"
+        "timestamp": "2025-07-23T10:30:00Z"
     }
     EOF
 
-    # Send test transaction to Event Hub
-    az eventhubs eventhub send \
-        --name ${EVENT_HUB_NAME} \
-        --namespace-name ${EVENT_HUB_NAMESPACE} \
-        --resource-group ${RESOURCE_GROUP} \
-        --data "$(cat sample-transaction.json)"
+    # Use Azure SDK or Event Hubs client to send test data
+    # Note: This would require an Event Hubs client application
+    echo "📝 To send test data, use an Event Hubs client application or the Azure portal"
+    echo "   Event Hub namespace: ${EVENT_HUB_NAMESPACE}"
+    echo "   Event Hub name: ${EVENT_HUB_NAME}"
 
-    echo "✅ Fraud detection pipeline is now active and processing transactions"
+    echo "✅ Fraud detection pipeline is now active and ready for transactions"
     ```
 
-    The fraud detection pipeline is now fully operational and processing real-time transaction data. The system will continuously monitor for fraudulent patterns and generate alerts as needed.
+    The fraud detection pipeline is now fully operational and ready to process real-time transaction data. The system will continuously monitor for fraudulent patterns and generate alerts as needed.
 
 ## Validation & Testing
 
@@ -576,29 +603,32 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
    Expected output: `"Running"`
 
-2. **Test Fraud Detection with High-Risk Transaction**:
+2. **Test Event Hub Connectivity**:
 
    ```bash
-   # Send high-value transaction that should trigger fraud alert
-   cat > high-risk-transaction.json << 'EOF'
-   {
-       "transactionId": "txn-fraud-001",
-       "userId": "user-123",
-       "amount": 5000.00,
-       "merchantId": "merchant-456",
-       "location": "Unknown",
-       "timestamp": "2025-07-12T10:35:00Z"
-   }
-   EOF
-
-   az eventhubs eventhub send \
+   # Verify Event Hub exists and is accessible
+   az eventhubs eventhub show \
        --name ${EVENT_HUB_NAME} \
        --namespace-name ${EVENT_HUB_NAMESPACE} \
        --resource-group ${RESOURCE_GROUP} \
-       --data "$(cat high-risk-transaction.json)"
+       --query "status"
    ```
 
-3. **Verify Fraud Alert Generation**:
+   Expected output: `"Active"`
+
+3. **Verify Function App Deployment**:
+
+   ```bash
+   # Check function app status
+   az functionapp show \
+       --name ${FUNCTION_APP} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query "state"
+   ```
+
+   Expected output: `"Running"`
+
+4. **Monitor Fraud Alert Generation**:
 
    ```bash
    # Check for fraud alerts in Cosmos DB
@@ -607,16 +637,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --container-name fraud-alerts \
        --account-name ${COSMOS_DB_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
-       --query-text "SELECT * FROM c ORDER BY c.timestamp DESC"
-   ```
-
-4. **Monitor Function App Logs**:
-
-   ```bash
-   # Check function execution logs
-   az monitor log-analytics query \
-       --workspace ${ML_WORKSPACE} \
-       --analytics-query "traces | where message contains 'Fraud alert' | order by timestamp desc"
+       --query-text "SELECT * FROM c ORDER BY c.timestamp DESC OFFSET 0 LIMIT 10"
    ```
 
 ## Cleanup
@@ -663,7 +684,6 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    # Remove temporary files
    rm -f fraud-detection-query.sql
    rm -f sample-transaction.json
-   rm -f high-risk-transaction.json
    rm -rf fraud-alert-function
    
    echo "✅ Local files cleaned up"
@@ -673,11 +693,11 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 Real-time fraud detection represents a critical capability for modern financial institutions, requiring sophisticated stream processing combined with intelligent machine learning algorithms. Azure Stream Analytics provides the foundational infrastructure for processing millions of transactions per second while maintaining sub-second latency requirements. The service's SQL-like query language enables complex event processing patterns essential for detecting fraud signatures across multiple dimensions including transaction velocity, amount anomalies, and behavioral patterns. For comprehensive guidance on stream processing architectures, reference the [Azure Stream Analytics documentation](https://docs.microsoft.com/en-us/azure/stream-analytics/) and [real-time fraud detection patterns](https://docs.microsoft.com/en-us/azure/stream-analytics/stream-analytics-real-time-fraud-detection).
 
-The integration of Azure Machine Learning as a replacement for the retired Azure AI Anomaly Detector provides enhanced flexibility and control over fraud detection algorithms. Organizations can now implement custom models tailored to their specific transaction patterns, customer behaviors, and risk profiles. This approach enables continuous model improvement through retraining with new fraud patterns and supports advanced techniques like ensemble models and deep learning architectures. The containerized deployment model ensures consistent performance across development and production environments while enabling rapid model updates as fraud tactics evolve. Detailed guidance on ML model deployment can be found in the [Azure Machine Learning documentation](https://docs.microsoft.com/en-us/azure/machine-learning/how-to-deploy-online-endpoints).
+The integration of Azure Machine Learning provides enhanced flexibility and control over fraud detection algorithms compared to traditional rule-based systems. Organizations can implement custom models tailored to their specific transaction patterns, customer behaviors, and risk profiles. This approach enables continuous model improvement through retraining with new fraud patterns and supports advanced techniques like ensemble models and deep learning architectures. The containerized deployment model ensures consistent performance across development and production environments while enabling rapid model updates as fraud tactics evolve. Detailed guidance on ML model deployment can be found in the [Azure Machine Learning documentation](https://docs.microsoft.com/en-us/azure/machine-learning/how-to-deploy-online-endpoints).
 
 Event-driven architectures using Azure Event Hubs and Azure Functions create a scalable foundation for fraud response automation. This pattern enables immediate response to high-risk transactions while maintaining detailed audit trails for compliance and investigation purposes. The serverless nature of Azure Functions ensures cost-effective scaling during fraud attack scenarios while providing the flexibility to integrate with existing fraud management systems, notification platforms, and automated blocking mechanisms. The combination of Stream Analytics processing and Function-based response handling follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles for reliability, security, and operational excellence.
 
-From a cost optimization perspective, the consumption-based pricing models of Stream Analytics and Azure Functions align costs with actual fraud detection workloads. Organizations can optimize expenses by rightsizing streaming units based on transaction volumes and implementing intelligent alerting thresholds to minimize false positives. The use of Cosmos DB with appropriate partition strategies ensures efficient storage and retrieval of fraud data while supporting global distribution for multinational organizations. For detailed cost optimization strategies, review the [Azure Stream Analytics pricing guide](https://azure.microsoft.com/en-us/pricing/details/stream-analytics/) and [fraud detection cost optimization patterns](https://docs.microsoft.com/en-us/azure/architecture/solution-ideas/articles/fraud-detection).
+From a cost optimization perspective, the consumption-based pricing models of Stream Analytics and Azure Functions align costs with actual fraud detection workloads. Organizations can optimize expenses by rightsizing streaming units based on transaction volumes and implementing intelligent alerting thresholds to minimize false positives. The use of Cosmos DB with appropriate partition strategies ensures efficient storage and retrieval of fraud data while supporting global distribution for multinational organizations. For detailed cost optimization strategies, review the [Azure pricing documentation](https://azure.microsoft.com/en-us/pricing/) and consider implementing automated scaling policies based on transaction volume patterns.
 
 > **Tip**: Implement gradual rollout strategies for fraud detection rules to minimize business disruption. Start with monitoring mode before enabling automated blocking, and use A/B testing to validate new fraud detection algorithms against historical data.
 
@@ -691,10 +711,15 @@ Extend this fraud detection solution by implementing these advanced enhancements
 
 3. **Adaptive Fraud Scoring**: Implement dynamic fraud scoring that adjusts thresholds based on user behavior patterns, time of day, transaction types, and historical fraud rates to minimize false positives while maintaining high detection rates.
 
-4. **Geospatial Fraud Detection**: Integrate Azure Maps services to detect impossible travel patterns, geographic velocity anomalies, and location-based fraud indicators for enhanced transaction validation.
+4. **Geographic Fraud Detection**: Integrate Azure Maps services to detect impossible travel patterns, geographic velocity anomalies, and location-based fraud indicators for enhanced transaction validation.
 
 5. **Automated Model Retraining**: Implement MLOps pipelines that continuously retrain fraud detection models using new fraud patterns and feedback from fraud investigators to maintain detection accuracy over time.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

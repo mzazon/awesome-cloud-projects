@@ -1,0 +1,915 @@
+# Google Cloud Infrastructure Manager Configuration
+# Financial Compliance Monitoring with AML AI and BigQuery
+# Recipe ID: f7a8b9c2
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: financial-compliance-aml-bigquery
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  info:
+    title: Financial Compliance Monitoring with AML AI and BigQuery
+    description: Intelligent financial compliance monitoring system using BigQuery ML for AML detection
+    version: 1.1
+    author: Google Cloud Solutions
+    date: 2025-07-12
+  content:
+    examples:
+    - name: basic-deployment
+      location: .
+
+---
+
+# Infrastructure Manager Blueprint Configuration
+imports:
+- path: main.tf
+
+# Variable definitions for Infrastructure Manager
+variables:
+  # Project and Location Settings
+  project_id:
+    description: "Google Cloud Project ID for AML compliance system"
+    type: string
+    required: true
+  
+  region:
+    description: "Primary region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Primary zone for compute resources"
+    type: string
+    default: "us-central1-a"
+  
+  # Resource Naming
+  resource_suffix:
+    description: "Unique suffix for resource names to avoid conflicts"
+    type: string
+    default: "aml001"
+  
+  # BigQuery Configuration
+  dataset_location:
+    description: "Location for BigQuery dataset (US, EU, or region)"
+    type: string
+    default: "US"
+    
+  dataset_name:
+    description: "Name for the AML compliance BigQuery dataset"
+    type: string
+    default: "aml_compliance_data"
+  
+  # Storage Configuration
+  storage_class:
+    description: "Storage class for compliance reports bucket"
+    type: string
+    default: "STANDARD"
+    enum: ["STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"]
+  
+  # Function Configuration
+  function_memory:
+    description: "Memory allocation for Cloud Functions (MB)"
+    type: number
+    default: 256
+    
+  function_timeout:
+    description: "Timeout for Cloud Functions (seconds)"
+    type: number
+    default: 60
+  
+  # Scheduler Configuration
+  schedule_timezone:
+    description: "Timezone for scheduled compliance reports"
+    type: string
+    default: "America/New_York"
+    
+  report_schedule:
+    description: "Cron schedule for compliance reports (daily at 2 AM)"
+    type: string
+    default: "0 2 * * *"
+  
+  # Security and Compliance
+  enable_audit_logs:
+    description: "Enable audit logging for compliance tracking"
+    type: boolean
+    default: true
+    
+  enable_versioning:
+    description: "Enable object versioning on storage bucket"
+    type: boolean
+    default: true
+  
+  # Labels for resource management
+  labels:
+    description: "Labels to apply to all resources"
+    type: object
+    default:
+      environment: "production"
+      application: "aml-compliance"
+      cost-center: "risk-management"
+      compliance: "true"
+
+# Terraform configuration for Infrastructure Manager
+resources:
+  - name: terraform-config
+    type: terraform.configurations
+    properties:
+      source: |
+        # Terraform configuration for GCP Financial Compliance AML System
+        
+        terraform {
+          required_version = ">= 1.0"
+          required_providers {
+            google = {
+              source  = "hashicorp/google"
+              version = "~> 5.0"
+            }
+            google-beta = {
+              source  = "hashicorp/google-beta"
+              version = "~> 5.0"
+            }
+            random = {
+              source  = "hashicorp/random"
+              version = "~> 3.4"
+            }
+            archive = {
+              source  = "hashicorp/archive"
+              version = "~> 2.4"
+            }
+          }
+        }
+        
+        # Local variables for resource naming and configuration
+        locals {
+          # Resource names with consistent naming convention
+          dataset_name = var.dataset_name
+          bucket_name = "aml-reports-${var.resource_suffix}"
+          topic_name = "aml-alerts-${var.resource_suffix}"
+          
+          # Function names
+          alert_function_name = "process-aml-alerts-${var.resource_suffix}"
+          report_function_name = "compliance-report-generator-${var.resource_suffix}"
+          
+          # Scheduler job name
+          scheduler_job_name = "daily-compliance-report-${var.resource_suffix}"
+          
+          # Common labels for all resources
+          common_labels = merge(var.labels, {
+            managed-by = "infrastructure-manager"
+            recipe-id  = "f7a8b9c2"
+          })
+        }
+        
+        # Random suffix for globally unique resource names
+        resource "random_id" "suffix" {
+          byte_length = 4
+        }
+        
+        # Data source for current project information
+        data "google_project" "current" {
+          project_id = var.project_id
+        }
+        
+        # Enable required APIs for AML compliance system
+        resource "google_project_service" "required_apis" {
+          for_each = toset([
+            "bigquery.googleapis.com",
+            "cloudfunctions.googleapis.com",
+            "cloudscheduler.googleapis.com",
+            "pubsub.googleapis.com",
+            "storage.googleapis.com",
+            "monitoring.googleapis.com",
+            "logging.googleapis.com",
+            "cloudbuild.googleapis.com"
+          ])
+          
+          project = var.project_id
+          service = each.value
+          
+          disable_on_destroy = false
+          
+          timeouts {
+            create = "10m"
+            update = "10m"
+          }
+        }
+        
+        # BigQuery dataset for AML compliance data
+        resource "google_bigquery_dataset" "aml_dataset" {
+          dataset_id    = local.dataset_name
+          project       = var.project_id
+          location      = var.dataset_location
+          description   = "AML compliance dataset for transaction monitoring and ML models"
+          
+          labels = local.common_labels
+          
+          # Access control for compliance team
+          access {
+            role   = "OWNER"
+            user_by_email = "${data.google_project.current.number}-compute@developer.gserviceaccount.com"
+          }
+          
+          access {
+            role   = "READER"
+            special_group = "projectReaders"
+          }
+          
+          access {
+            role   = "WRITER"
+            special_group = "projectWriters"
+          }
+          
+          # Delete protection for compliance data
+          deletion_protection = true
+          
+          depends_on = [google_project_service.required_apis]
+        }
+        
+        # Transactions table for AML monitoring
+        resource "google_bigquery_table" "transactions" {
+          dataset_id = google_bigquery_dataset.aml_dataset.dataset_id
+          table_id   = "transactions"
+          project    = var.project_id
+          
+          description = "Transaction data table for AML monitoring and analysis"
+          labels      = local.common_labels
+          
+          schema = jsonencode([
+            {
+              name = "transaction_id"
+              type = "STRING"
+              mode = "REQUIRED"
+              description = "Unique identifier for the transaction"
+            },
+            {
+              name = "timestamp"
+              type = "TIMESTAMP"
+              mode = "REQUIRED"
+              description = "Transaction timestamp in UTC"
+            },
+            {
+              name = "account_id"
+              type = "STRING"
+              mode = "REQUIRED"
+              description = "Account identifier for the transaction"
+            },
+            {
+              name = "amount"
+              type = "NUMERIC"
+              mode = "REQUIRED"
+              description = "Transaction amount in base currency units"
+            },
+            {
+              name = "currency"
+              type = "STRING"
+              mode = "REQUIRED"
+              description = "ISO 4217 currency code"
+            },
+            {
+              name = "transaction_type"
+              type = "STRING"
+              mode = "REQUIRED"
+              description = "Type of transaction (WIRE, ACH, etc.)"
+            },
+            {
+              name = "counterparty_id"
+              type = "STRING"
+              mode = "NULLABLE"
+              description = "Counterparty identifier for the transaction"
+            },
+            {
+              name = "country_code"
+              type = "STRING"
+              mode = "NULLABLE"
+              description = "ISO 3166-1 alpha-2 country code"
+            },
+            {
+              name = "risk_score"
+              type = "NUMERIC"
+              mode = "NULLABLE"
+              description = "Calculated risk score (0.0 to 1.0)"
+            },
+            {
+              name = "is_suspicious"
+              type = "BOOLEAN"
+              mode = "NULLABLE"
+              description = "Manual classification of suspicious activity"
+            }
+          ])
+          
+          # Partitioning for performance optimization
+          time_partitioning {
+            type  = "DAY"
+            field = "timestamp"
+            require_partition_filter = true
+          }
+          
+          # Clustering for query optimization
+          clustering = ["country_code", "transaction_type"]
+        }
+        
+        # Compliance alerts table for audit trail
+        resource "google_bigquery_table" "compliance_alerts" {
+          dataset_id = google_bigquery_dataset.aml_dataset.dataset_id
+          table_id   = "compliance_alerts"
+          project    = var.project_id
+          
+          description = "Compliance alerts table for audit trail and investigation tracking"
+          labels      = local.common_labels
+          
+          schema = jsonencode([
+            {
+              name = "alert_id"
+              type = "STRING"
+              mode = "REQUIRED"
+              description = "Unique alert identifier"
+            },
+            {
+              name = "transaction_id"
+              type = "STRING"
+              mode = "REQUIRED"
+              description = "Associated transaction identifier"
+            },
+            {
+              name = "risk_score"
+              type = "NUMERIC"
+              mode = "REQUIRED"
+              description = "ML-calculated risk score"
+            },
+            {
+              name = "alert_timestamp"
+              type = "TIMESTAMP"
+              mode = "REQUIRED"
+              description = "Alert generation timestamp"
+            },
+            {
+              name = "status"
+              type = "STRING"
+              mode = "REQUIRED"
+              description = "Alert status (OPEN, INVESTIGATING, CLOSED)"
+            },
+            {
+              name = "investigator"
+              type = "STRING"
+              mode = "NULLABLE"
+              description = "Assigned investigator identifier"
+            },
+            {
+              name = "resolution"
+              type = "STRING"
+              mode = "NULLABLE"
+              description = "Investigation resolution details"
+            },
+            {
+              name = "resolution_timestamp"
+              type = "TIMESTAMP"
+              mode = "NULLABLE"
+              description = "Alert resolution timestamp"
+            }
+          ])
+          
+          # Partitioning for audit efficiency
+          time_partitioning {
+            type  = "DAY"
+            field = "alert_timestamp"
+            require_partition_filter = true
+          }
+        }
+        
+        # Pub/Sub topic for AML alerts
+        resource "google_pubsub_topic" "aml_alerts" {
+          name    = local.topic_name
+          project = var.project_id
+          labels  = local.common_labels
+          
+          # Message retention for compliance audit
+          message_retention_duration = "86400s" # 24 hours
+          
+          depends_on = [google_project_service.required_apis]
+        }
+        
+        # Pub/Sub subscription for alert processing
+        resource "google_pubsub_subscription" "aml_alerts_subscription" {
+          name    = "${local.topic_name}-subscription"
+          topic   = google_pubsub_topic.aml_alerts.name
+          project = var.project_id
+          labels  = local.common_labels
+          
+          # Message acknowledgment deadline
+          ack_deadline_seconds = 60
+          
+          # Retry policy for failed message processing
+          retry_policy {
+            minimum_backoff = "10s"
+            maximum_backoff = "300s"
+          }
+          
+          # Dead letter policy for unprocessable messages
+          dead_letter_policy {
+            dead_letter_topic     = google_pubsub_topic.aml_alerts_dlq.id
+            max_delivery_attempts = 5
+          }
+        }
+        
+        # Dead letter queue for failed alert processing
+        resource "google_pubsub_topic" "aml_alerts_dlq" {
+          name    = "${local.topic_name}-dlq"
+          project = var.project_id
+          labels  = local.common_labels
+        }
+        
+        # Cloud Storage bucket for compliance reports
+        resource "google_storage_bucket" "compliance_reports" {
+          name     = local.bucket_name
+          project  = var.project_id
+          location = var.region
+          
+          labels = local.common_labels
+          
+          # Enable versioning for compliance requirements
+          versioning {
+            enabled = var.enable_versioning
+          }
+          
+          # Lifecycle management for cost optimization
+          lifecycle_rule {
+            condition {
+              age = 90
+            }
+            action {
+              type          = "SetStorageClass"
+              storage_class = "NEARLINE"
+            }
+          }
+          
+          lifecycle_rule {
+            condition {
+              age = 365
+            }
+            action {
+              type          = "SetStorageClass"
+              storage_class = "COLDLINE"
+            }
+          }
+          
+          lifecycle_rule {
+            condition {
+              age = 2555 # 7 years for regulatory compliance
+            }
+            action {
+              type          = "SetStorageClass"
+              storage_class = "ARCHIVE"
+            }
+          }
+          
+          # Encryption configuration
+          encryption {
+            default_kms_key_name = google_kms_crypto_key.bucket_key.id
+          }
+          
+          # Uniform bucket-level access for security
+          uniform_bucket_level_access = true
+          
+          depends_on = [google_project_service.required_apis]
+        }
+        
+        # KMS key ring for encryption
+        resource "google_kms_key_ring" "compliance_keyring" {
+          name     = "aml-compliance-keyring-${var.resource_suffix}"
+          location = var.region
+          project  = var.project_id
+          
+          depends_on = [google_project_service.required_apis]
+        }
+        
+        # KMS crypto key for bucket encryption
+        resource "google_kms_crypto_key" "bucket_key" {
+          name            = "aml-bucket-key"
+          key_ring        = google_kms_key_ring.compliance_keyring.id
+          rotation_period = "2592000s" # 30 days
+          
+          labels = local.common_labels
+          
+          lifecycle {
+            prevent_destroy = true
+          }
+        }
+        
+        # Service account for Cloud Functions
+        resource "google_service_account" "function_service_account" {
+          account_id   = "aml-function-sa-${random_id.suffix.hex}"
+          display_name = "AML Compliance Functions Service Account"
+          description  = "Service account for AML compliance Cloud Functions"
+          project      = var.project_id
+        }
+        
+        # IAM roles for function service account
+        resource "google_project_iam_member" "function_bigquery_user" {
+          project = var.project_id
+          role    = "roles/bigquery.dataEditor"
+          member  = "serviceAccount:${google_service_account.function_service_account.email}"
+        }
+        
+        resource "google_project_iam_member" "function_storage_admin" {
+          project = var.project_id
+          role    = "roles/storage.objectAdmin"
+          member  = "serviceAccount:${google_service_account.function_service_account.email}"
+        }
+        
+        resource "google_project_iam_member" "function_pubsub_subscriber" {
+          project = var.project_id
+          role    = "roles/pubsub.subscriber"
+          member  = "serviceAccount:${google_service_account.function_service_account.email}"
+        }
+        
+        resource "google_project_iam_member" "function_monitoring_writer" {
+          project = var.project_id
+          role    = "roles/monitoring.metricWriter"
+          member  = "serviceAccount:${google_service_account.function_service_account.email}"
+        }
+        
+        # Cloud Function source code archive for alert processing
+        data "archive_file" "alert_function_source" {
+          type        = "zip"
+          output_path = "/tmp/alert-function-source.zip"
+          source {
+            content = <<-EOT
+              import json
+              import logging
+              import os
+              from google.cloud import bigquery
+              from google.cloud import monitoring_v3
+              
+              def process_aml_alert(cloud_event):
+                  """Process AML alert from Pub/Sub"""
+                  try:
+                      # Decode the CloudEvent message
+                      alert_data = json.loads(cloud_event.data['message']['data'])
+                      
+                      logging.info(f"Processing AML alert: {alert_data}")
+                      
+                      # Initialize BigQuery client
+                      client = bigquery.Client()
+                      
+                      # Log alert to compliance table
+                      query = f"""
+                      INSERT INTO `{alert_data['project_id']}.{alert_data['dataset']}.compliance_alerts`
+                      (alert_id, transaction_id, risk_score, alert_timestamp, status)
+                      VALUES (
+                          GENERATE_UUID(),
+                          '{alert_data['transaction_id']}',
+                          {alert_data['risk_score']},
+                          CURRENT_TIMESTAMP(),
+                          'OPEN'
+                      )
+                      """
+                      
+                      job = client.query(query)
+                      job.result()
+                      
+                      # Create monitoring metric for alert processing
+                      monitoring_client = monitoring_v3.MetricServiceClient()
+                      
+                      logging.info(f"AML alert processed successfully: {alert_data['transaction_id']}")
+                      
+                      return "Alert processed"
+                      
+                  except Exception as e:
+                      logging.error(f"Error processing AML alert: {e}")
+                      raise
+            EOT
+            filename = "main.py"
+          }
+          source {
+            content = <<-EOT
+              google-cloud-bigquery==3.15.0
+              google-cloud-monitoring==2.18.0
+              functions-framework==3.5.0
+            EOT
+            filename = "requirements.txt"
+          }
+        }
+        
+        # Cloud Storage bucket for function source code
+        resource "google_storage_bucket_object" "alert_function_source" {
+          name   = "alert-function-source-${random_id.suffix.hex}.zip"
+          bucket = google_storage_bucket.compliance_reports.name
+          source = data.archive_file.alert_function_source.output_path
+        }
+        
+        # Cloud Function for alert processing
+        resource "google_cloudfunctions2_function" "alert_processor" {
+          name        = local.alert_function_name
+          project     = var.project_id
+          location    = var.region
+          description = "Process AML alerts from Pub/Sub"
+          
+          labels = local.common_labels
+          
+          build_config {
+            runtime     = "python311"
+            entry_point = "process_aml_alert"
+            
+            source {
+              storage_source {
+                bucket = google_storage_bucket.compliance_reports.name
+                object = google_storage_bucket_object.alert_function_source.name
+              }
+            }
+          }
+          
+          service_config {
+            max_instance_count = 10
+            min_instance_count = 0
+            available_memory   = "${var.function_memory}M"
+            timeout_seconds    = var.function_timeout
+            
+            environment_variables = {
+              PROJECT_ID = var.project_id
+              DATASET_ID = local.dataset_name
+            }
+            
+            service_account_email = google_service_account.function_service_account.email
+          }
+          
+          event_trigger {
+            trigger_region = var.region
+            event_type     = "google.cloud.pubsub.topic.v1.messagePublished"
+            pubsub_topic   = google_pubsub_topic.aml_alerts.id
+          }
+          
+          depends_on = [google_project_service.required_apis]
+        }
+        
+        # Cloud Function source code for compliance reporting
+        data "archive_file" "report_function_source" {
+          type        = "zip"
+          output_path = "/tmp/report-function-source.zip"
+          source {
+            content = <<-EOT
+              import json
+              import os
+              from datetime import datetime, timedelta
+              from google.cloud import bigquery
+              from google.cloud import storage
+              
+              def generate_compliance_report(request):
+                  """Generate daily compliance report"""
+                  try:
+                      client = bigquery.Client()
+                      storage_client = storage.Client()
+                      
+                      # Get bucket name from environment
+                      bucket_name = os.environ.get('BUCKET_NAME')
+                      if not bucket_name:
+                          raise ValueError("BUCKET_NAME environment variable not set")
+                      
+                      # Generate report for previous day
+                      yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+                      
+                      # Query suspicious transactions
+                      query = f"""
+                      SELECT 
+                          transaction_id,
+                          timestamp,
+                          account_id,
+                          amount,
+                          currency,
+                          risk_score,
+                          country_code
+                      FROM `{client.project}.aml_compliance_data.transactions`
+                      WHERE DATE(timestamp) = '{yesterday}'
+                        AND is_suspicious = true
+                      ORDER BY risk_score DESC
+                      """
+                      
+                      results = client.query(query).to_dataframe()
+                      
+                      # Generate report content
+                      report_content = f"""
+              AML Compliance Report - {yesterday}
+              
+              Total Suspicious Transactions: {len(results)}
+              High Risk Transactions (>0.8): {len(results[results['risk_score'] > 0.8]) if len(results) > 0 else 0}
+              
+              Detailed Transactions:
+              {results.to_string(index=False) if len(results) > 0 else 'No suspicious transactions found'}
+              
+              Generated: {datetime.now().isoformat()}
+                      """
+                      
+                      # Upload report to Cloud Storage
+                      bucket = storage_client.bucket(bucket_name)
+                      blob = bucket.blob(f'compliance-reports/aml-report-{yesterday}.txt')
+                      blob.upload_from_string(report_content)
+                      
+                      print(f"Compliance report generated for {yesterday}")
+                      return f"Report generated for {yesterday}", 200
+                      
+                  except Exception as e:
+                      print(f"Error generating compliance report: {e}")
+                      return f"Error generating report: {str(e)}", 500
+            EOT
+            filename = "main.py"
+          }
+          source {
+            content = <<-EOT
+              google-cloud-bigquery==3.15.0
+              google-cloud-storage==2.12.0
+              pandas==2.1.4
+              functions-framework==3.5.0
+            EOT
+            filename = "requirements.txt"
+          }
+        }
+        
+        # Cloud Storage object for report function source
+        resource "google_storage_bucket_object" "report_function_source" {
+          name   = "report-function-source-${random_id.suffix.hex}.zip"
+          bucket = google_storage_bucket.compliance_reports.name
+          source = data.archive_file.report_function_source.output_path
+        }
+        
+        # Cloud Function for compliance reporting
+        resource "google_cloudfunctions2_function" "report_generator" {
+          name        = local.report_function_name
+          project     = var.project_id
+          location    = var.region
+          description = "Generate automated compliance reports"
+          
+          labels = local.common_labels
+          
+          build_config {
+            runtime     = "python311"
+            entry_point = "generate_compliance_report"
+            
+            source {
+              storage_source {
+                bucket = google_storage_bucket.compliance_reports.name
+                object = google_storage_bucket_object.report_function_source.name
+              }
+            }
+          }
+          
+          service_config {
+            max_instance_count = 1
+            min_instance_count = 0
+            available_memory   = "512M"
+            timeout_seconds    = 300
+            
+            environment_variables = {
+              PROJECT_ID  = var.project_id
+              BUCKET_NAME = google_storage_bucket.compliance_reports.name
+            }
+            
+            service_account_email = google_service_account.function_service_account.email
+          }
+          
+          depends_on = [google_project_service.required_apis]
+        }
+        
+        # IAM binding for report function HTTP trigger
+        resource "google_cloudfunctions2_function_iam_member" "report_function_invoker" {
+          project        = var.project_id
+          location       = var.region
+          cloud_function = google_cloudfunctions2_function.report_generator.name
+          role           = "roles/cloudfunctions.invoker"
+          member         = "serviceAccount:${google_service_account.function_service_account.email}"
+        }
+        
+        # Cloud Scheduler job for automated compliance reporting
+        resource "google_cloud_scheduler_job" "compliance_report_job" {
+          name        = local.scheduler_job_name
+          project     = var.project_id
+          region      = var.region
+          description = "Daily AML compliance report generation"
+          
+          schedule  = var.report_schedule
+          time_zone = var.schedule_timezone
+          
+          http_target {
+            http_method = "GET"
+            uri         = google_cloudfunctions2_function.report_generator.service_config[0].uri
+            
+            oidc_token {
+              service_account_email = google_service_account.function_service_account.email
+            }
+          }
+          
+          depends_on = [google_project_service.required_apis]
+        }
+        
+        # Cloud Monitoring dashboard for AML system
+        resource "google_monitoring_dashboard" "aml_dashboard" {
+          dashboard_json = jsonencode({
+            displayName = "AML Compliance Monitoring Dashboard"
+            mosaicLayout = {
+              tiles = [
+                {
+                  width = 6
+                  height = 4
+                  widget = {
+                    title = "Transaction Volume"
+                    xyChart = {
+                      dataSets = [{
+                        timeSeriesQuery = {
+                          timeSeriesFilter = {
+                            filter = "resource.type=\"bigquery_dataset\""
+                            aggregation = {
+                              alignmentPeriod = "300s"
+                              perSeriesAligner = "ALIGN_RATE"
+                            }
+                          }
+                        }
+                        plotType = "LINE"
+                      }]
+                    }
+                  }
+                },
+                {
+                  width = 6
+                  height = 4
+                  widget = {
+                    title = "Alert Processing Rate"
+                    xyChart = {
+                      dataSets = [{
+                        timeSeriesQuery = {
+                          timeSeriesFilter = {
+                            filter = "resource.type=\"cloud_function\""
+                            aggregation = {
+                              alignmentPeriod = "300s"
+                              perSeriesAligner = "ALIGN_RATE"
+                            }
+                          }
+                        }
+                        plotType = "LINE"
+                      }]
+                    }
+                  }
+                }
+              ]
+            }
+          })
+          
+          project = var.project_id
+        }
+        
+        # Output values for verification and integration
+        output "dataset_id" {
+          description = "BigQuery dataset ID for AML compliance data"
+          value       = google_bigquery_dataset.aml_dataset.dataset_id
+        }
+        
+        output "bucket_name" {
+          description = "Cloud Storage bucket name for compliance reports"
+          value       = google_storage_bucket.compliance_reports.name
+        }
+        
+        output "pubsub_topic" {
+          description = "Pub/Sub topic name for AML alerts"
+          value       = google_pubsub_topic.aml_alerts.name
+        }
+        
+        output "alert_function_name" {
+          description = "Cloud Function name for alert processing"
+          value       = google_cloudfunctions2_function.alert_processor.name
+        }
+        
+        output "report_function_name" {
+          description = "Cloud Function name for compliance reporting"
+          value       = google_cloudfunctions2_function.report_generator.name
+        }
+        
+        output "scheduler_job_name" {
+          description = "Cloud Scheduler job name for automated reporting"
+          value       = google_cloud_scheduler_job.compliance_report_job.name
+        }
+        
+        output "dashboard_url" {
+          description = "Cloud Monitoring dashboard URL"
+          value       = "https://console.cloud.google.com/monitoring/dashboards/custom/${google_monitoring_dashboard.aml_dashboard.id}?project=${var.project_id}"
+        }
+        
+        output "service_account_email" {
+          description = "Service account email for Cloud Functions"
+          value       = google_service_account.function_service_account.email
+        }
+
+# Deployment outputs for Infrastructure Manager
+outputs:
+  aml_dataset_id:
+    description: "BigQuery dataset ID for AML compliance data"
+    
+  compliance_bucket_name:
+    description: "Cloud Storage bucket name for compliance reports"
+    
+  alert_topic_name:
+    description: "Pub/Sub topic name for AML alerts"
+    
+  monitoring_dashboard_url:
+    description: "URL to the AML monitoring dashboard"
+    
+  function_service_account:
+    description: "Service account email for Cloud Functions"

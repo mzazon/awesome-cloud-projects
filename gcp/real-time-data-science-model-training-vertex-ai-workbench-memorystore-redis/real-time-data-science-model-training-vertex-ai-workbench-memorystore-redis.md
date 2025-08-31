@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Vertex AI Workbench, Memorystore Redis, Cloud Batch, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-24
 passed-qa: null
 tags: machine-learning, data-science, caching, real-time, vertex-ai, redis, model-training, jupyter
 recipe-generator-version: 1.3
@@ -82,7 +82,7 @@ graph TB
 # Set environment variables for GCP resources
 export PROJECT_ID="ml-training-$(date +%s)"
 export REGION="us-central1"
-export ZONE="us-central1-a"
+export ZONE="us-central1-b"
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -99,6 +99,7 @@ gcloud services enable batch.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable storage.googleapis.com
 gcloud services enable compute.googleapis.com
+gcloud services enable notebooks.googleapis.com
 
 # Create Cloud Storage bucket for datasets and models
 export BUCKET_NAME="ml-training-bucket-${RANDOM_SUFFIX}"
@@ -134,9 +135,14 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        --labels=environment=training,use-case=ml-caching
    
    # Wait for Redis instance to be ready
-   gcloud redis instances describe ${REDIS_INSTANCE_NAME} \
+   echo "Waiting for Redis instance to become ready..."
+   while [[ $(gcloud redis instances describe ${REDIS_INSTANCE_NAME} \
        --region=${REGION} \
-       --format="value(state)"
+       --format="value(state)") != "READY" ]]; do
+       echo "Redis instance status: $(gcloud redis instances describe ${REDIS_INSTANCE_NAME} \
+           --region=${REGION} --format="value(state)")"
+       sleep 30
+   done
    
    echo "✅ Redis instance created for feature caching"
    ```
@@ -156,15 +162,22 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        --machine-type=n1-standard-4 \
        --accelerator-type=NVIDIA_TESLA_T4 \
        --accelerator-core-count=1 \
-       --boot-disk-size=100GB \
+       --boot-disk-size=100 \
        --boot-disk-type=pd-ssd \
-       --data-disk-size=200GB \
+       --data-disk-size=200 \
        --data-disk-type=pd-ssd \
-       --metadata="enable-oslogin=true" \
-       --labels=environment=training,team=data-science
+       --labels=environment=training,team=data-science \
+       --install-gpu-driver
    
    # Wait for instance to be ready
-   sleep 120
+   echo "Waiting for Workbench instance to become active..."
+   while [[ $(gcloud workbench instances describe ${WORKBENCH_NAME} \
+       --location=${ZONE} \
+       --format="value(state)") != "ACTIVE" ]]; do
+       echo "Workbench instance status: $(gcloud workbench instances describe ${WORKBENCH_NAME} \
+           --location=${ZONE} --format="value(state)")"
+       sleep 30
+   done
    
    echo "✅ Vertex AI Workbench instance created with GPU acceleration"
    ```
@@ -173,7 +186,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 
 3. **Configure Network Connectivity for Redis Access**:
 
-   Establishing secure network connectivity between the Workbench instance and Redis cluster ensures low-latency access to cached features while maintaining security isolation. The VPC peering configuration enables private communication without exposing Redis to public internet access.
+   Establishing secure network connectivity between the Workbench instance and Redis cluster ensures low-latency access to cached features while maintaining security isolation. The firewall configuration enables private communication without exposing Redis to public internet access.
 
    ```bash
    # Get Redis instance details for network configuration
@@ -186,7 +199,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        --format="value(port)")
    
    # Create firewall rule for Redis access from Workbench
-   gcloud compute firewall-rules create allow-redis-access \
+   gcloud compute firewall-rules create allow-redis-access-${RANDOM_SUFFIX} \
        --allow tcp:${REDIS_PORT} \
        --source-ranges=10.0.0.0/8 \
        --target-tags=redis-client \
@@ -359,7 +372,7 @@ EOF
     "taskSpec": {
       "runnables": [{
         "script": {
-          "text": "python3 /mnt/disks/training_script.py"
+          "text": "#!/bin/bash\ncd /tmp\ngsutil cp gs://${BUCKET_NAME}/scripts/training_script.py .\npip install redis pandas scikit-learn google-cloud-storage\npython3 training_script.py"
         }
       }],
       "computeResource": {
@@ -406,15 +419,15 @@ EOF
         "width": 6,
         "height": 4,
         "widget": {
-          "title": "Redis Cache Hit Ratio",
+          "title": "Redis Memory Usage",
           "xyChart": {
             "dataSets": [{
               "timeSeriesQuery": {
                 "timeSeriesFilter": {
-                  "filter": "resource.type=\"redis_instance\"",
+                  "filter": "resource.type=\"redis_instance\" AND metric.type=\"redis.googleapis.com/server/memory_usage_ratio\"",
                   "aggregation": {
                     "alignmentPeriod": "60s",
-                    "perSeriesAligner": "ALIGN_RATE"
+                    "perSeriesAligner": "ALIGN_MEAN"
                   }
                 }
               }
@@ -426,12 +439,12 @@ EOF
         "width": 6,
         "height": 4,
         "widget": {
-          "title": "Workbench Instance CPU Usage",
+          "title": "Batch Job Status",
           "xyChart": {
             "dataSets": [{
               "timeSeriesQuery": {
                 "timeSeriesFilter": {
-                  "filter": "resource.type=\"compute_instance\"",
+                  "filter": "resource.type=\"batch_job\"",
                   "aggregation": {
                     "alignmentPeriod": "60s",
                     "perSeriesAligner": "ALIGN_MEAN"
@@ -559,19 +572,33 @@ EOF
        --location=${REGION} \
        --config=batch_job.json
    
-   # Monitor job status
+   # Monitor job status with timeout
    echo "Monitoring batch job execution..."
-   gcloud batch jobs describe ${JOB_NAME} \
-       --location=${REGION} \
-       --format="value(status.state)"
+   timeout=1800  # 30 minutes timeout
+   elapsed=0
    
-   # Wait for job completion (this may take several minutes)
-   while [[ $(gcloud batch jobs describe ${JOB_NAME} --location=${REGION} --format="value(status.state)") != "SUCCEEDED" ]]; do
-       echo "Job status: $(gcloud batch jobs describe ${JOB_NAME} --location=${REGION} --format="value(status.state)")"
+   while [[ $elapsed -lt $timeout ]]; do
+       job_state=$(gcloud batch jobs describe ${JOB_NAME} \
+           --location=${REGION} \
+           --format="value(status.state)" 2>/dev/null || echo "UNKNOWN")
+       
+       echo "Job status: ${job_state}"
+       
+       if [[ "${job_state}" == "SUCCEEDED" ]]; then
+           echo "✅ Training pipeline executed successfully via Cloud Batch"
+           break
+       elif [[ "${job_state}" == "FAILED" ]]; then
+           echo "❌ Training job failed"
+           break
+       fi
+       
        sleep 30
+       elapsed=$((elapsed + 30))
    done
    
-   echo "✅ Training pipeline executed successfully via Cloud Batch"
+   if [[ $elapsed -ge $timeout ]]; then
+       echo "⚠️ Job monitoring timed out after ${timeout} seconds"
+   fi
    ```
 
    The distributed training job is now executing with Redis caching integration, demonstrating scalable ML pipeline orchestration. This configuration enables efficient resource utilization while maintaining high-performance feature access through in-memory caching.
@@ -595,10 +622,10 @@ EOF
    # Check Workbench instance status
    gcloud workbench instances describe ${WORKBENCH_NAME} \
        --location=${ZONE} \
-       --format="table(name,state,machineType,acceleratorConfig.type)"
+       --format="table(name,state,machineType)"
    ```
 
-   Expected output: Workbench instance in "ACTIVE" state with specified machine type and GPU configuration.
+   Expected output: Workbench instance in "ACTIVE" state with specified machine type.
 
 3. Test Redis caching performance:
 
@@ -634,6 +661,8 @@ print(f"Redis Read Time: {read_time:.4f} seconds")
 print(f"Data integrity check: {np.array_equal(test_data, cached_data)}")
 EOF
    
+   REDIS_HOST=${REDIS_HOST} \
+   REDIS_PORT=${REDIS_PORT} \
    python3 test_redis_performance.py
    ```
 
@@ -642,15 +671,15 @@ EOF
 4. Verify Cloud Batch job execution:
 
    ```bash
-   # Check batch job logs
+   # Check batch job logs and status
    gcloud batch jobs describe ${JOB_NAME} \
        --location=${REGION} \
        --format="table(name,status.state,status.runDuration)"
    
-   # View job logs
+   # View job logs (if available)
    gcloud logging read "resource.type=\"batch_task\" AND resource.labels.job_id=\"${JOB_NAME}\"" \
        --limit=10 \
-       --format="table(timestamp,severity,textPayload)"
+       --format="table(timestamp,severity,textPayload)" || echo "No logs available yet"
    ```
 
    Expected output: Successful job completion with training logs showing Redis connectivity and model training progress.
@@ -703,7 +732,7 @@ EOF
 
    ```bash
    # Remove firewall rule
-   gcloud compute firewall-rules delete allow-redis-access --quiet
+   gcloud compute firewall-rules delete allow-redis-access-${RANDOM_SUFFIX} --quiet
    
    # Clean up temporary files
    rm -f generate_dataset.py training_script.py batch_job.json
@@ -743,4 +772,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

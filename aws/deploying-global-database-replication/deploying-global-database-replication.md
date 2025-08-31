@@ -4,14 +4,14 @@ id: b925ccc9
 category: database
 difficulty: 300
 subject: aws
-services: aurora,rds,global,database
+services: aurora,rds,cloudwatch,iam
 estimated-time: 240 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: aurora,global-database,multi-master,replication,disaster-recovery,write-forwarding
+tags: aurora,global-database,multi-region,replication,disaster-recovery,write-forwarding
 recipe-generator-version: 1.3
 ---
 
@@ -98,10 +98,10 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for Aurora, RDS, and Global Database operations
+1. AWS account with appropriate permissions for Aurora, RDS, Global Database, and CloudWatch operations
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of Aurora cluster architecture and database replication concepts
-4. Basic knowledge of MySQL/PostgreSQL and database connection management
+4. Basic knowledge of MySQL database administration and connection management
 5. Familiarity with multi-region AWS architectures and networking
 6. Estimated cost: $500-800/month for global database setup across 3 regions with db.r5.large instances
 
@@ -111,11 +111,14 @@ graph TB
 
 ```bash
 # Set environment variables for multi-region setup
+export AWS_REGION=$(aws configure get region)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+    --query Account --output text)
+
+# Define regions for global database deployment
 export PRIMARY_REGION="us-east-1"
 export SECONDARY_REGION_1="eu-west-1"
 export SECONDARY_REGION_2="ap-southeast-1"
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-    --query Account --output text)
 
 # Generate unique identifiers for resources
 RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
@@ -129,9 +132,9 @@ export PRIMARY_CLUSTER_ID="primary-cluster-${RANDOM_SUFFIX}"
 export SECONDARY_CLUSTER_1_ID="secondary-eu-${RANDOM_SUFFIX}"
 export SECONDARY_CLUSTER_2_ID="secondary-asia-${RANDOM_SUFFIX}"
 
-# Database configuration
+# Database configuration using latest Aurora MySQL version 3
 export DB_ENGINE="aurora-mysql"
-export ENGINE_VERSION="8.0.mysql_aurora.3.02.0"
+export ENGINE_VERSION="8.0.mysql_aurora.3.09.0"
 export DB_INSTANCE_CLASS="db.r5.large"
 export MASTER_USERNAME="globaladmin"
 
@@ -146,6 +149,7 @@ echo "Global DB ID: ${GLOBAL_DB_IDENTIFIER}"
 echo "Primary Region: ${PRIMARY_REGION}"
 echo "Secondary Regions: ${SECONDARY_REGION_1}, ${SECONDARY_REGION_2}"
 echo "Master Username: ${MASTER_USERNAME}"
+echo "Engine Version: ${ENGINE_VERSION}"
 echo "Password stored in: MASTER_PASSWORD variable"
 ```
 
@@ -175,7 +179,7 @@ echo "Password stored in: MASTER_PASSWORD variable"
 
 2. **Create Primary Aurora Cluster**:
 
-   The primary cluster serves as the authoritative source for all write operations in the global database architecture. Aurora Global Database uses a single-writer, multi-reader model where the primary cluster in one region handles all write operations, ensuring strong consistency and eliminating the complexities of multi-master conflict resolution. This design choice provides better performance and reliability than traditional multi-master approaches.
+   The primary cluster serves as the authoritative source for all write operations in the global database architecture. Aurora Global Database uses a single-writer, multi-reader model where the primary cluster in one region handles all write operations, ensuring strong consistency and eliminating the complexities of multi-master conflict resolution. This design choice provides better performance and reliability than traditional multi-master approaches, following AWS Well-Architected Framework principles for reliability and operational excellence.
 
    ```bash
    # Create primary cluster in us-east-1
@@ -189,6 +193,7 @@ echo "Password stored in: MASTER_PASSWORD variable"
        --backup-retention-period 7 \
        --preferred-backup-window "07:00-09:00" \
        --preferred-maintenance-window "sun:09:00-sun:11:00" \
+       --storage-encrypted \
        --region ${PRIMARY_REGION}
    
    # Wait for primary cluster creation
@@ -199,7 +204,7 @@ echo "Password stored in: MASTER_PASSWORD variable"
    echo "✅ Primary cluster ${PRIMARY_CLUSTER_ID} created in ${PRIMARY_REGION}"
    ```
 
-   The primary cluster is now operational and serves as the foundation for the global database. All write operations from any region will ultimately be processed by this cluster, ensuring data consistency across the global infrastructure.
+   The primary cluster is now operational with encryption at rest and automated backups enabled, following AWS security best practices. All write operations from any region will ultimately be processed by this cluster, ensuring data consistency across the global infrastructure.
 
 3. **Create Primary Cluster Database Instances**:
 
@@ -212,7 +217,8 @@ echo "Password stored in: MASTER_PASSWORD variable"
        --db-instance-identifier "${PRIMARY_CLUSTER_ID}-writer" \
        --db-instance-class ${DB_INSTANCE_CLASS} \
        --engine ${DB_ENGINE} \
-       --engine-version ${ENGINE_VERSION} \
+       --monitoring-interval 60 \
+       --monitoring-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role" \
        --region ${PRIMARY_REGION}
    
    # Create reader instance for primary cluster
@@ -221,7 +227,8 @@ echo "Password stored in: MASTER_PASSWORD variable"
        --db-instance-identifier "${PRIMARY_CLUSTER_ID}-reader" \
        --db-instance-class ${DB_INSTANCE_CLASS} \
        --engine ${DB_ENGINE} \
-       --engine-version ${ENGINE_VERSION} \
+       --monitoring-interval 60 \
+       --monitoring-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role" \
        --region ${PRIMARY_REGION}
    
    # Wait for instances to be available
@@ -236,7 +243,7 @@ echo "Password stored in: MASTER_PASSWORD variable"
    echo "✅ Primary cluster instances created and available"
    ```
 
-   Both instances are now running and ready to handle database operations. The primary cluster can now accept connections and process transactions while simultaneously replicating data to secondary regions as they come online.
+   Both instances are now running with enhanced monitoring enabled and ready to handle database operations. The primary cluster can now accept connections and process transactions while simultaneously replicating data to secondary regions as they come online.
 
 4. **Create First Secondary Cluster in Europe**:
 
@@ -248,8 +255,8 @@ echo "Password stored in: MASTER_PASSWORD variable"
        --global-cluster-identifier ${GLOBAL_DB_IDENTIFIER} \
        --db-cluster-identifier ${SECONDARY_CLUSTER_1_ID} \
        --engine ${DB_ENGINE} \
-       --engine-version ${ENGINE_VERSION} \
        --enable-global-write-forwarding \
+       --storage-encrypted \
        --region ${SECONDARY_REGION_1}
    
    # Wait for secondary cluster creation
@@ -273,7 +280,8 @@ echo "Password stored in: MASTER_PASSWORD variable"
        --db-instance-identifier "${SECONDARY_CLUSTER_1_ID}-writer" \
        --db-instance-class ${DB_INSTANCE_CLASS} \
        --engine ${DB_ENGINE} \
-       --engine-version ${ENGINE_VERSION} \
+       --monitoring-interval 60 \
+       --monitoring-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role" \
        --region ${SECONDARY_REGION_1}
    
    # Create reader instance for European secondary cluster
@@ -282,7 +290,8 @@ echo "Password stored in: MASTER_PASSWORD variable"
        --db-instance-identifier "${SECONDARY_CLUSTER_1_ID}-reader" \
        --db-instance-class ${DB_INSTANCE_CLASS} \
        --engine ${DB_ENGINE} \
-       --engine-version ${ENGINE_VERSION} \
+       --monitoring-interval 60 \
+       --monitoring-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role" \
        --region ${SECONDARY_REGION_1}
    
    # Wait for instances to be available
@@ -309,8 +318,8 @@ echo "Password stored in: MASTER_PASSWORD variable"
        --global-cluster-identifier ${GLOBAL_DB_IDENTIFIER} \
        --db-cluster-identifier ${SECONDARY_CLUSTER_2_ID} \
        --engine ${DB_ENGINE} \
-       --engine-version ${ENGINE_VERSION} \
        --enable-global-write-forwarding \
+       --storage-encrypted \
        --region ${SECONDARY_REGION_2}
    
    # Wait for secondary cluster creation
@@ -334,7 +343,8 @@ echo "Password stored in: MASTER_PASSWORD variable"
        --db-instance-identifier "${SECONDARY_CLUSTER_2_ID}-writer" \
        --db-instance-class ${DB_INSTANCE_CLASS} \
        --engine ${DB_ENGINE} \
-       --engine-version ${ENGINE_VERSION} \
+       --monitoring-interval 60 \
+       --monitoring-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role" \
        --region ${SECONDARY_REGION_2}
    
    # Create reader instance for Asian secondary cluster
@@ -343,7 +353,8 @@ echo "Password stored in: MASTER_PASSWORD variable"
        --db-instance-identifier "${SECONDARY_CLUSTER_2_ID}-reader" \
        --db-instance-class ${DB_INSTANCE_CLASS} \
        --engine ${DB_ENGINE} \
-       --engine-version ${ENGINE_VERSION} \
+       --monitoring-interval 60 \
+       --monitoring-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role" \
        --region ${SECONDARY_REGION_2}
    
    # Wait for instances to be available
@@ -402,7 +413,6 @@ echo "Password stored in: MASTER_PASSWORD variable"
 
    ```bash
    # Create sample database and table on primary cluster
-   # Note: Replace with actual database connection method
    mysql -h ${PRIMARY_WRITER_ENDPOINT} \
        -u ${MASTER_USERNAME} -p${MASTER_PASSWORD} \
        --execute "
@@ -431,7 +441,6 @@ echo "Password stored in: MASTER_PASSWORD variable"
 
     ```bash
     # Test write forwarding from European cluster
-    # Note: In practice, you'll need to configure session parameters
     mysql -h ${SECONDARY_1_WRITER_ENDPOINT} \
         -u ${MASTER_USERNAME} -p${MASTER_PASSWORD} \
         --execute "
@@ -456,7 +465,7 @@ echo "Password stored in: MASTER_PASSWORD variable"
 
 11. **Configure CloudWatch Monitoring**:
 
-    Monitoring is essential for maintaining global database performance and identifying potential issues before they impact applications. Performance Insights provides detailed database performance metrics, query analysis, and wait event monitoring that helps optimize database performance across all regions.
+    Monitoring is essential for maintaining global database performance and identifying potential issues before they impact applications. Performance Insights provides detailed database performance metrics, query analysis, and wait event monitoring that helps optimize database performance across all regions following AWS operational excellence principles.
 
     ```bash
     # Enable enhanced monitoring for all instances
@@ -523,7 +532,7 @@ echo "Password stored in: MASTER_PASSWORD variable"
             }
         ]
     }
-    EOF
+EOF
     
     aws cloudwatch put-dashboard \
         --dashboard-name "Aurora-Global-Database-${RANDOM_SUFFIX}" \
@@ -738,17 +747,17 @@ echo "Password stored in: MASTER_PASSWORD variable"
 
 ## Discussion
 
-Aurora Global Database with write forwarding represents a sophisticated approach to global database replication that addresses the complex requirements of modern distributed applications. Unlike traditional multi-master replication systems that can suffer from conflict resolution issues and eventual consistency problems, Aurora Global Database maintains a single-master architecture where all writes are processed by the primary cluster, ensuring strong consistency across all regions while allowing local write operations through the write forwarding mechanism.
+Aurora Global Database with write forwarding represents a sophisticated approach to global database replication that addresses the complex requirements of modern distributed applications. Unlike traditional multi-master replication systems that can suffer from conflict resolution issues and eventual consistency problems, Aurora Global Database maintains a single-master architecture where all writes are processed by the primary cluster, ensuring strong consistency across all regions while allowing local write operations through the write forwarding mechanism. This architecture aligns with the AWS Well-Architected Framework's reliability pillar by providing predictable performance and data consistency guarantees.
 
-The write forwarding feature is particularly valuable for applications that need to provide consistent user experiences across multiple geographic regions without requiring complex application-level routing logic. When a write operation is submitted to a secondary cluster, Aurora automatically forwards the statement to the primary cluster along with all necessary session and transactional context, processes the write operation, and then replicates the changes back to all secondary clusters. This approach eliminates the need for applications to maintain region-specific write routing while providing sub-second replication latency between regions.
+The write forwarding feature is particularly valuable for applications that need to provide consistent user experiences across multiple geographic regions without requiring complex application-level routing logic. When a write operation is submitted to a secondary cluster, Aurora automatically forwards the statement to the primary cluster along with all necessary session and transactional context, processes the write operation, and then replicates the changes back to all secondary clusters. This approach eliminates the need for applications to maintain region-specific write routing while providing sub-second replication latency between regions, following the performance efficiency pillar of the Well-Architected Framework.
 
-From a performance perspective, Aurora Global Database provides significant advantages over traditional cross-region replication approaches. The dedicated replication infrastructure operates at the storage layer rather than the database engine level, which means replication has minimal impact on the performance of the primary cluster. Additionally, applications can leverage local read replicas in each region for read-heavy workloads while using write forwarding for write operations, providing an optimal balance between performance and consistency.
+From a performance perspective, Aurora Global Database provides significant advantages over traditional cross-region replication approaches. The dedicated replication infrastructure operates at the storage layer rather than the database engine level, which means replication has minimal impact on the performance of the primary cluster. Additionally, applications can leverage local read replicas in each region for read-heavy workloads while using write forwarding for write operations, providing an optimal balance between performance and consistency while supporting cost optimization through efficient resource utilization.
 
-The architecture also provides robust disaster recovery capabilities with both planned switchover and emergency failover mechanisms. In the event of a regional outage, Aurora Global Database can promote a secondary cluster to become the new primary cluster, typically completing the process within minutes and with minimal data loss. This level of resilience is crucial for mission-critical applications that cannot tolerate extended downtime or significant data loss.
+The architecture also provides robust disaster recovery capabilities with both planned switchover and emergency failover mechanisms. In the event of a regional outage, Aurora Global Database can promote a secondary cluster to become the new primary cluster, typically completing the process within minutes and with minimal data loss. This level of resilience is crucial for mission-critical applications that cannot tolerate extended downtime or significant data loss, supporting the reliability pillar's requirement for automatic recovery from failure.
 
-> **Tip**: Monitor the AuroraGlobalDBReplicationLag metric closely to ensure replication performance meets your application requirements. High replication lag can indicate network issues or high write volume that may require optimization.
+> **Tip**: Monitor the AuroraGlobalDBReplicationLag metric closely to ensure replication performance meets your application requirements. High replication lag can indicate network issues or high write volume that may require optimization. See the [AWS CloudWatch documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/aws-services-cloudwatch-metrics.html) for detailed monitoring guidance.
 
-> **Note**: Write forwarding adds network latency to write operations from secondary regions, so consider your application's latency requirements when designing the overall architecture. For applications with strict latency requirements, consider caching strategies or read-heavy workload patterns.
+> **Note**: Write forwarding adds network latency to write operations from secondary regions, so consider your application's latency requirements when designing the overall architecture. For applications with strict latency requirements, consider caching strategies or read-heavy workload patterns as outlined in the [AWS Aurora User Guide](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database.html).
 
 ## Challenge
 
@@ -766,4 +775,11 @@ Extend this global database solution by implementing these advanced enhancements
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

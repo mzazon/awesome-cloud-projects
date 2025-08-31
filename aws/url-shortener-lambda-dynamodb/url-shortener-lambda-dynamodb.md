@@ -6,16 +6,16 @@ difficulty: 100
 subject: aws
 services: Lambda, DynamoDB, API Gateway, CloudWatch
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-25
 passed-qa: null
 tags: serverless, url-shortener, lambda, dynamodb, api-gateway, beginners
 recipe-generator-version: 1.3
 ---
 
-# URL Shortener Service with Lambda
+# URL Shortener Service with Lambda and DynamoDB
 
 ## Problem
 
@@ -36,26 +36,26 @@ graph TB
     end
     
     subgraph "API Layer"
-        API[API Gateway]
+        API[API Gateway HTTP API]
         CORS[CORS Headers]
     end
     
     subgraph "Compute Layer"
-        LAMBDA[Lambda Functions]
-        CREATE[Create URL Function]
-        REDIRECT[Redirect Function]
+        LAMBDA[Lambda Function]
+        CREATE[Create URL Handler]
+        REDIRECT[Redirect Handler]
     end
     
     subgraph "Data Layer"
         DDB[DynamoDB Table]
         URLS[URL Mappings]
-        METRICS[Click Metrics]
+        METRICS[Click Analytics]
     end
     
     subgraph "Monitoring"
         CW[CloudWatch]
         LOGS[Function Logs]
-        METRICS_CW[Custom Metrics]
+        DASHBOARD[Metrics Dashboard]
     end
     
     USER --> API
@@ -76,7 +76,7 @@ graph TB
     
     LAMBDA --> CW
     CW --> LOGS
-    CW --> METRICS_CW
+    CW --> DASHBOARD
     
     style DDB fill:#FF9900
     style LAMBDA fill:#FF9900
@@ -87,9 +87,9 @@ graph TB
 ## Prerequisites
 
 1. AWS account with appropriate permissions for Lambda, DynamoDB, API Gateway, and CloudWatch
-2. AWS CLI installed and configured (or AWS CloudShell)
+2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of serverless architecture patterns and HTTP APIs
-4. Python 3.9 or later for Lambda function development
+4. Python 3.12 or later for Lambda function development
 5. Estimated cost: $0.50-$2.00 per month for development usage (within Free Tier limits)
 
 > **Note**: This recipe follows AWS Well-Architected Framework principles for serverless applications. See [AWS Well-Architected Serverless Lens](https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/welcome.html) for additional guidance.
@@ -454,7 +454,7 @@ EOF
    echo "✅ Lambda function package created"
    ```
 
-   The function implements secure URL validation, generates unique short IDs using SHA-256 hashing, and includes comprehensive error handling. The code follows AWS Lambda best practices with proper logging and response formatting.
+   The function implements secure URL validation, generates unique short IDs using SHA-256 hashing with Base62 encoding, and includes comprehensive error handling. The code follows AWS Lambda best practices with proper logging, response formatting, and efficient DynamoDB operations.
 
 3. **Deploy Lambda Function**:
 
@@ -464,10 +464,10 @@ EOF
        --role-name ${FUNCTION_NAME}-role \
        --query Role.Arn --output text)
    
-   # Create Lambda function
+   # Create Lambda function with Python 3.12 runtime
    aws lambda create-function \
        --function-name ${FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb:///tmp/lambda-function.zip \
@@ -487,7 +487,7 @@ EOF
    API Gateway provides a fully managed service for creating, deploying, and managing HTTP APIs. The HTTP API offers lower latency and cost compared to REST APIs while supporting modern web standards including CORS and JWT authorizers.
 
    ```bash
-   # Create HTTP API
+   # Create HTTP API with CORS configuration
    API_ID=$(aws apigatewayv2 create-api \
        --name ${API_NAME} \
        --protocol-type HTTP \
@@ -500,7 +500,7 @@ EOF
        --function-name ${FUNCTION_NAME} \
        --query Configuration.FunctionArn --output text)
    
-   # Create integration
+   # Create integration for Lambda proxy
    INTEGRATION_ID=$(aws apigatewayv2 create-integration \
        --api-id ${API_ID} \
        --integration-type AWS_PROXY \
@@ -508,18 +508,19 @@ EOF
        --payload-format-version 1.0 \
        --query IntegrationId --output text)
    
-   # Create routes
+   # Create route for URL shortening
    aws apigatewayv2 create-route \
        --api-id ${API_ID} \
        --route-key "POST /shorten" \
        --target integrations/${INTEGRATION_ID}
    
+   # Create route for URL redirection
    aws apigatewayv2 create-route \
        --api-id ${API_ID} \
        --route-key "GET /{proxy+}" \
        --target integrations/${INTEGRATION_ID}
    
-   # Create stage
+   # Create production stage with auto-deploy
    aws apigatewayv2 create-stage \
        --api-id ${API_ID} \
        --stage-name prod \
@@ -529,12 +530,12 @@ EOF
    echo "✅ API Gateway HTTP API created: ${API_ID}"
    ```
 
-   The API Gateway now provides HTTP endpoints with automatic CORS handling and efficient Lambda proxy integration. The configuration enables both URL creation and redirection through different HTTP methods.
+   The API Gateway now provides HTTP endpoints with automatic CORS handling and efficient Lambda proxy integration. The configuration enables both URL creation and redirection through different HTTP methods and routes.
 
 5. **Grant API Gateway Permission to Invoke Lambda**:
 
    ```bash
-   # Add Lambda permission for API Gateway
+   # Add Lambda permission for API Gateway invocation
    aws lambda add-permission \
        --function-name ${FUNCTION_NAME} \
        --statement-id api-gateway-invoke \
@@ -550,7 +551,7 @@ EOF
    CloudWatch provides comprehensive monitoring for our serverless application, including function execution metrics, error rates, and custom business metrics. This observability enables proactive issue detection and performance optimization.
 
    ```bash
-   # Create CloudWatch dashboard
+   # Create CloudWatch dashboard for monitoring
    aws cloudwatch put-dashboard \
        --dashboard-name "URLShortener-${RANDOM_SUFFIX}" \
        --dashboard-body '{
@@ -624,14 +625,13 @@ EOF
 3. **Test URL Redirection**:
 
    ```bash
-   # Extract short_id from previous response and test redirection
-   # First, get the short_id from the response
+   # Extract short_id from response and test redirection
    SHORT_ID=$(curl -s -X POST ${API_URL}/shorten \
        -H "Content-Type: application/json" \
        -d '{"url": "https://docs.aws.amazon.com/lambda/latest/dg/welcome.html"}' | \
        python3 -c "import json,sys; print(json.load(sys.stdin)['short_id'])")
    
-   # Test redirection
+   # Test redirection with verbose headers
    curl -I ${API_URL}/${SHORT_ID}
    ```
 
@@ -723,19 +723,19 @@ This serverless URL shortener demonstrates key AWS architectural patterns for bu
 
 The architecture follows AWS Well-Architected Framework principles across all five pillars. For operational excellence, CloudWatch provides comprehensive monitoring and logging. Security is implemented through IAM roles with least privilege access, HTTPS encryption, and input validation. Reliability is achieved through DynamoDB's 99.999% availability SLA and Lambda's automatic scaling and error handling. Performance efficiency comes from optimized cold start times and pay-per-request billing models.
 
-Cost optimization is inherent in the serverless design, with zero charges during idle periods and automatic scaling based on demand. The solution can handle sudden traffic spikes without pre-provisioning capacity while maintaining consistent performance. DynamoDB's on-demand billing eliminates capacity planning concerns while providing unlimited scalability.
+Cost optimization is inherent in the serverless design, with zero charges during idle periods and automatic scaling based on demand. The solution can handle sudden traffic spikes without pre-provisioning capacity while maintaining consistent performance. DynamoDB's on-demand billing eliminates capacity planning concerns while providing unlimited scalability for URL storage and click tracking.
 
-The short ID generation algorithm uses SHA-256 hashing combined with Base62 encoding to create URL-safe identifiers with extremely low collision probability. URL expiration and click tracking provide additional business value while maintaining data governance best practices. For production deployments, consider implementing rate limiting, custom domains, and enhanced analytics as described in the [AWS API Gateway documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-request-throttling.html).
+The short ID generation algorithm uses SHA-256 hashing combined with UUID elements and Base62 encoding to create URL-safe identifiers with extremely low collision probability. URL expiration and click tracking provide additional business value while maintaining data governance best practices. For production deployments, consider implementing rate limiting, custom domains, and enhanced analytics as described in the [AWS API Gateway documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-request-throttling.html).
 
-> **Tip**: Enable AWS X-Ray tracing for distributed request tracing across Lambda, API Gateway, and DynamoDB to identify performance bottlenecks and optimize response times.
+> **Tip**: Enable AWS X-Ray tracing for distributed request tracing across Lambda, API Gateway, and DynamoDB to identify performance bottlenecks and optimize response times. See the [X-Ray developer guide](https://docs.aws.amazon.com/xray/latest/devguide/) for implementation details.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Custom Domain Integration**: Configure Route 53 and ACM to provide branded short URLs (e.g., `https://short.yourcompany.com/abc123`) following the [API Gateway custom domain guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-custom-domains.html).
+1. **Custom Domain Integration**: Configure Route 53 and AWS Certificate Manager to provide branded short URLs (e.g., `https://short.yourcompany.com/abc123`) following the [API Gateway custom domain guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-custom-domains.html).
 
-2. **Advanced Analytics Dashboard**: Implement comprehensive analytics using DynamoDB Streams, Kinesis Data Firehose, and QuickSight to track geographic distribution, device types, and referrer patterns with real-time visualization.
+2. **Advanced Analytics Dashboard**: Implement comprehensive analytics using DynamoDB Streams, Kinesis Data Firehose, and QuickSight to track geographic distribution, device types, and referrer patterns with real-time visualization capabilities.
 
 3. **Bulk URL Processing**: Add SQS queue integration for batch URL shortening operations, enabling CSV file uploads and processing thousands of URLs asynchronously with dead letter queue error handling.
 
@@ -745,4 +745,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

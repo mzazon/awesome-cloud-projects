@@ -146,7 +146,9 @@ cat > lambda-response-policy.json << EOF
         "securityhub:BatchUpdateFindings",
         "sns:Publish",
         "inspector2:ListFindings",
-        "inspector2:BatchGetFinding"
+        "inspector2:BatchGetFinding",
+        "ec2:CreateTags",
+        "ec2:DescribeInstances"
       ],
       "Resource": "*"
     }
@@ -216,6 +218,7 @@ echo "✅ Environment variables set and policy documents created"
 import json
 import boto3
 import logging
+import os
 from datetime import datetime
 
 logger = logging.getLogger()
@@ -292,11 +295,27 @@ def lambda_handler(event, context):
             'body': json.dumps({'error': str(e)})
         }
 EOF
+
+   # Create Lambda execution trust policy
+   cat > lambda-execution-trust-policy.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
    
    # Create IAM role for Lambda
    aws iam create-role \
        --role-name $LAMBDA_FUNCTION_NAME-role \
-       --assume-role-policy-document file://lambda-response-policy.json
+       --assume-role-policy-document file://lambda-execution-trust-policy.json
    
    # Attach basic Lambda execution policy
    aws iam attach-role-policy \
@@ -594,26 +613,34 @@ EOF
 
 1. **Verify Inspector is scanning resources**:
 
+   Amazon Inspector requires several minutes to begin scanning after enablement. The coverage statistics provide visibility into which resources are actively being assessed for vulnerabilities, while the coverage list shows the detailed scanning status for each resource type.
+
    ```bash
-   # Check Inspector coverage
+   # Check Inspector coverage statistics
    aws inspector2 get-coverage-statistics \
        --filter-criteria '{
          "resourceType": [{"comparison": "EQUALS", "value": "EC2_INSTANCE"}]
        }'
    
-   # List active scans
+   # List active scans and their status
    aws inspector2 list-coverage \
        --filter-criteria '{
          "scanStatusCode": [{"comparison": "EQUALS", "value": "ACTIVE"}]
        }'
+   
+   # Verify Inspector is enabled for all resource types
+   aws inspector2 batch-get-account-status \
+       --account-ids $AWS_ACCOUNT_ID
    ```
 
-   Expected output: Coverage statistics showing resources being scanned
+   Expected output: Coverage statistics showing resources being scanned with ACTIVE status
 
 2. **Check Security Hub findings**:
 
+   Security Hub aggregates findings from Inspector and other security services, normalizing them into the AWS Security Finding Format (ASFF). This validation ensures that Inspector findings are properly flowing into Security Hub and being processed by the automated response system.
+
    ```bash
-   # Get recent findings
+   # Get recent findings from Security Hub
    aws securityhub get-findings \
        --filters '{
          "CreatedAt": [
@@ -623,42 +650,71 @@ EOF
            }
          ]
        }' \
-       --query 'Findings[*].[Title,Severity.Label,Resources[0].Type]' \
+       --query 'Findings[*].[Title,Severity.Label,Resources[0].Type,ProductArn]' \
+       --output table
+   
+   # Check Security Hub status and enabled standards
+   aws securityhub get-enabled-standards \
+       --query 'StandardsSubscriptions[*].[StandardsArn,StandardsStatus]' \
        --output table
    ```
 
-   Expected output: Table showing recent security findings
+   Expected output: Table showing recent security findings with their severity levels and source services
 
 3. **Test EventBridge rule and Lambda function**:
 
+   EventBridge rules require proper event formatting to trigger successfully. This test simulates a high-severity Security Hub finding to validate the entire automated response pipeline, from event detection through Lambda execution and SNS notification.
+
    ```bash
-   # Trigger a test event
+   # Trigger a test event to simulate Security Hub finding
    aws events put-events \
        --entries '[
          {
            "Source": "aws.securityhub",
            "DetailType": "Security Hub Findings - Imported",
-           "Detail": "{\"findings\":[{\"Id\":\"test-finding\",\"Title\":\"Test Security Finding\",\"Severity\":{\"Label\":\"HIGH\"},\"Resources\":[{\"Id\":\"test-resource\",\"Type\":\"AwsEc2Instance\"}]}]}"
+           "Detail": "{\"findings\":[{\"Id\":\"test-finding-123\",\"Title\":\"Test Security Finding\",\"Description\":\"Test vulnerability for validation\",\"Severity\":{\"Label\":\"HIGH\"},\"Resources\":[{\"Id\":\"arn:aws:ec2:us-east-1:123456789012:instance/i-1234567890abcdef0\",\"Type\":\"AwsEc2Instance\"}],\"AwsAccountId\":\"$AWS_ACCOUNT_ID\",\"Region\":\"$AWS_REGION\"}]}"
          }
        ]'
    
-   # Check Lambda function logs
+   # Wait for processing
+   sleep 10
+   
+   # Check Lambda function logs for execution
    aws logs describe-log-groups \
        --log-group-name-prefix "/aws/lambda/$LAMBDA_FUNCTION_NAME"
+   
+   # Get recent Lambda invocation logs
+   LOG_GROUP="/aws/lambda/$LAMBDA_FUNCTION_NAME"
+   aws logs filter-log-events \
+       --log-group-name $LOG_GROUP \
+       --start-time $(date -d '5 minutes ago' +%s)000 \
+       --query 'events[*].message'
    ```
 
 4. **Verify Security Hub insights**:
 
+   Security Hub insights provide aggregated views of security findings, enabling rapid identification of trends and priority issues. These custom insights help security teams focus on the most critical vulnerabilities across their environment.
+
    ```bash
-   # List custom insights
+   # List all custom insights
    aws securityhub get-insights \
-       --query 'Insights[*].[Name,GroupByAttribute]' \
+       --query 'Insights[*].[Name,GroupByAttribute,Filters]' \
        --output table
    
-   # Get insight results
-   aws securityhub get-insight-results \
-       --insight-arn "$(aws securityhub get-insights \
-           --query 'Insights[0].InsightArn' --output text)"
+   # Get results from the first custom insight
+   INSIGHT_ARN=$(aws securityhub get-insights \
+       --query 'Insights[0].InsightArn' --output text)
+   
+   if [ "$INSIGHT_ARN" != "None" ]; then
+       aws securityhub get-insight-results \
+           --insight-arn "$INSIGHT_ARN" \
+           --query 'InsightResults.ResultValues[*].[GroupByAttributeValue,Count]' \
+           --output table
+   fi
+   
+   # Verify Security Hub configuration
+   aws securityhub describe-hub \
+       --query '{HubArn:HubArn,SubscribedAt:SubscribedAt,AutoEnableControls:AutoEnableControls}'
    ```
 
 ## Cleanup
@@ -772,4 +828,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

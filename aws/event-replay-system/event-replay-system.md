@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: eventbridge, lambda, s3, iam
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: event-driven, disaster-recovery, replay, automation, compliance
 recipe-generator-version: 1.3
 ---
 
 # Event Replay with EventBridge Archive
-
 
 ## Problem
 
@@ -81,6 +80,8 @@ graph TB
 4. Basic knowledge of JSON event filtering and patterns
 5. Estimated cost: $5-15 per month for moderate event volumes
 
+> **Note**: EventBridge Archive can store events for up to 10 years with configurable retention periods. Choose retention based on compliance requirements and cost considerations.
+
 ## Preparation
 
 ```bash
@@ -111,7 +112,7 @@ echo "✅ Environment prepared with unique identifiers"
 
 1. **Create Custom Event Bus**:
 
-   EventBridge custom event buses provide isolated namespaces for application events, enabling better organization and security compared to the default event bus. Custom buses allow you to apply specific access controls, routing rules, and archiving policies tailored to your application's needs. This separation is crucial for multi-tenant architectures and compliance requirements.
+   EventBridge custom event buses provide isolated namespaces for application events, enabling better organization and security compared to the default event bus. Custom buses allow you to apply specific access controls, routing rules, and archiving policies tailored to your application's needs. This separation is crucial for multi-tenant architectures and compliance requirements, following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
    ```bash
    # Create custom event bus for replay demonstration
@@ -242,10 +243,10 @@ echo "✅ Environment prepared with unique identifiers"
        --role-name EventReplayProcessorRole-${RANDOM_SUFFIX} \
        --query 'Role.Arn' --output text)
    
-   # Create Lambda function
+   # Create Lambda function with latest Python runtime
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler event-processor.lambda_handler \
        --zip-file fileb://event-processor.zip \
@@ -323,9 +324,9 @@ echo "✅ Environment prepared with unique identifiers"
 
    The event archive is now active and will automatically capture matching events for the next 30 days. This provides the historical event storage necessary for replay operations while implementing cost-effective retention policies that align with business and compliance requirements.
 
-> **Note**: EventBridge Archive can store events for up to 10 years with configurable retention periods. Choose retention based on compliance requirements and cost considerations. See [EventBridge Archive documentation](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-archive.html) for detailed configuration options and storage considerations.
-
 6. **Generate Test Events for Archiving**:
+
+   Creating sample events demonstrates the event structure and populates the archive for testing replay functionality. These events simulate real-world scenarios such as order processing and user registration, providing a foundation for validating the replay system's behavior.
 
    ```bash
    # Create sample events to populate the archive
@@ -335,7 +336,7 @@ echo "✅ Environment prepared with unique identifiers"
            --entries Source=myapp.orders,DetailType="Order Created",Detail="{\"orderId\":\"order-${i}\",\"amount\":$((RANDOM % 1000 + 50)),\"customerId\":\"customer-${i}\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
            --event-bus-name ${EVENT_BUS_NAME}
        
-       # Generate user events
+       # Generate user events  
        aws events put-events \
            --entries Source=myapp.users,DetailType="User Registered",Detail="{\"userId\":\"user-${i}\",\"email\":\"user${i}@example.com\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
            --event-bus-name ${EVENT_BUS_NAME}
@@ -347,7 +348,11 @@ echo "✅ Environment prepared with unique identifiers"
    echo "✅ Generated 20 test events for archive"
    ```
 
+   Test events are now being sent to EventBridge and will be processed by your Lambda function while simultaneously being captured by the archive based on the defined event patterns.
+
 7. **Wait for Events to be Archived**:
+
+   EventBridge Archive has a delay of up to 10 minutes before events appear in the archive. This waiting period ensures events are properly stored and available for replay operations.
 
    ```bash
    # Wait for events to be archived (EventBridge has up to 10 minute delay)
@@ -362,6 +367,8 @@ echo "✅ Environment prepared with unique identifiers"
    
    echo "✅ Events are being archived (may take up to 10 minutes)"
    ```
+
+   The archive statistics provide visibility into the archiving process, showing the current state and number of events captured. Note that EventCount metrics may take up to 24 hours to reconcile completely.
 
 8. **Create Replay Configuration**:
 
@@ -394,6 +401,8 @@ echo "✅ Environment prepared with unique identifiers"
 
 9. **Monitor Replay Progress**:
 
+   Monitoring replay operations ensures successful completion and provides visibility into the replay process. This monitoring approach tracks replay status and provides real-time feedback on progress.
+
    ```bash
    # Monitor replay status
    echo "Monitoring replay progress..."
@@ -424,7 +433,11 @@ echo "✅ Environment prepared with unique identifiers"
    done
    ```
 
+   The monitoring loop provides real-time feedback on replay progress and automatically detects completion or failure states. This approach ensures you can track replay operations and respond appropriately to different outcomes.
+
 10. **Implement Selective Replay with Filtering**:
+
+    Selective replay enables precise control over which events are reprocessed, supporting targeted recovery scenarios or focused testing of specific event types.
 
     ```bash
     # Create targeted replay for specific event types only
@@ -450,7 +463,11 @@ echo "✅ Environment prepared with unique identifiers"
         --output table
     ```
 
+    The selective replay demonstrates how to replay specific subsets of archived events, enabling precise control over recovery or testing scenarios without processing unnecessary events.
+
 11. **Create Replay Automation Script**:
+
+    Automation scripts standardize replay operations and integrate with operational procedures, enabling consistent replay execution across different scenarios.
 
     ```bash
     # Create automated replay script
@@ -481,11 +498,15 @@ echo "✅ Environment prepared with unique identifiers"
     # Start replay (customize destination as needed)
     aws events start-replay \
         --replay-name ${REPLAY_NAME} \
-        --event-source-arn $(aws events describe-archive --archive-name ${ARCHIVE_NAME} --query 'SourceArn' --output text) \
+        --event-source-arn $(aws events describe-archive \
+            --archive-name ${ARCHIVE_NAME} \
+            --query 'SourceArn' --output text) \
         --event-start-time ${START_TIME} \
         --event-end-time ${END_TIME} \
         --destination '{
-          "Arn": "'$(aws events describe-archive --archive-name ${ARCHIVE_NAME} --query 'SourceArn' --output text)'"
+          "Arn": "'$(aws events describe-archive \
+            --archive-name ${ARCHIVE_NAME} \
+            --query 'SourceArn' --output text)'"
         }'
     
     echo "Replay started successfully: ${REPLAY_NAME}"
@@ -500,9 +521,17 @@ echo "✅ Environment prepared with unique identifiers"
     echo "✅ Created replay automation script"
     ```
 
+    The automation script provides a standardized approach to replay operations, enabling operational teams to execute replays consistently with parameterized time windows and archive sources.
+
 12. **Set up Monitoring and Alerts**:
 
+    Comprehensive monitoring provides visibility into replay operations and enables proactive response to failures or issues during replay execution.
+
     ```bash
+    # Create CloudWatch log group for replay monitoring
+    aws logs create-log-group \
+        --log-group-name /aws/events/replay-monitoring
+    
     # Create CloudWatch alarm for replay failures
     aws cloudwatch put-metric-alarm \
         --alarm-name "EventBridge-Replay-Failures" \
@@ -514,14 +543,12 @@ echo "✅ Environment prepared with unique identifiers"
         --threshold 1 \
         --comparison-operator GreaterThanOrEqualToThreshold \
         --evaluation-periods 1 \
-        --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:eventbridge-alerts
-    
-    # Create custom metric for replay monitoring
-    aws logs create-log-group \
-        --log-group-name /aws/events/replay-monitoring
+        --treat-missing-data notBreaching
     
     echo "✅ Set up monitoring and alerting"
     ```
+
+    The monitoring configuration establishes CloudWatch logs and alarms to track replay operations and alert on failures, providing operational visibility into the replay system's health and performance.
 
 ## Validation & Testing
 
@@ -692,13 +719,13 @@ echo "✅ Environment prepared with unique identifiers"
 
 ## Discussion
 
-EventBridge Archive provides a powerful mechanism for event replay that addresses critical operational needs in event-driven architectures. The archive feature automatically captures events based on configurable patterns, enabling selective storage and replay of specific event types. This solution demonstrates how to implement comprehensive event replay capabilities that support both operational recovery and development testing scenarios.
+EventBridge Archive provides a powerful mechanism for event replay that addresses critical operational needs in event-driven architectures. The archive feature automatically captures events based on configurable patterns, enabling selective storage and replay of specific event types. This solution demonstrates how to implement comprehensive event replay capabilities that support both operational recovery and development testing scenarios while following AWS Well-Architected Framework principles.
 
 The architecture shown here implements several key patterns for event replay. First, selective archiving using event patterns ensures that only relevant events are stored, reducing storage costs and improving replay performance. Second, the replay mechanism supports both full and filtered replay operations, allowing teams to replay specific event types or time windows. Finally, the integration with Lambda functions demonstrates how replayed events can be distinguished from original events using the `replay-name` metadata field.
 
 Event replay serves multiple business purposes beyond disaster recovery. Development teams can use archived events to test new features against production data patterns, validate system behavior changes, and reproduce complex scenarios for debugging. Compliance teams can replay events to demonstrate system behavior during audits or regulatory reviews. Operations teams can use selective replay to recover from partial system failures without affecting the entire system.
 
-The solution implements several best practices for event replay systems. Event pattern filtering at the archive level ensures efficient storage utilization, while replay filtering enables precise control over which events are replayed. The monitoring and alerting capabilities provide visibility into replay operations, helping teams track progress and identify issues. The automation script demonstrates how replay operations can be standardized and integrated into operational runbooks.
+The solution implements several best practices for event replay systems. Event pattern filtering at the archive level ensures efficient storage utilization, while replay filtering enables precise control over which events are replayed. The monitoring and alerting capabilities provide visibility into replay operations, helping teams track progress and identify issues. The automation script demonstrates how replay operations can be standardized and integrated into operational runbooks. For comprehensive guidance on EventBridge Archive configuration and best practices, see the [EventBridge Archive documentation](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-archive.html).
 
 > **Tip**: EventBridge Archive has a reconciliation period of up to 24 hours for EventCount and SizeBytes metrics. For operational monitoring, rely on CloudWatch Logs from your Lambda functions for real-time replay tracking.
 
@@ -706,16 +733,23 @@ The solution implements several best practices for event replay systems. Event p
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Region Replay Strategy**: Implement cross-region event replay using EventBridge replication and multiple archives for disaster recovery scenarios.
+1. **Multi-Region Replay Strategy**: Implement cross-region event replay using EventBridge replication and multiple archives for disaster recovery scenarios across AWS regions.
 
-2. **Intelligent Replay Ordering**: Create a system that maintains event causality during replay by analyzing event dependencies and replaying events in the correct sequence.
+2. **Intelligent Replay Ordering**: Create a system that maintains event causality during replay by analyzing event dependencies and replaying events in the correct sequence based on business logic relationships.
 
-3. **Replay Testing Framework**: Build automated testing that validates system behavior by comparing original event processing results with replay processing results.
+3. **Replay Testing Framework**: Build automated testing that validates system behavior by comparing original event processing results with replay processing results, ensuring consistent business logic execution.
 
-4. **Event Replay Dashboard**: Develop a monitoring dashboard that provides real-time visibility into replay progress, event volumes, and system health during replay operations.
+4. **Event Replay Dashboard**: Develop a monitoring dashboard using CloudWatch or QuickSight that provides real-time visibility into replay progress, event volumes, and system health during replay operations.
 
-5. **Compliance Audit Trail**: Implement detailed audit logging that tracks all replay operations, including who initiated replays, what events were replayed, and the business justification for each replay operation.
+5. **Compliance Audit Trail**: Implement detailed audit logging that tracks all replay operations, including who initiated replays, what events were replayed, and the business justification for each replay operation using CloudTrail integration.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

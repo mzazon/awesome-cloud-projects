@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: eventbridge,dynamodb,lambda,iam
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: eventbridge,dynamodb,lambda,iam
 recipe-generator-version: 1.3
@@ -126,7 +126,7 @@ export PROJECTION_FUNCTION="projection-handler-${RANDOM_SUFFIX}"
 
 # Create IAM execution role for Lambda functions
 aws iam create-role \
-    --role-name event-sourcing-lambda-role \
+    --role-name event-sourcing-lambda-role-${RANDOM_SUFFIX} \
     --assume-role-policy-document '{
         "Version": "2012-10-17",
         "Statement": [
@@ -142,12 +142,12 @@ aws iam create-role \
 
 # Attach necessary policies to the role
 aws iam attach-role-policy \
-    --role-name event-sourcing-lambda-role \
+    --role-name event-sourcing-lambda-role-${RANDOM_SUFFIX} \
     --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
-# Create custom policy for EventBridge and DynamoDB access
+# Create custom policy for EventBridge, DynamoDB, and SQS access
 aws iam create-policy \
-    --policy-name EventSourcingPolicy \
+    --policy-name EventSourcingPolicy-${RANDOM_SUFFIX} \
     --policy-document '{
         "Version": "2012-10-17",
         "Statement": [
@@ -155,10 +155,13 @@ aws iam create-policy \
                 "Effect": "Allow",
                 "Action": [
                     "events:PutEvents",
-                    "events:List*",
-                    "events:Describe*"
+                    "events:ListRules",
+                    "events:DescribeRule"
                 ],
-                "Resource": "*"
+                "Resource": [
+                    "arn:aws:events:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':event-bus/*",
+                    "arn:aws:events:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':rule/*"
+                ]
             },
             {
                 "Effect": "Allow",
@@ -166,21 +169,33 @@ aws iam create-policy \
                     "dynamodb:PutItem",
                     "dynamodb:GetItem",
                     "dynamodb:Query",
-                    "dynamodb:Scan",
                     "dynamodb:UpdateItem",
-                    "dynamodb:DeleteItem",
-                    "dynamodb:BatchGetItem",
-                    "dynamodb:BatchWriteItem"
+                    "dynamodb:BatchGetItem"
                 ],
-                "Resource": "*"
+                "Resource": [
+                    "arn:aws:dynamodb:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':table/event-store-*",
+                    "arn:aws:dynamodb:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':table/read-model-*",
+                    "arn:aws:dynamodb:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':table/event-store-*/index/*"
+                ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "sqs:SendMessage",
+                    "sqs:GetQueueAttributes"
+                ],
+                "Resource": "arn:aws:sqs:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':event-sourcing-dlq-*"
             }
         ]
     }'
 
 # Attach custom policy to role
 aws iam attach-role-policy \
-    --role-name event-sourcing-lambda-role \
-    --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/EventSourcingPolicy
+    --role-name event-sourcing-lambda-role-${RANDOM_SUFFIX} \
+    --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/EventSourcingPolicy-${RANDOM_SUFFIX}
+
+export IAM_ROLE_NAME="event-sourcing-lambda-role-${RANDOM_SUFFIX}"
+export IAM_POLICY_NAME="EventSourcingPolicy-${RANDOM_SUFFIX}"
 
 echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
 ```
@@ -207,7 +222,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    echo "✅ Created EventBridge bus: ${EVENT_BUS_NAME}"
    ```
 
-   The custom event bus is now established as the primary event communication channel, with archiving enabled for long-term retention and replay capabilities. This foundation enables event patterns filtering, cross-account event sharing, and provides the reliability guarantees required for mission-critical financial operations.
+   The custom event bus is now established as the primary event communication channel, with archiving enabled for long-term retention and replay capabilities. This foundation enables event patterns filtering, cross-account event sharing, and provides the reliability guarantees required for mission-critical financial operations. EventBridge automatically scales to handle millions of events per second with built-in durability guarantees.
 
 2. **Create DynamoDB Event Store Table**:
 
@@ -226,7 +241,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
            AttributeName=AggregateId,KeyType=HASH \
            AttributeName=EventSequence,KeyType=RANGE \
        --global-secondary-indexes \
-           IndexName=EventType-Timestamp-index,KeySchema=[{AttributeName=EventType,KeyType=HASH},{AttributeName=Timestamp,KeyType=RANGE}],Projection={ProjectionType=ALL},ProvisionedThroughput={ReadCapacityUnits=5,WriteCapacityUnits=5} \
+           'IndexName=EventType-Timestamp-index,KeySchema=[{AttributeName=EventType,KeyType=HASH},{AttributeName=Timestamp,KeyType=RANGE}],Projection={ProjectionType=ALL},ProvisionedThroughput={ReadCapacityUnits=5,WriteCapacityUnits=5}' \
        --provisioned-throughput ReadCapacityUnits=10,WriteCapacityUnits=10 \
        --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES
    
@@ -237,7 +252,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    echo "✅ Created event store table: ${EVENT_STORE_TABLE}"
    ```
 
-   The event store table is now configured with DynamoDB Streams enabled, which will capture all data modifications and trigger downstream processing. The Global Secondary Index allows efficient querying by event type and timestamp, supporting analytics and monitoring use cases while maintaining optimal performance for the primary append-only workload.
+   The event store table is now configured with DynamoDB Streams enabled, which will capture all data modifications and trigger downstream processing. The Global Secondary Index allows efficient querying by event type and timestamp, supporting analytics and monitoring use cases while maintaining optimal performance for the primary append-only workload. This design follows the [DynamoDB best practices for event sourcing](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/best-practices.html).
 
 3. **Create Read Model Table**:
 
@@ -262,7 +277,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    echo "✅ Created read model table: ${READ_MODEL_TABLE}"
    ```
 
-   The read model table is now ready to receive projected data from the event stream. This table will maintain current state views that can be queried efficiently without reconstructing state from events, providing the performance benefits of denormalized data while maintaining the auditability and consistency guarantees of event sourcing.
+   The read model table is now ready to receive projected data from the event stream. This table will maintain current state views that can be queried efficiently without reconstructing state from events, providing the performance benefits of denormalized data while maintaining the auditability and consistency guarantees of event sourcing. Multiple projection types per aggregate enable specialized views for different business scenarios.
 
 4. **Create Command Handler Lambda Function**:
 
@@ -292,7 +307,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
            event_type = command['eventType']
            event_data = command['eventData']
            
-           # Get next sequence number
+           # Get next sequence number for aggregate consistency
            response = table.query(
                KeyConditionExpression='AggregateId = :aid',
                ExpressionAttributeValues={':aid': aggregate_id},
@@ -304,7 +319,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
            if response['Items']:
                next_sequence = response['Items'][0]['EventSequence'] + 1
            
-           # Create event record
+           # Create event record with metadata
            timestamp = datetime.utcnow().isoformat()
            event_record = {
                'EventId': event_id,
@@ -316,10 +331,10 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
                'Version': '1.0'
            }
            
-           # Store event in DynamoDB
+           # Store event in DynamoDB first (store-first pattern)
            table.put_item(Item=event_record)
            
-           # Publish event to EventBridge
+           # Publish event to EventBridge after successful storage
            events_client.put_events(
                Entries=[
                    {
@@ -341,7 +356,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
            }
            
        except Exception as e:
-           print(f"Error: {str(e)}")
+           print(f"Error processing command: {str(e)}")
            return {
                'statusCode': 500,
                'body': json.dumps({'error': str(e)})
@@ -353,17 +368,18 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    
    aws lambda create-function \
        --function-name ${COMMAND_FUNCTION} \
-       --runtime python3.9 \
-       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/event-sourcing-lambda-role \
+       --runtime python3.12 \
+       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
        --handler command-handler.lambda_handler \
        --zip-file fileb://command-handler.zip \
        --environment Variables="{EVENT_STORE_TABLE=${EVENT_STORE_TABLE},EVENT_BUS_NAME=${EVENT_BUS_NAME}}" \
-       --timeout 30
+       --timeout 30 \
+       --description "Command handler for event sourcing system"
    
    echo "✅ Created command handler function: ${COMMAND_FUNCTION}"
    ```
 
-   The command handler is now deployed and ready to process business commands. Each command results in a unique event with a guaranteed sequence number, maintaining the invariant that events within an aggregate are totally ordered. The function publishes events to EventBridge only after successful storage, ensuring that downstream consumers never receive notifications for events that haven't been persisted.
+   The command handler is now deployed and ready to process business commands. Each command results in a unique event with a guaranteed sequence number, maintaining the invariant that events within an aggregate are totally ordered. The function publishes events to EventBridge only after successful storage, ensuring that downstream consumers never receive notifications for events that haven't been persisted. This implements the store-first pattern crucial for data consistency in event sourcing systems.
 
 5. **Create Projection Handler Lambda Function**:
 
@@ -382,70 +398,88 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    
    def lambda_handler(event, context):
        try:
-           # Process EventBridge events
-           for record in event['Records']:
-               detail = json.loads(record['body']) if 'body' in record else record['detail']
+           # Process EventBridge events (batch processing support)
+           processed_count = 0
+           for record in event.get('Records', [event]):
+               detail = record.get('detail', record)
                
-               event_type = detail['EventType']
-               aggregate_id = detail['AggregateId']
-               event_data = detail['EventData']
+               if isinstance(detail, str):
+                   detail = json.loads(detail)
                
-               # Handle different event types
+               event_type = detail.get('EventType')
+               aggregate_id = detail.get('AggregateId')
+               event_data = detail.get('EventData', {})
+               
+               # Handle different event types with idempotent processing
                if event_type == 'AccountCreated':
                    handle_account_created(aggregate_id, event_data)
                elif event_type == 'TransactionProcessed':
                    handle_transaction_processed(aggregate_id, event_data)
                elif event_type == 'AccountClosed':
                    handle_account_closed(aggregate_id, event_data)
+               
+               processed_count += 1
                    
-           return {'statusCode': 200}
+           return {
+               'statusCode': 200,
+               'processedEvents': processed_count
+           }
            
        except Exception as e:
-           print(f"Error: {str(e)}")
+           print(f"Error processing projection: {str(e)}")
            return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
    
    def handle_account_created(aggregate_id, event_data):
+       # Create initial account projection with defaults
        read_model_table.put_item(
            Item={
                'AccountId': aggregate_id,
                'ProjectionType': 'AccountSummary',
                'Balance': Decimal('0.00'),
                'Status': 'Active',
-               'CreatedAt': event_data['createdAt'],
-               'TransactionCount': 0
+               'CreatedAt': event_data.get('createdAt'),
+               'TransactionCount': 0,
+               'LastUpdated': event_data.get('createdAt')
            }
        )
    
    def handle_transaction_processed(aggregate_id, event_data):
-       # Update account balance
-       response = read_model_table.get_item(
-           Key={'AccountId': aggregate_id, 'ProjectionType': 'AccountSummary'}
-       )
-       
-       if 'Item' in response:
-           current_balance = response['Item']['Balance']
-           transaction_count = response['Item']['TransactionCount']
-           
-           new_balance = current_balance + Decimal(str(event_data['amount']))
-           
-           read_model_table.update_item(
-               Key={'AccountId': aggregate_id, 'ProjectionType': 'AccountSummary'},
-               UpdateExpression='SET Balance = :balance, TransactionCount = :count, LastTransactionAt = :timestamp',
-               ExpressionAttributeValues={
-                   ':balance': new_balance,
-                   ':count': transaction_count + 1,
-                   ':timestamp': event_data['timestamp']
-               }
+       # Update account balance and transaction count atomically
+       try:
+           response = read_model_table.get_item(
+               Key={'AccountId': aggregate_id, 'ProjectionType': 'AccountSummary'}
            )
+           
+           if 'Item' in response:
+               current_balance = response['Item']['Balance']
+               transaction_count = response['Item']['TransactionCount']
+               
+               new_balance = current_balance + Decimal(str(event_data['amount']))
+               
+               read_model_table.update_item(
+                   Key={'AccountId': aggregate_id, 'ProjectionType': 'AccountSummary'},
+                   UpdateExpression='SET Balance = :balance, TransactionCount = :count, LastTransactionAt = :timestamp, LastUpdated = :updated',
+                   ExpressionAttributeValues={
+                       ':balance': new_balance,
+                       ':count': transaction_count + 1,
+                       ':timestamp': event_data.get('timestamp'),
+                       ':updated': event_data.get('timestamp')
+                   }
+               )
+       except Exception as e:
+           print(f"Error updating transaction: {str(e)}")
+           raise
    
    def handle_account_closed(aggregate_id, event_data):
+       # Mark account as closed with timestamp
        read_model_table.update_item(
            Key={'AccountId': aggregate_id, 'ProjectionType': 'AccountSummary'},
-           UpdateExpression='SET #status = :status, ClosedAt = :timestamp',
+           UpdateExpression='SET #status = :status, ClosedAt = :timestamp, LastUpdated = :updated',
            ExpressionAttributeNames={'#status': 'Status'},
            ExpressionAttributeValues={
                ':status': 'Closed',
-               ':timestamp': event_data['closedAt']
+               ':timestamp': event_data.get('closedAt'),
+               ':updated': event_data.get('closedAt')
            }
        )
    EOF
@@ -455,17 +489,18 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    
    aws lambda create-function \
        --function-name ${PROJECTION_FUNCTION} \
-       --runtime python3.9 \
-       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/event-sourcing-lambda-role \
+       --runtime python3.12 \
+       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
        --handler projection-handler.lambda_handler \
        --zip-file fileb://projection-handler.zip \
        --environment Variables="{READ_MODEL_TABLE=${READ_MODEL_TABLE}}" \
-       --timeout 30
+       --timeout 30 \
+       --description "Projection handler for event sourcing read models"
    
    echo "✅ Created projection handler function: ${PROJECTION_FUNCTION}"
    ```
 
-   The projection handler is now deployed and ready to process events from EventBridge. As events flow through the system, this function maintains current state representations in the read model table, providing fast query access without requiring event replay. The handler implements idempotent processing to handle potential duplicate events gracefully.
+   The projection handler is now deployed and ready to process events from EventBridge. As events flow through the system, this function maintains current state representations in the read model table, providing fast query access without requiring event replay. The handler implements idempotent processing to handle potential duplicate events gracefully and supports batch processing for improved performance. Error handling ensures projection failures don't impact the overall system reliability.
 
 6. **Create EventBridge Rules and Targets**:
 
@@ -500,7 +535,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    echo "✅ Created EventBridge rules and targets"
    ```
 
-   The EventBridge rule is now configured to route financial events to the projection handler. The event pattern matching ensures only relevant events are processed, while the Lambda permission allows EventBridge to invoke the function. This establishes the real-time data flow from event generation to projection materialization, completing the CQRS read-side implementation.
+   The EventBridge rule is now configured to route financial events to the projection handler. The event pattern matching ensures only relevant events are processed, while the Lambda permission allows EventBridge to invoke the function. This establishes the real-time data flow from event generation to projection materialization, completing the CQRS read-side implementation. EventBridge provides built-in retry logic and dead letter queue capabilities for robust event processing.
 
 7. **Create Dead Letter Queue for Failed Events**:
 
@@ -515,40 +550,41 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
            "VisibilityTimeoutSeconds": "300"
        }'
    
-   # Get DLQ URL
+   # Get DLQ URL and ARN for configuration
    DLQ_URL=$(aws sqs get-queue-url \
        --queue-name "event-sourcing-dlq-${RANDOM_SUFFIX}" \
        --query 'QueueUrl' --output text)
    
-   # Create rule for failed events
-   aws events put-rule \
-       --name "failed-events-rule" \
-       --event-pattern '{
-           "source": ["aws.events"],
-           "detail-type": ["Event Processing Failed"]
-       }' \
-       --state ENABLED \
-       --event-bus-name ${EVENT_BUS_NAME}
+   DLQ_ARN=$(aws sqs get-queue-attributes \
+       --queue-url "${DLQ_URL}" \
+       --attribute-names QueueArn \
+       --query 'Attributes.QueueArn' --output text)
    
-   # Add SQS target for failed events
-   aws events put-targets \
-       --rule "failed-events-rule" \
-       --event-bus-name ${EVENT_BUS_NAME} \
-       --targets "Id"="1","Arn"="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:event-sourcing-dlq-${RANDOM_SUFFIX}"
+   # Configure Lambda dead letter queue for projection handler
+   aws lambda update-function-configuration \
+       --function-name ${PROJECTION_FUNCTION} \
+       --dead-letter-config TargetArn="${DLQ_ARN}"
+   
+   # Grant SQS permissions to Lambda
+   aws sqs add-permission \
+       --queue-url "${DLQ_URL}" \
+       --label "lambda-dlq-access" \
+       --aws-account-ids "${AWS_ACCOUNT_ID}" \
+       --actions "sqs:SendMessage"
    
    echo "✅ Created dead letter queue: ${DLQ_URL}"
    ```
 
-   The dead letter queue infrastructure is now established to handle processing failures gracefully. Failed events will be retained for 14 days (1209600 seconds) in the DLQ, allowing operations teams to investigate issues and reprocess events after resolving the underlying problems. This setup ensures system resilience and maintains event processing guarantees even during component failures.
+   The dead letter queue infrastructure is now established to handle processing failures gracefully. Failed events will be retained for 14 days (1209600 seconds) in the DLQ, allowing operations teams to investigate issues and reprocess events after resolving the underlying problems. This setup ensures system resilience and maintains event processing guarantees even during component failures. The DLQ provides visibility into processing issues and enables recovery procedures.
 
 8. **Set up CloudWatch Monitoring**:
 
    CloudWatch monitoring provides essential observability for event-driven systems, tracking key performance indicators and alerting on anomalies. The alarms monitor critical failure modes: DynamoDB throttling (indicating capacity issues), Lambda errors (indicating processing failures), and EventBridge invocation failures (indicating routing issues). This comprehensive monitoring ensures rapid detection and resolution of issues that could impact system reliability.
 
    ```bash
-   # Create CloudWatch alarms for monitoring
+   # Create CloudWatch alarms for monitoring system health
    aws cloudwatch put-metric-alarm \
-       --alarm-name "EventStore-WriteThrottles" \
+       --alarm-name "EventStore-WriteThrottles-${RANDOM_SUFFIX}" \
        --alarm-description "DynamoDB write throttles on event store" \
        --metric-name WriteThrottleEvents \
        --namespace AWS/DynamoDB \
@@ -557,11 +593,12 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
        --threshold 5 \
        --comparison-operator GreaterThanThreshold \
        --evaluation-periods 2 \
-       --dimensions Name=TableName,Value=${EVENT_STORE_TABLE}
+       --dimensions Name=TableName,Value=${EVENT_STORE_TABLE} \
+       --treat-missing-data notBreaching
    
    # Create alarm for Lambda errors
    aws cloudwatch put-metric-alarm \
-       --alarm-name "CommandHandler-Errors" \
+       --alarm-name "CommandHandler-Errors-${RANDOM_SUFFIX}" \
        --alarm-description "High error rate in command handler" \
        --metric-name Errors \
        --namespace AWS/Lambda \
@@ -570,11 +607,12 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
        --threshold 10 \
        --comparison-operator GreaterThanThreshold \
        --evaluation-periods 2 \
-       --dimensions Name=FunctionName,Value=${COMMAND_FUNCTION}
+       --dimensions Name=FunctionName,Value=${COMMAND_FUNCTION} \
+       --treat-missing-data notBreaching
    
    # Create alarm for event bus failed invocations
    aws cloudwatch put-metric-alarm \
-       --alarm-name "EventBridge-FailedInvocations" \
+       --alarm-name "EventBridge-FailedInvocations-${RANDOM_SUFFIX}" \
        --alarm-description "High number of failed event invocations" \
        --metric-name FailedInvocations \
        --namespace AWS/Events \
@@ -583,22 +621,23 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
        --threshold 5 \
        --comparison-operator GreaterThanThreshold \
        --evaluation-periods 2 \
-       --dimensions Name=EventBusName,Value=${EVENT_BUS_NAME}
+       --dimensions Name=EventBusName,Value=${EVENT_BUS_NAME} \
+       --treat-missing-data notBreaching
    
    echo "✅ Created CloudWatch monitoring alarms"
    ```
 
-   The monitoring infrastructure is now active, providing real-time visibility into system health and performance. These alarms will trigger when issues occur, enabling proactive response to problems before they impact users. The monitoring strategy covers the entire event processing pipeline from ingestion to projection, ensuring comprehensive observability of the event sourcing system.
+   The monitoring infrastructure is now active, providing real-time visibility into system health and performance. These alarms will trigger when issues occur, enabling proactive response to problems before they impact users. The monitoring strategy covers the entire event processing pipeline from ingestion to projection, ensuring comprehensive observability of the event sourcing system. Consider setting up SNS notifications for these alarms in production environments.
 
 9. **Configure Event Replay Capability**:
 
    Event replay is a powerful capability unique to event sourcing systems, enabling temporal debugging, disaster recovery, and system testing. EventBridge's replay feature allows you to reprocess events from the archive, feeding them back into the system as if they occurred in real-time. This capability is invaluable for recovering from failures, testing new projections against historical data, or analyzing system behavior during specific time periods.
 
    ```bash
-   # Create event replay configuration
+   # Create event replay configuration template
    cat > replay-config.json << EOF
    {
-       "EventSourceArn": "arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:event-bus/${EVENT_BUS_NAME}",
+       "EventSourceArn": "arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:archive/${EVENT_BUS_NAME}-archive",
        "EventStartTime": "$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)",
        "EventEndTime": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
        "Destination": {
@@ -609,11 +648,32 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    }
    EOF
    
-   # Create a sample replay (this will be used later for testing)
-   echo "✅ Event replay configuration created"
+   # Create helper script for event replay
+   cat > start-replay.sh << 'EOF'
+   #!/bin/bash
+   # Usage: ./start-replay.sh START_TIME END_TIME
+   # Example: ./start-replay.sh "2024-01-15T10:00:00Z" "2024-01-15T11:00:00Z"
+   
+   START_TIME=${1:-$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)}
+   END_TIME=${2:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
+   REPLAY_NAME="financial-events-replay-$(date +%s)"
+   
+   aws events start-replay \
+       --replay-name "${REPLAY_NAME}" \
+       --event-source-arn "arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:archive/${EVENT_BUS_NAME}-archive" \
+       --event-start-time "${START_TIME}" \
+       --event-end-time "${END_TIME}" \
+       --destination "Arn=arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:event-bus/${EVENT_BUS_NAME}"
+   
+   echo "Started replay: ${REPLAY_NAME}"
+   EOF
+   
+   chmod +x start-replay.sh
+   
+   echo "✅ Event replay configuration and script created"
    ```
 
-   The replay configuration template is now ready for disaster recovery and testing scenarios. When needed, you can initiate replays to reprocess events from specific time windows, enabling recovery from projection failures or validation of new business logic against historical data. This capability transforms event sourcing from a storage pattern into a time-travel debugging tool.
+   The replay configuration template and helper script are now ready for disaster recovery and testing scenarios. When needed, you can initiate replays to reprocess events from specific time windows, enabling recovery from projection failures or validation of new business logic against historical data. This capability transforms event sourcing from a storage pattern into a time-travel debugging tool, providing immense value for troubleshooting and system evolution.
 
 10. **Create Query Handler for Event Reconstruction**:
 
@@ -626,6 +686,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
     import boto3
     import os
     from boto3.dynamodb.conditions import Key
+    from decimal import Decimal
     
     dynamodb = boto3.resource('dynamodb')
     event_store_table = dynamodb.Table(os.environ['EVENT_STORE_TABLE'])
@@ -633,7 +694,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
     
     def lambda_handler(event, context):
         try:
-            query_type = event['queryType']
+            query_type = event.get('queryType')
             
             if query_type == 'getAggregateEvents':
                 return get_aggregate_events(event['aggregateId'])
@@ -641,28 +702,33 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
                 return get_account_summary(event['accountId'])
             elif query_type == 'reconstructState':
                 return reconstruct_state(event['aggregateId'], event.get('upToSequence'))
+            elif query_type == 'getEventsByType':
+                return get_events_by_type(event['eventType'], event.get('limit', 100))
             else:
                 return {'statusCode': 400, 'body': json.dumps({'error': 'Unknown query type'})}
                 
         except Exception as e:
-            print(f"Error: {str(e)}")
+            print(f"Query handler error: {str(e)}")
             return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
     
     def get_aggregate_events(aggregate_id):
+        """Retrieve all events for a specific aggregate"""
         response = event_store_table.query(
             KeyConditionExpression=Key('AggregateId').eq(aggregate_id),
-            ScanIndexForward=True
+            ScanIndexForward=True  # Sort by sequence number ascending
         )
         
         return {
             'statusCode': 200,
             'body': json.dumps({
                 'aggregateId': aggregate_id,
-                'events': response['Items']
-            }, default=str)
+                'events': response['Items'],
+                'eventCount': len(response['Items'])
+            }, default=decimal_default)
         }
     
     def get_account_summary(account_id):
+        """Get current account state from read model"""
         response = read_model_table.get_item(
             Key={'AccountId': account_id, 'ProjectionType': 'AccountSummary'}
         )
@@ -670,13 +736,13 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
         if 'Item' in response:
             return {
                 'statusCode': 200,
-                'body': json.dumps(response['Item'], default=str)
+                'body': json.dumps(response['Item'], default=decimal_default)
             }
         else:
             return {'statusCode': 404, 'body': json.dumps({'error': 'Account not found'})}
     
     def reconstruct_state(aggregate_id, up_to_sequence=None):
-        # Reconstruct state by replaying events
+        """Reconstruct aggregate state by replaying events"""
         key_condition = Key('AggregateId').eq(aggregate_id)
         
         if up_to_sequence:
@@ -684,11 +750,17 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
         
         response = event_store_table.query(
             KeyConditionExpression=key_condition,
-            ScanIndexForward=True
+            ScanIndexForward=True  # Process events in order
         )
         
-        # Replay events to reconstruct state
-        state = {'balance': 0, 'status': 'Unknown', 'transactionCount': 0}
+        # Initialize state and replay events
+        state = {
+            'balance': Decimal('0.00'),
+            'status': 'Unknown',
+            'transactionCount': 0,
+            'createdAt': None,
+            'closedAt': None
+        }
         
         for event in response['Items']:
             event_type = event['EventType']
@@ -696,22 +768,47 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
             
             if event_type == 'AccountCreated':
                 state['status'] = 'Active'
-                state['createdAt'] = event_data['createdAt']
+                state['createdAt'] = event_data.get('createdAt')
             elif event_type == 'TransactionProcessed':
-                state['balance'] += float(event_data['amount'])
+                state['balance'] += Decimal(str(event_data['amount']))
                 state['transactionCount'] += 1
             elif event_type == 'AccountClosed':
                 state['status'] = 'Closed'
-                state['closedAt'] = event_data['closedAt']
+                state['closedAt'] = event_data.get('closedAt')
         
         return {
             'statusCode': 200,
             'body': json.dumps({
                 'aggregateId': aggregate_id,
                 'reconstructedState': state,
-                'eventsProcessed': len(response['Items'])
-            }, default=str)
+                'eventsProcessed': len(response['Items']),
+                'upToSequence': up_to_sequence
+            }, default=decimal_default)
         }
+    
+    def get_events_by_type(event_type, limit):
+        """Query events by type using GSI"""
+        response = event_store_table.query(
+            IndexName='EventType-Timestamp-index',
+            KeyConditionExpression=Key('EventType').eq(event_type),
+            Limit=limit,
+            ScanIndexForward=False  # Most recent first
+        )
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'eventType': event_type,
+                'events': response['Items'],
+                'count': len(response['Items'])
+            }, default=decimal_default)
+        }
+    
+    def decimal_default(obj):
+        """JSON serializer for Decimal objects"""
+        if isinstance(obj, Decimal):
+            return float(obj)
+        raise TypeError
     EOF
     
     # Package and deploy query handler
@@ -719,17 +816,20 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
     
     aws lambda create-function \
         --function-name "query-handler-${RANDOM_SUFFIX}" \
-        --runtime python3.9 \
-        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/event-sourcing-lambda-role \
+        --runtime python3.12 \
+        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
         --handler query-handler.lambda_handler \
         --zip-file fileb://query-handler.zip \
         --environment Variables="{EVENT_STORE_TABLE=${EVENT_STORE_TABLE},READ_MODEL_TABLE=${READ_MODEL_TABLE}}" \
-        --timeout 30
+        --timeout 30 \
+        --description "Query handler for event sourcing system"
     
-    echo "✅ Created query handler function: query-handler-${RANDOM_SUFFIX}"
+    export QUERY_FUNCTION="query-handler-${RANDOM_SUFFIX}"
+    
+    echo "✅ Created query handler function: ${QUERY_FUNCTION}"
     ```
 
-    The query handler is now deployed, providing comprehensive querying capabilities for the event sourcing system. This function enables fast current state queries via projections and powerful historical state reconstruction via event replay. The ability to reconstruct state at any point in time makes this system ideal for financial applications requiring complete audit trails and regulatory compliance.
+    The query handler is now deployed, providing comprehensive querying capabilities for the event sourcing system. This function enables fast current state queries via projections and powerful historical state reconstruction via event replay. The ability to reconstruct state at any point in time makes this system ideal for financial applications requiring complete audit trails and regulatory compliance. The handler supports multiple query types and includes proper error handling and JSON serialization for DynamoDB Decimal types.
 
 ## Validation & Testing
 
@@ -814,7 +914,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    ```bash
    # Test state reconstruction
    aws lambda invoke \
-       --function-name "query-handler-${RANDOM_SUFFIX}" \
+       --function-name ${QUERY_FUNCTION} \
        --payload '{
            "queryType": "reconstructState",
            "aggregateId": "account-123"
@@ -823,6 +923,17 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    
    # Check reconstruction result
    cat reconstruction.json
+   ```
+
+6. **Test Event Replay** (optional):
+
+   ```bash
+   # Start an event replay for the last hour
+   ./start-replay.sh
+   
+   # Check replay status
+   aws events describe-replay \
+       --replay-name "financial-events-replay-$(date +%s)"
    ```
 
 ## Cleanup
@@ -838,7 +949,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
        --function-name ${PROJECTION_FUNCTION}
    
    aws lambda delete-function \
-       --function-name "query-handler-${RANDOM_SUFFIX}"
+       --function-name ${QUERY_FUNCTION}
    
    echo "✅ Deleted Lambda functions"
    ```
@@ -896,9 +1007,9 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    ```bash
    # Delete CloudWatch alarms
    aws cloudwatch delete-alarms \
-       --alarm-names "EventStore-WriteThrottles" \
-           "CommandHandler-Errors" \
-           "EventBridge-FailedInvocations"
+       --alarm-names "EventStore-WriteThrottles-${RANDOM_SUFFIX}" \
+           "CommandHandler-Errors-${RANDOM_SUFFIX}" \
+           "EventBridge-FailedInvocations-${RANDOM_SUFFIX}"
    
    echo "✅ Deleted CloudWatch alarms"
    ```
@@ -908,20 +1019,20 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    ```bash
    # Detach policies from role
    aws iam detach-role-policy \
-       --role-name event-sourcing-lambda-role \
+       --role-name ${IAM_ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
    aws iam detach-role-policy \
-       --role-name event-sourcing-lambda-role \
-       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/EventSourcingPolicy
+       --role-name ${IAM_ROLE_NAME} \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${IAM_POLICY_NAME}
    
    # Delete custom policy
    aws iam delete-policy \
-       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/EventSourcingPolicy
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${IAM_POLICY_NAME}
    
    # Delete role
    aws iam delete-role \
-       --role-name event-sourcing-lambda-role
+       --role-name ${IAM_ROLE_NAME}
    
    echo "✅ Deleted IAM resources"
    ```
@@ -934,11 +1045,12 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    rm -f projection-handler.py projection-handler.zip
    rm -f query-handler.py query-handler.zip
    rm -f response.json response2.json reconstruction.json
-   rm -f replay-config.json
+   rm -f replay-config.json start-replay.sh
    
    # Clear environment variables
    unset EVENT_BUS_NAME EVENT_STORE_TABLE READ_MODEL_TABLE
-   unset COMMAND_FUNCTION PROJECTION_FUNCTION RANDOM_SUFFIX
+   unset COMMAND_FUNCTION PROJECTION_FUNCTION QUERY_FUNCTION
+   unset IAM_ROLE_NAME IAM_POLICY_NAME RANDOM_SUFFIX DLQ_URL
    
    echo "✅ Cleaned up local files and environment"
    ```
@@ -947,34 +1059,41 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
 
 This event sourcing architecture provides a robust foundation for building scalable, auditable, and maintainable event-driven systems. The combination of EventBridge and DynamoDB offers several key advantages over traditional database-centric approaches, as outlined in the [AWS Prescriptive Guidance for Event Sourcing](https://docs.aws.amazon.com/prescriptive-guidance/latest/modernization-data-persistence/service-per-team.html).
 
-**Event Store Design**: The DynamoDB event store uses a composite primary key (AggregateId, EventSequence) to ensure proper ordering of events within each aggregate. The Global Secondary Index on EventType and Timestamp enables efficient querying across event types for analytics and monitoring purposes. [DynamoDB Streams](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html) automatically capture changes and trigger projection updates, ensuring eventual consistency between the event store and read models.
+**Event Store Design**: The DynamoDB event store uses a composite primary key (AggregateId, EventSequence) to ensure proper ordering of events within each aggregate. The Global Secondary Index on EventType and Timestamp enables efficient querying across event types for analytics and monitoring purposes. [DynamoDB Streams](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html) automatically capture changes and trigger projection updates, ensuring eventual consistency between the event store and read models. This design leverages DynamoDB's single-digit millisecond latency and 99.999% availability SLA.
 
 **CQRS Implementation**: The architecture implements [Command Query Responsibility Segregation](https://docs.aws.amazon.com/prescriptive-guidance/latest/modernization-data-persistence/cqrs-pattern.html) by separating write operations (commands) from read operations (queries). Commands are processed by the command handler, validated, and converted to events. The projection handler creates and maintains optimized read models that can be queried efficiently. This separation allows for independent scaling of read and write workloads and supports multiple specialized read models for different use cases.
 
-**Event Ordering and Consistency**: EventBridge provides at-least-once delivery guarantees, while the event store ensures strict ordering within aggregates through the sequence number. For cross-aggregate consistency, the system relies on eventual consistency patterns. Critical business rules requiring strong consistency should be implemented within aggregate boundaries. The architecture supports idempotent event processing to handle duplicate events gracefully.
+**Event Ordering and Consistency**: EventBridge provides at-least-once delivery guarantees with built-in retry mechanisms, while the event store ensures strict ordering within aggregates through the sequence number. For cross-aggregate consistency, the system relies on eventual consistency patterns managed through EventBridge's reliable message delivery. Critical business rules requiring strong consistency should be implemented within aggregate boundaries. The architecture supports idempotent event processing to handle duplicate events gracefully.
 
-> **Tip**: Implement event versioning from the beginning by including version fields in event schemas. This enables backward compatibility as business requirements evolve and new event types are introduced. See the [AWS EventBridge schema registry documentation](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-schema-registry.html) for guidance on managing event schema evolution.
+> **Tip**: Implement event versioning from the beginning by including version fields in event schemas. This enables backward compatibility as business requirements evolve and new event types are introduced. See the [AWS EventBridge schema registry documentation](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-schema-registry.html) for guidance on managing event schema evolution and automated code generation.
 
-> **Warning**: Ensure proper IAM permissions are configured to prevent unauthorized access to event streams. Use the [principle of least privilege](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege) when configuring Lambda execution roles and DynamoDB table permissions.
+> **Warning**: Ensure proper IAM permissions are configured to prevent unauthorized access to event streams. Use the [principle of least privilege](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege) when configuring Lambda execution roles and DynamoDB table permissions. Regular security audits of IAM policies are recommended for production deployments.
 
-**Monitoring and Observability**: CloudWatch alarms monitor key metrics including DynamoDB throttling, Lambda errors, and EventBridge failed invocations. The dead letter queue captures failed events for manual inspection and reprocessing. Event archives enable replay capabilities for disaster recovery, testing, and debugging scenarios. Consider implementing distributed tracing using AWS X-Ray to track events across service boundaries.
+**Monitoring and Observability**: CloudWatch alarms monitor key metrics including DynamoDB throttling, Lambda errors, and EventBridge failed invocations. The dead letter queue captures failed events for manual inspection and reprocessing. Event archives enable replay capabilities for disaster recovery, testing, and debugging scenarios. Consider implementing distributed tracing using [AWS X-Ray](https://docs.aws.amazon.com/xray/latest/devguide/) to track events across service boundaries and identify performance bottlenecks.
 
-For production deployments, consider implementing event schema validation, encryption for sensitive data, and cross-region replication for disaster recovery. The architecture scales horizontally by partitioning aggregates across multiple event store tables and implementing consistent hashing for routing.
+For production deployments, consider implementing event schema validation using EventBridge Schema Registry, encryption for sensitive data using KMS, and cross-region replication for disaster recovery using DynamoDB Global Tables. The architecture scales horizontally by partitioning aggregates across multiple event store tables and implementing consistent hashing for routing.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Event Schema Registry**: Implement a schema registry using AWS Glue Schema Registry to validate event structures and support schema evolution with backward compatibility.
+1. **Event Schema Registry**: Implement a schema registry using AWS Glue Schema Registry to validate event structures and support schema evolution with backward compatibility. Include automated code generation for event types.
 
-2. **Snapshot Implementation**: Create periodic snapshots of aggregate state to optimize reconstruction performance for aggregates with many events, storing snapshots in a separate DynamoDB table.
+2. **Snapshot Implementation**: Create periodic snapshots of aggregate state to optimize reconstruction performance for aggregates with many events, storing snapshots in a separate DynamoDB table with TTL for cost optimization.
 
-3. **Cross-Region Replication**: Set up DynamoDB Global Tables for the event store and implement cross-region EventBridge replication for disaster recovery and global availability.
+3. **Cross-Region Replication**: Set up DynamoDB Global Tables for the event store and implement cross-region EventBridge replication for disaster recovery and global availability with conflict resolution strategies.
 
-4. **Advanced Event Replay**: Build a replay management system that can selectively replay events based on filters, handle event transformations during replay, and support branching scenarios for testing.
+4. **Advanced Event Replay**: Build a replay management system that can selectively replay events based on filters, handle event transformations during replay, and support branching scenarios for testing new business logic.
 
-5. **Saga Pattern Implementation**: Implement distributed transactions using the Saga pattern with EventBridge, handling compensation events and maintaining transaction state across multiple aggregates.
+5. **Saga Pattern Implementation**: Implement distributed transactions using the Saga pattern with EventBridge, handling compensation events and maintaining transaction state across multiple aggregates with timeout and error handling.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

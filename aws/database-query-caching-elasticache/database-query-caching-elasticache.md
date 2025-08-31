@@ -1,15 +1,15 @@
 ---
 title: Database Query Caching with ElastiCache
 id: ee9da7f5
-category: storage
+category: database
 difficulty: 200
 subject: aws
 services: elasticache,rds,vpc,ec2
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cache,database,redis,performance,optimization
 recipe-generator-version: 1.3
@@ -165,7 +165,7 @@ echo "Database Instance ID: ${DB_INSTANCE_ID}"
    Parameter groups allow you to customize Redis configuration settings beyond the default values, enabling optimization for specific workloads and use cases. The maxmemory-policy setting controls how Redis handles memory pressure, which is critical for caching scenarios where you need predictable eviction behavior. The allkeys-lru policy ensures that the least recently used keys are evicted first, making it ideal for database query caching where access patterns follow temporal locality principles.
 
    ```bash
-   # Create parameter group for Redis optimization
+   # Create parameter group for Redis 7.x optimization
    aws elasticache create-cache-parameter-group \
        --cache-parameter-group-family "redis7.x" \
        --cache-parameter-group-name "${PARAMETER_GROUP_NAME}" \
@@ -190,7 +190,7 @@ echo "Database Instance ID: ${DB_INSTANCE_ID}"
    # Create Redis replication group with automatic failover
    aws elasticache create-replication-group \
        --replication-group-id "${CACHE_CLUSTER_ID}" \
-       --replication-group-description "Redis cluster for database caching" \
+       --description "Redis cluster for database caching" \
        --engine redis \
        --cache-node-type cache.t3.micro \
        --num-cache-clusters 2 \
@@ -364,7 +364,7 @@ echo "Database Instance ID: ${DB_INSTANCE_ID}"
        result1 = cache_aside_get(cache_key, lambda: get_product_by_id(product_id))
        db_time = time.time() - start_time
        
-       # Second call - cache hit
+       # Second call - cache hit  
        start_time = time.time()
        result2 = cache_aside_get(cache_key, lambda: get_product_by_id(product_id))
        cache_time = time.time() - start_time
@@ -416,7 +416,7 @@ echo "Database Instance ID: ${DB_INSTANCE_ID}"
     Cache pattern demonstration provides hands-on experience with Redis operations and monitoring capabilities essential for production cache management. Understanding cache statistics, memory usage patterns, and eviction policies helps in optimizing cache performance and capacity planning. These monitoring capabilities enable proactive cache management and performance tuning based on real-world usage patterns.
 
     ```bash
-    # Test cache operations
+    # Test cache operations with TTL
     redis-cli -h "${REDIS_ENDPOINT}" \
         SET "user:1001" '{"name":"John Doe","email":"john@example.com"}' EX 300
     
@@ -425,7 +425,7 @@ echo "Database Instance ID: ${DB_INSTANCE_ID}"
     # Monitor cache statistics
     redis-cli -h "${REDIS_ENDPOINT}" INFO stats
     
-    # Test cache eviction with maxmemory
+    # Test cache eviction policy configuration
     redis-cli -h "${REDIS_ENDPOINT}" CONFIG GET maxmemory-policy
     
     echo "✅ Cache patterns demonstrated successfully"
@@ -478,10 +478,12 @@ echo "Database Instance ID: ${DB_INSTANCE_ID}"
 
    ```bash
    # Check cache hit ratio and performance metrics
-   redis-cli -h "${REDIS_ENDPOINT}" INFO stats | grep -E "(keyspace_hits|keyspace_misses)"
+   redis-cli -h "${REDIS_ENDPOINT}" INFO stats | \
+       grep -E "(keyspace_hits|keyspace_misses)"
    
    # Monitor memory usage
-   redis-cli -h "${REDIS_ENDPOINT}" INFO memory | grep used_memory_human
+   redis-cli -h "${REDIS_ENDPOINT}" INFO memory | \
+       grep used_memory_human
    ```
 
 ## Cleanup
@@ -489,10 +491,9 @@ echo "Database Instance ID: ${DB_INSTANCE_ID}"
 1. **Remove ElastiCache Resources**:
 
    ```bash
-   # Delete replication group
+   # Delete replication group (without final snapshot for testing)
    aws elasticache delete-replication-group \
-       --replication-group-id "${CACHE_CLUSTER_ID}" \
-       --final-snapshot-identifier "${CACHE_CLUSTER_ID}-final-snapshot"
+       --replication-group-id "${CACHE_CLUSTER_ID}"
    
    echo "✅ ElastiCache replication group deletion initiated"
    ```
@@ -505,11 +506,15 @@ echo "Database Instance ID: ${DB_INSTANCE_ID}"
        --db-instance-identifier "${DB_INSTANCE_ID}" \
        --skip-final-snapshot
    
+   # Wait for RDS deletion to complete
+   aws rds wait db-instance-deleted \
+       --db-instance-identifier "${DB_INSTANCE_ID}"
+   
    # Delete DB subnet group
    aws rds delete-db-subnet-group \
        --db-subnet-group-name "db-subnet-group-${RANDOM_SUFFIX}"
    
-   echo "✅ RDS database deletion initiated"
+   echo "✅ RDS database deletion completed"
    ```
 
 3. **Remove EC2 Instance**:
@@ -527,6 +532,10 @@ echo "Database Instance ID: ${DB_INSTANCE_ID}"
 4. **Remove Network Resources**:
 
    ```bash
+   # Wait for ElastiCache deletion to complete
+   aws elasticache wait replication-group-deleted \
+       --replication-group-id "${CACHE_CLUSTER_ID}"
+   
    # Delete cache subnet group
    aws elasticache delete-cache-subnet-group \
        --cache-subnet-group-name "${SUBNET_GROUP_NAME}"
@@ -556,28 +565,35 @@ echo "Database Instance ID: ${DB_INSTANCE_ID}"
 
 Database query caching with ElastiCache Redis represents a fundamental performance optimization strategy that can dramatically improve application response times while reducing database load. The cache-aside pattern demonstrated in this recipe provides a balance between data consistency and performance, allowing applications to maintain control over what data gets cached and when it expires, as detailed in the [AWS Database Caching Strategies whitepaper](https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/caching-patterns.html).
 
-The key architectural decision in this implementation is using Redis replication groups with automatic failover, which ensures high availability while maintaining sub-millisecond response times. The choice of cache.t3.micro instances provides cost-effective performance for development and testing, while the allkeys-lru eviction policy ensures that the most frequently accessed data remains in cache even when memory limits are reached. This approach follows [ElastiCache best practices](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/BestPractices.html) for optimal performance and reliability.
+The key architectural decision in this implementation is using Redis replication groups with automatic failover, which ensures high availability while maintaining sub-millisecond response times. The choice of cache.t3.micro instances provides cost-effective performance for development and testing, while the allkeys-lru eviction policy ensures that the most frequently accessed data remains in cache even when memory limits are reached. This approach follows [ElastiCache best practices](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/BestPractices.html) for optimal performance and reliability, with Redis 7.x offering enhanced performance and feature capabilities.
 
 ElastiCache Redis offers several advantages over self-managed Redis installations, including automatic patch management, backup and restore capabilities, and CloudWatch integration for monitoring. The managed service handles complex operational tasks like cluster management, failover detection, and security updates, allowing development teams to focus on application logic rather than infrastructure management. This operational efficiency is particularly valuable in production environments where system reliability and performance consistency are critical business requirements.
 
 > **Warning**: Monitor your cache hit ratio regularly using CloudWatch metrics. A hit ratio below 80% may indicate that your TTL values are too short or that your cache size is insufficient for your workload.
 
-The write-through pattern can be combined with cache-aside for write-heavy workloads, while cache warming strategies can preload frequently accessed data during application startup. Consider implementing cache versioning for cache invalidation strategies and use Redis data structures like sorted sets for more complex caching scenarios such as leaderboards or time-series data. For production implementations, explore [ElastiCache parameter group optimization](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/ParameterGroups.html) to fine-tune performance based on your specific application requirements.
+For production implementations, consider enabling [in-transit encryption](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/in-transit-encryption.html) and at-rest encryption for enhanced security. The write-through pattern can be combined with cache-aside for write-heavy workloads, while cache warming strategies can preload frequently accessed data during application startup. Advanced scenarios should explore [ElastiCache parameter group optimization](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/ParameterGroups.html) to fine-tune performance based on specific application requirements and workload characteristics.
 
 ## Challenge
 
 Extend this database caching solution with these advanced implementations:
 
-1. **Implement Cache Warming Strategy**: Create a Lambda function that preloads frequently accessed data into the cache during off-peak hours, reducing cache misses during high-traffic periods.
+1. **Implement Cache Warming Strategy**: Create a Lambda function that preloads frequently accessed data into the cache during off-peak hours, reducing cache misses during high-traffic periods and improving first-user experience.
 
-2. **Add Cache Invalidation Patterns**: Implement database triggers or application-level cache invalidation using Redis pub/sub to automatically update cached data when the underlying database changes.
+2. **Add Cache Invalidation Patterns**: Implement database triggers or application-level cache invalidation using Redis pub/sub to automatically update cached data when the underlying database changes, ensuring data consistency.
 
-3. **Deploy Multi-Region Cache Replication**: Set up ElastiCache Global Datastore to replicate cached data across multiple AWS regions for global application performance.
+3. **Deploy Multi-Region Cache Replication**: Set up ElastiCache Global Datastore to replicate cached data across multiple AWS regions for global application performance and disaster recovery capabilities.
 
-4. **Implement Advanced Cache Patterns**: Add write-through caching for write-heavy workloads and implement cache-aside with circuit breaker patterns for resilient database access.
+4. **Implement Advanced Cache Patterns**: Add write-through caching for write-heavy workloads and implement cache-aside with circuit breaker patterns for resilient database access during failures.
 
-5. **Create Cache Analytics Dashboard**: Build a comprehensive monitoring solution using CloudWatch, X-Ray, and QuickSight to track cache performance metrics, hit ratios, and cost optimization opportunities.
+5. **Create Cache Analytics Dashboard**: Build a comprehensive monitoring solution using CloudWatch, X-Ray, and QuickSight to track cache performance metrics, hit ratios, and cost optimization opportunities with automated alerting.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

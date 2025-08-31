@@ -4,12 +4,12 @@ id: b7f3e9a2
 category: networking
 difficulty: 200
 subject: gcp
-services: Cloud Endpoints, Cloud Armor, Cloud Load Balancing
+services: Cloud Endpoints, Cloud Armor, Cloud Load Balancing, Compute Engine
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: api-gateway, security, ddos-protection, rate-limiting, web-application-firewall
 recipe-generator-version: 1.3
@@ -79,9 +79,9 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and appropriate IAM permissions (Project Editor or custom roles for Compute Engine, Cloud Endpoints, Cloud Armor, and Load Balancing)
-2. Google Cloud CLI (gcloud) installed and configured
+2. Google Cloud CLI (gcloud) installed and configured (version 400.0.0 or later)
 3. Basic understanding of REST APIs, HTTP load balancing, and security concepts
-4. Docker installed for containerizing backend services
+4. Knowledge of OpenAPI specifications and container deployment concepts
 5. Estimated cost: $50-100/month for production workloads (varies based on traffic volume and attack mitigation usage)
 
 > **Note**: Cloud Armor charges are based on the number of rules and requests processed. Review [Cloud Armor pricing](https://cloud.google.com/armor/pricing) for detailed cost calculations based on your expected traffic patterns.
@@ -243,6 +243,9 @@ echo "✅ APIs enabled and environment ready"
    # Deploy the API configuration to Cloud Endpoints
    gcloud endpoints services deploy openapi-spec.yaml
    
+   # Wait for service deployment to complete
+   sleep 30
+   
    # Get the service configuration ID
    export CONFIG_ID=$(gcloud endpoints configs list \
        --service=${API_NAME}.endpoints.${PROJECT_ID}.cloud.goog \
@@ -282,16 +285,16 @@ echo "✅ APIs enabled and environment ready"
        --exceed-action=deny-429 \
        --enforce-on-key=IP
    
-   # Add OWASP protection rule
+   # Add OWASP XSS protection rule
    gcloud compute security-policies rules create 2000 \
        --security-policy=${SECURITY_POLICY_NAME} \
-       --expression="evaluatePreconfiguredExpr('xss-canary')" \
+       --expression="evaluatePreconfiguredExpr('xss-v33-stable')" \
        --action=deny-403
    
    # Add SQL injection protection
    gcloud compute security-policies rules create 3000 \
        --security-policy=${SECURITY_POLICY_NAME} \
-       --expression="evaluatePreconfiguredExpr('sqli-canary')" \
+       --expression="evaluatePreconfiguredExpr('sqli-v33-stable')" \
        --action=deny-403
    
    # Add geo-restriction (example: block traffic from specific countries)
@@ -305,9 +308,9 @@ echo "✅ APIs enabled and environment ready"
 
    Cloud Armor security policy is now active with multiple layers of protection including rate limiting, OWASP Top 10 threat detection, and geographic restrictions. These rules automatically protect your API against volumetric attacks, application-layer threats, and suspicious traffic patterns while maintaining legitimate user access.
 
-5. **Deploy Endpoints Service Proxy (ESP)**:
+5. **Deploy Endpoints Service Proxy (ESPv2)**:
 
-   The Endpoints Service Proxy (ESP) acts as the gateway between Cloud Endpoints and your backend services. ESP handles authentication, authorization, monitoring, and request transformation while providing the bridge between Google's managed API infrastructure and your application code.
+   The Endpoints Service Proxy version 2 (ESPv2) acts as the gateway between Cloud Endpoints and your backend services. ESPv2 handles authentication, authorization, monitoring, and request transformation while providing the bridge between Google's managed API infrastructure and your application code.
 
    ```bash
    # Get the backend service internal IP
@@ -315,38 +318,41 @@ echo "✅ APIs enabled and environment ready"
        --zone=${ZONE} \
        --format="value(networkInterfaces[0].networkIP)")
    
-   # Create ESP container instance
+   # Create ESPv2 container instance
    gcloud compute instances create-with-container esp-proxy-${RANDOM_SUFFIX} \
        --zone=${ZONE} \
        --machine-type=e2-medium \
        --network-tier=PREMIUM \
        --tags=esp-proxy,http-server,https-server \
        --container-image=gcr.io/endpoints-release/endpoints-runtime:2 \
-       --container-env=ESPv2_ARGS=--service=${API_NAME}.endpoints.${PROJECT_ID}.cloud.goog --rollout_strategy=managed --backend=http://${BACKEND_IP}:8080 \
+       --container-env=ESPv2_ARGS="--service=${API_NAME}.endpoints.${PROJECT_ID}.cloud.goog --rollout_strategy=managed --backend=http://${BACKEND_IP}:8080" \
        --boot-disk-size=20GB \
        --boot-disk-type=pd-standard
    
-   # Create firewall rules for ESP proxy
+   # Create firewall rules for ESPv2 proxy
    gcloud compute firewall-rules create allow-esp-proxy \
        --allow=tcp:8080 \
        --source-ranges=0.0.0.0/0 \
        --target-tags=esp-proxy \
-       --description="Allow traffic to ESP proxy"
+       --description="Allow traffic to ESPv2 proxy"
    
-   echo "✅ ESP proxy deployed and configured"
+   # Wait for ESPv2 to start
+   sleep 60
+   
+   echo "✅ ESPv2 proxy deployed and configured"
    ```
 
-   The Endpoints Service Proxy is now running and configured to handle API requests. ESP automatically validates API keys, enforces rate limits defined in your OpenAPI specification, and forwards legitimate requests to your backend services while providing detailed logging and monitoring capabilities.
+   The Endpoints Service Proxy is now running and configured to handle API requests. ESPv2 automatically validates API keys, enforces rate limits defined in your OpenAPI specification, and forwards legitimate requests to your backend services while providing detailed logging and monitoring capabilities.
 
 6. **Create Load Balancer with Cloud Armor Integration**:
 
    Google Cloud Load Balancing provides global distribution and high availability for your API gateway while integrating seamlessly with Cloud Armor for advanced security. This configuration ensures your APIs can handle traffic spikes while maintaining consistent security policies across all entry points.
 
    ```bash
-   # Create instance group for ESP proxy
+   # Create instance group for ESPv2 proxy
    gcloud compute instance-groups unmanaged create esp-proxy-group \
        --zone=${ZONE} \
-       --description="Instance group for ESP proxy instances"
+       --description="Instance group for ESPv2 proxy instances"
    
    gcloud compute instance-groups unmanaged add-instances esp-proxy-group \
        --zone=${ZONE} \
@@ -361,7 +367,7 @@ echo "✅ APIs enabled and environment ready"
        --healthy-threshold=2 \
        --unhealthy-threshold=3
    
-   # Create backend service
+   # Create backend service with Cloud Armor policy
    gcloud compute backend-services create esp-backend-service \
        --protocol=HTTP \
        --health-checks=esp-health-check \
@@ -378,7 +384,7 @@ echo "✅ APIs enabled and environment ready"
    echo "✅ Backend service created with Cloud Armor integration"
    ```
 
-   The load balancer backend service is configured with health checks and Cloud Armor security policies. This ensures only healthy ESP proxy instances receive traffic while all requests are processed through your comprehensive security rules for threat detection and mitigation.
+   The load balancer backend service is configured with health checks and Cloud Armor security policies. This ensures only healthy ESPv2 proxy instances receive traffic while all requests are processed through your comprehensive security rules for threat detection and mitigation.
 
 7. **Configure URL Maps and Frontend Services**:
 
@@ -397,7 +403,7 @@ echo "✅ APIs enabled and environment ready"
    export GATEWAY_IP=$(gcloud compute addresses describe esp-gateway-ip \
        --global --format="value(address)")
    
-   # Create HTTPS target proxy (for production SSL termination)
+   # Create HTTP target proxy
    gcloud compute target-http-proxies create esp-http-proxy \
        --url-map=esp-url-map \
        --global
@@ -413,7 +419,7 @@ echo "✅ APIs enabled and environment ready"
    echo "✅ API Gateway accessible at: http://${GATEWAY_IP}"
    ```
 
-   Your secure API gateway is now fully operational with a static IP address and global load balancing. All incoming requests flow through Cloud Armor security policies, Cloud Endpoints authentication, and are proxied to your backend services through the ESP, providing enterprise-grade security and performance.
+   Your secure API gateway is now fully operational with a static IP address and global load balancing. All incoming requests flow through Cloud Armor security policies, Cloud Endpoints authentication, and are proxied to your backend services through the ESPv2, providing enterprise-grade security and performance.
 
 ## Validation & Testing
 
@@ -450,7 +456,7 @@ echo "✅ APIs enabled and environment ready"
    echo ""
    ```
 
-   Expected output: Unauthenticated requests should return 403, authenticated requests should return 200, and rate limiting should trigger 429 responses after 100 requests.
+   Expected output: Unauthenticated requests should return 401 or 403, authenticated requests should return 200, and rate limiting should trigger 429 responses after 100 requests.
 
 3. **Verify Security Rule Enforcement**:
 
@@ -513,7 +519,8 @@ echo "✅ APIs enabled and environment ready"
    ```bash
    # Delete API key
    gcloud services api-keys delete \
-       $(gcloud services api-keys list --filter="displayName:'Secure API Gateway Key'" \
+       $(gcloud services api-keys list \
+       --filter="displayName:'Secure API Gateway Key'" \
        --format="value(name)") --quiet
    
    # Delete static IP address
@@ -533,13 +540,13 @@ echo "✅ APIs enabled and environment ready"
 
 This secure API gateway architecture demonstrates how Google Cloud's managed services work together to provide enterprise-grade API security and performance. Cloud Endpoints handles the API management layer, providing authentication, monitoring, and developer-friendly features like automatic documentation generation and SDK creation. The service integrates seamlessly with OpenAPI specifications, making it easy to define and enforce API contracts while maintaining compatibility with existing development workflows.
 
-Cloud Armor adds a crucial security layer by providing Web Application Firewall capabilities and DDoS protection at Google's network edge. The security policies we implemented protect against OWASP Top 10 vulnerabilities, implement geographic restrictions, and provide rate limiting to prevent abuse. This edge-based protection ensures malicious traffic is blocked before it reaches your application infrastructure, reducing costs and improving performance for legitimate users.
+Cloud Armor adds a crucial security layer by providing Web Application Firewall capabilities and DDoS protection at Google's network edge. The security policies we implemented protect against OWASP Top 10 vulnerabilities, implement geographic restrictions, and provide rate limiting to prevent abuse. This edge-based protection ensures malicious traffic is blocked before it reaches your application infrastructure, reducing costs and improving performance for legitimate users. The updated security rule expressions use the latest stable rulesets (`xss-v33-stable` and `sqli-v33-stable`) which provide enhanced threat detection capabilities.
 
 The integration of Cloud Load Balancing provides global distribution and high availability while serving as the integration point between Cloud Armor and your backend services. This architecture can automatically scale to handle traffic spikes while maintaining consistent security policies across all regions. For production deployments, consider implementing SSL/TLS termination, custom domains, and advanced monitoring with Cloud Operations to provide complete observability into your API performance and security posture.
 
-The Endpoints Service Proxy (ESP) serves as the critical bridge between Google's managed API infrastructure and your application code. ESP handles the complex tasks of request validation, authentication enforcement, and metrics collection while providing seamless integration with Google Cloud's monitoring and logging systems. This proxy architecture allows your backend services to focus on business logic while ESP manages the operational concerns of API gateway functionality.
+The Endpoints Service Proxy version 2 (ESPv2) serves as the critical bridge between Google's managed API infrastructure and your application code. ESPv2 handles the complex tasks of request validation, authentication enforcement, and metrics collection while providing seamless integration with Google Cloud's monitoring and logging systems. This proxy architecture allows your backend services to focus on business logic while ESPv2 manages the operational concerns of API gateway functionality.
 
-> **Tip**: For production environments, implement multiple ESP proxy instances across different zones and configure autoscaling based on CPU utilization and request volume. This ensures high availability and optimal performance during traffic spikes.
+> **Tip**: For production environments, implement multiple ESPv2 proxy instances across different zones and configure autoscaling based on CPU utilization and request volume. This ensures high availability and optimal performance during traffic spikes.
 
 Key documentation references for this implementation include the [Cloud Endpoints documentation](https://cloud.google.com/endpoints/docs) for API management patterns, [Cloud Armor security policies](https://cloud.google.com/armor/docs/security-policy-overview) for threat protection configuration, [Load Balancing best practices](https://cloud.google.com/load-balancing/docs/best-practices) for performance optimization, the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) for enterprise design patterns, and [Cloud Operations monitoring](https://cloud.google.com/monitoring/docs) for comprehensive observability setup.
 
@@ -547,16 +554,21 @@ Key documentation references for this implementation include the [Cloud Endpoint
 
 Extend this solution by implementing these enhancements:
 
-1. **SSL/TLS Termination and Custom Domains**: Configure Google-managed SSL certificates and custom domain names for production-ready HTTPS endpoints with proper certificate management and automatic renewal.
+1. **SSL/TLS Termination and Custom Domains**: Configure Google-managed SSL certificates and custom domain names for production-ready HTTPS endpoints with proper certificate management and automatic renewal using Cloud Load Balancing SSL certificates.
 
 2. **Advanced Rate Limiting and Quota Management**: Implement per-user quotas using Cloud Endpoints quotas feature, configure different rate limits for different API endpoints, and add request size limitations to prevent resource exhaustion attacks.
 
-3. **Multi-Region Deployment with Failover**: Deploy the API gateway architecture across multiple regions with Cross-Region Load Balancing for global high availability and automatic failover capabilities.
+3. **Multi-Region Deployment with Failover**: Deploy the API gateway architecture across multiple regions with Cross-Region Load Balancing for global high availability and automatic failover capabilities using Google Cloud's Anycast IP addresses.
 
-4. **Integration with Cloud IAM and Identity-Aware Proxy**: Replace API key authentication with Google Cloud IAM and implement Identity-Aware Proxy for enterprise SSO integration and fine-grained access controls.
+4. **Integration with Cloud IAM and Identity-Aware Proxy**: Replace API key authentication with Google Cloud IAM and implement Identity-Aware Proxy for enterprise SSO integration and fine-grained access controls based on user context.
 
-5. **Advanced Monitoring and Alerting**: Set up comprehensive monitoring dashboards using Cloud Monitoring, implement SLI/SLO tracking for API performance, and configure alerting for security events and performance degradation.
+5. **Advanced Monitoring and Alerting**: Set up comprehensive monitoring dashboards using Cloud Monitoring, implement SLI/SLO tracking for API performance, and configure alerting for security events and performance degradation using Cloud Operations suite.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

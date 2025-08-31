@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Monitor SCOM Managed Instance, Azure SQL Managed Instance, Azure Virtual Network
 estimated-time: 150 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: scom, migration, monitoring, hybrid, management-packs
 recipe-generator-version: 1.3
@@ -91,17 +91,17 @@ graph TB
 2. Existing System Center Operations Manager 2019 or 2022 deployment
 3. Azure CLI installed and configured (or Azure CloudShell access)
 4. PowerShell with Operations Manager module installed
-5. Network connectivity between on-premises and Azure environments
+5. On-premises Active Directory domain controller with network connectivity to Azure
 6. Estimated cost: $2,000-$5,000 per month for typical 500 VM deployment
 
-> **Note**: SCOM Managed Instance requires Azure SQL Managed Instance, which has specific networking requirements including dedicated subnets and minimum IP address allocation.
+> **Note**: SCOM Managed Instance requires Azure SQL Managed Instance, which has specific networking requirements including dedicated subnets and minimum IP address allocation of /27 for SQL MI subnet.
 
 ## Preparation
 
 ```bash
 # Set environment variables for the migration
 export RESOURCE_GROUP="rg-scom-migration"
-export LOCATION="East US"
+export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
@@ -114,7 +114,7 @@ export KEY_VAULT_NAME="kv-scom-${RANDOM_SUFFIX}"
 # Create resource group for SCOM migration
 az group create \
     --name ${RESOURCE_GROUP} \
-    --location "${LOCATION}" \
+    --location ${LOCATION} \
     --tags purpose=scom-migration environment=production
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
@@ -123,7 +123,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 az network vnet create \
     --name ${VNET_NAME} \
     --resource-group ${RESOURCE_GROUP} \
-    --location "${LOCATION}" \
+    --location ${LOCATION} \
     --address-prefix 10.0.0.0/16 \
     --subnet-name scom-mi-subnet \
     --subnet-prefix 10.0.1.0/24
@@ -143,9 +143,9 @@ echo "✅ Virtual network and subnets configured"
 
 1. **Export Management Packs from On-Premises SCOM**:
 
-   Before migrating to Azure Monitor SCOM Managed Instance, you must inventory and export all management packs from your existing SCOM environment. This step preserves your monitoring configurations and custom management packs that contain your organization's monitoring logic and overrides.
+   Before migrating to Azure Monitor SCOM Managed Instance, you must inventory and export all management packs from your existing SCOM environment. Management packs contain your organization's monitoring rules, knowledge, and customizations that define how SCOM monitors applications and infrastructure components.
 
-   ```bash
+   ```powershell
    # Connect to your on-premises SCOM management server
    # Run this PowerShell script on your SCOM management server
    
@@ -153,27 +153,27 @@ echo "✅ Virtual network and subnets configured"
    Get-SCOMManagementPack | Select-Object DisplayName, Name, Sealed, Version, LastModified | \
        Sort-Object DisplayName | Export-Csv -Path "C:\Temp\MP_Inventory.csv" -NoTypeInformation
    
-   # Export unsealed management packs
+   # Export unsealed management packs (custom/modified packs)
    Get-SCOMManagementPack | Where-Object { $_.Sealed -eq $false } | \
        Export-SCOMManagementPack -Path "C:\Temp\Unsealed_MPs"
    
-   # Export user roles and permissions
+   # Export user roles and permissions for reference
    Get-SCOMUserRole | Select-Object Name, DisplayName, Description | \
        Export-Csv -Path "C:\Temp\UserRoles.csv" -NoTypeInformation
    ```
 
-   Your management packs are now exported and ready for migration. This inventory provides the foundation for understanding your current monitoring scope and ensures continuity of monitoring capabilities in the Azure environment.
+   Your management packs are now exported and catalogued. This inventory provides the foundation for understanding your current monitoring scope and ensures continuity of monitoring capabilities in the Azure environment.
 
 2. **Create Azure SQL Managed Instance**:
 
-   Azure SQL Managed Instance serves as the database backend for SCOM Managed Instance, hosting both the Operations Database and Data Warehouse. This fully managed service eliminates the operational overhead of managing SQL Server infrastructure while providing enterprise-grade performance and security.
+   Azure SQL Managed Instance serves as the database backend for SCOM Managed Instance, hosting both the Operations Database and Data Warehouse. This fully managed service provides enterprise-grade performance, security, and availability while eliminating the operational overhead of managing SQL Server infrastructure, patching, and backup operations.
 
    ```bash
    # Create SQL Managed Instance for SCOM backend
    az sql mi create \
        --name ${SQL_MI_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
+       --location ${LOCATION} \
        --subnet $(az network vnet subnet show \
            --name sql-mi-subnet \
            --vnet-name ${VNET_NAME} \
@@ -185,42 +185,35 @@ echo "✅ Virtual network and subnets configured"
        --tier GeneralPurpose \
        --family Gen5 \
        --admin-user scomadmin \
-       --admin-password 'P@ssw0rd123!' \
+       --admin-password 'ComplexP@ssw0rd123!' \
        --public-data-endpoint-enabled true
    
-   # Wait for SQL MI creation to complete (may take 4-6 hours)
+   # Monitor SQL MI creation progress (may take 4-6 hours)
+   echo "Waiting for SQL Managed Instance creation..."
    az sql mi show \
        --name ${SQL_MI_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query provisioningState --output tsv
    
-   echo "✅ SQL Managed Instance created successfully"
+   echo "✅ SQL Managed Instance creation initiated"
    ```
 
-   The SQL Managed Instance is now provisioned with the necessary configuration for SCOM databases. This managed service provides automatic patching, backup, and high availability features essential for enterprise monitoring infrastructure.
+   The SQL Managed Instance is now provisioning with the necessary configuration for SCOM databases. This managed service provides automatic patching, backup, and high availability features essential for enterprise monitoring infrastructure while maintaining full SQL Server compatibility.
 
 3. **Configure Azure Key Vault for Secrets Management**:
 
-   Azure Key Vault provides secure storage for sensitive configuration data including SQL connection strings, service account credentials, and encryption keys. This centralized secrets management enhances security posture and enables secure authentication between Azure services.
+   Azure Key Vault provides secure, centralized storage for sensitive configuration data including domain credentials, connection strings, and encryption keys. This security foundation enables zero-trust authentication patterns and meets enterprise compliance requirements for secrets management.
 
    ```bash
-   # Create Key Vault for SCOM secrets
+   # Create Key Vault for SCOM secrets management
    az keyvault create \
        --name ${KEY_VAULT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
+       --location ${LOCATION} \
        --sku standard \
        --enable-rbac-authorization false
    
-   # Store SQL connection string in Key Vault
-   SQL_CONNECTION_STRING="Server=${SQL_MI_NAME}.public.database.windows.net,3342;Database=master;User ID=scomadmin;Password=P@ssw0rd123!;Encrypt=true;TrustServerCertificate=false;"
-   
-   az keyvault secret set \
-       --vault-name ${KEY_VAULT_NAME} \
-       --name "sql-connection-string" \
-       --value "${SQL_CONNECTION_STRING}"
-   
-   # Create managed identity for SCOM MI
+   # Create managed identity for SCOM MI authentication
    az identity create \
        --name "scom-mi-identity" \
        --resource-group ${RESOURCE_GROUP}
@@ -230,62 +223,60 @@ echo "✅ Virtual network and subnets configured"
        --resource-group ${RESOURCE_GROUP} \
        --query principalId --output tsv)
    
-   echo "✅ Key Vault configured with managed identity"
+   # Grant Key Vault access to managed identity
+   az keyvault set-policy \
+       --name ${KEY_VAULT_NAME} \
+       --object-id ${IDENTITY_ID} \
+       --secret-permissions get list
+   
+   echo "✅ Key Vault configured with managed identity access"
    ```
 
-   Key Vault now securely stores connection strings and provides managed identity access for SCOM Managed Instance. This security foundation enables zero-trust authentication patterns and centralized secrets management.
+   Key Vault now provides secure storage with managed identity access for SCOM Managed Instance. This security architecture eliminates the need to store credentials in configuration files while providing centralized secrets management and audit capabilities.
 
-4. **Create Azure Monitor SCOM Managed Instance**:
+4. **Store Domain Credentials in Key Vault**:
 
-   Azure Monitor SCOM Managed Instance provides the core monitoring infrastructure with automatic scaling, patching, and high availability. This managed service maintains full compatibility with existing SCOM agents and management packs while eliminating infrastructure management overhead.
+   Domain credentials must be securely stored in Key Vault to enable SCOM Managed Instance to join your Active Directory domain and authenticate with domain resources. This step ensures secure credential management following Azure security best practices.
 
    ```bash
-   # Create SCOM Managed Instance
-   az monitor scom-managed-instance create \
-       --name ${SCOM_MI_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
-       --sql-managed-instance-id $(az sql mi show \
-           --name ${SQL_MI_NAME} \
-           --resource-group ${RESOURCE_GROUP} \
-           --query id --output tsv) \
-       --subnet-id $(az network vnet subnet show \
-           --name scom-mi-subnet \
-           --vnet-name ${VNET_NAME} \
-           --resource-group ${RESOURCE_GROUP} \
-           --query id --output tsv) \
-       --managed-identity-id $(az identity show \
-           --name "scom-mi-identity" \
-           --resource-group ${RESOURCE_GROUP} \
-           --query id --output tsv) \
-       --key-vault-uri $(az keyvault show \
-           --name ${KEY_VAULT_NAME} \
-           --resource-group ${RESOURCE_GROUP} \
-           --query properties.vaultUri --output tsv)
+   # Store domain username in Key Vault
+   # Replace with your actual domain username
+   az keyvault secret set \
+       --vault-name ${KEY_VAULT_NAME} \
+       --name "domain-username" \
+       --value "scom-svc@yourdomain.com"
    
-   # Wait for SCOM MI creation to complete
-   az monitor scom-managed-instance show \
-       --name ${SCOM_MI_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --query provisioningState --output tsv
+   # Store domain password in Key Vault
+   # Replace with your actual domain password
+   az keyvault secret set \
+       --vault-name ${KEY_VAULT_NAME} \
+       --name "domain-password" \
+       --value "YourSecureDomainPassword123!"
    
-   echo "✅ SCOM Managed Instance created successfully"
+   # Store SQL connection information for reference
+   SQL_FQDN="${SQL_MI_NAME}.${SUBSCRIPTION_ID}.database.windows.net"
+   az keyvault secret set \
+       --vault-name ${KEY_VAULT_NAME} \
+       --name "sql-server-fqdn" \
+       --value "${SQL_FQDN}"
+   
+   echo "✅ Domain credentials securely stored in Key Vault"
    ```
 
-   The SCOM Managed Instance is now deployed with enterprise-grade monitoring capabilities. This cloud-native implementation provides automatic scaling, patching, and integration with Azure monitoring services while maintaining full SCOM compatibility.
+   Domain credentials are now securely stored in Key Vault with appropriate access controls. These credentials will be used by SCOM Managed Instance to join the Active Directory domain and enable integrated authentication with your existing infrastructure.
 
-5. **Configure Network Security and Connectivity**:
+5. **Create Network Security and Connectivity**:
 
-   Proper network configuration ensures secure communication between on-premises agents, Azure services, and management infrastructure. Network security groups and firewall rules establish the secure communication channels required for hybrid monitoring scenarios.
+   Proper network security configuration ensures secure communication between on-premises agents, Azure services, and management infrastructure. Network Security Groups (NSGs) establish defense-in-depth security by controlling traffic flow between subnets and external networks.
 
    ```bash
    # Create Network Security Group for SCOM MI subnet
    az network nsg create \
        --name nsg-scom-mi \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}"
+       --location ${LOCATION}
    
-   # Allow SCOM agent communication
+   # Allow SCOM agent communication (port 5723)
    az network nsg rule create \
        --name Allow-SCOM-Agents \
        --nsg-name nsg-scom-mi \
@@ -308,7 +299,7 @@ echo "✅ Virtual network and subnets configured"
        --source-address-prefixes VirtualNetwork \
        --source-port-ranges '*' \
        --destination-address-prefixes VirtualNetwork \
-       --destination-port-ranges 1433 3342 \
+       --destination-port-ranges 1433 \
        --access Allow \
        --priority 1100 \
        --direction Outbound
@@ -320,171 +311,191 @@ echo "✅ Virtual network and subnets configured"
        --resource-group ${RESOURCE_GROUP} \
        --network-security-group nsg-scom-mi
    
-   echo "✅ Network security configured"
+   echo "✅ Network security groups configured"
    ```
 
-   Network security groups now provide controlled access for SCOM agents and database connectivity. This security configuration ensures that only authorized traffic flows between monitoring components while maintaining defense-in-depth principles.
+   Network security groups now provide controlled access for SCOM agents and database connectivity. This security configuration ensures that only authorized traffic flows between monitoring components while maintaining defense-in-depth security principles.
 
-6. **Import Management Packs to SCOM Managed Instance**:
+6. **Create SCOM Managed Instance via Azure Portal**:
 
-   Management pack migration preserves your existing monitoring investments and custom configurations. This process involves importing both sealed and unsealed management packs, ensuring continuity of monitoring capabilities and business-specific customizations.
+   Azure Monitor SCOM Managed Instance must be created through the Azure portal as Azure CLI commands are not yet available for this service. The portal provides a guided experience with validation checks to ensure proper configuration and prerequisites.
 
    ```bash
-   # Upload management packs to Azure Storage for import
+   # Generate deployment parameters for portal creation
+   echo "SCOM Managed Instance creation parameters:"
+   echo "Resource Group: ${RESOURCE_GROUP}"
+   echo "Instance Name: ${SCOM_MI_NAME}"
+   echo "Location: ${LOCATION}"
+   echo "VNet: ${VNET_NAME}"
+   echo "Subnet: scom-mi-subnet"
+   echo "SQL MI: ${SQL_MI_NAME}"
+   echo "Key Vault: ${KEY_VAULT_NAME}"
+   echo "Managed Identity: scom-mi-identity"
+   
+   echo "Navigate to Azure Portal -> SCOM Managed Instance -> Create"
+   echo "Use the parameters above to complete the creation wizard"
+   
+   # Create placeholder for tracking deployment
+   cat > scom-deployment-info.json << EOF
+   {
+     "resourceGroup": "${RESOURCE_GROUP}",
+     "scomInstanceName": "${SCOM_MI_NAME}",
+     "location": "${LOCATION}",
+     "virtualNetwork": "${VNET_NAME}",
+     "sqlManagedInstance": "${SQL_MI_NAME}",
+     "keyVault": "${KEY_VAULT_NAME}",
+     "deploymentStatus": "pending-portal-creation"
+   }
+   EOF
+   
+   echo "✅ Portal creation parameters generated"
+   ```
+
+   SCOM Managed Instance parameters are prepared for Azure portal creation. Navigate to the Azure portal and use these parameters to create the instance through the guided wizard, which includes prerequisite validation and configuration verification.
+
+7. **Configure Management Pack Storage**:
+
+   Management pack migration requires temporary storage for uploading exported management packs to Azure. Azure Storage provides secure, scalable storage for management pack files during the import process, enabling seamless transfer of monitoring configurations.
+
+   ```bash
+   # Create storage account for management pack uploads
    az storage account create \
        --name "scommigration${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
-       --sku Standard_LRS
+       --location ${LOCATION} \
+       --sku Standard_LRS \
+       --kind StorageV2
    
+   # Get storage account key
    STORAGE_KEY=$(az storage account keys list \
        --account-name "scommigration${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
        --query [0].value --output tsv)
    
+   # Create container for management packs
    az storage container create \
        --name management-packs \
        --account-name "scommigration${RANDOM_SUFFIX}" \
-       --account-key ${STORAGE_KEY}
+       --account-key ${STORAGE_KEY} \
+       --public-access off
    
-   # Import management packs using Operations Manager console
-   # Connect to SCOM MI using Operations Manager console
-   # Navigate to Administration -> Management Packs -> Import
-   # Import both sealed and unsealed management packs
+   # Generate SAS token for secure uploads
+   EXPIRY_DATE=$(date -u -d "+30 days" +%Y-%m-%dT%H:%MZ)
+   SAS_TOKEN=$(az storage container generate-sas \
+       --name management-packs \
+       --account-name "scommigration${RANDOM_SUFFIX}" \
+       --account-key ${STORAGE_KEY} \
+       --permissions rwl \
+       --expiry ${EXPIRY_DATE} \
+       --output tsv)
    
-   echo "✅ Management pack import process initiated"
+   echo "✅ Management pack storage configured"
+   echo "Upload URL: https://scommigration${RANDOM_SUFFIX}.blob.core.windows.net/management-packs?${SAS_TOKEN}"
    ```
 
-   Management packs are now uploaded to Azure Storage and ready for import into SCOM Managed Instance. This preserves your monitoring logic, custom rules, and organizational configurations while transitioning to the cloud-based infrastructure.
+   Storage account is now configured for secure management pack uploads. Use the generated SAS URL to upload your exported management packs, which will then be imported into SCOM Managed Instance through the Operations Manager console.
 
-7. **Configure Agent Multi-homing for Gradual Migration**:
+8. **Configure Agent Multi-homing for Gradual Migration**:
 
-   Multi-homing allows SCOM agents to report to both on-premises and Azure environments simultaneously, enabling gradual migration with zero monitoring downtime. This approach provides validation opportunities and rollback capabilities during the migration process.
+   Multi-homing enables SCOM agents to report to both on-premises and Azure environments simultaneously, providing a safe migration path with zero monitoring downtime. This approach allows validation of monitoring data in the cloud environment while maintaining existing monitoring capabilities.
 
    ```bash
-   # Configure multi-homing for pilot agent group
-   # Run this PowerShell on agent machines or via Group Policy
-   
-   # PowerShell script for agent multi-homing configuration
+   # Generate multi-homing configuration script
    cat > configure-multihoming.ps1 << 'EOF'
-   # Get SCOM MI management server details
-   $ScomMIServer = "${SCOM_MI_NAME}.${LOCATION}.cloudapp.azure.com"
-   $ScomMIPort = 5723
+   # SCOM Agent Multi-homing Configuration Script
+   param(
+       [Parameter(Mandatory=$true)]
+       [string]$ScomMIFQDN,
+       [int]$ScomMIPort = 5723
+   )
    
-   # Add SCOM MI as additional management group
-   $Agent = Get-WmiObject -Class "Microsoft.ManagementInfrastructure.Agent" -Namespace "root\Microsoft\SystemCenter\Agent"
-   $Agent.AddManagementGroup("SCOM_MI_MG", $ScomMIServer, $ScomMIPort)
-   
-   # Verify multi-homing configuration
-   Get-SCOMAgent | Select-Object DisplayName, PrimaryManagementServerName
+   try {
+       # Get current agent configuration
+       $Agent = Get-WmiObject -Class "Microsoft.ManagementInfrastructure.Agent" -Namespace "root\Microsoft\SystemCenter\Agent"
+       
+       # Add SCOM MI as additional management group
+       Write-Output "Adding SCOM MI management group..."
+       $Agent.AddManagementGroup("SCOM_MI_MG", $ScomMIFQDN, $ScomMIPort)
+       
+       # Verify multi-homing configuration
+       Write-Output "Current agent configuration:"
+       Get-SCOMAgent | Select-Object DisplayName, PrimaryManagementServerName
+       
+       Write-Output "Multi-homing configuration completed successfully"
+   }
+   catch {
+       Write-Error "Failed to configure multi-homing: $($_.Exception.Message)"
+   }
    EOF
    
-   # Apply multi-homing configuration to pilot agents
-   # This script should be run on target agent machines
+   # Create deployment instructions
+   echo "Multi-homing configuration script created: configure-multihoming.ps1"
+   echo "Deploy to pilot agents using: .\configure-multihoming.ps1 -ScomMIFQDN <SCOM-MI-FQDN>"
    
-   echo "✅ Multi-homing configuration prepared for pilot agents"
+   echo "✅ Multi-homing configuration prepared"
    ```
 
-   Agent multi-homing is now configured for gradual migration. This approach allows you to validate monitoring data in SCOM Managed Instance while maintaining existing monitoring capabilities, ensuring seamless transition without service interruption.
-
-8. **Configure Azure Monitor Integration**:
-
-   Azure Monitor integration enables centralized logging, alerting, and dashboard capabilities that extend beyond traditional SCOM functionality. This integration provides cloud-native monitoring features while preserving existing SCOM investments.
-
-   ```bash
-   # Create Log Analytics workspace for SCOM MI integration
-   az monitor log-analytics workspace create \
-       --workspace-name "law-scom-${RANDOM_SUFFIX}" \
-       --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
-       --retention-time 30
-   
-   WORKSPACE_ID=$(az monitor log-analytics workspace show \
-       --workspace-name "law-scom-${RANDOM_SUFFIX}" \
-       --resource-group ${RESOURCE_GROUP} \
-       --query customerId --output tsv)
-   
-   # Configure SCOM MI to send data to Log Analytics
-   az monitor scom-managed-instance update \
-       --name ${SCOM_MI_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --log-analytics-workspace-id ${WORKSPACE_ID}
-   
-   # Create Azure Monitor action group for alerting
-   az monitor action-group create \
-       --name "ag-scom-alerts" \
-       --resource-group ${RESOURCE_GROUP} \
-       --short-name "SCOMAlerts" \
-       --email-receiver name=admin email=admin@company.com
-   
-   echo "✅ Azure Monitor integration configured"
-   ```
-
-   SCOM Managed Instance now integrates with Azure Monitor for enhanced logging and alerting capabilities. This integration provides centralized monitoring data, advanced analytics, and cloud-native alerting while maintaining SCOM's deep application monitoring capabilities.
+   Agent multi-homing script is prepared for gradual migration deployment. This PowerShell script can be deployed to pilot agent groups to enable dual reporting, allowing validation of SCOM Managed Instance monitoring while maintaining existing on-premises monitoring capabilities.
 
 ## Validation & Testing
 
 1. **Verify SCOM Managed Instance deployment**:
 
    ```bash
-   # Check SCOM MI status and configuration
-   az monitor scom-managed-instance show \
-       --name ${SCOM_MI_NAME} \
+   # Check resource group for deployed resources
+   az resource list \
        --resource-group ${RESOURCE_GROUP} \
-       --query '{name:name,state:provisioningState,location:location}' \
        --output table
    
-   # Verify SQL MI connectivity
+   # Verify SQL MI deployment status
    az sql mi show \
        --name ${SQL_MI_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query '{name:name,state:state,fqdn:fullyQualifiedDomainName}' \
        --output table
+   
+   # Check network connectivity prerequisites
+   az network vnet show \
+       --name ${VNET_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query '{name:name,location:location,addressSpace:addressSpace}' \
+       --output table
    ```
 
-   Expected output: Both services should show "Succeeded" provisioning state and be accessible via their FQDNs.
+   Expected output: SQL Managed Instance should show "Ready" state and all network resources should be properly deployed with correct configurations.
 
-2. **Test agent connectivity to SCOM Managed Instance**:
+2. **Test network connectivity to Azure services**:
 
-   ```bash
-   # Test network connectivity from agent subnet
-   # Run from a VM in the same VNet or connected network
-   
-   # Test SCOM MI management server port
-   Test-NetConnection -ComputerName "${SCOM_MI_NAME}.${LOCATION}.cloudapp.azure.com" -Port 5723
+   ```powershell
+   # Test connectivity from on-premises network
+   # Run from a domain-joined machine with SCOM agent
    
    # Test SQL MI connectivity
-   Test-NetConnection -ComputerName "${SQL_MI_NAME}.public.database.windows.net" -Port 3342
+   Test-NetConnection -ComputerName "${SQL_MI_NAME}.public.${SUBSCRIPTION_ID}.database.windows.net" -Port 3342
+   
+   # Test Key Vault connectivity
+   Test-NetConnection -ComputerName "${KEY_VAULT_NAME}.vault.azure.net" -Port 443
+   
+   # Verify DNS resolution for Azure services
+   Resolve-DnsName -Name "${SQL_MI_NAME}.public.${SUBSCRIPTION_ID}.database.windows.net"
    ```
 
-3. **Validate management pack import and functionality**:
+3. **Validate management pack preparation**:
 
-   ```bash
-   # Connect to SCOM MI using Operations Manager console
-   # Verify management pack import status
-   # Check agent health and monitoring data collection
+   ```powershell
+   # Verify exported management pack files
+   Get-ChildItem -Path "C:\Temp\Unsealed_MPs" -Recurse | 
+       Select-Object Name, Length, LastWriteTime
    
-   # Run health check script in Operations Manager console
-   Get-SCOMManagementPack | Where-Object {$_.DisplayName -like "*Custom*"} | 
-       Select-Object DisplayName, Version, Sealed
+   # Check management pack inventory
+   Import-Csv -Path "C:\Temp\MP_Inventory.csv" | 
+       Where-Object {$_.Sealed -eq $false} | 
+       Select-Object DisplayName, Version
    ```
 
 ## Cleanup
 
-1. **Remove pilot agent multi-homing configuration**:
-
-   ```bash
-   # Remove Azure SCOM MI management group from pilot agents
-   # Run this PowerShell on agent machines
-   
-   # PowerShell script to remove multi-homing
-   $Agent = Get-WmiObject -Class "Microsoft.ManagementInfrastructure.Agent" -Namespace "root\Microsoft\SystemCenter\Agent"
-   $Agent.RemoveManagementGroup("SCOM_MI_MG")
-   
-   echo "✅ Multi-homing configuration removed from pilot agents"
-   ```
-
-2. **Remove temporary storage resources**:
+1. **Remove temporary storage resources**:
 
    ```bash
    # Delete temporary storage account used for migration
@@ -494,6 +505,22 @@ echo "✅ Virtual network and subnets configured"
        --yes
    
    echo "✅ Temporary storage resources removed"
+   ```
+
+2. **Remove pilot agent multi-homing configuration**:
+
+   ```powershell
+   # Remove Azure SCOM MI management group from pilot agents
+   # Run this PowerShell on agent machines
+   
+   try {
+       $Agent = Get-WmiObject -Class "Microsoft.ManagementInfrastructure.Agent" -Namespace "root\Microsoft\SystemCenter\Agent"
+       $Agent.RemoveManagementGroup("SCOM_MI_MG")
+       Write-Output "Multi-homing configuration removed successfully"
+   }
+   catch {
+       Write-Error "Failed to remove multi-homing: $($_.Exception.Message)"
+   }
    ```
 
 3. **Clean up migration environment (if needed)**:
@@ -526,16 +553,21 @@ Migration complexity varies based on the existing SCOM deployment size and custo
 
 Extend this SCOM migration solution by implementing these advanced capabilities:
 
-1. **Implement automated management pack deployment pipeline** using Azure DevOps to version control and deploy management pack updates across multiple SCOM Managed Instance environments.
+1. **Implement automated management pack deployment pipeline** using Azure DevOps to version control and deploy management pack updates across multiple SCOM Managed Instance environments with proper testing and approval workflows.
 
-2. **Create custom Azure Monitor workbooks** that combine SCOM alerting data with Azure Monitor metrics to provide unified dashboards for hybrid infrastructure monitoring.
+2. **Create custom Azure Monitor workbooks** that combine SCOM alerting data with Azure Monitor metrics to provide unified dashboards for hybrid infrastructure monitoring and cross-platform correlation.
 
-3. **Develop disaster recovery automation** using Azure Site Recovery and Azure Automation to provide automated failover and failback capabilities for SCOM Managed Instance.
+3. **Develop disaster recovery automation** using Azure Site Recovery and Azure Automation to provide automated failover and failback capabilities for SCOM Managed Instance with RPO/RTO targets.
 
-4. **Build intelligent alerting with Azure Logic Apps** that correlates SCOM alerts with other Azure services to reduce alert fatigue and improve incident response times.
+4. **Build intelligent alerting with Azure Logic Apps** that correlates SCOM alerts with other Azure services to reduce alert fatigue and improve incident response times through automated enrichment and routing.
 
-5. **Implement cost optimization monitoring** using Azure Cost Management APIs to track SCOM Managed Instance usage patterns and optimize resource allocation based on monitoring workload requirements.
+5. **Implement cost optimization monitoring** using Azure Cost Management APIs to track SCOM Managed Instance usage patterns and optimize resource allocation based on monitoring workload requirements and seasonal patterns.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -4,12 +4,12 @@ id: 8b5d2e9a
 category: devops
 difficulty: 300
 subject: aws
-services: codecommit,codebuild,codepipeline
+services: codecommit,codebuild,codepipeline,ecr
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: devops,gitops,ci-cd,codecommit,codebuild
 recipe-generator-version: 1.3
@@ -85,12 +85,12 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with permissions for CodeCommit, CodeBuild, CodePipeline, IAM, and ECS
+1. AWS account with permissions for CodeCommit, CodeBuild, CodePipeline, ECR, ECS, IAM, and CloudWatch Logs
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Git client installed locally
 4. Basic understanding of GitOps principles and containerized applications
 5. Docker knowledge for building container images
-6. Estimated cost: $10-20 per month for development workloads (varies by usage)
+6. Estimated cost: $15-25 per month for development workloads (varies by usage)
 
 > **Note**: This recipe creates resources in the AWS Free Tier where possible, but ECS and ALB usage may incur charges. See [AWS Pricing](https://aws.amazon.com/pricing/) for detailed cost information.
 
@@ -200,7 +200,7 @@ EOF
     "start": "node app.js"
   },
   "dependencies": {
-    "express": "^4.18.0"
+    "express": "^4.19.0"
   }
 }
 EOF
@@ -281,6 +281,11 @@ EOF
        --query 'repositories[0].repositoryUri' \
        --output text)
    
+   # Enable ECR image scanning for security
+   aws ecr put-image-scanning-configuration \
+       --repository-name ${REPO_NAME} \
+       --image-scanning-configuration scanOnPush=true
+   
    echo "✅ ECR repository created: ${ECR_URI}"
    export ECR_URI
    ```
@@ -360,7 +365,7 @@ EOF
        }' \
        --environment '{
          "type": "LINUX_CONTAINER",
-         "image": "aws/codebuild/amazonlinux2-x86_64-standard:5.0",
+         "image": "aws/codebuild/amazonlinux-x86_64-standard:5.0",
          "computeType": "BUILD_GENERAL1_SMALL",
          "privilegedMode": true
        }' \
@@ -371,11 +376,42 @@ EOF
 
    The build project is configured with container privileges for Docker operations and linked to our CodeCommit repository. This automation eliminates manual build processes and ensures consistent, repeatable deployments triggered by Git operations.
 
-8. **Create ECS Cluster and Task Definition**:
+8. **Create ECS Task Execution Role and ECS Cluster**:
 
-   Amazon ECS provides the container orchestration platform for our GitOps deployments. The cluster and task definition establish the runtime environment where our containerized applications will be deployed automatically based on Git changes.
+   Amazon ECS requires a task execution role to pull container images and send logs to CloudWatch. We'll create this role and then establish the ECS cluster that will host our containerized applications deployed through GitOps.
 
    ```bash
+   # Create ECS task execution role trust policy
+   cat > config/policies/ecs-task-execution-trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+   
+   # Create ECS task execution role
+   aws iam create-role \
+       --role-name ecsTaskExecutionRole-${RANDOM_SUFFIX} \
+       --assume-role-policy-document file://config/policies/ecs-task-execution-trust-policy.json
+   
+   # Attach the managed policy for ECS task execution
+   aws iam attach-role-policy \
+       --role-name ecsTaskExecutionRole-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+   
+   # Get the role ARN for use in task definition
+   TASK_EXECUTION_ROLE_ARN=$(aws iam get-role \
+       --role-name ecsTaskExecutionRole-${RANDOM_SUFFIX} \
+       --query 'Role.Arn' --output text)
+   
    # Create ECS cluster
    aws ecs create-cluster --cluster-name ${CLUSTER_NAME}
    
@@ -387,7 +423,7 @@ EOF
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "256",
   "memory": "512",
-  "executionRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole",
+  "executionRoleArn": "${TASK_EXECUTION_ROLE_ARN}",
   "containerDefinitions": [
     {
       "name": "gitops-app",
@@ -617,6 +653,13 @@ EOF
    
    aws iam delete-role --role-name CodeBuildGitOpsRole-${RANDOM_SUFFIX}
    
+   # Detach and delete ECS task execution role
+   aws iam detach-role-policy \
+       --role-name ecsTaskExecutionRole-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+   
+   aws iam delete-role --role-name ecsTaskExecutionRole-${RANDOM_SUFFIX}
+   
    # Delete CodePipeline role if created
    aws iam delete-role --role-name CodePipelineGitOpsRole-${RANDOM_SUFFIX} 2>/dev/null || true
    
@@ -636,13 +679,13 @@ EOF
 
 GitOps represents a paradigm shift in how organizations approach continuous deployment and infrastructure management. By treating Git repositories as the single source of truth for both application code and infrastructure configurations, teams achieve unprecedented visibility, auditability, and reliability in their deployment processes. This recipe demonstrates the foundational concepts using AWS native services, providing a platform for more sophisticated GitOps implementations.
 
-The architecture presented here leverages AWS CodeCommit for secure source control, CodeBuild for automated builds, and integrates with container orchestration through ECS. This combination provides enterprise-grade security through IAM integration while maintaining the simplicity that makes GitOps workflows accessible to development teams. The declarative nature of the configuration files means that the desired state of the system is always explicit and version-controlled.
+The architecture presented here leverages AWS CodeCommit for secure source control, CodeBuild for automated builds, and integrates with container orchestration through ECS. This combination provides enterprise-grade security through IAM integration while maintaining the simplicity that makes GitOps workflows accessible to development teams. The declarative nature of the configuration files means that the desired state of the system is always explicit and version-controlled. For more information on AWS GitOps best practices, see the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) operational excellence pillar.
 
 Key benefits of this GitOps approach include immutable deployments through container images, complete audit trails through Git history, and the ability to easily rollback to previous states by reverting commits. The automated pipeline eliminates human error in deployments while providing consistent, repeatable processes across different environments. Security is enhanced through the principle of least privilege in IAM roles and the elimination of direct human access to production systems.
 
-Performance considerations include optimizing Docker image builds through multi-stage builds and layer caching, implementing proper resource allocation in ECS task definitions, and utilizing CodeBuild's distributed build capabilities for larger applications. Cost optimization can be achieved through appropriate instance sizing, implementing lifecycle policies for ECR images, and using Fargate Spot pricing for non-critical workloads.
+Performance considerations include optimizing Docker image builds through multi-stage builds and layer caching, implementing proper resource allocation in ECS task definitions, and utilizing CodeBuild's distributed build capabilities for larger applications. Cost optimization can be achieved through appropriate instance sizing, implementing lifecycle policies for ECR images, and using Fargate Spot pricing for non-critical workloads. For comprehensive guidance, reference the [AWS CodeBuild User Guide](https://docs.aws.amazon.com/codebuild/latest/userguide/welcome.html) and [Amazon ECS Best Practices Guide](https://docs.aws.amazon.com/AmazonECS/latest/bestpracticesguide/intro.html).
 
-> **Tip**: Implement branch protection rules in CodeCommit to require pull request reviews before merging to main branches. This adds an additional quality gate while maintaining the automated deployment benefits of GitOps workflows.
+> **Tip**: Implement branch protection rules in CodeCommit to require pull request reviews before merging to main branches. This adds an additional quality gate while maintaining the automated deployment benefits of GitOps workflows. Consider using [AWS CodeGuru Reviewer](https://docs.aws.amazon.com/codeguru/latest/reviewer-ug/welcome.html) for automated code quality insights.
 
 ## Challenge
 
@@ -650,14 +693,21 @@ Extend this GitOps implementation by adding these advanced capabilities:
 
 1. **Multi-Environment Deployment Pipeline**: Create separate Git branches for development, staging, and production environments with environment-specific configurations and automated promotion workflows between environments.
 
-2. **Infrastructure as Code Integration**: Add AWS CDK or CloudFormation templates to the repository that define the complete infrastructure stack, enabling true infrastructure GitOps where infrastructure changes are also managed through Git workflows.
+2. **Infrastructure as Code Integration**: Add [AWS CDK](https://docs.aws.amazon.com/cdk/v2/guide/home.html) or [CloudFormation templates](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/Welcome.html) to the repository that define the complete infrastructure stack, enabling true infrastructure GitOps where infrastructure changes are also managed through Git workflows.
 
-3. **Advanced Monitoring and Observability**: Implement comprehensive monitoring using CloudWatch Container Insights, AWS X-Ray for distributed tracing, and custom metrics that trigger automated rollbacks when deployment quality gates fail.
+3. **Advanced Monitoring and Observability**: Implement comprehensive monitoring using [CloudWatch Container Insights](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html), [AWS X-Ray for distributed tracing](https://docs.aws.amazon.com/xray/latest/devguide/aws-xray.html), and custom metrics that trigger automated rollbacks when deployment quality gates fail.
 
-4. **Security Scanning Integration**: Add container vulnerability scanning using Amazon Inspector or third-party tools in the CodeBuild pipeline, implementing security gates that prevent deployment of vulnerable images.
+4. **Security Scanning Integration**: Add container vulnerability scanning using [Amazon Inspector](https://docs.aws.amazon.com/inspector/latest/user/what-is-inspector.html) or third-party tools in the CodeBuild pipeline, implementing security gates that prevent deployment of vulnerable images.
 
-5. **Blue-Green Deployment Strategy**: Implement blue-green deployments using ECS services and Application Load Balancer target groups, enabling zero-downtime deployments with automatic traffic shifting and rollback capabilities.
+5. **Blue-Green Deployment Strategy**: Implement [blue-green deployments](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-type-bluegreen.html) using ECS services and Application Load Balancer target groups, enabling zero-downtime deployments with automatic traffic shifting and rollback capabilities.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

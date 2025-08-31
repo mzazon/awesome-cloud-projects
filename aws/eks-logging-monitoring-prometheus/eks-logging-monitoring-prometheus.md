@@ -4,12 +4,12 @@ id: a5e9c4f7
 category: containers
 difficulty: 300
 subject: aws
-services: eks,cloudwatch,prometheus
+services: EKS,CloudWatch,AMP,VPC
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers,eks,kubernetes,logging,monitoring,prometheus
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Enterprise Kubernetes environments running on Amazon EKS require comprehensive o
 
 ## Solution
 
-This recipe implements a comprehensive observability stack for Amazon EKS that combines AWS CloudWatch for centralized logging and Container Insights for infrastructure monitoring with Prometheus for application metrics collection. The solution enables control plane logging, deploys Fluent Bit for log aggregation, configures Container Insights for enhanced observability, and sets up Prometheus with AWS Managed Service for time-series metrics monitoring.
+This recipe implements a comprehensive observability stack for Amazon EKS that combines AWS CloudWatch for centralized logging and Container Insights for infrastructure monitoring with Amazon Managed Service for Prometheus for application metrics collection. The solution enables control plane logging, deploys Fluent Bit for log aggregation, configures Container Insights for enhanced observability, and sets up managed Prometheus scrapers for time-series metrics monitoring.
 
 ## Architecture Diagram
 
@@ -63,7 +63,6 @@ graph TB
     
     subgraph "Alerting & Visualization"
         ALARMS[CloudWatch Alarms]
-        GRAFANA[Amazon Managed Grafana]
         SNS[SNS Notifications]
     end
     
@@ -81,7 +80,6 @@ graph TB
     
     METRICS --> DASHBOARDS
     LOGS --> DASHBOARDS
-    AMP --> GRAFANA
     
     METRICS --> ALARMS
     ALARMS --> SNS
@@ -95,13 +93,12 @@ graph TB
 ## Prerequisites
 
 1. AWS account with appropriate permissions for EKS, CloudWatch, and Prometheus services
-2. AWS CLI v2 installed and configured (minimum version 2.0.0)
-3. kubectl installed and configured for EKS cluster access
-4. eksctl installed for EKS cluster management (optional but recommended)
-5. Basic knowledge of Kubernetes, logging, and monitoring concepts
-6. Estimated cost: $50-100/month for small clusters (varies by log volume and metrics retention)
+2. AWS CLI v2 installed and configured (minimum version 2.15.0)
+3. kubectl installed and configured for EKS cluster access (version 1.30+)
+4. Basic knowledge of Kubernetes, logging, and monitoring concepts
+5. Estimated cost: $75-150/month for small clusters (varies by log volume and metrics retention)
 
-> **Note**: This recipe requires elevated permissions to create IAM roles, EKS clusters, and configure logging services. Ensure your AWS credentials have the necessary permissions outlined in the [IAM best practices guide](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
+> **Note**: This recipe requires elevated permissions to create IAM roles, EKS clusters, and configure logging services. Ensure your AWS credentials have the necessary permissions outlined in the [EKS service IAM role requirements](https://docs.aws.amazon.com/eks/latest/userguide/service_IAM_role.html).
 
 ## Preparation
 
@@ -195,7 +192,7 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
 
 1. **Create EKS Cluster Service Role**:
 
-   IAM service roles enable AWS services to securely perform actions on your behalf using temporary credentials. Unlike IAM users, service roles don't have permanent credentials and are assumed by trusted entities when needed. This follows the principle of least privilege by granting only the minimum permissions required for EKS to manage your cluster infrastructure.
+   IAM service roles enable AWS services to securely perform actions using temporary credentials following the principle of least privilege. EKS requires a service role to manage cluster infrastructure including EC2 instances, security groups, and elastic network interfaces on your behalf.
 
    ```bash
    # Create IAM role for EKS cluster service
@@ -227,17 +224,17 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
    echo "✅ EKS Cluster Service Role created: $CLUSTER_ROLE_ARN"
    ```
 
-   The service role is now established with appropriate permissions to manage the EKS control plane. This role enables EKS to create and manage AWS resources on your behalf, including EC2 instances, security groups, and network interfaces required for cluster operations.
+   The service role provides EKS with permissions to create and manage AWS resources including load balancers, security groups, and EC2 instances required for cluster operations while maintaining secure, temporary credential access.
 
 2. **Create EKS Cluster with Comprehensive Logging**:
 
-   EKS control plane logging provides detailed audit trails of all API server activities, authentication events, and cluster operations. Enabling comprehensive logging is essential for security compliance, troubleshooting, and understanding cluster behavior. The logging data is automatically sent to CloudWatch Logs for centralized analysis.
+   EKS control plane logging captures detailed audit trails of all API server activities, authentication events, and cluster operations. This logging is essential for security compliance, troubleshooting, and understanding cluster behavior patterns.
 
    ```bash
    # Create EKS cluster with all control plane logging enabled
    aws eks create-cluster \
        --name $CLUSTER_NAME \
-       --version 1.28 \
+       --version 1.31 \
        --role-arn $CLUSTER_ROLE_ARN \
        --resources-vpc-config subnetIds=$SUBNET_1,$SUBNET_2 \
        --logging '{"clusterLogging":[{"types":["api","audit","authenticator","controllerManager","scheduler"],"enabled":true}]}'
@@ -252,11 +249,11 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
    echo "✅ EKS cluster created with comprehensive logging enabled"
    ```
 
-   The EKS cluster is now operational with full control plane logging enabled. All API server requests, audit events, authentication attempts, and controller manager activities are being captured and sent to CloudWatch Logs. This provides the foundation for security monitoring and compliance reporting.
+   The EKS cluster now automatically sends all control plane logs to CloudWatch Logs, providing security teams with detailed audit trails for compliance and operations teams with troubleshooting data.
 
 3. **Create Node Group IAM Role and Deploy Worker Nodes**:
 
-   Worker nodes require specific IAM permissions to join the cluster, pull container images, and interact with AWS services. The node group IAM role provides these permissions while maintaining security best practices through service-linked roles and managed policies.
+   Worker nodes require specific IAM permissions to join the cluster, pull container images from ECR, and interact with AWS services. The managed node group provides automatic patching and scaling capabilities.
 
    ```bash
    # Create IAM role for worker nodes
@@ -301,7 +298,7 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
        --subnets $SUBNET_1 $SUBNET_2 \
        --instance-types t3.medium \
        --scaling-config minSize=2,maxSize=4,desiredSize=2 \
-       --ami-type AL2_x86_64
+       --ami-type AL2023_x86_64_STANDARD
    
    # Wait for node group to become active
    echo "Waiting for node group to become active..."
@@ -312,16 +309,108 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
    echo "✅ EKS node group created and ready"
    ```
 
-   The worker node group is now active and ready to run workloads. The nodes have the necessary permissions to join the cluster, pull container images from ECR, and interact with other AWS services. This provides the compute foundation for running monitoring and logging agents.
+   The worker nodes are now active with Amazon Linux 2023 AMI and have the necessary permissions to run container workloads, pull images, and communicate with the cluster control plane.
 
-4. **Deploy CloudWatch Container Insights**:
+4. **Create OIDC Identity Provider for Service Accounts**:
 
-   Container Insights provides performance monitoring and log collection for containerized applications. It collects metrics at the cluster, node, pod, and container level, providing comprehensive visibility into resource utilization and application performance patterns.
+   IAM roles for service accounts (IRSA) enables secure authentication between Kubernetes service accounts and AWS services without storing long-term credentials in the cluster.
+
+   ```bash
+   # Create OIDC identity provider for the cluster
+   export OIDC_ISSUER=$(aws eks describe-cluster \
+       --name $CLUSTER_NAME \
+       --query 'cluster.identity.oidc.issuer' \
+       --output text | sed 's|https://||')
+   
+   # Check if OIDC provider already exists
+   if ! aws iam list-open-id-connect-providers \
+       --query "OpenIDConnectProviderList[?ends_with(Arn, '$OIDC_ISSUER')]" \
+       --output text | grep -q $OIDC_ISSUER; then
+       
+       # Get the certificate thumbprint
+       THUMBPRINT=$(echo | openssl s_client -servername oidc.eks.${AWS_REGION}.amazonaws.com -showcerts -connect oidc.eks.${AWS_REGION}.amazonaws.com:443 2>&- | tac | sed -n '/-----END CERTIFICATE-----/,/-----BEGIN CERTIFICATE-----/p; /-----BEGIN CERTIFICATE-----/q' | tac | openssl x509 -fingerprint -noout | sed 's/.*=//; s/://g')
+       
+       # Create OIDC identity provider
+       aws iam create-open-id-connect-provider \
+           --url https://${OIDC_ISSUER} \
+           --client-id-list sts.amazonaws.com \
+           --thumbprint-list ${THUMBPRINT}
+   fi
+   
+   echo "✅ OIDC identity provider configured"
+   ```
+
+   The OIDC identity provider enables secure, temporary credential delegation between Kubernetes service accounts and AWS IAM roles, eliminating the need for long-term AWS credentials in pods.
+
+5. **Deploy Fluent Bit for Log Collection**:
+
+   Fluent Bit efficiently collects, parses, and forwards container logs to CloudWatch Logs with minimal resource overhead. It runs as a DaemonSet to ensure comprehensive log collection from all containers.
 
    ```bash
    # Create namespace for Amazon CloudWatch
    kubectl create namespace amazon-cloudwatch
    
+   # Create service account for Fluent Bit
+   cat > fluent-bit-service-account.yaml << EOF
+   apiVersion: v1
+   kind: ServiceAccount
+   metadata:
+     name: fluent-bit
+     namespace: amazon-cloudwatch
+   EOF
+   
+   kubectl apply -f fluent-bit-service-account.yaml
+   
+   # Create IAM role for Fluent Bit
+   cat > fluent-bit-role-trust-policy.json << EOF
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Principal": {
+           "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_ISSUER}"
+         },
+         "Action": "sts:AssumeRoleWithWebIdentity",
+         "Condition": {
+           "StringEquals": {
+             "${OIDC_ISSUER}:sub": "system:serviceaccount:amazon-cloudwatch:fluent-bit",
+             "${OIDC_ISSUER}:aud": "sts.amazonaws.com"
+           }
+         }
+       }
+     ]
+   }
+   EOF
+   
+   export FLUENT_BIT_ROLE_ARN=$(aws iam create-role \
+       --role-name ${CLUSTER_NAME}-fluent-bit-role \
+       --assume-role-policy-document file://fluent-bit-role-trust-policy.json \
+       --query 'Role.Arn' --output text)
+   
+   # Attach CloudWatch Logs policy
+   aws iam attach-role-policy \
+       --role-name ${CLUSTER_NAME}-fluent-bit-role \
+       --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+   
+   # Annotate service account with IAM role
+   kubectl annotate serviceaccount fluent-bit \
+       -n amazon-cloudwatch \
+       eks.amazonaws.com/role-arn=$FLUENT_BIT_ROLE_ARN
+   
+   # Deploy Fluent Bit using the official AWS manifest
+   kubectl apply -f https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/fluent-bit/fluent-bit.yaml
+   
+   echo "✅ Fluent Bit deployed for log collection"
+   ```
+
+   Fluent Bit is now collecting logs from all containers and forwarding them to CloudWatch Logs with automatic log group creation and Kubernetes metadata enrichment.
+
+6. **Deploy CloudWatch Agent for Container Insights**:
+
+   The CloudWatch agent collects detailed performance metrics from containers and infrastructure, providing insights into CPU, memory, disk, and network utilization patterns for capacity planning and performance optimization.
+
+   ```bash
    # Create service account for CloudWatch agent
    cat > cloudwatch-agent-service-account.yaml << EOF
    apiVersion: v1
@@ -341,12 +430,13 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
        {
          "Effect": "Allow",
          "Principal": {
-           "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/$(aws eks describe-cluster --name $CLUSTER_NAME --query 'cluster.identity.oidc.issuer' --output text | sed 's|https://||')"
+           "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_ISSUER}"
          },
          "Action": "sts:AssumeRoleWithWebIdentity",
          "Condition": {
            "StringEquals": {
-             "$(aws eks describe-cluster --name $CLUSTER_NAME --query 'cluster.identity.oidc.issuer' --output text | sed 's|https://||'):sub": "system:serviceaccount:amazon-cloudwatch:cloudwatch-agent"
+             "${OIDC_ISSUER}:sub": "system:serviceaccount:amazon-cloudwatch:cloudwatch-agent",
+             "${OIDC_ISSUER}:aud": "sts.amazonaws.com"
            }
          }
        }
@@ -369,402 +459,26 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
        -n amazon-cloudwatch \
        eks.amazonaws.com/role-arn=$CLOUDWATCH_AGENT_ROLE_ARN
    
-   echo "✅ CloudWatch agent service account and IAM role configured"
-   ```
-
-   The CloudWatch agent infrastructure is now configured with proper IAM permissions using IAM roles for service accounts (IRSA). This enables secure, temporary credential delegation without storing long-term credentials in the cluster, following security best practices for Kubernetes workloads.
-
-5. **Deploy Fluent Bit for Log Collection**:
-
-   Fluent Bit is a lightweight, high-performance log processor that efficiently collects, parses, and forwards container logs to CloudWatch Logs. It runs as a DaemonSet on each worker node to ensure comprehensive log collection from all containers while maintaining minimal resource overhead.
-
-   ```bash
-   # Create ConfigMap for Fluent Bit configuration
-   cat > fluent-bit-config.yaml << EOF
-   apiVersion: v1
-   kind: ConfigMap
-   metadata:
-     name: fluent-bit-config
-     namespace: amazon-cloudwatch
-   data:
-     fluent-bit.conf: |
-       [SERVICE]
-           Flush                     5
-           Grace                     30
-           Log_Level                 info
-           Daemon                    off
-           Parsers_File              parsers.conf
-           HTTP_Server               On
-           HTTP_Listen               0.0.0.0
-           HTTP_Port                 2020
-           storage.path              /var/fluent-bit/state/flb-storage/
-           storage.sync              normal
-           storage.checksum          off
-           storage.backlog.mem_limit 5M
-       
-       [INPUT]
-           Name                tail
-           Tag                 application.*
-           Exclude_Path        /var/log/containers/cloudwatch-agent*, /var/log/containers/fluent-bit*, /var/log/containers/aws-node*, /var/log/containers/kube-proxy*
-           Path                /var/log/containers/*.log
-           multiline.parser    docker, cri
-           DB                  /var/fluent-bit/state/flb_container.db
-           Mem_Buf_Limit       50MB
-           Skip_Long_Lines     On
-           Refresh_Interval    10
-           Rotate_Wait         30
-           storage.type        filesystem
-           Read_from_Head      Off
-       
-       [INPUT]
-           Name                tail
-           Tag                 dataplane.systemd.*
-           Path                /var/log/journal
-           multiline.parser    docker, cri
-           DB                  /var/fluent-bit/state/flb_journal.db
-           Mem_Buf_Limit       25MB
-           Skip_Long_Lines     On
-           Refresh_Interval    10
-           Read_from_Head      Off
-       
-       [FILTER]
-           Name                kubernetes
-           Match               application.*
-           Kube_URL            https://kubernetes.default.svc:443
-           Kube_Tag_Prefix     application.var.log.containers.
-           Merge_Log           On
-           Merge_Log_Key       log_processed
-           K8S-Logging.Parser  On
-           K8S-Logging.Exclude Off
-           Labels              Off
-           Annotations         Off
-           Use_Kubelet         On
-           Kubelet_Port        10250
-           Buffer_Size         0
-       
-       [OUTPUT]
-           Name                cloudwatch_logs
-           Match               application.*
-           region              ${AWS_REGION}
-           log_group_name      /aws/containerinsights/${CLUSTER_NAME}/application
-           log_stream_prefix   \${kubernetes_namespace_name}-
-           auto_create_group   On
-           extra_user_agent    container-insights
-       
-       [OUTPUT]
-           Name                cloudwatch_logs
-           Match               dataplane.systemd.*
-           region              ${AWS_REGION}
-           log_group_name      /aws/containerinsights/${CLUSTER_NAME}/dataplane
-           log_stream_prefix   \${hostname}-
-           auto_create_group   On
-           extra_user_agent    container-insights
-     
-     parsers.conf: |
-       [PARSER]
-           Name                docker
-           Format              json
-           Time_Key            time
-           Time_Format         %Y-%m-%dT%H:%M:%S.%L
-           Time_Keep           On
+   # Deploy CloudWatch agent using the official AWS manifest
+   kubectl apply -f https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/cloudwatch-namespace.yaml
    
-       [PARSER]
-           Name                cri
-           Format              regex
-           Regex               ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]*) (?<message>.*)$
-           Time_Key            time
-           Time_Format         %Y-%m-%dT%H:%M:%S.%L%z
-   EOF
+   kubectl apply -f https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/cwagent/cwagent-serviceaccount.yaml
    
-   kubectl apply -f fluent-bit-config.yaml
+   # Set cluster name in the configmap
+   curl https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/cwagent/cwagent-configmap.yaml | \
+   sed "s/{{cluster_name}}/${CLUSTER_NAME}/;s/{{region_name}}/${AWS_REGION}/" | \
+   kubectl apply -f -
    
-   # Deploy Fluent Bit DaemonSet
-   cat > fluent-bit-daemonset.yaml << EOF
-   apiVersion: apps/v1
-   kind: DaemonSet
-   metadata:
-     name: fluent-bit
-     namespace: amazon-cloudwatch
-   spec:
-     selector:
-       matchLabels:
-         name: fluent-bit
-     template:
-       metadata:
-         labels:
-           name: fluent-bit
-       spec:
-         serviceAccountName: cloudwatch-agent
-         containers:
-         - name: fluent-bit
-           image: amazon/aws-for-fluent-bit:stable
-           imagePullPolicy: Always
-           env:
-           - name: AWS_REGION
-             value: "${AWS_REGION}"
-           - name: CLUSTER_NAME
-             value: "${CLUSTER_NAME}"
-           - name: HTTP_SERVER
-             value: "On"
-           - name: HTTP_PORT
-             value: "2020"
-           - name: READ_FROM_HEAD
-             value: "Off"
-           - name: READ_FROM_TAIL
-             value: "On"
-           - name: HOST_NAME
-             valueFrom:
-               fieldRef:
-                 fieldPath: spec.nodeName
-           - name: HOSTNAME
-             valueFrom:
-               fieldRef:
-                 apiVersion: v1
-                 fieldPath: metadata.name
-           resources:
-             limits:
-               memory: 200Mi
-             requests:
-               cpu: 500m
-               memory: 100Mi
-           volumeMounts:
-           - name: fluentbitstate
-             mountPath: /var/fluent-bit/state
-           - name: varlog
-             mountPath: /var/log
-             readOnly: true
-           - name: varlibdockercontainers
-             mountPath: /var/lib/docker/containers
-             readOnly: true
-           - name: fluent-bit-config
-             mountPath: /fluent-bit/etc/
-           - name: runlogjournal
-             mountPath: /run/log/journal
-             readOnly: true
-           - name: dmesg
-             mountPath: /var/log/dmesg
-             readOnly: true
-         terminationGracePeriodSeconds: 10
-         volumes:
-         - name: fluentbitstate
-           hostPath:
-             path: /var/fluent-bit/state
-         - name: varlog
-           hostPath:
-             path: /var/log
-         - name: varlibdockercontainers
-           hostPath:
-             path: /var/lib/docker/containers
-         - name: fluent-bit-config
-           configMap:
-             name: fluent-bit-config
-         - name: runlogjournal
-           hostPath:
-             path: /run/log/journal
-         - name: dmesg
-           hostPath:
-             path: /var/log/dmesg
-         tolerations:
-         - key: node-role.kubernetes.io/master
-           operator: Exists
-           effect: NoSchedule
-         - operator: "Exists"
-           effect: "NoExecute"
-         - operator: "Exists"
-           effect: "NoSchedule"
-   EOF
-   
-   kubectl apply -f fluent-bit-daemonset.yaml
-   
-   echo "✅ Fluent Bit deployed for log collection"
-   ```
-
-   Fluent Bit is now collecting logs from all containers and systemd services, parsing them with appropriate metadata, and forwarding them to CloudWatch Logs. This provides centralized log aggregation with automatic log group creation and Kubernetes metadata enrichment for efficient log analysis.
-
-6. **Deploy CloudWatch Agent for Container Insights**:
-
-   The CloudWatch agent collects detailed performance metrics from containers and the underlying infrastructure. It provides insights into CPU, memory, disk, and network utilization patterns, enabling proactive monitoring and capacity planning for your EKS workloads.
-
-   ```bash
-   # Deploy CloudWatch agent for Container Insights
-   cat > cwagent-config.yaml << EOF
-   apiVersion: v1
-   kind: ConfigMap
-   metadata:
-     name: cwagentconfig
-     namespace: amazon-cloudwatch
-   data:
-     cwagentconfig.json: |
-       {
-         "metrics": {
-           "namespace": "ContainerInsights",
-           "metrics_collected": {
-             "cpu": {
-               "measurement": [
-                 "cpu_usage_idle",
-                 "cpu_usage_iowait",
-                 "cpu_usage_user",
-                 "cpu_usage_system"
-               ],
-               "metrics_collection_interval": 60,
-               "resources": [
-                 "*"
-               ],
-               "totalcpu": false
-             },
-             "disk": {
-               "measurement": [
-                 "used_percent"
-               ],
-               "metrics_collection_interval": 60,
-               "resources": [
-                 "*"
-               ]
-             },
-             "diskio": {
-               "measurement": [
-                 "io_time",
-                 "read_bytes",
-                 "write_bytes",
-                 "reads",
-                 "writes"
-               ],
-               "metrics_collection_interval": 60,
-               "resources": [
-                 "*"
-               ]
-             },
-             "mem": {
-               "measurement": [
-                 "mem_used_percent"
-               ],
-               "metrics_collection_interval": 60
-             },
-             "netstat": {
-               "measurement": [
-                 "tcp_established",
-                 "tcp_time_wait"
-               ],
-               "metrics_collection_interval": 60
-             },
-             "swap": {
-               "measurement": [
-                 "swap_used_percent"
-               ],
-               "metrics_collection_interval": 60
-             }
-           }
-         }
-       }
-   EOF
-   
-   kubectl apply -f cwagent-config.yaml
-   
-   # Deploy CloudWatch agent DaemonSet
-   cat > cwagent-daemonset.yaml << EOF
-   apiVersion: apps/v1
-   kind: DaemonSet
-   metadata:
-     name: cloudwatch-agent
-     namespace: amazon-cloudwatch
-   spec:
-     selector:
-       matchLabels:
-         name: cloudwatch-agent
-     template:
-       metadata:
-         labels:
-           name: cloudwatch-agent
-       spec:
-         serviceAccountName: cloudwatch-agent
-         containers:
-         - name: cloudwatch-agent
-           image: amazon/cloudwatch-agent:1.300026.2b361
-           ports:
-           - containerPort: 8125
-             hostPort: 8125
-             protocol: UDP
-           resources:
-             limits:
-               cpu: 200m
-               memory: 200Mi
-             requests:
-               cpu: 200m
-               memory: 200Mi
-           env:
-           - name: HOST_IP
-             valueFrom:
-               fieldRef:
-                 fieldPath: status.hostIP
-           - name: HOST_NAME
-             valueFrom:
-               fieldRef:
-                 fieldPath: spec.nodeName
-           - name: K8S_NAMESPACE
-             valueFrom:
-               fieldRef:
-                 fieldPath: metadata.namespace
-           volumeMounts:
-           - name: cwagentconfig
-             mountPath: /etc/cwagentconfig
-           - name: rootfs
-             mountPath: /rootfs
-             readOnly: true
-           - name: dockersock
-             mountPath: /var/run/docker.sock
-             readOnly: true
-           - name: varlibdocker
-             mountPath: /var/lib/docker
-             readOnly: true
-           - name: containerdsock
-             mountPath: /run/containerd/containerd.sock
-             readOnly: true
-           - name: sys
-             mountPath: /sys
-             readOnly: true
-           - name: devdisk
-             mountPath: /dev/disk
-             readOnly: true
-         volumes:
-         - name: cwagentconfig
-           configMap:
-             name: cwagentconfig
-         - name: rootfs
-           hostPath:
-             path: /
-         - name: dockersock
-           hostPath:
-             path: /var/run/docker.sock
-         - name: varlibdocker
-           hostPath:
-             path: /var/lib/docker
-         - name: containerdsock
-           hostPath:
-             path: /run/containerd/containerd.sock
-         - name: sys
-           hostPath:
-             path: /sys
-         - name: devdisk
-           hostPath:
-             path: /dev/disk/
-         terminationGracePeriodSeconds: 60
-         tolerations:
-         - operator: "Exists"
-           effect: "NoSchedule"
-         - operator: "Exists"
-           effect: "NoExecute"
-   EOF
-   
-   kubectl apply -f cwagent-daemonset.yaml
+   kubectl apply -f https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/cwagent/cwagent-daemonset.yaml
    
    echo "✅ CloudWatch agent deployed for Container Insights"
    ```
 
-   Container Insights metrics collection is now active across all worker nodes. The CloudWatch agent is collecting comprehensive performance data including CPU, memory, disk, and network metrics, providing the foundation for monitoring dashboards and automated alerting.
+   Container Insights metrics collection is now active, providing comprehensive performance data for monitoring dashboards and alerting systems.
 
 7. **Create Amazon Managed Service for Prometheus Workspace**:
 
-   Amazon Managed Service for Prometheus provides a fully managed, highly available Prometheus-compatible monitoring service. It eliminates the operational overhead of managing Prometheus infrastructure while providing seamless integration with EKS clusters for metrics collection and storage.
+   Amazon Managed Service for Prometheus provides fully managed, highly available Prometheus-compatible monitoring with automatic scaling, patching, and backup without operational overhead.
 
    ```bash
    # Create Prometheus workspace
@@ -775,47 +489,22 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
    echo "Waiting for Prometheus workspace to become active..."
    aws amp wait workspace-active --workspace-id $PROMETHEUS_WORKSPACE_ID
    
-   # Create IAM role for Prometheus scraper
-   cat > prometheus-scraper-role-trust-policy.json << EOF
-   {
-     "Version": "2012-10-17",
-     "Statement": [
-       {
-         "Effect": "Allow",
-         "Principal": {
-           "Service": "aps.amazonaws.com"
-         },
-         "Action": "sts:AssumeRole"
-       }
-     ]
-   }
-   EOF
-   
-   export PROMETHEUS_SCRAPER_ROLE_ARN=$(aws iam create-role \
-       --role-name ${CLUSTER_NAME}-prometheus-scraper-role \
-       --assume-role-policy-document file://prometheus-scraper-role-trust-policy.json \
-       --query 'Role.Arn' --output text)
-   
-   # Attach Prometheus scraper policy
-   aws iam attach-role-policy \
-       --role-name ${CLUSTER_NAME}-prometheus-scraper-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonPrometheusRemoteWriteAccess
-   
    echo "✅ Prometheus workspace created: $PROMETHEUS_WORKSPACE_ID"
+   echo "Workspace endpoint: https://aps-workspaces.${AWS_REGION}.amazonaws.com/workspaces/${PROMETHEUS_WORKSPACE_ID}/"
    ```
 
-   The Amazon Managed Service for Prometheus workspace is now available and ready to receive metrics data. This provides a scalable, secure foundation for time-series metrics storage with automatic backup, patching, and version upgrades managed by AWS.
+   The Prometheus workspace is ready to receive time-series metrics with enterprise-grade reliability, security, and automatic management by AWS.
 
 8. **Deploy Prometheus Scraper Configuration**:
 
-   The managed Prometheus scraper automatically discovers and collects metrics from your EKS cluster using standard Prometheus service discovery mechanisms. It collects metrics from the Kubernetes API server, kubelet, and any applications exposing Prometheus metrics endpoints.
+   The managed Prometheus scraper automatically discovers and collects metrics from EKS clusters using Kubernetes service discovery, eliminating the need to manage Prometheus server infrastructure.
 
    ```bash
    # Create scraper configuration
    cat > prometheus-scraper-config.yaml << EOF
    global:
-     scrape_interval: 15s
-     evaluation_interval: 15s
+     scrape_interval: 30s
+     evaluation_interval: 30s
    
    scrape_configs:
    - job_name: 'kubernetes-apiservers'
@@ -852,59 +541,23 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
        target_label: __metrics_path__
        replacement: /api/v1/nodes/\${1}/proxy/metrics
    
-   - job_name: 'kubernetes-pods'
+   - job_name: 'kubernetes-cadvisor'
      kubernetes_sd_configs:
-     - role: pod
+     - role: node
+     scheme: https
+     tls_config:
+       ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+       insecure_skip_verify: true
+     bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
      relabel_configs:
-     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
-       action: keep
-       regex: true
-     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
-       action: replace
-       target_label: __metrics_path__
-       regex: (.+)
-     - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
-       action: replace
-       regex: ([^:]+)(?::\d+)?;(\d+)
-       replacement: \$1:\$2
-       target_label: __address__
      - action: labelmap
-       regex: __meta_kubernetes_pod_label_(.+)
-     - source_labels: [__meta_kubernetes_namespace]
-       action: replace
-       target_label: kubernetes_namespace
-     - source_labels: [__meta_kubernetes_pod_name]
-       action: replace
-       target_label: kubernetes_pod_name
-   
-   - job_name: 'kubernetes-service-endpoints'
-     kubernetes_sd_configs:
-     - role: endpoints
-     relabel_configs:
-     - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
-       action: keep
-       regex: true
-     - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
-       action: replace
-       target_label: __scheme__
-       regex: (https?)
-     - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
-       action: replace
-       target_label: __metrics_path__
+       regex: __meta_kubernetes_node_label_(.+)
+     - target_label: __address__
+       replacement: kubernetes.default.svc:443
+     - source_labels: [__meta_kubernetes_node_name]
        regex: (.+)
-     - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
-       action: replace
-       target_label: __address__
-       regex: ([^:]+)(?::\d+)?;(\d+)
-       replacement: \$1:\$2
-     - action: labelmap
-       regex: __meta_kubernetes_service_label_(.+)
-     - source_labels: [__meta_kubernetes_namespace]
-       action: replace
-       target_label: kubernetes_namespace
-     - source_labels: [__meta_kubernetes_service_name]
-       action: replace
-       target_label: kubernetes_name
+       target_label: __metrics_path__
+       replacement: /api/v1/nodes/\${1}/proxy/metrics/cadvisor
    EOF
    
    # Create Prometheus scraper
@@ -918,11 +571,11 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
    echo "✅ Prometheus scraper created: $SCRAPER_ID"
    ```
 
-   The Prometheus scraper is now actively collecting metrics from your EKS cluster. It automatically discovers targets using Kubernetes service discovery and scrapes metrics from the API server, nodes, and any services or pods with proper Prometheus annotations. This provides comprehensive metrics coverage for both infrastructure and application monitoring.
+   The Prometheus scraper is actively collecting metrics from the Kubernetes API server, nodes, and cAdvisor, providing comprehensive infrastructure and container metrics.
 
 9. **Create CloudWatch Dashboards**:
 
-   CloudWatch dashboards provide centralized visualization of your EKS cluster metrics, combining Container Insights data with control plane logs for comprehensive operational visibility. These dashboards enable quick identification of performance issues and cluster health trends.
+   CloudWatch dashboards provide centralized visualization combining Container Insights data with control plane logs for comprehensive operational visibility and rapid issue identification.
 
    ```bash
    # Create comprehensive CloudWatch dashboard
@@ -956,9 +609,9 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
          "height": 6,
          "properties": {
            "metrics": [
-             [ "ContainerInsights", "cluster_running_count", "ClusterName", "${CLUSTER_NAME}" ],
-             [ ".", "cluster_pending_count", ".", "." ],
-             [ ".", "cluster_failed_count", ".", "." ]
+             [ "ContainerInsights", "pod_running", "ClusterName", "${CLUSTER_NAME}" ],
+             [ ".", "pod_pending", ".", "." ],
+             [ ".", "pod_failed", ".", "." ]
            ],
            "view": "timeSeries",
            "stacked": false,
@@ -993,7 +646,7 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
          "width": 12,
          "height": 6,
          "properties": {
-           "query": "SOURCE '/aws/eks/${CLUSTER_NAME}/cluster' | fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+           "query": "SOURCE '/aws/eks/${CLUSTER_NAME}/cluster' | fields @timestamp, @message\\n| filter @message like /ERROR/\\n| sort @timestamp desc\\n| limit 20",
            "region": "${AWS_REGION}",
            "title": "EKS Control Plane Errors",
            "view": "table"
@@ -1008,13 +661,14 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
        --dashboard-body file://cloudwatch-dashboard.json
    
    echo "✅ CloudWatch dashboard created"
+   echo "Dashboard URL: https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=${CLUSTER_NAME}-observability"
    ```
 
-   The CloudWatch dashboard is now available and displaying real-time metrics from your EKS cluster. It provides immediate visibility into node health, pod status, resource utilization, and control plane errors, enabling rapid identification and resolution of operational issues.
+   The CloudWatch dashboard provides real-time visibility into cluster health, resource utilization, and control plane errors for rapid operational issue identification.
 
 10. **Deploy Sample Application with Prometheus Metrics**:
 
-    A sample application with Prometheus metrics endpoints demonstrates how applications can expose custom metrics for monitoring. This enables application-level observability beyond infrastructure metrics, providing insights into business logic and application performance.
+    A sample application demonstrates how to expose custom metrics that are automatically discovered and scraped by the Prometheus scraper for application-level observability.
 
     ```bash
     # Deploy sample application with Prometheus metrics
@@ -1040,10 +694,10 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
         spec:
           containers:
           - name: sample-app
-            image: nginx:1.21
+            image: prom/node-exporter:latest
             ports:
-            - containerPort: 80
-            - containerPort: 8080
+            - containerPort: 9100
+              name: metrics
             resources:
               requests:
                 cpu: 100m
@@ -1051,9 +705,6 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
               limits:
                 cpu: 200m
                 memory: 256Mi
-            env:
-            - name: PROMETHEUS_ENABLED
-              value: "true"
     ---
     apiVersion: v1
     kind: Service
@@ -1062,17 +713,14 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
       namespace: default
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
+        prometheus.io/port: "9100"
     spec:
       selector:
         app: sample-app
       ports:
-      - name: http
-        port: 80
-        targetPort: 80
       - name: metrics
-        port: 8080
-        targetPort: 8080
+        port: 9100
+        targetPort: 9100
       type: ClusterIP
     EOF
     
@@ -1081,13 +729,18 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
     echo "✅ Sample application with Prometheus metrics deployed"
     ```
 
-    The sample application is now running with Prometheus metrics annotations. This demonstrates how applications can expose metrics endpoints that are automatically discovered and scraped by the Prometheus scraper, providing application-specific monitoring capabilities.
+    The sample application exposes node exporter metrics that are automatically discovered and scraped by the Prometheus scraper, demonstrating application-specific monitoring capabilities.
 
 11. **Configure CloudWatch Alarms**:
 
-    CloudWatch alarms provide automated alerting based on metric thresholds, enabling proactive responses to performance issues and capacity constraints. These alarms form the foundation of an effective monitoring strategy by alerting operations teams before issues impact end users.
+    CloudWatch alarms provide automated alerting based on metric thresholds, enabling proactive responses to performance issues and capacity constraints before they impact end users.
 
     ```bash
+    # Create SNS topic for alerts
+    export SNS_TOPIC_ARN=$(aws sns create-topic \
+        --name ${CLUSTER_NAME}-alerts \
+        --query 'TopicArn' --output text)
+    
     # Create CloudWatch alarms for key metrics
     aws cloudwatch put-metric-alarm \
         --alarm-name "${CLUSTER_NAME}-high-cpu-utilization" \
@@ -1099,7 +752,7 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
         --threshold 80 \
         --comparison-operator GreaterThanThreshold \
         --evaluation-periods 2 \
-        --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${CLUSTER_NAME}-alerts \
+        --alarm-actions $SNS_TOPIC_ARN \
         --dimensions Name=ClusterName,Value=${CLUSTER_NAME}
     
     aws cloudwatch put-metric-alarm \
@@ -1112,58 +765,27 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
         --threshold 80 \
         --comparison-operator GreaterThanThreshold \
         --evaluation-periods 2 \
-        --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${CLUSTER_NAME}-alerts \
+        --alarm-actions $SNS_TOPIC_ARN \
         --dimensions Name=ClusterName,Value=${CLUSTER_NAME}
     
     aws cloudwatch put-metric-alarm \
-        --alarm-name "${CLUSTER_NAME}-high-pod-count" \
+        --alarm-name "${CLUSTER_NAME}-high-failed-pods" \
         --alarm-description "High number of failed pods in EKS cluster" \
-        --metric-name cluster_failed_count \
+        --metric-name pod_failed \
         --namespace ContainerInsights \
         --statistic Average \
         --period 300 \
         --threshold 5 \
         --comparison-operator GreaterThanThreshold \
         --evaluation-periods 1 \
-        --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${CLUSTER_NAME}-alerts \
+        --alarm-actions $SNS_TOPIC_ARN \
         --dimensions Name=ClusterName,Value=${CLUSTER_NAME}
     
     echo "✅ CloudWatch alarms configured for key metrics"
+    echo "SNS Topic ARN: $SNS_TOPIC_ARN"
     ```
 
-    CloudWatch alarms are now monitoring critical cluster metrics and will trigger notifications when thresholds are exceeded. This enables proactive incident response and helps maintain optimal cluster performance by alerting on resource constraints and application failures.
-
-12. **Create CloudWatch Log Insights Queries**:
-
-    CloudWatch Logs Insights provides powerful query capabilities for analyzing log data from your EKS cluster. Pre-configured queries enable rapid troubleshooting by surfacing common issues such as authentication failures, errors, and security events.
-
-    ```bash
-    # Create saved queries for CloudWatch Logs Insights
-    cat > log-insights-queries.json << EOF
-    [
-      {
-        "queryName": "EKS-Control-Plane-Errors",
-        "query": "fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 50",
-        "logGroups": ["/aws/eks/${CLUSTER_NAME}/cluster"]
-      },
-      {
-        "queryName": "EKS-Authentication-Failures",
-        "query": "fields @timestamp, @message\n| filter @message like /authentication failed/\n| sort @timestamp desc\n| limit 50",
-        "logGroups": ["/aws/eks/${CLUSTER_NAME}/cluster"]
-      },
-      {
-        "queryName": "Application-Pod-Errors",
-        "query": "fields @timestamp, kubernetes.namespace_name, kubernetes.pod_name, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 50",
-        "logGroups": ["/aws/containerinsights/${CLUSTER_NAME}/application"]
-      }
-    ]
-    EOF
-    
-    echo "✅ CloudWatch Log Insights queries saved"
-    echo "Use these queries in CloudWatch Logs Insights console for troubleshooting"
-    ```
-
-    CloudWatch Logs Insights queries are now available for rapid troubleshooting and analysis. These pre-configured queries help identify control plane errors, authentication failures, and application issues, enabling faster incident resolution and cluster diagnostics.
+    CloudWatch alarms monitor critical cluster metrics and trigger SNS notifications when thresholds are exceeded, enabling proactive incident response and optimal cluster performance maintenance.
 
 ## Validation & Testing
 
@@ -1188,11 +810,11 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
    kubectl get nodes
    kubectl get pods --all-namespaces
    
-   # Check Fluent Bit pods
+   # Check monitoring pods
    kubectl get pods -n amazon-cloudwatch
    ```
 
-   Expected output: All nodes should show "Ready" status, and Fluent Bit pods should be running.
+   Expected output: All nodes should show "Ready" status, and monitoring pods should be running.
 
 3. **Verify CloudWatch Logs**:
 
@@ -1242,16 +864,19 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
 
 ## Cleanup
 
-1. **Delete CloudWatch Alarms**:
+1. **Delete CloudWatch Alarms and SNS Topic**:
 
    ```bash
    # Delete all alarms for the cluster
    aws cloudwatch delete-alarms \
        --alarm-names "${CLUSTER_NAME}-high-cpu-utilization" \
        "${CLUSTER_NAME}-high-memory-utilization" \
-       "${CLUSTER_NAME}-high-pod-count"
+       "${CLUSTER_NAME}-high-failed-pods"
    
-   echo "✅ CloudWatch alarms deleted"
+   # Delete SNS topic
+   aws sns delete-topic --topic-arn $SNS_TOPIC_ARN
+   
+   echo "✅ CloudWatch alarms and SNS topic deleted"
    ```
 
 2. **Delete CloudWatch Dashboard**:
@@ -1282,13 +907,7 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
    # Delete sample application
    kubectl delete -f sample-app-with-metrics.yaml
    
-   # Delete CloudWatch agent and Fluent Bit
-   kubectl delete -f cwagent-daemonset.yaml
-   kubectl delete -f fluent-bit-daemonset.yaml
-   kubectl delete -f cwagent-config.yaml
-   kubectl delete -f fluent-bit-config.yaml
-   
-   # Delete namespace
+   # Delete monitoring namespace (this removes all resources)
    kubectl delete namespace amazon-cloudwatch
    
    echo "✅ Kubernetes resources deleted"
@@ -1341,6 +960,13 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
    
    aws iam delete-role --role-name ${CLUSTER_NAME}-node-role
    
+   # Delete Fluent Bit role
+   aws iam detach-role-policy \
+       --role-name ${CLUSTER_NAME}-fluent-bit-role \
+       --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+   
+   aws iam delete-role --role-name ${CLUSTER_NAME}-fluent-bit-role
+   
    # Delete CloudWatch agent role
    aws iam detach-role-policy \
        --role-name ${CLUSTER_NAME}-cloudwatch-agent-role \
@@ -1348,31 +974,21 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
    
    aws iam delete-role --role-name ${CLUSTER_NAME}-cloudwatch-agent-role
    
-   # Delete Prometheus scraper role
-   aws iam detach-role-policy \
-       --role-name ${CLUSTER_NAME}-prometheus-scraper-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonPrometheusRemoteWriteAccess
-   
-   aws iam delete-role --role-name ${CLUSTER_NAME}-prometheus-scraper-role
-   
    echo "✅ IAM roles deleted"
    ```
 
 7. **Delete VPC and Networking Resources**:
 
    ```bash
-   # Delete route table associations
-   aws ec2 disassociate-route-table \
-       --association-id $(aws ec2 describe-route-tables \
-           --route-table-ids $ROUTE_TABLE_ID \
-           --query 'RouteTables[0].Associations[0].RouteTableAssociationId' \
-           --output text)
+   # Delete route table associations and routes
+   ASSOCIATION_IDS=$(aws ec2 describe-route-tables \
+       --route-table-ids $ROUTE_TABLE_ID \
+       --query 'RouteTables[0].Associations[?Main==`false`].RouteTableAssociationId' \
+       --output text)
    
-   aws ec2 disassociate-route-table \
-       --association-id $(aws ec2 describe-route-tables \
-           --route-table-ids $ROUTE_TABLE_ID \
-           --query 'RouteTables[0].Associations[1].RouteTableAssociationId' \
-           --output text)
+   for ASSOC_ID in $ASSOCIATION_IDS; do
+       aws ec2 disassociate-route-table --association-id $ASSOC_ID
+   done
    
    # Delete route table
    aws ec2 delete-route-table --route-table-id $ROUTE_TABLE_ID
@@ -1394,48 +1010,52 @@ echo "Subnet IDs: $SUBNET_1, $SUBNET_2"
    # Clean up configuration files
    rm -f eks-cluster-role-trust-policy.json
    rm -f node-group-role-trust-policy.json
+   rm -f fluent-bit-role-trust-policy.json
    rm -f cloudwatch-agent-role-trust-policy.json
-   rm -f prometheus-scraper-role-trust-policy.json
-   rm -f fluent-bit-config.yaml
-   rm -f fluent-bit-daemonset.yaml
-   rm -f cwagent-config.yaml
-   rm -f cwagent-daemonset.yaml
+   rm -f fluent-bit-service-account.yaml
+   rm -f cloudwatch-agent-service-account.yaml
    rm -f prometheus-scraper-config.yaml
    rm -f cloudwatch-dashboard.json
    rm -f sample-app-with-metrics.yaml
-   rm -f log-insights-queries.json
    
    echo "✅ VPC and networking resources deleted"
    ```
 
 ## Discussion
 
-This comprehensive observability solution for Amazon EKS demonstrates how to implement enterprise-grade logging and monitoring using AWS native services. The architecture combines multiple data collection methods to provide complete visibility into cluster operations, application performance, and infrastructure health.
+This comprehensive observability solution for Amazon EKS demonstrates enterprise-grade logging and monitoring using AWS native services following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html). The architecture combines multiple data collection methods to provide complete visibility into cluster operations, application performance, and infrastructure health.
 
-The solution leverages [EKS control plane logging](https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html) to capture all API server activities, audit events, and authentication attempts. This provides security teams with detailed trails of all cluster operations and helps with compliance requirements. Fluent Bit acts as a lightweight log processor that efficiently collects and forwards container logs to CloudWatch Logs, while [Container Insights](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html) provides deep visibility into cluster resource utilization and performance metrics.
+The solution leverages [EKS control plane logging](https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html) to capture all API server activities, audit events, and authentication attempts. This provides security teams with detailed audit trails for compliance requirements while enabling operations teams to troubleshoot cluster issues. [Fluent Bit integration](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Container-Insights-setup-logs-FluentBit.html) acts as a lightweight log processor that efficiently collects and forwards container logs to CloudWatch Logs, while [Container Insights](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html) provides deep visibility into cluster resource utilization and performance metrics.
 
-[Amazon Managed Service for Prometheus](https://docs.aws.amazon.com/prometheus/latest/userguide/what-is-Amazon-Managed-Service-Prometheus.html) offers a fully managed solution for collecting and storing time-series metrics from Kubernetes workloads. Unlike self-managed Prometheus installations, the managed service handles scaling, availability, and maintenance automatically. The integration with EKS through managed scrapers simplifies configuration while providing enterprise-grade reliability and security.
+[Amazon Managed Service for Prometheus](https://docs.aws.amazon.com/prometheus/latest/userguide/what-is-Amazon-Managed-Service-Prometheus.html) offers a fully managed solution for collecting and storing time-series metrics from Kubernetes workloads. Unlike self-managed Prometheus installations, the managed service handles scaling, availability, and maintenance automatically while providing enterprise-grade reliability and security. The integration with EKS through managed collectors simplifies configuration and reduces operational overhead.
 
-The observability stack includes pre-configured dashboards and alerts that provide immediate value for operations teams. CloudWatch Logs Insights enables powerful log analysis capabilities, while the combination of CloudWatch metrics and Prometheus data provides comprehensive monitoring coverage. This dual approach ensures that teams can leverage both AWS native tooling and open-source monitoring standards.
+The observability stack includes pre-configured dashboards and alerts that provide immediate operational value. CloudWatch Logs Insights enables powerful log analysis capabilities, while the combination of CloudWatch metrics and Prometheus data provides comprehensive monitoring coverage. This dual approach ensures teams can leverage both AWS native tooling and open-source monitoring standards.
 
-> **Warning**: Monitor your log volumes and metrics retention policies carefully, as CloudWatch Logs and Container Insights can generate significant costs with high-volume applications. Consider implementing log filtering and metric aggregation strategies to optimize costs while maintaining observability.
+> **Warning**: Monitor your log volumes and metrics retention policies carefully, as CloudWatch Logs and Container Insights can generate significant costs with high-volume applications. Implement log filtering and metric aggregation strategies to optimize costs. Review the [CloudWatch pricing documentation](https://aws.amazon.com/cloudwatch/pricing/) for cost optimization guidance.
 
-> **Tip**: Use CloudWatch Logs Insights for ad-hoc analysis and create custom metrics for business-specific KPIs. Consider integrating with [Amazon Managed Grafana](https://aws.amazon.com/grafana/) for advanced visualization and alerting capabilities. Review the [IAM security best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html) regularly to ensure your monitoring infrastructure follows the principle of least privilege.
+> **Tip**: Use CloudWatch Logs Insights for ad-hoc analysis and create custom metrics for business-specific KPIs. Consider integrating with Amazon Managed Grafana for advanced visualization capabilities. Regularly review [IAM security best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html) to ensure your monitoring infrastructure follows the principle of least privilege.
 
 ## Challenge
 
 Extend this observability solution by implementing these advanced monitoring capabilities:
 
-1. **Implement distributed tracing** with AWS X-Ray to track request flows across microservices, integrating with the existing logging infrastructure for correlated observability.
+1. **Implement distributed tracing** with AWS X-Ray to track request flows across microservices, integrating with existing logging infrastructure for correlated observability and end-to-end transaction monitoring.
 
-2. **Deploy Amazon Managed Grafana** to create custom dashboards that combine CloudWatch metrics with Prometheus data, providing unified visualization for both infrastructure and application metrics.
+2. **Deploy Amazon Managed Grafana** to create custom dashboards combining CloudWatch metrics with Prometheus data, providing unified visualization and advanced alerting capabilities for both infrastructure and application metrics.
 
-3. **Configure advanced alerting** with multi-dimensional CloudWatch alarms and Prometheus AlertManager rules, implementing escalation policies and PagerDuty integration for critical incidents.
+3. **Configure advanced alerting** with multi-dimensional CloudWatch alarms and Prometheus AlertManager rules, implementing escalation policies with AWS Systems Manager Incident Manager for critical incidents.
 
-4. **Implement log anomaly detection** using CloudWatch Logs Insights and Amazon OpenSearch Service to automatically identify unusual patterns in application logs and system events.
+4. **Implement log anomaly detection** using CloudWatch Logs Insights and Amazon OpenSearch Service with machine learning to automatically identify unusual patterns in application logs and system events.
 
-5. **Create automated remediation workflows** using AWS Lambda and Step Functions triggered by CloudWatch alarms, implementing self-healing capabilities for common cluster issues.
+5. **Create automated remediation workflows** using AWS Lambda and Step Functions triggered by CloudWatch alarms, implementing self-healing capabilities for common cluster issues like pod restarts and resource scaling.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

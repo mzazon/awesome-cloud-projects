@@ -6,17 +6,16 @@ difficulty: 400
 subject: aws
 services: EKS, Auto Scaling, CloudWatch, EC2
 estimated-time: 240 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: eks, auto-scaling, kubernetes, hpa, cluster-autoscaler
 recipe-generator-version: 1.3
 ---
 
 # EKS Workload Auto Scaling
-
 
 ## Problem
 
@@ -138,28 +137,6 @@ export CLUSTER_FULL_NAME="${CLUSTER_NAME}-${RANDOM_SUFFIX}"
 export SERVICE_ACCOUNT_NAME="cluster-autoscaler"
 export NAMESPACE="kube-system"
 
-# Create IAM role for Cluster Autoscaler
-cat > cluster-autoscaler-trust-policy.json << EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/$(aws eks describe-cluster --name ${CLUSTER_FULL_NAME} --query 'cluster.identity.oidc.issuer' --output text | cut -d'/' -f3-)"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "$(aws eks describe-cluster --name ${CLUSTER_FULL_NAME} --query 'cluster.identity.oidc.issuer' --output text | cut -d'/' -f3-):sub": "system:serviceaccount:${NAMESPACE}:${SERVICE_ACCOUNT_NAME}",
-          "$(aws eks describe-cluster --name ${CLUSTER_FULL_NAME} --query 'cluster.identity.oidc.issuer' --output text | cut -d'/' -f3-):aud": "sts.amazonaws.com"
-        }
-      }
-    }
-  ]
-}
-EOF
-
 echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
 ```
 
@@ -178,7 +155,7 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
    metadata:
      name: ${CLUSTER_FULL_NAME}
      region: ${AWS_REGION}
-     version: "1.28"
+     version: "1.30"
    
    managedNodeGroups:
      - name: general-purpose
@@ -246,7 +223,9 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
    
    # Wait for metrics server to be ready
-   kubectl wait --for=condition=ready pod -l k8s-app=metrics-server -n kube-system --timeout=300s
+   kubectl wait --for=condition=ready pod \
+       -l k8s-app=metrics-server \
+       -n kube-system --timeout=300s
    
    # Verify metrics server is working
    kubectl top nodes
@@ -256,7 +235,7 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
 
    Metrics Server is now actively collecting resource utilization data from all nodes and pods in the cluster. The successful `kubectl top nodes` command confirms that metrics are being properly aggregated and exposed through the Kubernetes API. This establishes the data foundation that HPA requires to make intelligent scaling decisions based on actual resource consumption rather than static configurations.
 
-   > **Warning**: HPA requires resource requests to be defined for target containers to calculate utilization percentages. Without resource requests, HPA cannot determine scaling targets. See the [Kubernetes HPA documentation](https://docs.aws.amazon.com/eks/latest/userguide/horizontal-pod-autoscaler.html) for detailed configuration requirements.
+   > **Warning**: HPA requires resource requests to be defined for target containers to calculate utilization percentages. Without resource requests, HPA cannot determine scaling targets. See the [Amazon EKS HPA documentation](https://docs.aws.amazon.com/eks/latest/userguide/horizontal-pod-autoscaler.html) for detailed configuration requirements.
 
 3. **Deploy Cluster Autoscaler**:
 
@@ -268,19 +247,25 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
      https://raw.githubusercontent.com/kubernetes/autoscaler/master/cluster-autoscaler/cloudprovider/aws/examples/cluster-autoscaler-autodiscover.yaml
    
    # Update the cluster autoscaler configuration
-   sed -i '' "s/<YOUR CLUSTER NAME>/${CLUSTER_FULL_NAME}/g" cluster-autoscaler-autodiscover.yaml
+   sed -i.bak "s/<YOUR CLUSTER NAME>/${CLUSTER_FULL_NAME}/g" \
+       cluster-autoscaler-autodiscover.yaml
    
    # Apply the cluster autoscaler
    kubectl apply -f cluster-autoscaler-autodiscover.yaml
    
+   # Get the IAM role ARN created by eksctl
+   CA_ROLE_ARN=$(aws iam list-roles \
+       --query "Roles[?contains(RoleName,'${CLUSTER_FULL_NAME}') && contains(RoleName,'cluster-autoscaler')].Arn" \
+       --output text)
+   
    # Add cluster autoscaler annotations
    kubectl annotate serviceaccount cluster-autoscaler \
      -n kube-system \
-     eks.amazonaws.com/role-arn=arn:aws:iam::${AWS_ACCOUNT_ID}:role/eksctl-${CLUSTER_FULL_NAME}-addon-iamserviceaccount-kube-system-cluster-autoscaler-Role1-*
+     eks.amazonaws.com/role-arn=${CA_ROLE_ARN}
    
-   # Scale down the cluster autoscaler to 0 and back up to refresh the annotation
-   kubectl scale deployment cluster-autoscaler --replicas=0 -n kube-system
-   kubectl scale deployment cluster-autoscaler --replicas=1 -n kube-system
+   # Restart cluster autoscaler to pick up the annotation
+   kubectl rollout restart deployment cluster-autoscaler \
+       -n kube-system
    
    echo "✅ Cluster Autoscaler deployed successfully"
    ```
@@ -304,7 +289,9 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
      --set prometheus.operator.enabled=true
    
    # Wait for KEDA to be ready
-   kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=keda -n keda-system --timeout=300s
+   kubectl wait --for=condition=ready pod \
+       -l app.kubernetes.io/name=keda \
+       -n keda-system --timeout=300s
    
    echo "✅ KEDA installed successfully"
    ```
@@ -338,7 +325,7 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
        spec:
          containers:
          - name: cpu-demo
-           image: k8s.gcr.io/hpa-example
+           image: registry.k8s.io/hpa-example
            ports:
            - containerPort: 80
            resources:
@@ -432,7 +419,7 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
        spec:
          containers:
          - name: memory-demo
-           image: nginx:1.21
+           image: nginx:1.25
            ports:
            - containerPort: 80
            resources:
@@ -488,7 +475,47 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
 
    The memory-focused application is now deployed with HPA policies optimized for memory-constrained workloads. The shorter scale-up stabilization window (30 seconds) enables rapid response to memory pressure, while the longer scale-down window (300 seconds) prevents premature removal of replicas during temporary memory spikes. This configuration is particularly effective for applications with unpredictable memory allocation patterns or workloads that experience gradual memory growth over time.
 
-7. **Configure Custom Metrics with KEDA**:
+7. **Set Up Monitoring and Observability**:
+
+   Comprehensive monitoring is essential for understanding autoscaling behavior, identifying optimization opportunities, and troubleshooting scaling issues. Prometheus provides metrics collection and storage for cluster-wide resource utilization, scaling events, and application performance indicators. Grafana enables visualization of autoscaling patterns, helping operators understand when and why scaling decisions occur. This observability foundation supports data-driven optimization of scaling policies and provides the insights needed to maintain optimal cluster performance and cost efficiency.
+
+   ```bash
+   # Create monitoring namespace
+   kubectl create namespace monitoring
+   
+   # Deploy Prometheus for metrics collection
+   helm repo add prometheus-community \
+       https://prometheus-community.github.io/helm-charts
+   helm repo update
+   
+   # Install Prometheus
+   helm install prometheus prometheus-community/prometheus \
+     --namespace monitoring \
+     --set server.persistentVolume.size=20Gi \
+     --set server.retention=7d \
+     --set alertmanager.persistentVolume.size=10Gi
+   
+   # Install Grafana for visualization
+   helm repo add grafana https://grafana.github.io/helm-charts
+   helm install grafana grafana/grafana \
+     --namespace monitoring \
+     --set persistence.enabled=true \
+     --set persistence.size=10Gi \
+     --set adminPassword=admin123
+   
+   # Wait for monitoring stack to be ready
+   kubectl wait --for=condition=ready pod \
+       -l app=prometheus -n monitoring --timeout=300s
+   kubectl wait --for=condition=ready pod \
+       -l app.kubernetes.io/name=grafana \
+       -n monitoring --timeout=300s
+   
+   echo "✅ Monitoring stack deployed successfully"
+   ```
+
+   The monitoring infrastructure is now operational, providing comprehensive visibility into cluster autoscaling behavior and application performance. Prometheus is actively collecting metrics from all cluster components, including HPA decisions, Cluster Autoscaler events, and KEDA scaling triggers. Grafana provides rich visualization capabilities for analyzing scaling patterns, resource utilization trends, and the correlation between application load and scaling decisions. This observability stack enables proactive optimization of autoscaling policies and supports root cause analysis of performance issues.
+
+8. **Configure Custom Metrics with KEDA**:
 
    KEDA's ScaledObject enables event-driven autoscaling based on custom metrics that reflect actual business demand rather than just infrastructure utilization. This configuration demonstrates scaling based on Prometheus metrics, allowing applications to respond to application-specific signals such as request rates, queue depths, or custom business metrics. This approach provides more intelligent scaling decisions that align with user experience and business requirements, often resulting in better performance and cost optimization compared to resource-based scaling alone.
 
@@ -512,7 +539,7 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
        spec:
          containers:
          - name: custom-metrics-demo
-           image: nginx:1.21
+           image: nginx:1.25
            ports:
            - containerPort: 80
            resources:
@@ -561,7 +588,7 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
 
    The KEDA ScaledObject is now monitoring Prometheus metrics to drive intelligent scaling decisions based on actual application performance indicators. When HTTP request rates exceed 30 requests per second, KEDA will automatically scale the deployment up to handle increased load. This event-driven approach enables proactive scaling that anticipates user demand rather than reacting to resource exhaustion, resulting in better user experience and more efficient resource utilization patterns.
 
-8. **Configure Cluster Autoscaler Advanced Settings**:
+9. **Configure Cluster Autoscaler Advanced Settings**:
 
    Advanced Cluster Autoscaler configuration optimizes scaling behavior for production environments by implementing intelligent node selection, timing controls, and resource thresholds. The "least-waste" expander minimizes resource fragmentation by selecting node groups that best match pending pod requirements. Scale-down delays prevent unnecessary node churning, while the utilization threshold ensures nodes are only removed when genuinely underutilized, balancing cost optimization with operational stability and performance requirements.
 
@@ -580,42 +607,6 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
    ```
 
    Cluster Autoscaler is now optimized for production workloads with intelligent scaling behaviors that minimize costs while maintaining performance. The 10-minute scale-down delays provide sufficient time for workload patterns to stabilize, preventing rapid node additions and removals that could disrupt applications. Resource limits ensure Cluster Autoscaler itself operates efficiently without consuming excessive cluster resources, while the enhanced logging and node balancing features provide operational visibility and optimal resource distribution across availability zones.
-
-9. **Set Up Monitoring and Observability**:
-
-   Comprehensive monitoring is essential for understanding autoscaling behavior, identifying optimization opportunities, and troubleshooting scaling issues. Prometheus provides metrics collection and storage for cluster-wide resource utilization, scaling events, and application performance indicators. Grafana enables visualization of autoscaling patterns, helping operators understand when and why scaling decisions occur. This observability foundation supports data-driven optimization of scaling policies and provides the insights needed to maintain optimal cluster performance and cost efficiency.
-
-   ```bash
-   # Create monitoring namespace
-   kubectl create namespace monitoring
-   
-   # Deploy Prometheus for metrics collection
-   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-   helm repo update
-   
-   # Install Prometheus
-   helm install prometheus prometheus-community/prometheus \
-     --namespace monitoring \
-     --set server.persistentVolume.size=20Gi \
-     --set server.retention=7d \
-     --set alertmanager.persistentVolume.size=10Gi
-   
-   # Install Grafana for visualization
-   helm repo add grafana https://grafana.github.io/helm-charts
-   helm install grafana grafana/grafana \
-     --namespace monitoring \
-     --set persistence.enabled=true \
-     --set persistence.size=10Gi \
-     --set adminPassword=admin123
-   
-   # Wait for monitoring stack to be ready
-   kubectl wait --for=condition=ready pod -l app=prometheus -n monitoring --timeout=300s
-   kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=grafana -n monitoring --timeout=300s
-   
-   echo "✅ Monitoring stack deployed successfully"
-   ```
-
-   The monitoring infrastructure is now operational, providing comprehensive visibility into cluster autoscaling behavior and application performance. Prometheus is actively collecting metrics from all cluster components, including HPA decisions, Cluster Autoscaler events, and KEDA scaling triggers. Grafana provides rich visualization capabilities for analyzing scaling patterns, resource utilization trends, and the correlation between application load and scaling decisions. This observability stack enables proactive optimization of autoscaling policies and supports root cause analysis of performance issues.
 
 10. **Create Load Testing Configuration**:
 
@@ -641,14 +632,14 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
         spec:
           containers:
           - name: load-generator
-            image: busybox:1.35
+            image: busybox:1.36
             command:
             - /bin/sh
             - -c
             - |
               while true; do
                 echo "Starting load test..."
-                for i in $(seq 1 1000); do
+                for i in \$(seq 1 1000); do
                   wget -q -O- http://cpu-demo-service.demo-apps.svc.cluster.local/ &
                   wget -q -O- http://memory-demo-service.demo-apps.svc.cluster.local/ &
                   wget -q -O- http://custom-metrics-demo-service.demo-apps.svc.cluster.local/ &
@@ -818,7 +809,7 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
        spec:
          containers:
          - name: node-scale-test
-           image: nginx:1.21
+           image: nginx:1.25
            resources:
              requests:
                cpu: 500m
@@ -849,7 +840,8 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
 
    ```bash
    # Generate custom metrics load
-   kubectl run metrics-generator --image=busybox:1.35 -n demo-apps -- /bin/sh -c "while true; do wget -q -O- http://custom-metrics-demo-service/; sleep 1; done"
+   kubectl run metrics-generator --image=busybox:1.36 -n demo-apps \
+       -- /bin/sh -c "while true; do wget -q -O- http://custom-metrics-demo-service/; sleep 1; done"
    
    # Monitor KEDA scaling
    kubectl describe scaledobject custom-metrics-scaler -n demo-apps
@@ -916,7 +908,6 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
    # Clean up local files
    rm -f cluster-config.yaml
    rm -f cluster-autoscaler-autodiscover.yaml
-   rm -f cluster-autoscaler-trust-policy.json
    rm -f cpu-app.yaml
    rm -f memory-app.yaml
    rm -f custom-metrics-app.yaml
@@ -924,19 +915,20 @@ echo "✅ Environment prepared with cluster name: ${CLUSTER_FULL_NAME}"
    rm -f load-test.yaml
    rm -f node-scale-test.yaml
    rm -f vpa-config.yaml
+   rm -rf autoscaler/
    
    echo "✅ EKS cluster and local files deleted"
    ```
 
 ## Discussion
 
-This comprehensive autoscaling solution for Amazon EKS demonstrates the power of combining multiple autoscaling mechanisms to achieve optimal resource utilization and cost efficiency. The Horizontal Pod Autoscaler handles application-level scaling based on resource utilization metrics, while the Cluster Autoscaler manages infrastructure-level scaling by adding or removing EC2 instances based on pod scheduling requirements.
+This comprehensive autoscaling solution for Amazon EKS demonstrates the power of combining multiple autoscaling mechanisms to achieve optimal resource utilization and cost efficiency. The Horizontal Pod Autoscaler handles application-level scaling based on resource utilization metrics, while the Cluster Autoscaler manages infrastructure-level scaling by adding or removing EC2 instances based on pod scheduling requirements. This follows the AWS Well-Architected Framework's Performance Efficiency pillar by automating scaling decisions and optimizing resource usage based on actual demand.
 
-The integration of KEDA extends the scaling capabilities beyond basic CPU and memory metrics to include custom metrics from external systems like Prometheus, CloudWatch, or message queues. This enables more sophisticated scaling policies that reflect real application performance rather than just infrastructure utilization. The configuration includes advanced HPA behaviors with stabilization windows and scaling policies that prevent rapid oscillations and ensure smooth scaling transitions.
+The integration of KEDA extends the scaling capabilities beyond basic CPU and memory metrics to include custom metrics from external systems like Prometheus, CloudWatch, or message queues. This enables more sophisticated scaling policies that reflect real application performance rather than just infrastructure utilization. The configuration includes advanced HPA behaviors with stabilization windows and scaling policies that prevent rapid oscillations and ensure smooth scaling transitions, adhering to the Reliability pillar by maintaining consistent performance during scaling events.
 
-The solution addresses common enterprise challenges including cost optimization through right-sizing, performance assurance through proactive scaling, and operational efficiency through automation. The Pod Disruption Budgets ensure application availability during scaling events, while the monitoring stack provides visibility into scaling decisions and system performance. The multi-node group configuration with different instance types allows for workload-specific optimizations and cost-effective resource allocation.
+The solution addresses common enterprise challenges including cost optimization through right-sizing (Cost Optimization pillar), performance assurance through proactive scaling, and operational efficiency through automation (Operational Excellence pillar). The Pod Disruption Budgets ensure application availability during scaling events, while the monitoring stack provides visibility into scaling decisions and system performance. The multi-node group configuration with different instance types allows for workload-specific optimizations and cost-effective resource allocation across different compute patterns.
 
-> **Tip**: Configure cluster autoscaler with appropriate scale-down delays to prevent unnecessary node churning, and use node affinity rules to ensure critical workloads are placed on stable nodes. For comprehensive best practices, refer to the [AWS EKS Cluster Autoscaling documentation](https://docs.aws.amazon.com/eks/latest/best-practices/cluster-autoscaling.html).
+> **Tip**: Configure cluster autoscaler with appropriate scale-down delays to prevent unnecessary node churning, and use node affinity rules to ensure critical workloads are placed on stable nodes. For comprehensive best practices, refer to the [AWS EKS Cluster Autoscaling best practices](https://docs.aws.amazon.com/eks/latest/best-practices/cluster-autoscaling.html).
 
 ## Challenge
 
@@ -946,7 +938,7 @@ Extend this autoscaling solution by implementing these advanced enhancements:
 
 2. **Add multi-zone and multi-region scaling** with cross-zone pod affinity rules, zone-aware cluster autoscaler configuration, and disaster recovery failover mechanisms for high availability.
 
-3. **Create custom metrics pipelines** by integrating with external systems like Redis, RabbitMQ, or custom application metrics to enable business-logic-driven scaling decisions based on queue depths, active connections, or transaction rates.
+3. **Create custom metrics pipelines** by integrating with external systems like Amazon SQS, Amazon RDS, or custom application metrics to enable business-logic-driven scaling decisions based on queue depths, active connections, or transaction rates.
 
 4. **Implement cost-optimized scaling** with Spot Instance integration, mixed instance types, and intelligent placement strategies that balance cost savings with performance requirements across different workload types.
 
@@ -954,4 +946,11 @@ Extend this autoscaling solution by implementing these advanced enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: Lex, Lambda, DynamoDB, CloudWatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: chatbot, lex, natural-language, customer-service
 recipe-generator-version: 1.3
 ---
 
 # Chatbot Development with Amazon Lex
-
 
 ## Problem
 
@@ -203,6 +202,7 @@ echo "✅ Preparation completed successfully"
 import json
 import boto3
 import logging
+import os
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -252,9 +252,10 @@ def handle_order_status(event):
         return elicit_slot(event, 'OrderNumber', 
                           "Please provide your order number so I can check the status.")
     
-    # Query DynamoDB for order status
+    # Query DynamoDB for order status using environment variable
     try:
-        table = dynamodb.Table('customer-orders-example')  # Update with actual table name
+        table_name = os.environ.get('ORDERS_TABLE', 'customer-orders-example')
+        table = dynamodb.Table(table_name)
         response = table.get_item(Key={'OrderId': order_id})
         
         if 'Item' in response:
@@ -287,7 +288,7 @@ def elicit_slot(event, slot_name, message):
                 'slotToElicit': slot_name
             },
             'intent': event['sessionState']['intent'],
-            'originatingRequestId': event['requestAttributes'].get('x-amz-lex:request-id')
+            'originatingRequestId': event.get('requestAttributes', {}).get('x-amz-lex:request-id')
         },
         'messages': [
             {
@@ -307,7 +308,7 @@ def close_intent(event, message):
                 'name': event['sessionState']['intent']['name'],
                 'state': 'Fulfilled'
             },
-            'originatingRequestId': event['requestAttributes'].get('x-amz-lex:request-id')
+            'originatingRequestId': event.get('requestAttributes', {}).get('x-amz-lex:request-id')
         },
         'messages': [
             {
@@ -341,7 +342,7 @@ EOF
    
    aws lambda create-function \
        --function-name $LAMBDA_FUNCTION_NAME \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler lex_fulfillment.lambda_handler \
        --zip-file fileb:///tmp/lex_fulfillment.zip \
@@ -397,7 +398,8 @@ EOF
        --bot-id $BOT_ID \
        --bot-version DRAFT \
        --locale-id en_US \
-       --nlu-intent-confidence-threshold 0.7
+       --nlu-intent-confidence-threshold 0.7 \
+       --description "English US locale for customer service"
    
    # Create ProductInformation intent
    aws lexv2-models create-intent \
@@ -604,42 +606,118 @@ EOF
 
    The SupportRequest intent and Lambda integration are now configured, completing the conversational framework that balances automation with human assistance. The resource-based permission policy enables secure invocation of the fulfillment function while the broad source ARN pattern accommodates future bot versions and aliases. This integration architecture enables sophisticated conversation flows that can process business logic, access multiple data sources, and generate personalized responses in real-time.
 
-9. **Build and Test the Bot**:
+9. **Configure Lambda Fulfillment for All Intents**:
 
-   The bot building process compiles all intents, slot types, and sample utterances into an optimized NLU model that can accurately recognize user input and extract relevant information. This machine learning training phase is essential for achieving high-quality conversation experiences, as it analyzes patterns across all sample utterances to improve intent recognition accuracy. Bot versioning and aliases enable safe deployment practices where production environments remain stable while development continues on draft versions, supporting continuous improvement without service disruption.
+   Amazon Lex V2 requires explicit configuration of Lambda fulfillment at the bot alias level for the Lambda function to process intent requests. This configuration step associates the Lambda function with specific bot versions and enables the fulfillment processing that connects natural language understanding with custom business logic. The fulfillment configuration supports different Lambda functions for different conversation stages, providing flexibility for complex conversational workflows.
 
    ```bash
-   # Build the bot
-   aws lexv2-models build-bot-locale \
+   # Update each intent to use Lambda fulfillment
+   PRODUCT_INTENT_ID=$(aws lexv2-models list-intents \
        --bot-id $BOT_ID \
        --bot-version DRAFT \
-       --locale-id en_US
+       --locale-id en_US \
+       --query "intentSummaries[?intentName=='ProductInformation'].intentId" \
+       --output text)
    
-   # Wait for build to complete
-   echo "Waiting for bot build to complete..."
-   aws lexv2-models wait bot-locale-built \
+   ORDER_INTENT_ID=$(aws lexv2-models list-intents \
        --bot-id $BOT_ID \
        --bot-version DRAFT \
-       --locale-id en_US
+       --locale-id en_US \
+       --query "intentSummaries[?intentName=='OrderStatus'].intentId" \
+       --output text)
    
-   # Create bot version
-   aws lexv2-models create-bot-version \
+   SUPPORT_INTENT_ID=$(aws lexv2-models list-intents \
        --bot-id $BOT_ID \
-       --description "Production version of customer service bot"
+       --bot-version DRAFT \
+       --locale-id en_US \
+       --query "intentSummaries[?intentName=='SupportRequest'].intentId" \
+       --output text)
    
-   # Create bot alias for production
-   aws lexv2-models create-bot-alias \
+   # Configure fulfillment for ProductInformation intent
+   aws lexv2-models update-intent \
        --bot-id $BOT_ID \
-       --bot-alias-name production \
-       --description "Production alias for customer service bot" \
-       --bot-version "1"
+       --bot-version DRAFT \
+       --locale-id en_US \
+       --intent-id $PRODUCT_INTENT_ID \
+       --intent-name ProductInformation \
+       --fulfillment-code-hook '{
+           "enabled": true
+       }'
    
-   echo "✅ Bot built successfully and production alias created"
+   # Configure fulfillment for OrderStatus intent
+   aws lexv2-models update-intent \
+       --bot-id $BOT_ID \
+       --bot-version DRAFT \
+       --locale-id en_US \
+       --intent-id $ORDER_INTENT_ID \
+       --intent-name OrderStatus \
+       --fulfillment-code-hook '{
+           "enabled": true
+       }'
+   
+   # Configure fulfillment for SupportRequest intent
+   aws lexv2-models update-intent \
+       --bot-id $BOT_ID \
+       --bot-version DRAFT \
+       --locale-id en_US \
+       --intent-id $SUPPORT_INTENT_ID \
+       --intent-name SupportRequest \
+       --fulfillment-code-hook '{
+           "enabled": true
+       }'
+   
+   echo "✅ Lambda fulfillment configured for all intents"
    ```
 
-   The bot is now built and deployed with a production alias that provides a stable endpoint for integration with web applications, mobile apps, or messaging platforms. The versioning system ensures that updates can be tested thoroughly before deployment while the alias mechanism enables zero-downtime updates and rollback capabilities essential for production customer service operations.
+   Lambda fulfillment is now enabled for all intents, establishing the connection between natural language understanding and custom business logic. This configuration ensures that when users interact with the bot, their requests are processed by the Lambda function which can access backend systems, perform complex validations, and generate dynamic responses based on real-time data and business rules.
 
-10. **Populate Sample Data and Test**:
+10. **Build and Test the Bot**:
+
+    The bot building process compiles all intents, slot types, and sample utterances into an optimized NLU model that can accurately recognize user input and extract relevant information. This machine learning training phase is essential for achieving high-quality conversation experiences, as it analyzes patterns across all sample utterances to improve intent recognition accuracy. Bot versioning and aliases enable safe deployment practices where production environments remain stable while development continues on draft versions, supporting continuous improvement without service disruption.
+
+    ```bash
+    # Build the bot
+    aws lexv2-models build-bot-locale \
+        --bot-id $BOT_ID \
+        --bot-version DRAFT \
+        --locale-id en_US
+    
+    # Wait for build to complete
+    echo "Waiting for bot build to complete..."
+    aws lexv2-models wait bot-locale-built \
+        --bot-id $BOT_ID \
+        --bot-version DRAFT \
+        --locale-id en_US
+    
+    # Create bot version
+    aws lexv2-models create-bot-version \
+        --bot-id $BOT_ID \
+        --description "Production version of customer service bot"
+    
+    # Create bot alias for production with Lambda configuration
+    aws lexv2-models create-bot-alias \
+        --bot-id $BOT_ID \
+        --bot-alias-name production \
+        --description "Production alias for customer service bot" \
+        --bot-version "1" \
+        --bot-alias-locale-settings '{
+            "en_US": {
+                "enabled": true,
+                "codeHookSpecification": {
+                    "lambdaCodeHook": {
+                        "lambdaArn": "'$LAMBDA_ARN'",
+                        "codeHookInterfaceVersion": "1.0"
+                    }
+                }
+            }
+        }'
+    
+    echo "✅ Bot built successfully and production alias created"
+    ```
+
+    The bot is now built and deployed with a production alias that provides a stable endpoint for integration with web applications, mobile apps, or messaging platforms. The Lambda function is properly configured at the alias level, ensuring that all intent processing flows through the custom fulfillment logic. The versioning system ensures that updates can be tested thoroughly before deployment while the alias mechanism enables zero-downtime updates and rollback capabilities essential for production customer service operations.
+
+11. **Populate Sample Data and Test**:
 
     Sample data population enables comprehensive testing of the end-to-end conversation flow, from natural language input through intent recognition to database queries and response generation. This test data demonstrates the [DynamoDB integration capabilities](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GettingStartedDynamoDB.html) that enable real-time order status lookups while providing realistic scenarios for validating conversation logic. Proper test data coverage ensures the chatbot performs correctly across different order states and edge cases before customer deployment.
 
@@ -650,7 +728,7 @@ EOF
         --item '{
             "OrderId": {"S": "ORD123456"},
             "Status": {"S": "Shipped"},
-            "EstimatedDelivery": {"S": "2024-01-15"},
+            "EstimatedDelivery": {"S": "2025-08-15"},
             "CustomerEmail": {"S": "customer@example.com"}
         }'
     
@@ -659,7 +737,7 @@ EOF
         --item '{
             "OrderId": {"S": "ORD789012"},
             "Status": {"S": "Processing"},
-            "EstimatedDelivery": {"S": "2024-01-20"},
+            "EstimatedDelivery": {"S": "2025-08-25"},
             "CustomerEmail": {"S": "customer2@example.com"}
         }'
     
@@ -724,6 +802,11 @@ EOF
    # Check Lambda function logs
    aws logs describe-log-groups \
        --log-group-name-prefix "/aws/lambda/$LAMBDA_FUNCTION_NAME"
+   
+   # View recent log events
+   aws logs filter-log-events \
+       --log-group-name "/aws/lambda/$LAMBDA_FUNCTION_NAME" \
+       --start-time $(date -d '5 minutes ago' +%s)000
    ```
 
 ## Cleanup
@@ -797,28 +880,35 @@ EOF
 
 ## Discussion
 
-Amazon Lex V2 provides a powerful platform for building conversational interfaces that can significantly improve customer service operations. The key architectural decision in this implementation involves using Lambda functions for fulfillment, which enables custom business logic integration with existing systems like DynamoDB for order tracking and S3 for product catalogs. This approach allows organizations to create sophisticated chatbots that can handle complex workflows while maintaining the flexibility to integrate with enterprise systems.
+Amazon Lex V2 provides a powerful platform for building conversational interfaces that can significantly improve customer service operations. The key architectural decision in this implementation involves using Lambda functions for fulfillment, which enables custom business logic integration with existing systems like DynamoDB for order tracking and S3 for product catalogs. This approach allows organizations to create sophisticated chatbots that can handle complex workflows while maintaining the flexibility to integrate with enterprise systems and follow AWS Well-Architected Framework principles for operational excellence and cost optimization.
 
-The natural language understanding capabilities of Lex automatically handle variations in customer input, reducing the need for extensive training data. Intent-based architecture allows for clear separation of concerns, making the bot easily maintainable and extensible. The slot-filling mechanism ensures that required information is collected before processing requests, improving conversation flow and reducing user frustration.
+The natural language understanding capabilities of Lex automatically handle variations in customer input, reducing the need for extensive training data while providing high-quality intent recognition. Intent-based architecture allows for clear separation of concerns, making the bot easily maintainable and extensible. The slot-filling mechanism ensures that required information is collected before processing requests, improving conversation flow and reducing user frustration while following security best practices through proper IAM role configuration and least privilege access.
 
-Regarding deployment strategies, Lex V2 supports multiple channels including web chat widgets, mobile applications, and popular messaging platforms like Slack and Facebook Messenger. The bot versioning and alias system enables safe deployment of updates to production environments. For enterprise deployments, consider implementing conversation logs using CloudWatch for monitoring and analysis, and integrate with Amazon Connect for seamless handoff to human agents when needed.
+Regarding deployment strategies, Lex V2 supports multiple channels including web chat widgets, mobile applications, and popular messaging platforms like Slack and Facebook Messenger. The bot versioning and alias system enables safe deployment of updates to production environments following AWS deployment best practices. For enterprise deployments, consider implementing conversation logs using CloudWatch for monitoring and analysis, and integrate with Amazon Connect for seamless handoff to human agents when needed. Performance monitoring through CloudWatch metrics enables continuous optimization and scaling based on actual usage patterns.
 
-> **Tip**: Use Amazon Lex conversation logs and CloudWatch metrics to continuously improve bot performance by analyzing failed intents and optimizing sample utterances based on real user interactions. Monitor key metrics through the [Amazon Lex CloudWatch integration](https://docs.aws.amazon.com/lexv2/latest/dg/monitoring-aws-lex-cloudwatch.html) to identify conversation patterns and optimization opportunities.
+> **Tip**: Use Amazon Lex conversation logs and CloudWatch metrics to continuously improve bot performance by analyzing failed intents and optimizing sample utterances based on real user interactions. Monitor key metrics through the [Amazon Lex CloudWatch integration](https://docs.aws.amazon.com/lexv2/latest/dg/monitoring-aws-lex-cloudwatch.html) to identify conversation patterns and optimization opportunities while following AWS observability best practices.
 
 ## Challenge
 
 Extend this customer service chatbot by implementing these enhancements:
 
-1. **Multi-language Support**: Add Spanish and French locales to the bot with translated intents and responses, enabling international customer support capabilities.
+1. **Multi-language Support**: Add Spanish and French locales to the bot with translated intents and responses, enabling international customer support capabilities through Lex V2's multi-language features.
 
-2. **Voice Integration**: Integrate Amazon Polly for text-to-speech responses and configure the bot for voice interactions through Amazon Connect or custom phone systems.
+2. **Voice Integration**: Integrate Amazon Polly for text-to-speech responses and configure the bot for voice interactions through Amazon Connect or custom phone systems, leveraging AWS Contact Center solutions.
 
-3. **Sentiment Analysis**: Use Amazon Comprehend to analyze customer sentiment during conversations and automatically escalate frustrated customers to human agents.
+3. **Sentiment Analysis**: Use Amazon Comprehend to analyze customer sentiment during conversations and automatically escalate frustrated customers to human agents, implementing intelligent routing based on emotional context.
 
-4. **Advanced Analytics**: Implement conversation analytics using Amazon QuickSight to visualize bot performance metrics, popular intents, and customer satisfaction trends.
+4. **Advanced Analytics**: Implement conversation analytics using Amazon QuickSight to visualize bot performance metrics, popular intents, and customer satisfaction trends, following AWS analytics best practices.
 
-5. **Enterprise Integration**: Connect the bot to external CRM systems like Salesforce using API Gateway and Lambda to provide personalized customer experiences based on account history.
+5. **Enterprise Integration**: Connect the bot to external CRM systems like Salesforce using API Gateway and Lambda to provide personalized customer experiences based on account history, implementing secure enterprise connectivity patterns.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

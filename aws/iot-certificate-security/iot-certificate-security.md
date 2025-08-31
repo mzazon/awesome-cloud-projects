@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: iot-core, iot-device-defender, iam, cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot-security, device-certificates, x509-authentication, device-defender
 recipe-generator-version: 1.3
@@ -80,14 +80,14 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for IoT Core, IAM, and CloudWatch
+1. AWS account with appropriate permissions for IoT Core, IAM, CloudWatch, and DynamoDB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of X.509 certificates and public key infrastructure (PKI)
 4. Basic knowledge of MQTT protocol and JSON policy documents
 5. Familiarity with IoT security concepts and threat models
 6. Estimated cost: $10-15 per month for testing (IoT messages, CloudWatch logs, Device Defender)
 
-> **Note**: This recipe creates production-ready security configurations that should be carefully reviewed before deployment.
+> **Note**: This recipe creates production-ready security configurations that should be carefully reviewed before deployment. Follow AWS IoT security best practices and implement proper certificate lifecycle management.
 
 ## Preparation
 
@@ -110,10 +110,31 @@ export DEVICE_PREFIX="sensor"
 # Create local directory for certificates
 mkdir -p ./certificates
 
+# Create IoT logging role (if not exists)
+aws iam create-role \
+    --role-name IoTLoggingRole \
+    --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "iot.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+            }
+        ]
+    }' 2>/dev/null || true
+
+# Attach CloudWatch logging policy to IoT role
+aws iam attach-role-policy \
+    --role-name IoTLoggingRole \
+    --policy-arn arn:aws:iam::aws:policy/service-role/IoTLogsFullAccess
+
 # Enable IoT logging for security monitoring
 aws iot set-v2-logging-options \
     --role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/IoTLoggingRole \
-    --default-log-level ERROR || true
+    --default-log-level ERROR 2>/dev/null || true
 
 echo "✅ Environment prepared for IoT security implementation"
 ```
@@ -122,7 +143,7 @@ echo "✅ Environment prepared for IoT security implementation"
 
 1. **Create Thing Type and Security Policies**:
 
-   Thing types categorize devices with similar characteristics and security requirements. IoT policies define the specific permissions each device certificate can access, implementing the principle of least privilege for IoT device authorization.
+   AWS IoT Thing types categorize devices with similar characteristics and security requirements, enabling consistent policy application across device fleets. IoT policies define specific permissions using AWS IoT policy variables that dynamically scope access based on device identity, implementing the principle of least privilege. This approach ensures each device can only access resources specifically assigned to its identity while maintaining policy reusability across thousands of devices.
 
    ```bash
    # Create thing type for industrial sensors
@@ -189,11 +210,13 @@ echo "✅ Environment prepared for IoT security implementation"
    echo "✅ Thing type and security policies created"
    ```
 
-   > **Note**: IoT policy variables like `${iot:Connection.Thing.ThingName}` enable dynamic permissions based on device identity. This ensures each device can only access its own topics and resources. Review the [AWS IoT policy variables documentation](https://docs.aws.amazon.com/iot/latest/developerguide/iot-policy-variables.html) for additional dynamic authorization options.
+   The IoT policy uses dynamic variables like `${iot:Connection.Thing.ThingName}` to ensure each device can only access its own topics and resources. This eliminates the need for device-specific policies while maintaining strict access controls. The condition `iot:Connection.Thing.IsAttached` ensures only properly registered devices can connect.
+
+   > **Note**: IoT policy variables enable dynamic permissions based on device identity. Review the [AWS IoT policy variables documentation](https://docs.aws.amazon.com/iot/latest/developerguide/iot-policy-variables.html) for comprehensive authorization options.
 
 2. **Create Multiple IoT Devices with Certificates**:
 
-   Each IoT device requires a unique X.509 certificate for authentication, establishing cryptographic identity that enables secure communication with AWS IoT Core. This step provisions multiple devices with individual certificates, implementing the foundational security layer that prevents unauthorized access and enables device-specific authorization policies. Understanding certificate-based authentication is crucial for implementing enterprise-grade IoT security at scale.
+   Each IoT device requires a unique X.509 certificate for authentication, establishing cryptographic identity that enables secure communication with AWS IoT Core. This process generates 2048-bit RSA key pairs and issues certificates signed by AWS IoT's Certificate Authority, providing enterprise-grade security. The certificate-based authentication eliminates shared secret vulnerabilities while enabling individual device identity management at scale.
 
    ```bash
    # Function to create device with certificate
@@ -203,7 +226,7 @@ echo "✅ Environment prepared for IoT security implementation"
        
        echo "Creating device: ${thing_name}"
        
-       # Create IoT thing
+       # Create IoT thing with attributes
        aws iot create-thing \
            --thing-name ${thing_name} \
            --thing-type-name ${THING_TYPE_NAME} \
@@ -216,8 +239,9 @@ echo "✅ Environment prepared for IoT security implementation"
            --public-key-outfile "./certificates/${thing_name}.public.key" \
            --private-key-outfile "./certificates/${thing_name}.private.key")
        
-       # Extract certificate ARN
-       local cert_arn=$(echo ${cert_output} | grep -o 'arn:aws:iot:[^"]*')
+       # Extract certificate ARN using jq for reliable parsing
+       local cert_arn=$(echo ${cert_output} | \
+           python3 -c "import sys, json; print(json.load(sys.stdin)['certificateArn'])")
        
        # Attach policy to certificate
        aws iot attach-policy \
@@ -238,13 +262,13 @@ echo "✅ Environment prepared for IoT security implementation"
    done
    ```
 
-   The device creation process establishes secure identities for each IoT device by generating unique cryptographic certificates and associating them with device metadata. This creates the foundation for all subsequent security policies and monitoring capabilities, ensuring each device has a verifiable identity within the AWS IoT ecosystem.
+   Each device now has a unique cryptographic identity with associated metadata. The certificates enable mutual TLS authentication where both the device and AWS IoT Core verify each other's identity. Device attributes stored in the thing registry enable location-based and type-based policy decisions for advanced access controls.
 
-   > **Warning**: Store device certificates and private keys securely. In production environments, consider using hardware security modules (HSMs) or secure element chips for key storage. Never transmit private keys over unsecured channels or store them in plain text.
+   > **Warning**: Store device certificates and private keys securely. In production environments, use hardware security modules (HSMs) or secure element chips for key storage. Never transmit private keys over unsecured channels or store them in plain text. Follow [AWS IoT security best practices](https://docs.aws.amazon.com/iot/latest/developerguide/security-best-practices.html).
 
 3. **Configure Device Defender Security Profiles**:
 
-   AWS IoT Device Defender provides continuous security monitoring by establishing behavioral baselines for IoT devices and detecting anomalies that may indicate security threats. Security profiles define specific metrics and thresholds that trigger alerts when devices exhibit unusual behavior patterns, enabling proactive threat detection and automated incident response. This monitoring layer is essential for maintaining fleet-wide security visibility and compliance.
+   AWS IoT Device Defender provides continuous security monitoring by establishing behavioral baselines for IoT devices and detecting anomalies that indicate security threats. Security profiles define cloud-side and device-side metrics with configurable thresholds that trigger alerts when devices exhibit unusual behavior patterns. This monitoring layer provides fleet-wide security visibility essential for maintaining operational security and compliance in production environments.
 
    ```bash
    # Create security profile for anomaly detection
@@ -296,7 +320,7 @@ echo "✅ Environment prepared for IoT security implementation"
        --security-profile-description "Security monitoring for industrial IoT sensors" \
        --behaviors file://security-profile.json
    
-   # Attach security profile to thing group (create group first)
+   # Create thing group for devices
    aws iot create-thing-group \
        --thing-group-name "IndustrialSensors" \
        --thing-group-properties "thingGroupDescription=Industrial sensor devices"
@@ -316,13 +340,13 @@ echo "✅ Environment prepared for IoT security implementation"
    echo "✅ Device Defender security profiles configured"
    ```
 
-   Device Defender security profiles are now actively monitoring all devices in the IndustrialSensors thing group. The configured behavioral rules will automatically detect connection anomalies, authorization failures, and unusual message patterns, providing real-time security insights and enabling rapid response to potential threats.
+   Device Defender now monitors all devices in the IndustrialSensors thing group for suspicious behavior patterns. The security profile detects excessive connections, authorization failures, and unusual message sizes. These cloud-side metrics provide immediate security insights without requiring device-side agents, enabling security monitoring for resource-constrained IoT devices.
 
-   > **Tip**: Security profiles should be tailored to specific device types and operational patterns. Start with conservative thresholds and adjust based on observed device behavior. Consider creating different profiles for development, staging, and production environments to avoid false positives during testing.
+   > **Tip**: Security profiles should be tailored to specific device types and operational patterns. Monitor normal device behavior for several weeks before setting production thresholds. Consider different profiles for development, staging, and production environments to reduce false positives.
 
 4. **Set Up CloudWatch Monitoring and Alerts**:
 
-   CloudWatch integration provides centralized logging and metrics collection for IoT security events, enabling comprehensive visibility into device behavior and security incidents. This monitoring infrastructure captures authentication failures, connection patterns, and operational metrics, creating an audit trail essential for security analysis and compliance reporting. The dashboard and alerting capabilities enable operations teams to respond quickly to security threats.
+   CloudWatch integration provides centralized logging and metrics collection for IoT security events, enabling comprehensive visibility into device behavior and security incidents. This monitoring infrastructure creates audit trails essential for security analysis and compliance reporting while providing real-time alerting capabilities. The dashboard visualization enables operations teams to monitor security posture and respond quickly to threats.
 
    ```bash
    # Create CloudWatch log group for IoT connections
@@ -330,19 +354,22 @@ echo "✅ Environment prepared for IoT security implementation"
        --log-group-name "/aws/iot/security-events" \
        --retention-in-days 30
    
+   # Create SNS topic for security alerts (optional)
+   aws sns create-topic \
+       --name iot-security-alerts 2>/dev/null || true
+   
    # Create CloudWatch alarms for security events
    aws cloudwatch put-metric-alarm \
        --alarm-name "IoT-Unauthorized-Connections" \
        --alarm-description "Alert on unauthorized IoT connection attempts" \
-       --metric-name "aws:num-authorization-failures" \
+       --metric-name Connect.AuthError \
        --namespace "AWS/IoT" \
        --statistic "Sum" \
        --period 300 \
        --threshold 5 \
        --comparison-operator "GreaterThanThreshold" \
        --evaluation-periods 2 \
-       --alarm-actions "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:iot-security-alerts" \
-       --treat-missing-data "notBreaching" || true
+       --treat-missing-data "notBreaching"
    
    # Create CloudWatch dashboard for IoT security
    cat > iot-security-dashboard.json << EOF
@@ -350,11 +377,15 @@ echo "✅ Environment prepared for IoT security implementation"
        "widgets": [
            {
                "type": "metric",
+               "x": 0,
+               "y": 0,
+               "width": 12,
+               "height": 6,
                "properties": {
                    "metrics": [
                        ["AWS/IoT", "Connect.Success"],
-                       ["AWS/IoT", "Connect.AuthError"],
-                       ["AWS/IoT", "Connect.ClientError"]
+                       [".", "Connect.AuthError"],
+                       [".", "Connect.ClientError"]
                    ],
                    "period": 300,
                    "stat": "Sum",
@@ -364,12 +395,16 @@ echo "✅ Environment prepared for IoT security implementation"
            },
            {
                "type": "metric",
+               "x": 12,
+               "y": 0,
+               "width": 12,
+               "height": 6,
                "properties": {
                    "metrics": [
                        ["AWS/IoT", "PublishIn.Success"],
-                       ["AWS/IoT", "PublishIn.AuthError"],
-                       ["AWS/IoT", "Subscribe.Success"],
-                       ["AWS/IoT", "Subscribe.AuthError"]
+                       [".", "PublishIn.AuthError"],
+                       [".", "Subscribe.Success"],
+                       [".", "Subscribe.AuthError"]
                    ],
                    "period": 300,
                    "stat": "Sum",
@@ -388,19 +423,44 @@ echo "✅ Environment prepared for IoT security implementation"
    echo "✅ CloudWatch monitoring and alerts configured"
    ```
 
-   CloudWatch monitoring is now capturing all IoT security events and providing real-time visibility through the security dashboard. The configured alarms will automatically trigger notifications for suspicious activities, while log aggregation enables forensic analysis of security incidents and compliance auditing.
+   CloudWatch monitoring now captures all IoT security events with real-time dashboard visibility. The configured alarms automatically detect authentication failures and connection anomalies. Log retention policies ensure compliance while managing storage costs. This monitoring foundation enables security incident response and forensic analysis.
 
 5. **Create IoT Rules for Security Event Processing**:
 
-   IoT Rules Engine enables automated processing of security events and integration with downstream security systems. This step creates the infrastructure for automated incident response, including Lambda functions for event processing and DynamoDB storage for security event history. Automated event processing ensures rapid response to security threats while maintaining detailed audit logs for compliance and forensic analysis.
+   IoT Rules Engine enables automated processing of security events and integration with downstream security systems. This creates infrastructure for automated incident response including Lambda functions for event processing and DynamoDB storage for security event history. Automated event processing ensures rapid response to security threats while maintaining detailed audit logs required for compliance and forensic analysis.
 
    ```bash
+   # Create Lambda execution role
+   aws iam create-role \
+       --role-name IoTSecurityProcessorRole \
+       --assume-role-policy-document '{
+           "Version": "2012-10-17",
+           "Statement": [
+               {
+                   "Effect": "Allow",
+                   "Principal": {
+                       "Service": "lambda.amazonaws.com"
+                   },
+                   "Action": "sts:AssumeRole"
+               }
+           ]
+       }' 2>/dev/null || true
+   
+   # Attach necessary policies to Lambda role
+   aws iam attach-role-policy \
+       --role-name IoTSecurityProcessorRole \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   aws iam attach-role-policy \
+       --role-name IoTSecurityProcessorRole \
+       --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+   
    # Create Lambda function for security event processing
    cat > security-processor.py << 'EOF'
    import json
    import boto3
    import logging
-   from datetime import datetime
+   from datetime import datetime, timezone
    
    logger = logging.getLogger()
    logger.setLevel(logging.INFO)
@@ -434,10 +494,12 @@ echo "✅ Environment prepared for IoT security implementation"
                    'eventId': context.aws_request_id,
                    'deviceId': device_id,
                    'eventType': event_type,
-                   'timestamp': datetime.utcnow().isoformat(),
-                   'eventData': json.dumps(event)
+                   'timestamp': datetime.now(timezone.utc).isoformat(),
+                   'eventData': json.dumps(event),
+                   'ttl': int((datetime.now(timezone.utc).timestamp()) + (30 * 24 * 3600))  # 30 days TTL
                }
            )
+           logger.info(f"Security event stored for device: {device_id}")
        except Exception as e:
            logger.error(f"Failed to store security event: {str(e)}")
        
@@ -453,11 +515,12 @@ echo "✅ Environment prepared for IoT security implementation"
        --attribute-definitions \
            AttributeName=eventId,AttributeType=S \
            AttributeName=deviceId,AttributeType=S \
+           AttributeName=timestamp,AttributeType=S \
        --key-schema \
            AttributeName=eventId,KeyType=HASH \
        --global-secondary-indexes \
-           IndexName=DeviceIndex,KeySchema=[AttributeName=deviceId,KeyType=HASH],Projection={ProjectionType=ALL},ProvisionedThroughput={ReadCapacityUnits=5,WriteCapacityUnits=5} \
-       --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
+           IndexName=DeviceIndex,KeySchema=[AttributeName=deviceId,KeyType=HASH,AttributeName=timestamp,KeyType=RANGE],Projection={ProjectionType=ALL},BillingMode=PAY_PER_REQUEST \
+       --billing-mode PAY_PER_REQUEST
    
    # Wait for table to be created
    aws dynamodb wait table-exists --table-name IoTSecurityEvents
@@ -465,11 +528,11 @@ echo "✅ Environment prepared for IoT security implementation"
    echo "✅ Security event processing infrastructure created"
    ```
 
-   Security event processing infrastructure is now operational, automatically capturing and storing all IoT security events for analysis. The Lambda function provides a foundation for automated incident response, while DynamoDB storage enables historical analysis and compliance reporting of security incidents.
+   The security event processing infrastructure automatically captures and stores all IoT security events with time-to-live (TTL) for automatic cleanup. The Lambda function provides extensible foundation for automated incident response while DynamoDB storage enables historical analysis and compliance reporting. The global secondary index enables efficient queries by device ID and timestamp.
 
 6. **Implement Certificate Rotation Strategy**:
 
-   Certificate rotation is critical for maintaining long-term security by regularly replacing device certificates before expiration. This proactive approach prevents service disruptions from expired certificates while reducing the window of exposure if certificates are compromised. The automated rotation strategy ensures continuous device connectivity while maintaining the highest security standards for production IoT deployments.
+   Certificate rotation is critical for maintaining long-term security by regularly replacing device certificates before expiration. This proactive approach prevents service disruptions from expired certificates while reducing exposure windows if certificates are compromised. The automated rotation strategy uses EventBridge scheduling to monitor certificate expiration and trigger rotation workflows, ensuring continuous device connectivity while maintaining security best practices.
 
    ```bash
    # Create certificate rotation Lambda function
@@ -477,7 +540,7 @@ echo "✅ Environment prepared for IoT security implementation"
    import json
    import boto3
    import logging
-   from datetime import datetime, timedelta
+   from datetime import datetime, timedelta, timezone
    
    logger = logging.getLogger()
    logger.setLevel(logging.INFO)
@@ -485,48 +548,71 @@ echo "✅ Environment prepared for IoT security implementation"
    iot_client = boto3.client('iot')
    
    def lambda_handler(event, context):
-       """Rotate certificates for IoT devices based on expiration"""
+       """Monitor certificates for rotation needs based on expiration"""
        
        try:
            # List all certificates
-           certificates = iot_client.list_certificates(pageSize=100)
+           response = iot_client.list_certificates(pageSize=100)
+           certificates = response.get('certificates', [])
            
            rotation_actions = []
+           expiring_soon = []
            
-           for cert in certificates['certificates']:
+           for cert in certificates:
                cert_id = cert['certificateId']
                cert_arn = cert['certificateArn']
+               status = cert['status']
                
-               # Get certificate details
+               if status != 'ACTIVE':
+                   continue
+               
+               # Get certificate details to check expiration
                cert_details = iot_client.describe_certificate(
                    certificateId=cert_id
                )
                
-               # Check if certificate is expiring soon (within 30 days)
-               # This is a simplified check - production should parse actual expiry
-               creation_date = cert_details['certificateDescription']['creationDate']
+               # Check certificate validity period
+               validity = cert_details['certificateDescription'].get('validity', {})
+               not_after = validity.get('notAfter')
                
-               # Log certificate status
-               logger.info(f"Certificate {cert_id} created on {creation_date}")
+               if not_after:
+                   expiry_date = datetime.fromtimestamp(not_after, tz=timezone.utc)
+                   days_until_expiry = (expiry_date - datetime.now(timezone.utc)).days
+                   
+                   # Flag certificates expiring within 30 days
+                   if days_until_expiry <= 30:
+                       expiring_soon.append({
+                           'certificateId': cert_id,
+                           'certificateArn': cert_arn,
+                           'expiryDate': expiry_date.isoformat(),
+                           'daysUntilExpiry': days_until_expiry
+                       })
+                       
+                       logger.warning(f"Certificate {cert_id} expires in {days_until_expiry} days")
                
-               # In production, implement actual certificate rotation logic
                rotation_actions.append({
                    'certificateId': cert_id,
                    'certificateArn': cert_arn,
+                   'status': status,
                    'action': 'monitor',
-                   'creationDate': creation_date.isoformat()
+                   'expiryCheck': expiry_date.isoformat() if not_after else 'unknown'
                })
+           
+           # Log summary
+           logger.info(f"Checked {len(certificates)} certificates, {len(expiring_soon)} expiring soon")
            
            return {
                'statusCode': 200,
                'body': json.dumps({
                    'message': 'Certificate rotation check completed',
+                   'totalCertificates': len(certificates),
+                   'expiringSoon': expiring_soon,
                    'actions': rotation_actions
                })
            }
            
        except Exception as e:
-           logger.error(f"Certificate rotation failed: {str(e)}")
+           logger.error(f"Certificate rotation check failed: {str(e)}")
            return {
                'statusCode': 500,
                'body': json.dumps(f'Error: {str(e)}')
@@ -543,11 +629,11 @@ echo "✅ Environment prepared for IoT security implementation"
    echo "✅ Certificate rotation strategy implemented"
    ```
 
-   Certificate rotation monitoring is now active, providing proactive identification of certificates approaching expiration. This automation foundation ensures continuous device connectivity while maintaining security best practices for certificate lifecycle management in production environments.
+   Certificate rotation monitoring now actively identifies certificates approaching expiration with detailed expiry tracking. This automation provides early warning for certificate renewal needs and can be extended to automatically generate new certificates and coordinate device updates. The weekly check ensures sufficient time for planned certificate rotation in production environments.
 
 7. **Configure Advanced Security Policies**:
 
-   Advanced security policies implement sophisticated access controls using temporal and location-based restrictions, providing granular control over device permissions. These policies demonstrate how IoT Core's policy engine can enforce business rules and security requirements beyond basic authentication, enabling complex scenarios like maintenance windows, geo-fencing, and role-based access controls for different device types or operational contexts.
+   Advanced security policies implement sophisticated access controls using temporal and location-based restrictions, demonstrating IoT Core's policy engine capabilities beyond basic authentication. These policies enable complex scenarios like maintenance windows, geo-fencing, and role-based access controls for different device types. The conditional logic supports business requirements while maintaining security boundaries.
 
    ```bash
    # Create time-based access policy
@@ -633,11 +719,11 @@ echo "✅ Environment prepared for IoT security implementation"
    echo "✅ Advanced security policies configured"
    ```
 
-   Advanced security policies provide sophisticated access control capabilities, enabling time-based and location-based restrictions that align with operational requirements. These policies demonstrate the flexibility of IoT Core's authorization engine for implementing complex business rules and security requirements.
+   Advanced security policies demonstrate sophisticated access control capabilities including time-based restrictions (business hours only) and location-based constraints. These policies can enforce maintenance windows, geographic boundaries, and operational schedules while maintaining device authentication integrity. The flexible policy language supports complex business requirements.
 
 8. **Set Up Automated Compliance Monitoring**:
 
-   Automated compliance monitoring ensures continuous adherence to security policies and regulatory requirements through AWS Config and Security Hub integration. This monitoring layer provides ongoing validation of security configurations, certificate status, and policy compliance, generating automated findings when deviations are detected. Compliance automation is essential for regulated industries requiring continuous security posture assessment.
+   Automated compliance monitoring ensures continuous adherence to security policies and regulatory requirements through AWS Config and Security Hub integration. This monitoring layer provides ongoing validation of security configurations, certificate status, and policy compliance while generating automated findings when deviations are detected. Compliance automation is essential for regulated industries requiring continuous security posture assessment and audit documentation.
 
    ```bash
    # Create AWS Config rule for IoT certificate compliance
@@ -653,9 +739,10 @@ echo "✅ Environment prepared for IoT security implementation"
    }
    EOF
    
-   # Enable Config service and create rule
+   # Enable Config service and create rule (requires Config setup)
    aws configservice put-config-rule \
-       --config-rule file://iot-config-rule.json || true
+       --config-rule file://iot-config-rule.json 2>/dev/null || \
+       echo "Config rule creation skipped - requires AWS Config setup"
    
    # Create Security Hub custom insight for IoT security
    aws securityhub create-insight \
@@ -666,90 +753,22 @@ echo "✅ Environment prepared for IoT security implementation"
            }]
        }' \
        --name "IoT Security Findings" \
-       --group-by-attribute "Type" || true
+       --group-by-attribute "Type" 2>/dev/null || \
+       echo "Security Hub insight creation skipped - requires Security Hub setup"
    
    echo "✅ Automated compliance monitoring configured"
    ```
 
-   Automated compliance monitoring is now active, continuously validating security configurations and certificate status across the IoT fleet. This monitoring provides ongoing assurance of security posture compliance and generates automated findings for any deviations from established security baselines.
+   Automated compliance monitoring provides continuous validation of security configurations and certificate status across the IoT fleet. The AWS Config rule monitors certificate expiration while Security Hub insights aggregate IoT Device Defender findings. This monitoring ensures ongoing security posture compliance and generates documentation required for regulatory audits.
 
 9. **Test Security Controls and Monitoring**:
 
-   Security testing validates the effectiveness of implemented controls and ensures proper functioning of monitoring systems. This step creates testing tools that simulate device connections and verify authentication mechanisms, providing confidence that security policies are correctly enforced. Testing capabilities are essential for ongoing validation of security controls and troubleshooting connectivity issues in production environments.
+   Security testing validates the effectiveness of implemented controls and ensures proper functioning of monitoring systems. This creates testing tools that simulate device connections and verify authentication mechanisms, providing confidence that security policies are correctly enforced. The testing framework is essential for ongoing validation of security controls and troubleshooting connectivity issues in production environments.
 
    ```bash
    # Download Amazon Root CA certificate
    curl -o ./certificates/AmazonRootCA1.pem \
        https://www.amazontrust.com/repository/AmazonRootCA1.pem
-   
-   # Create test script for device authentication
-   cat > test-device-connection.py << 'EOF'
-   import paho.mqtt.client as mqtt
-   import ssl
-   import json
-   import sys
-   import time
-   
-   def on_connect(client, userdata, flags, rc):
-       if rc == 0:
-           print("✅ Device connected successfully")
-           client.subscribe(f"sensors/{userdata['thing_name']}/commands")
-       else:
-           print(f"❌ Connection failed with code {rc}")
-   
-   def on_message(client, userdata, msg):
-       print(f"📨 Received message: {msg.payload.decode()}")
-   
-   def on_publish(client, userdata, mid):
-       print(f"📤 Message published with mid: {mid}")
-   
-   # Test device connection
-   def test_device_connection(thing_name, cert_file, key_file):
-       client = mqtt.Client(thing_name)
-       client.user_data_set({'thing_name': thing_name})
-       
-       client.on_connect = on_connect
-       client.on_message = on_message
-       client.on_publish = on_publish
-       
-       # Configure TLS
-       client.tls_set(ca_certs="./certificates/AmazonRootCA1.pem",
-                      certfile=cert_file,
-                      keyfile=key_file,
-                      cert_reqs=ssl.CERT_REQUIRED,
-                      tls_version=ssl.PROTOCOL_TLS,
-                      ciphers=None)
-       
-       try:
-           # Connect to AWS IoT
-           client.connect("your-iot-endpoint.amazonaws.com", 8883, 60)
-           
-           # Start loop
-           client.loop_start()
-           
-           # Publish test message
-           test_payload = {
-               "temperature": 25.5,
-               "humidity": 60.2,
-               "timestamp": int(time.time())
-           }
-           
-           client.publish(f"sensors/{thing_name}/telemetry", 
-                         json.dumps(test_payload))
-           
-           time.sleep(5)
-           client.loop_stop()
-           client.disconnect()
-           
-       except Exception as e:
-           print(f"❌ Connection test failed: {e}")
-   
-   if __name__ == "__main__":
-       # Test connection for first device
-       test_device_connection("sensor-001", 
-                             "./certificates/sensor-001.cert.pem",
-                             "./certificates/sensor-001.private.key")
-   EOF
    
    # Get IoT endpoint for testing
    IOT_ENDPOINT=$(aws iot describe-endpoint \
@@ -757,15 +776,58 @@ echo "✅ Environment prepared for IoT security implementation"
        --query 'endpointAddress' \
        --output text)
    
+   # Create test script for device authentication
+   cat > test-device-connection.py << EOF
+   import ssl
+   import json
+   import sys
+   import time
+   import socket
+   
+   def test_device_connection(thing_name, cert_file, key_file, endpoint):
+       """Test device connection using certificates"""
+       try:
+           # Create SSL context
+           context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="./certificates/AmazonRootCA1.pem")
+           context.load_cert_chain(cert_file, key_file)
+           
+           # Test TLS connection to IoT endpoint
+           with socket.create_connection((endpoint, 8883), timeout=10) as sock:
+               with context.wrap_socket(sock, server_hostname=endpoint) as ssock:
+                   print(f"✅ TLS connection successful for {thing_name}")
+                   print(f"   Certificate subject: {ssock.getpeercert()['subject']}")
+                   return True
+                   
+       except Exception as e:
+           print(f"❌ Connection test failed for {thing_name}: {e}")
+           return False
+   
+   if __name__ == "__main__":
+       # Test connection for first device
+       endpoint = "${IOT_ENDPOINT}"
+       thing_name = "sensor-001"
+       cert_file = "./certificates/sensor-001.cert.pem"
+       key_file = "./certificates/sensor-001.private.key"
+       
+       if test_device_connection(thing_name, cert_file, key_file, endpoint):
+           print("✅ Device authentication test passed")
+       else:
+           print("❌ Device authentication test failed")
+   EOF
+   
+   # Test certificate validation
+   python3 test-device-connection.py 2>/dev/null || \
+       echo "Python test skipped - requires Python 3 and certificate files"
+   
    echo "IoT Endpoint: ${IOT_ENDPOINT}"
    echo "✅ Security controls and monitoring configured"
    ```
 
-   Security testing infrastructure is now available for validating device authentication and monitoring system functionality. The Python test script provides a practical tool for verifying certificate-based authentication and can be extended for ongoing security validation in production deployments.
+   Security testing infrastructure validates certificate-based authentication and TLS connectivity. The Python test script verifies that device certificates can establish secure connections to AWS IoT Core. This testing framework can be extended to validate policy enforcement, message publishing permissions, and subscription restrictions for comprehensive security validation.
 
 10. **Implement Device Quarantine Capability**:
 
-    Device quarantine provides automated incident response by immediately isolating compromised or suspicious devices from the IoT network. This capability replaces device permissions with a restrictive deny-all policy, preventing further unauthorized actions while maintaining device registration for forensic analysis. Quarantine capabilities are critical for containing security incidents and preventing lateral movement in compromised IoT deployments.
+    Device quarantine provides automated incident response by immediately isolating compromised or suspicious devices from the IoT network. This replaces device permissions with a restrictive deny-all policy, preventing unauthorized actions while maintaining device registration for forensic analysis. Quarantine capabilities are critical for containing security incidents and preventing lateral movement in compromised IoT deployments.
 
     ```bash
     # Create device quarantine Lambda function
@@ -780,13 +842,13 @@ echo "✅ Environment prepared for IoT security implementation"
     iot_client = boto3.client('iot')
     
     def lambda_handler(event, context):
-        """Quarantine suspicious IoT devices"""
+        """Quarantine suspicious IoT devices by replacing policies"""
         
         try:
             device_id = event['deviceId']
             reason = event.get('reason', 'Security violation')
             
-            # Create quarantine policy
+            # Create quarantine policy document
             quarantine_policy = {
                 "Version": "2012-10-17",
                 "Statement": [
@@ -806,14 +868,15 @@ echo "✅ Environment prepared for IoT security implementation"
                     policyName=policy_name,
                     policyDocument=json.dumps(quarantine_policy)
                 )
+                logger.info(f"Created quarantine policy {policy_name}")
             except iot_client.exceptions.ResourceAlreadyExistsException:
-                pass
+                logger.info(f"Quarantine policy {policy_name} already exists")
             
             # Get device certificates
             principals = iot_client.list_thing_principals(thingName=device_id)
             
             for principal in principals['principals']:
-                # Detach existing policies
+                # List and detach existing policies
                 attached_policies = iot_client.list_attached_policies(target=principal)
                 
                 for policy in attached_policies['policies']:
@@ -821,18 +884,24 @@ echo "✅ Environment prepared for IoT security implementation"
                         policyName=policy['policyName'],
                         target=principal
                     )
+                    logger.info(f"Detached policy {policy['policyName']} from {device_id}")
                 
                 # Attach quarantine policy
                 iot_client.attach_policy(
                     policyName=policy_name,
                     target=principal
                 )
+                logger.info(f"Attached quarantine policy to {device_id}")
             
-            logger.info(f"Device {device_id} quarantined: {reason}")
+            logger.warning(f"Device {device_id} quarantined: {reason}")
             
             return {
                 'statusCode': 200,
-                'body': json.dumps(f'Device {device_id} quarantined successfully')
+                'body': json.dumps({
+                    'message': f'Device {device_id} quarantined successfully',
+                    'reason': reason,
+                    'timestamp': context.aws_request_id
+                })
             }
             
         except Exception as e:
@@ -846,68 +915,75 @@ echo "✅ Environment prepared for IoT security implementation"
     echo "✅ Device quarantine capability implemented"
     ```
 
-    Device quarantine capability provides automated incident response for compromised devices, enabling immediate isolation while preserving forensic evidence. This security control ensures rapid containment of security incidents and prevents unauthorized access from spreading across the IoT fleet.
+    Device quarantine capability enables immediate isolation of compromised devices while preserving forensic evidence. The Lambda function systematically replaces all device policies with a deny-all policy, effectively blocking all device actions. This security control provides rapid incident containment and can be triggered manually or automatically based on Device Defender findings.
 
 ## Validation & Testing
 
 1. **Verify Device Registration and Certificates**:
 
    ```bash
-   # List all created things
-   aws iot list-things --thing-type-name ${THING_TYPE_NAME}
+   # List all created things with details
+   aws iot list-things --thing-type-name ${THING_TYPE_NAME} \
+       --query 'things[*].[thingName,thingArn]' --output table
    
-   # Verify certificate attachments
+   # Verify certificate attachments for each device
    for i in {001..003}; do
        thing_name="${DEVICE_PREFIX}-${i}"
        echo "Checking ${thing_name}:"
-       aws iot list-thing-principals --thing-name ${thing_name}
+       aws iot list-thing-principals --thing-name ${thing_name} \
+           --query 'principals[0]' --output text
    done
    ```
 
-   Expected output: Each device should have associated certificate principals
+   Expected output: Each device should have associated certificate principals with valid ARNs
 
 2. **Test Security Policy Enforcement**:
 
    ```bash
-   # Test policy validation
+   # Validate security profile behaviors
    aws iot validate-security-profile-behaviors \
        --behaviors file://security-profile.json
    
-   # Check security profile attachment
+   # Check security profile attachment status
    aws iot list-targets-for-security-profile \
-       --security-profile-name "IndustrialSensorSecurity"
+       --security-profile-name "IndustrialSensorSecurity" \
+       --query 'securityProfileTargets[*].arn' --output table
    ```
 
-   Expected output: Security profile should be attached to thing group
+   Expected output: Security profile should be attached to the IndustrialSensors thing group
 
 3. **Verify Monitoring and Alerts**:
 
    ```bash
-   # Check CloudWatch dashboard
+   # Check CloudWatch dashboard configuration
    aws cloudwatch get-dashboard \
-       --dashboard-name "IoT-Security-Dashboard"
+       --dashboard-name "IoT-Security-Dashboard" \
+       --query 'DashboardArn' --output text
    
-   # Verify Device Defender security profile
+   # Verify Device Defender security profile details
    aws iot describe-security-profile \
-       --security-profile-name "IndustrialSensorSecurity"
+       --security-profile-name "IndustrialSensorSecurity" \
+       --query '[securityProfileName,securityProfileDescription]' --output table
    ```
 
-   Expected output: Dashboard and security profile should be configured properly
+   Expected output: Dashboard and security profile should be properly configured with expected metrics
 
-4. **Test Certificate Authentication**:
+4. **Test Certificate Authentication Status**:
 
    ```bash
-   # List certificates and verify they're active
+   # List active certificates with status
    aws iot list-certificates --page-size 10 \
-       --query 'certificates[?status==`ACTIVE`].[certificateId,status]' \
+       --query 'certificates[?status==`ACTIVE`].[certificateId,status,creationDate]' \
        --output table
    
-   # Test policy attachment
-   CERT_ARN=$(aws iot list-certificates --query 'certificates[0].certificateArn' --output text)
-   aws iot list-attached-policies --target ${CERT_ARN}
+   # Test policy attachment for active certificates
+   CERT_ARN=$(aws iot list-certificates \
+       --query 'certificates[0].certificateArn' --output text)
+   aws iot list-attached-policies --target ${CERT_ARN} \
+       --query 'policies[*].policyName' --output table
    ```
 
-   Expected output: All certificates should be active with policies attached
+   Expected output: All certificates should be active with appropriate policies attached
 
 ## Cleanup
 
@@ -929,24 +1005,24 @@ echo "✅ Environment prepared for IoT security implementation"
 2. **Clean up IoT Devices and Certificates**:
 
    ```bash
-   # Function to clean up device
+   # Function to clean up device resources
    cleanup_device() {
        local device_id=$1
        local thing_name="${DEVICE_PREFIX}-${device_id}"
        
-       # Get certificate ARN
+       # Get certificate ARN for this device
        local cert_arn=$(aws iot list-thing-principals \
            --thing-name ${thing_name} \
-           --query 'principals[0]' --output text)
+           --query 'principals[0]' --output text 2>/dev/null)
        
-       if [ "$cert_arn" != "None" ]; then
-           # Extract certificate ID
+       if [ "$cert_arn" != "None" ] && [ "$cert_arn" != "" ]; then
+           # Extract certificate ID from ARN
            local cert_id=$(echo $cert_arn | cut -d'/' -f2)
            
-           # Detach policy from certificate
-           aws iot detach-policy \
-               --policy-name "RestrictiveSensorPolicy" \
-               --target ${cert_arn}
+           # Detach all policies from certificate
+           aws iot list-attached-policies --target ${cert_arn} \
+               --query 'policies[*].policyName' --output text | \
+               xargs -n1 -I {} aws iot detach-policy --policy-name {} --target ${cert_arn}
            
            # Detach certificate from thing
            aws iot detach-thing-principal \
@@ -958,44 +1034,43 @@ echo "✅ Environment prepared for IoT security implementation"
                --certificate-id ${cert_id} \
                --new-status INACTIVE
            
-           aws iot delete-certificate \
-               --certificate-id ${cert_id}
+           aws iot delete-certificate --certificate-id ${cert_id}
        fi
        
-       # Remove from thing group
+       # Remove device from thing group
        aws iot remove-thing-from-thing-group \
            --thing-group-name "IndustrialSensors" \
-           --thing-name ${thing_name}
+           --thing-name ${thing_name} 2>/dev/null || true
        
-       # Delete thing
+       # Delete the IoT thing
        aws iot delete-thing --thing-name ${thing_name}
        
        echo "✅ Device ${thing_name} cleaned up"
    }
    
-   # Clean up all devices
+   # Clean up all created devices
    for i in {001..003}; do
        cleanup_device $i
    done
    ```
 
-3. **Remove Policies and Resources**:
+3. **Remove Policies and Thing Resources**:
 
    ```bash
-   # Delete IoT policies
+   # Delete all IoT policies created
    aws iot delete-policy --policy-name "RestrictiveSensorPolicy"
    aws iot delete-policy --policy-name "TimeBasedAccessPolicy"
    aws iot delete-policy --policy-name "LocationBasedAccessPolicy"
-   aws iot delete-policy --policy-name "DeviceQuarantinePolicy"
+   aws iot delete-policy --policy-name "DeviceQuarantinePolicy" 2>/dev/null || true
    
    # Delete thing group and thing type
    aws iot delete-thing-group --thing-group-name "IndustrialSensors"
    aws iot delete-thing-type --thing-type-name ${THING_TYPE_NAME}
    
-   echo "✅ Policies and resources removed"
+   echo "✅ Policies and thing resources removed"
    ```
 
-4. **Clean up Monitoring Resources**:
+4. **Clean up Monitoring and Processing Resources**:
 
    ```bash
    # Delete CloudWatch resources
@@ -1007,45 +1082,63 @@ echo "✅ Environment prepared for IoT security implementation"
    aws dynamodb delete-table --table-name IoTSecurityEvents
    
    # Delete EventBridge rule
-   aws events delete-rule --name "IoT-Certificate-Rotation-Check"
+   aws events delete-rule --name "IoT-Certificate-Rotation-Check" --force-delete-rule
+   
+   # Delete IAM roles created
+   aws iam detach-role-policy --role-name IoTLoggingRole \
+       --policy-arn arn:aws:iam::aws:policy/service-role/IoTLogsFullAccess
+   aws iam delete-role --role-name IoTLoggingRole
+   
+   aws iam detach-role-policy --role-name IoTSecurityProcessorRole \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   aws iam detach-role-policy --role-name IoTSecurityProcessorRole \
+       --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+   aws iam delete-role --role-name IoTSecurityProcessorRole
    
    # Clean up local files
    rm -rf ./certificates/
    rm -f *.json *.py
    
-   echo "✅ All monitoring resources cleaned up"
+   echo "✅ All monitoring and processing resources cleaned up"
    ```
 
 ## Discussion
 
-This comprehensive IoT security implementation demonstrates enterprise-grade security practices for large-scale IoT deployments. The solution addresses multiple security layers through X.509 certificate-based authentication, fine-grained authorization policies, and continuous monitoring capabilities.
+This comprehensive IoT security implementation demonstrates enterprise-grade security practices for large-scale IoT deployments following AWS Well-Architected Framework principles. The solution addresses multiple security layers through X.509 certificate-based authentication, fine-grained authorization policies, continuous monitoring capabilities, and automated incident response mechanisms.
 
-The certificate-based authentication model provides several critical advantages over traditional approaches. Each device receives a unique X.509 certificate that serves as its cryptographic identity, eliminating risks associated with shared credentials. The certificates support mutual TLS authentication, ensuring both device and server identity verification. This approach scales effectively to thousands of devices while maintaining individual device accountability and enabling selective access revocation without affecting other devices.
+The certificate-based authentication model provides critical advantages over traditional approaches by establishing unique cryptographic identities for each device. X.509 certificates eliminate shared credential vulnerabilities while supporting mutual TLS authentication that verifies both device and server identity. This approach scales effectively to thousands of devices while maintaining individual device accountability and enabling selective access revocation without affecting other devices. The certificates integrate seamlessly with AWS IoT Core's policy engine for dynamic authorization decisions.
 
-The policy framework leverages AWS IoT Core's integration with IAM policy language to implement sophisticated access controls. Thing policy variables like `${iot:Connection.Thing.ThingName}` and `${iot:Connection.Thing.Attributes[location]}` enable dynamic authorization based on device identity and attributes. This approach supports complex scenarios like time-based access, location-based restrictions, and device-type-specific permissions while maintaining policy reusability across device fleets.
+The policy framework leverages AWS IoT Core's integration with IAM policy language to implement sophisticated access controls. Policy variables like `${iot:Connection.Thing.ThingName}` and `${iot:Connection.Thing.Attributes[location]}` enable dynamic authorization based on device identity and attributes. This approach supports complex scenarios including time-based access restrictions, location-based constraints, and device-type-specific permissions while maintaining policy reusability across device fleets. The conditional logic enables enforcement of business rules and operational requirements without compromising security boundaries.
 
-AWS IoT Device Defender provides continuous security monitoring by establishing behavior baselines for individual devices and detecting anomalies in connection patterns, message volumes, and authorization attempts. The security profiles can be customized for different device types and deployment environments, while integration with CloudWatch enables automated incident response through Lambda functions and SNS notifications.
+AWS IoT Device Defender provides continuous security monitoring by establishing behavioral baselines for individual devices and detecting anomalies in connection patterns, message volumes, and authorization attempts. The security profiles can be customized for different device types and deployment environments, while integration with CloudWatch enables automated incident response through Lambda functions and SNS notifications. This monitoring layer is essential for maintaining fleet-wide security visibility and compliance in production environments.
 
-> **Tip**: Implement certificate rotation policies before deployment to production, as certificate replacement requires careful coordination with device firmware update mechanisms.
+> **Tip**: Implement certificate rotation policies before production deployment, as certificate replacement requires careful coordination with device firmware update mechanisms. Plan for over-the-air update capabilities and consider staged rollouts for certificate updates.
 
-The architecture supports advanced security scenarios including device quarantine capabilities, automated compliance monitoring through AWS Config, and integration with AWS Security Hub for centralized security management. These capabilities are essential for regulated industries where security incidents must be quickly contained and documented for audit purposes.
+The architecture supports advanced security scenarios including device quarantine capabilities, automated compliance monitoring through AWS Config, and integration with AWS Security Hub for centralized security management. These capabilities are essential for regulated industries where security incidents must be quickly contained and documented for audit purposes. The automated event processing ensures rapid response to threats while maintaining detailed logs required for forensic analysis and compliance reporting.
 
-For production deployments, consider implementing additional security measures such as certificate pinning on devices, network-level isolation through VPC endpoints, and hardware security modules (HSMs) for certificate authority operations. Regular security assessments and penetration testing should validate the effectiveness of implemented controls against evolving threat landscapes.
+For production deployments, consider implementing additional security measures such as certificate pinning on devices, network-level isolation through VPC endpoints, and hardware security modules (HSMs) for certificate authority operations. Regular security assessments and penetration testing should validate the effectiveness of implemented controls against evolving threat landscapes. Integration with external SIEM systems and threat intelligence feeds can enhance detection capabilities and incident response coordination.
 
 ## Challenge
 
 Extend this solution by implementing these advanced security enhancements:
 
-1. **Implement Just-in-Time (JIT) Certificate Provisioning**: Create a system that generates device certificates on-demand during device onboarding, integrating with AWS IoT Device Provisioning for zero-touch provisioning workflows.
+1. **Implement Just-in-Time (JIT) Certificate Provisioning**: Create a system that generates device certificates on-demand during device onboarding, integrating with [AWS IoT Device Provisioning](https://docs.aws.amazon.com/iot/latest/developerguide/iot-provision.html) for zero-touch provisioning workflows with claim certificates and provisioning templates.
 
-2. **Build Certificate Authority (CA) Management**: Set up a private CA using AWS Certificate Manager Private CA to issue device certificates, implement certificate revocation lists (CRLs), and automate certificate lifecycle management.
+2. **Build Certificate Authority (CA) Management**: Set up a private CA using [AWS Certificate Manager Private CA](https://docs.aws.amazon.com/acm-pca/latest/userguide/) to issue device certificates, implement certificate revocation lists (CRLs), and automate certificate lifecycle management with rotation schedules.
 
-3. **Deploy Fleet-Wide Security Policies**: Create hierarchical policy structures that inherit from device groups, implement policy versioning and rollback capabilities, and build automated policy compliance checking.
+3. **Deploy Fleet-Wide Security Policies**: Create hierarchical policy structures that inherit from device groups, implement policy versioning and rollback capabilities, and build automated policy compliance checking using AWS Config custom rules.
 
-4. **Integrate with External Security Systems**: Connect IoT Device Defender with SIEM platforms, implement automated threat intelligence feed integration, and build custom security analytics using Amazon OpenSearch Service.
+4. **Integrate with External Security Systems**: Connect IoT Device Defender with SIEM platforms like Splunk or Elasticsearch, implement automated threat intelligence feed integration, and build custom security analytics using [Amazon OpenSearch Service](https://docs.aws.amazon.com/opensearch-service/).
 
-5. **Implement Device Attestation**: Add hardware-based device identity verification using TPM chips, implement secure boot verification, and create firmware integrity monitoring capabilities.
+5. **Implement Device Attestation**: Add hardware-based device identity verification using TPM chips, implement secure boot verification, and create firmware integrity monitoring capabilities using cryptographic signatures and hash validation.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

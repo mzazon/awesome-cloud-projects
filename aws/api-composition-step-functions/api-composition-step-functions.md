@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: Step Functions, API Gateway, Lambda, DynamoDB
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: api-composition, step-functions, api-gateway, serverless, microservices
 recipe-generator-version: 1.3
@@ -114,6 +114,7 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
 
 export PROJECT_NAME="api-composition-${RANDOM_SUFFIX}"
 export ROLE_NAME="StepFunctionsCompositionRole-${RANDOM_SUFFIX}"
+export LAMBDA_ROLE_NAME="LambdaExecutionRole-${RANDOM_SUFFIX}"
 export STATE_MACHINE_NAME="OrderProcessingWorkflow-${RANDOM_SUFFIX}"
 export API_NAME="CompositionAPI-${RANDOM_SUFFIX}"
 
@@ -130,16 +131,63 @@ aws dynamodb create-table \
     --key-schema AttributeName=auditId,KeyType=HASH \
     --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
 
+aws dynamodb create-table \
+    --table-name "${PROJECT_NAME}-reservations" \
+    --attribute-definitions AttributeName=orderId,AttributeType=S \
+    --key-schema AttributeName=orderId,KeyType=HASH \
+    --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
+
 # Wait for tables to be created
 aws dynamodb wait table-exists --table-name "${PROJECT_NAME}-orders"
 aws dynamodb wait table-exists --table-name "${PROJECT_NAME}-audit"
+aws dynamodb wait table-exists --table-name "${PROJECT_NAME}-reservations"
 
 echo "✅ DynamoDB tables created successfully"
 ```
 
 ## Steps
 
-1. **Create IAM Role for Step Functions**:
+1. **Create IAM Role for Lambda Functions**:
+
+   Lambda functions require an execution role to access other AWS services and write CloudWatch logs. This foundational security setup enables Lambda functions to interact with DynamoDB and other services while following the principle of least privilege. The execution role provides the necessary permissions without embedding credentials in code.
+
+   ```bash
+   # Create trust policy for Lambda
+   cat > lambda-trust-policy.json << EOF
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Principal": {
+           "Service": "lambda.amazonaws.com"
+         },
+         "Action": "sts:AssumeRole"
+       }
+     ]
+   }
+   EOF
+   
+   # Create the Lambda execution role
+   aws iam create-role \
+       --role-name "${LAMBDA_ROLE_NAME}" \
+       --assume-role-policy-document file://lambda-trust-policy.json
+   
+   # Attach basic Lambda execution policy
+   aws iam attach-role-policy \
+       --role-name "${LAMBDA_ROLE_NAME}" \
+       --policy-arn "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+   
+   # Get the Lambda role ARN
+   LAMBDA_ROLE_ARN=$(aws iam get-role --role-name "${LAMBDA_ROLE_NAME}" \
+       --query Role.Arn --output text)
+   
+   echo "✅ Lambda execution role created with ARN: ${LAMBDA_ROLE_ARN}"
+   ```
+
+   The Lambda execution role is now configured with basic execution permissions for CloudWatch logging. This secure foundation enables Lambda functions to execute and write logs while maintaining proper access controls for our microservices architecture.
+
+2. **Create IAM Role for Step Functions**:
 
    IAM roles enable Step Functions to securely access other AWS services on your behalf without hardcoding credentials. The execution role defines what resources your state machine can access, implementing the principle of least privilege. Understanding IAM roles is fundamental to building secure serverless workflows, as documented in the [Step Functions execution roles guide](https://docs.aws.amazon.com/step-functions/latest/dg/manage-state-machine-permissions.html).
 
@@ -217,12 +265,12 @@ echo "✅ DynamoDB tables created successfully"
    ROLE_ARN=$(aws iam get-role --role-name "${ROLE_NAME}" \
        --query Role.Arn --output text)
    
-   echo "✅ IAM role created with ARN: ${ROLE_ARN}"
+   echo "✅ Step Functions IAM role created with ARN: ${ROLE_ARN}"
    ```
 
    The IAM role is now configured with the necessary permissions to invoke Lambda functions, access DynamoDB tables, and write CloudWatch logs. This security foundation enables Step Functions to orchestrate your microservices while maintaining proper access controls and audit capabilities.
 
-2. **Create Mock Lambda Functions for Microservices**:
+3. **Create Mock Lambda Functions for Microservices**:
 
    Lambda functions provide the serverless compute layer for our microservices architecture. Each function represents a domain-specific service (user management, inventory) that can be developed, deployed, and scaled independently. This [microservices pattern with Lambda](https://docs.aws.amazon.com/whitepapers/latest/serverless-multi-tier-architectures-api-gateway-lambda/microservices-with-lambda.html) enables teams to work autonomously while maintaining service boundaries and reducing operational overhead.
 
@@ -267,11 +315,11 @@ echo "✅ DynamoDB tables created successfully"
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-user-service" \
        --runtime python3.9 \
-       --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/service-role/lambda-execution-role" \
+       --role "${LAMBDA_ROLE_ARN}" \
        --handler user-service.lambda_handler \
        --zip-file fileb://user-service.zip \
        --timeout 30 \
-       --memory-size 128 || echo "Function may already exist"
+       --memory-size 128
    
    # Create inventory service
    cat > inventory-service.py << 'EOF'
@@ -308,18 +356,18 @@ echo "✅ DynamoDB tables created successfully"
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-inventory-service" \
        --runtime python3.9 \
-       --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/service-role/lambda-execution-role" \
+       --role "${LAMBDA_ROLE_ARN}" \
        --handler inventory-service.lambda_handler \
        --zip-file fileb://inventory-service.zip \
        --timeout 30 \
-       --memory-size 128 || echo "Function may already exist"
+       --memory-size 128
    
    echo "✅ Mock microservices created successfully"
    ```
 
    These Lambda functions now serve as independent microservices that can be invoked by Step Functions. Each service maintains its own business logic and can be modified, tested, and deployed independently. This decoupled architecture enables parallel development teams and supports different scaling requirements for each service component.
 
-3. **Create Step Functions State Machine Definition**:
+4. **Create Step Functions State Machine Definition**:
 
    State machines define the business logic flow using Amazon States Language (ASL), providing visual workflow representation and built-in error handling. The state machine orchestrates microservice calls, handles conditional logic, and manages data transformation between services. This declarative approach separates orchestration concerns from individual service implementations, as explained in the [Step Functions workflows guide](https://docs.aws.amazon.com/step-functions/latest/dg/tutorial-creating-lambda-state-machine.html).
 
@@ -520,7 +568,7 @@ echo "✅ DynamoDB tables created successfully"
 
    The state machine now provides a centralized orchestration engine that coordinates multiple microservices according to your business rules. The visual workflow representation makes complex business logic understandable to both technical and business stakeholders, while built-in error handling ensures reliable execution even when individual services encounter issues.
 
-4. **Create API Gateway with Step Functions Integration**:
+5. **Create API Gateway with Step Functions Integration**:
 
    API Gateway provides the HTTP interface that exposes your Step Functions workflows as REST APIs. This integration pattern allows external clients to trigger complex workflows through simple HTTP requests while API Gateway handles request routing, throttling, and response transformation. The [API Gateway Step Functions integration](https://docs.aws.amazon.com/step-functions/latest/dg/connect-api-gateway.html) enables you to build composable APIs that aggregate multiple backend services.
 
@@ -577,7 +625,7 @@ echo "✅ DynamoDB tables created successfully"
 
    API Gateway now has the necessary permissions to invoke Step Functions on behalf of client requests. This secure integration enables HTTP clients to trigger complex workflows without requiring direct access to Step Functions, providing an additional security layer and enabling features like request validation, rate limiting, and API key management.
 
-5. **Configure API Gateway Method with Request Mapping**:
+6. **Configure API Gateway Method with Request Mapping**:
 
    Request mapping templates transform incoming HTTP requests into the format expected by Step Functions, enabling protocol adaptation without code changes. This powerful feature allows you to expose a clean, client-friendly API interface while maintaining flexibility in your backend service contracts. The mapping templates use Velocity Template Language (VTL) to perform data transformation and validation.
 
@@ -626,7 +674,7 @@ echo "✅ DynamoDB tables created successfully"
 
    The API method now provides a seamless integration between HTTP clients and Step Functions workflows. Request mapping templates ensure that client requests are properly formatted for workflow execution, while response templates provide consistent API responses. This abstraction layer enables API versioning and client-specific customizations without modifying backend workflows.
 
-6. **Create GET Method for Order Status**:
+7. **Create GET Method for Order Status**:
 
    This demonstrates direct service integration where API Gateway queries DynamoDB without requiring Lambda functions or Step Functions. This pattern reduces latency and costs for simple data retrieval operations while maintaining consistent API interfaces. Direct integrations are ideal for CRUD operations that don't require complex business logic or orchestration.
 
@@ -681,7 +729,7 @@ echo "✅ DynamoDB tables created successfully"
        --http-method GET \
        --status-code 200 \
        --response-templates '{
-         "application/json": "{\"orderId\": \"$input.json('\'\'$.Item.orderId.S''\'')\"}"
+         "application/json": "{\"orderId\": \"$input.json('\'\'$.Item.orderId.S'\'\')\", \"status\": \"$input.json('\'\'$.Item.status.S'\'\')\", \"orderTotal\": \"$input.json('\'\'$.Item.orderTotal.N'\'\'')\"}"
        }'
    
    echo "✅ Order status endpoint created"
@@ -689,7 +737,7 @@ echo "✅ DynamoDB tables created successfully"
 
    The status endpoint provides immediate access to order data without triggering workflow executions. This efficient pattern demonstrates how to combine orchestrated workflows for complex operations with direct data access for simple queries, optimizing both performance and cost for different use cases.
 
-7. **Deploy API Gateway and Test**:
+8. **Deploy API Gateway and Test**:
 
    API Gateway deployments create immutable snapshots of your API configuration that can be deployed to different stages (dev, test, prod). This deployment model enables controlled rollouts, testing strategies, and rollback capabilities. Understanding deployment stages is crucial for managing API lifecycle and ensuring consistent environments across development workflows.
 
@@ -728,7 +776,7 @@ echo "✅ DynamoDB tables created successfully"
 
    The API is now live and accepting requests from clients. The test demonstrates the complete request flow: client HTTP request → API Gateway → Step Functions → Lambda services → DynamoDB storage → response. This end-to-end validation confirms that all integration points are working correctly and the composite API is ready for production use.
 
-8. **Add Error Handling and Compensation Logic**:
+9. **Add Error Handling and Compensation Logic**:
 
    Advanced error handling patterns include retry logic, exponential backoff, and compensation workflows that implement the saga pattern for distributed transactions. These patterns ensure data consistency across multiple services when partial failures occur. The [Step Functions error handling guide](https://docs.aws.amazon.com/step-functions/latest/dg/concepts-error-handling.html) provides comprehensive guidance on building resilient workflows that gracefully handle service failures and network issues.
 
@@ -1075,6 +1123,7 @@ echo "✅ DynamoDB tables created successfully"
    # Delete DynamoDB tables
    aws dynamodb delete-table --table-name "${PROJECT_NAME}-orders"
    aws dynamodb delete-table --table-name "${PROJECT_NAME}-audit"
+   aws dynamodb delete-table --table-name "${PROJECT_NAME}-reservations"
    
    echo "✅ DynamoDB tables deleted"
    ```
@@ -1082,7 +1131,7 @@ echo "✅ DynamoDB tables created successfully"
 5. **Delete IAM Roles**:
 
    ```bash
-   # Detach policies and delete roles
+   # Detach policies and delete Step Functions role
    aws iam detach-role-policy \
        --role-name "${ROLE_NAME}" \
        --policy-arn "arn:aws:iam::aws:policy/service-role/AWSLambdaRole"
@@ -1093,6 +1142,14 @@ echo "✅ DynamoDB tables created successfully"
    
    aws iam delete-role --role-name "${ROLE_NAME}"
    
+   # Delete Lambda execution role
+   aws iam detach-role-policy \
+       --role-name "${LAMBDA_ROLE_NAME}" \
+       --policy-arn "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+   
+   aws iam delete-role --role-name "${LAMBDA_ROLE_NAME}"
+   
+   # Delete API Gateway role
    aws iam detach-role-policy \
        --role-name "APIGatewayStepFunctionsRole-${RANDOM_SUFFIX}" \
        --policy-arn "arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess"
@@ -1101,8 +1158,8 @@ echo "✅ DynamoDB tables created successfully"
    
    # Remove local files
    rm -f trust-policy.json composition-policy.json apigw-trust-policy.json
-   rm -f state-machine-definition.json enhanced-state-machine.json
-   rm -f user-service.py inventory-service.py
+   rm -f lambda-trust-policy.json state-machine-definition.json
+   rm -f enhanced-state-machine.json user-service.py inventory-service.py
    rm -f user-service.zip inventory-service.zip
    
    echo "✅ All resources cleaned up successfully"
@@ -1138,4 +1195,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

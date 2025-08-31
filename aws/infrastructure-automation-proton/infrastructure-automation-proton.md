@@ -4,12 +4,12 @@ id: 191267c5
 category: devops
 difficulty: 300
 subject: aws
-services: proton, cdk, codepipeline, lambda, s3
-estimated-time: 60 minutes
-recipe-version: 1.1
+services: proton, cdk, ecs, iam
+estimated-time: 90 minutes
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, proton, cdk, infrastructure-automation, templates, governance, self-service, standardization
 recipe-generator-version: 1.3
@@ -60,65 +60,88 @@ graph TB
 
 ## Prerequisites
 
-- AWS account with administrator access
-- AWS CLI version 2 installed and configured
-- Node.js 16.x or later installed for CDK
-- Basic understanding of Infrastructure as Code concepts
-- Git installed and configured
-- Understanding of CI/CD pipeline concepts
-- Estimated cost: $15-25 for testing with sample environments
+1. AWS account with administrator access
+2. AWS CLI version 2 installed and configured
+3. Node.js 18.x or later installed for CDK
+4. Basic understanding of Infrastructure as Code concepts
+5. Git installed and configured
+6. Understanding of CI/CD pipeline concepts
+7. Estimated cost: $20-35 for testing with sample environments
+
+> **Note**: This recipe follows AWS Well-Architected Framework principles for operational excellence and security. Review the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) for additional guidance.
+
+## Preparation
+
+```bash
+# Set environment variables for AWS and unique resource naming
+export AWS_REGION=$(aws configure get region)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+    --query Account --output text)
+
+# Generate unique identifier for resource naming
+export RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
+    --exclude-punctuation --exclude-uppercase \
+    --password-length 6 --require-each-included-type \
+    --output text --query RandomPassword)
+
+# Set resource names using the suffix
+export PROTON_SERVICE_ROLE_NAME="ProtonServiceRole-$RANDOM_SUFFIX"
+export TEMPLATE_BUCKET="proton-templates-$RANDOM_SUFFIX"
+
+echo "✅ Environment variables configured for region: $AWS_REGION"
+```
 
 ## Steps
 
-1. **Set up environment variables for consistent resource naming**:
-
-   Establishing consistent naming conventions is critical for managing infrastructure at scale. These environment variables ensure unique resource names across your organization while maintaining clarity about resource ownership and purpose.
-
-   ```bash
-   export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-   	--query Account --output text)
-   export AWS_REGION=$(aws configure get region)
-   export RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
-   	--exclude-punctuation --exclude-uppercase \
-   	--password-length 6 --require-each-included-type \
-   	--output text --query RandomPassword)
-   export PROTON_SERVICE_ROLE_NAME="ProtonServiceRole-$RANDOM_SUFFIX"
-   export TEMPLATE_BUCKET="proton-templates-$RANDOM_SUFFIX"
-   ```
-
-   These variables are now set and will be used throughout the deployment process to ensure consistent resource naming and avoid conflicts with existing resources.
-
-2. **Install and bootstrap AWS CDK**:
+1. **Install and bootstrap AWS CDK**:
 
    AWS CDK requires one-time bootstrapping to deploy foundational resources like S3 buckets and IAM roles that CDK uses for deployments. This step prepares your AWS account to work with CDK-generated CloudFormation templates.
 
    ```bash
+   # Install AWS CDK CLI globally
    npm install -g aws-cdk
-   cdk --version
-   ```
 
-   ```bash
+   # Verify installation
+   cdk --version
+
+   # Bootstrap your AWS environment for CDK
    cdk bootstrap aws://${AWS_ACCOUNT_ID}/${AWS_REGION}
+
+   echo "✅ CDK installed and AWS account bootstrapped"
    ```
 
    The CDK is now installed and your AWS account is bootstrapped with the necessary resources for CDK deployments. This foundation enables all subsequent CDK operations.
 
-3. **Create S3 bucket for storing template bundles**:
+2. **Create S3 bucket for storing template bundles**:
 
    AWS Proton requires template bundles to be stored in S3 where it can access them during environment and service provisioning. This bucket serves as the central repository for all your infrastructure templates.
 
    ```bash
-   aws s3api create-bucket --bucket $TEMPLATE_BUCKET \
-   	--region $AWS_REGION
+   # Create S3 bucket with region-specific handling
+   if [ "$AWS_REGION" = "us-east-1" ]; then
+       aws s3api create-bucket --bucket $TEMPLATE_BUCKET
+   else
+       aws s3api create-bucket --bucket $TEMPLATE_BUCKET \
+           --region $AWS_REGION \
+           --create-bucket-configuration LocationConstraint=$AWS_REGION
+   fi
+
+   # Enable versioning for template history
+   aws s3api put-bucket-versioning \
+       --bucket $TEMPLATE_BUCKET \
+       --versioning-configuration Status=Enabled
+
+   echo "✅ S3 bucket created: $TEMPLATE_BUCKET"
    ```
 
    The S3 bucket is now created and ready to store your Proton template bundles. This centralized storage approach enables version control and secure access to your infrastructure templates.
 
-4. **Create IAM service role for AWS Proton**:
+3. **Create IAM service role for AWS Proton**:
 
    AWS Proton requires specific IAM permissions to provision and manage infrastructure on your behalf. This service role grants Proton the necessary permissions while maintaining security through the principle of least privilege.
 
    ```bash
+   # Create trust policy for Proton service
    cat > proton-service-trust-policy.json << 'EOF'
    {
      "Version": "2012-10-17",
@@ -133,46 +156,161 @@ graph TB
      ]
    }
    EOF
-   ```
 
-   ```bash
+   # Create the IAM role
    aws iam create-role \
-   	--role-name $PROTON_SERVICE_ROLE_NAME \
-   	--assume-role-policy-document \
-   	file://proton-service-trust-policy.json
-   ```
+       --role-name $PROTON_SERVICE_ROLE_NAME \
+       --assume-role-policy-document \
+       file://proton-service-trust-policy.json
 
-   ```bash
+   # Attach the AWS managed policy for Proton
    aws iam attach-role-policy \
-   	--role-name $PROTON_SERVICE_ROLE_NAME \
-   	--policy-arn arn:aws:iam::aws:policy/service-role/AWSProtonServiceRole
+       --role-name $PROTON_SERVICE_ROLE_NAME \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSProtonServiceRole
+
+   echo "✅ Proton service role created: $PROTON_SERVICE_ROLE_NAME"
    ```
 
    The IAM service role is now configured with appropriate permissions for Proton to manage your infrastructure. This role enables Proton to provision environments and services while maintaining security boundaries.
 
-5. **Create directory structure for Proton template**:
+4. **Create CDK project for environment template**:
+
+   Environment templates define shared infrastructure like VPCs, clusters, and networking that multiple services can leverage. This CDK project will generate the CloudFormation template that Proton uses to create environments.
+
+   ```bash
+   # Create directory and initialize CDK project
+   mkdir proton-environment-template
+   cd proton-environment-template
+   cdk init app --language typescript
+
+   echo "✅ Environment template CDK project initialized"
+   ```
+
+   The environment template CDK project is now created. This project will define the foundational infrastructure that services will deploy into.
+
+5. **Create environment infrastructure stack**:
+
+   This stack defines a VPC with public and private subnets, an ECS cluster, and supporting infrastructure. The design follows AWS best practices for network isolation and scalability.
+
+   ```bash
+   # Install required CDK packages for environment template
+   npm install aws-cdk-lib constructs
+
+   # Create the environment stack
+   cat > lib/proton-environment-stack.ts << 'EOF'
+   import * as cdk from 'aws-cdk-lib';
+   import * as ec2 from 'aws-cdk-lib/aws-ec2';
+   import * as ecs from 'aws-cdk-lib/aws-ecs';
+   import { Construct } from 'constructs';
+
+   export class ProtonEnvironmentStack extends cdk.Stack {
+     constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+       super(scope, id, props);
+
+       // Create VPC with public and private subnets
+       const vpc = new ec2.Vpc(this, 'VPC', {
+         ipAddresses: ec2.IpAddresses.cidr('{{environment.inputs.vpc_cidr}}'),
+         maxAzs: 2,
+         subnetConfiguration: [
+           {
+             name: 'Public',
+             subnetType: ec2.SubnetType.PUBLIC,
+             cidrMask: 24,
+           },
+           {
+             name: 'Private',
+             subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+             cidrMask: 24,
+           },
+         ],
+         enableDnsHostnames: true,
+         enableDnsSupport: true,
+       });
+
+       // Create ECS cluster
+       const cluster = new ecs.Cluster(this, 'Cluster', {
+         vpc: vpc,
+         clusterName: '{{environment.name}}-cluster',
+         containerInsights: true,
+       });
+
+       // Output VPC ID for service templates to reference
+       new cdk.CfnOutput(this, 'VpcId', {
+         value: vpc.vpcId,
+         description: 'VPC ID for services to reference',
+       });
+
+       // Output cluster name for service templates
+       new cdk.CfnOutput(this, 'ClusterName', {
+         value: cluster.clusterName,
+         description: 'ECS Cluster name for services',
+       });
+
+       // Output private subnet IDs
+       new cdk.CfnOutput(this, 'PrivateSubnetIds', {
+         value: vpc.privateSubnets.map(subnet => subnet.subnetId).join(','),
+         description: 'Private subnet IDs for services',
+       });
+     }
+   }
+   EOF
+
+   echo "✅ Environment stack created"
+   ```
+
+   The environment stack defines enterprise-grade networking infrastructure with proper subnet isolation and an ECS cluster configured for container workloads.
+
+6. **Update environment CDK app**:
+
+   ```bash
+   # Update the main CDK app file
+   cat > bin/proton-environment-template.ts << 'EOF'
+   #!/usr/bin/env node
+   import 'source-map-support/register';
+   import * as cdk from 'aws-cdk-lib';
+   import { ProtonEnvironmentStack } from '../lib/proton-environment-stack';
+
+   const app = new cdk.App();
+   new ProtonEnvironmentStack(app, 'ProtonEnvironmentStack');
+   EOF
+
+   # Build and synthesize the template
+   npm run build
+   cdk synth
+
+   echo "✅ Environment template synthesized"
+   ```
+
+7. **Create directory structure for environment template**:
 
    AWS Proton templates must follow a specific directory structure that includes infrastructure code, schemas, and manifest files. This organization enables Proton to understand and validate your template components.
 
    ```bash
-   mkdir -p ../environment-template/v1/infrastructure
-   cd ../environment-template/v1
+   # Return to parent directory and create template structure
+   cd ..
+   mkdir -p environment-template/v1/infrastructure
+   cd environment-template/v1
+
+   echo "✅ Environment template directory structure created"
    ```
 
    The directory structure is now created following Proton's conventions. This standardized layout ensures compatibility with Proton's template processing pipeline.
 
-6. **Copy the synthesized CloudFormation template**:
+8. **Copy the synthesized CloudFormation template**:
 
    CDK synthesis generates CloudFormation templates that AWS Proton can deploy. This step bridges the gap between CDK's TypeScript constructs and Proton's CloudFormation-based deployment engine.
 
    ```bash
+   # Copy synthesized template to Proton structure
    cp ../../proton-environment-template/cdk.out/ProtonEnvironmentStack.template.json \
-   	infrastructure/cloudformation.yaml
+       infrastructure/cloudformation.yaml
+
+   echo "✅ Environment CloudFormation template copied"
    ```
 
    The CDK-generated CloudFormation template is now packaged for Proton deployment. This template contains all the networking and compute infrastructure needed for your environment.
 
-7. **Create the environment template schema**:
+9. **Create the environment template schema**:
 
    The schema defines the interface that development teams will use to configure environments. It provides input validation and default values, ensuring consistent deployments while allowing necessary customization.
 
@@ -201,52 +339,59 @@ graph TB
          required:
            - environment_name
    EOF
+
+   echo "✅ Environment template schema created"
    ```
 
    The schema is now defined with validation rules and defaults. This interface standardizes how teams configure environments while preventing common configuration errors.
 
-8. **Create the manifest file**:
+10. **Create the environment manifest file**:
 
-   The manifest file tells Proton how to process the template files and which infrastructure engine to use. This metadata is essential for Proton's template processing pipeline.
+    The manifest file tells Proton how to process the template files and which infrastructure engine to use. This metadata is essential for Proton's template processing pipeline.
 
-   ```bash
-   cat > infrastructure/manifest.yaml << 'EOF'
-   infrastructure:
-     templates:
-       - file: "cloudformation.yaml"
-         engine: "cloudformation"
-         template_language: "yaml"
-   EOF
-   ```
+    ```bash
+    cat > infrastructure/manifest.yaml << 'EOF'
+    infrastructure:
+      templates:
+        - file: "cloudformation.yaml"
+          engine: "cloudformation"
+          template_language: "yaml"
+    EOF
 
-   The manifest file is configured to instruct Proton to use CloudFormation for deployment. This completes the environment template bundle structure.
+    echo "✅ Environment manifest file created"
+    ```
 
-9. **Initialize CDK project for service template**:
+    The manifest file is configured to instruct Proton to use CloudFormation for deployment. This completes the environment template bundle structure.
 
-   Service templates define how individual applications deploy into environments. Unlike environment templates that create shared infrastructure, service templates focus on application-specific resources like containers, load balancers, and databases.
+11. **Initialize CDK project for service template**:
 
-   ```bash
-   cd ../../
-   mkdir proton-service-template
-   cd proton-service-template
-   cdk init app --language typescript
-   ```
+    Service templates define how individual applications deploy into environments. Unlike environment templates that create shared infrastructure, service templates focus on application-specific resources like containers, load balancers, and databases.
 
-   The service template CDK project is now initialized. This separate project allows you to define application deployment patterns independently from environment infrastructure.
+    ```bash
+    cd ../../
+    mkdir proton-service-template
+    cd proton-service-template
+    cdk init app --language typescript
 
-10. **Install additional CDK packages**:
+    echo "✅ Service template CDK project initialized"
+    ```
+
+    The service template CDK project is now initialized. This separate project allows you to define application deployment patterns independently from environment infrastructure.
+
+12. **Install additional CDK packages for service template**:
 
     Service templates require additional CDK constructs for container orchestration, load balancing, and logging. These packages provide high-level abstractions for common application deployment patterns.
 
     ```bash
-    npm install @aws-cdk/aws-ecs @aws-cdk/aws-ecs-patterns \
-    	@aws-cdk/aws-ec2 @aws-cdk/aws-elasticloadbalancingv2 \
-    	@aws-cdk/aws-logs @aws-cdk/aws-iam
+    # Install required CDK v2 packages
+    npm install aws-cdk-lib constructs
+
+    echo "✅ CDK v2 packages installed"
     ```
 
     The required CDK packages are now installed. These libraries provide the constructs needed to create containerized services with proper networking, scaling, and observability.
 
-11. **Create the service infrastructure stack**:
+13. **Create the service infrastructure stack**:
 
     This service template creates a production-ready web service using AWS Fargate with auto-scaling, load balancing, and centralized logging. The template demonstrates how services can reference environment infrastructure through Proton's template variable system, enabling loose coupling between infrastructure layers.
 
@@ -270,14 +415,14 @@ graph TB
 
         // Import ECS Cluster from environment
         const cluster = ecs.Cluster.fromClusterAttributes(this, 'ImportedCluster', {
-          clusterName: '{{environment.name}}-cluster',
+          clusterName: '{{environment.outputs.ClusterName}}',
           vpc: vpc
         });
 
         // Create CloudWatch log group
         const logGroup = new logs.LogGroup(this, 'ServiceLogGroup', {
           logGroupName: `/aws/ecs/{{service.name}}-{{service_instance.name}}`,
-          retention: logs.RetentionDays.ONE_WEEK,
+          retention: logs.RetentionDaysEnum.ONE_WEEK,
           removalPolicy: cdk.RemovalPolicy.DESTROY
         });
 
@@ -332,11 +477,13 @@ graph TB
       }
     }
     EOF
+
+    echo "✅ Service stack created"
     ```
 
     The service stack is now defined with enterprise-grade features including health checks, auto-scaling, and centralized logging. This template provides a robust foundation for containerized web applications.
 
-12. **Update the service CDK app**:
+14. **Update the service CDK app**:
 
     ```bash
     cat > bin/proton-service-template.ts << 'EOF'
@@ -348,40 +495,44 @@ graph TB
     const app = new cdk.App();
     new ProtonServiceStack(app, 'ProtonServiceStack');
     EOF
-    ```
 
-13. **Build and synthesize the service template**:
-
-    ```bash
+    # Build and synthesize the service template
     npm run build
     cdk synth
+
+    echo "✅ Service template synthesized"
     ```
 
-> **Warning**: Ensure that your service template references environment outputs correctly. The syntax `{{environment.outputs.VpcId}}` allows services to access infrastructure created by the environment template.
+    > **Warning**: Ensure that your service template references environment outputs correctly. The syntax `{{environment.outputs.VpcId}}` allows services to access infrastructure created by the environment template.
 
-14. **Create service template directory structure**:
+15. **Create service template directory structure**:
 
     Service templates use the `instance_infrastructure` directory to contain resources that get deployed for each service instance. This structure allows multiple instances of the same service to coexist in different environments.
 
     ```bash
-    mkdir -p ../service-template/v1/instance_infrastructure
-    cd ../service-template/v1
+    cd ..
+    mkdir -p service-template/v1/instance_infrastructure
+    cd service-template/v1
+
+    echo "✅ Service template directory structure created"
     ```
 
     The service template directory structure is now created. This organization enables Proton to manage multiple service instances while maintaining isolation between deployments.
 
-15. **Copy synthesized CloudFormation template**:
+16. **Copy synthesized CloudFormation template**:
 
     The CDK-generated CloudFormation template contains all the application-specific infrastructure needed to run your service, including Fargate tasks, load balancers, and auto-scaling policies.
 
     ```bash
     cp ../../proton-service-template/cdk.out/ProtonServiceStack.template.json \
-    	instance_infrastructure/cloudformation.yaml
+        instance_infrastructure/cloudformation.yaml
+
+    echo "✅ Service CloudFormation template copied"
     ```
 
     The service CloudFormation template is now packaged for Proton deployment. This template will be used to create individual service instances in your environments.
 
-16. **Create service template schema**:
+17. **Create service template schema**:
 
     The schema defines the interface for developers using this service template. It specifies required and optional parameters with validation rules, making it easy for teams to deploy services without deep infrastructure knowledge while ensuring consistency.
 
@@ -447,9 +598,11 @@ graph TB
             - image
             - port
     EOF
+
+    echo "✅ Service template schema created"
     ```
 
-17. **Create service manifest file**:
+18. **Create service manifest file**:
 
     ```bash
     cat > instance_infrastructure/manifest.yaml << 'EOF'
@@ -459,93 +612,111 @@ graph TB
           engine: "cloudformation"
           template_language: "yaml"
     EOF
+
+    echo "✅ Service manifest file created"
     ```
 
-18. **Create template bundles**:
+19. **Create template bundles**:
 
     AWS Proton requires templates to be packaged as compressed archives and stored in S3. This packaging approach enables version control and secure distribution of your infrastructure templates across teams and environments.
 
     ```bash
+    # Package environment template
     cd ../environment-template
     tar -czf environment-template-v1.tar.gz v1/
     aws s3 cp environment-template-v1.tar.gz s3://$TEMPLATE_BUCKET/
-    ```
 
-    ```bash
+    # Package service template  
     cd ../service-template
     tar -czf service-template-v1.tar.gz v1/
     aws s3 cp service-template-v1.tar.gz s3://$TEMPLATE_BUCKET/
+
+    echo "✅ Template bundles uploaded to S3"
     ```
 
     Both template bundles are now uploaded to S3 and ready for registration with Proton. These archives contain all the necessary files for Proton to understand and deploy your infrastructure templates.
 
-19. **Register the environment template**:
+20. **Register the environment template**:
 
     ```bash
-    PROTON_SERVICE_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROTON_SERVICE_ROLE_NAME}"
+    # Set Proton service role ARN
+    export PROTON_SERVICE_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROTON_SERVICE_ROLE_NAME}"
 
+    # Register environment template
     aws proton create-environment-template \
-    	--name "vpc-ecs-environment" \
-    	--display-name "VPC with ECS Cluster" \
-    	--description "Standard VPC environment with ECS cluster for containerized applications"
+        --name "vpc-ecs-environment" \
+        --display-name "VPC with ECS Cluster" \
+        --description "Standard VPC environment with ECS cluster for containerized applications"
+
+    echo "✅ Environment template registered"
     ```
 
-20. **Create environment template version**:
+21. **Create environment template version**:
 
     ```bash
     aws proton create-environment-template-version \
-    	--template-name "vpc-ecs-environment" \
-    	--description "Initial version with VPC and ECS cluster" \
-    	--source s3="{bucket=${TEMPLATE_BUCKET},key=environment-template-v1.tar.gz}"
+        --template-name "vpc-ecs-environment" \
+        --description "Initial version with VPC and ECS cluster" \
+        --source s3="{bucket=${TEMPLATE_BUCKET},key=environment-template-v1.tar.gz}"
+
+    echo "✅ Environment template version created"
     ```
 
-21. **Wait for template version to be registered and publish it**:
+22. **Wait for template version to be registered and publish it**:
 
     ```bash
+    # Wait for registration to complete
     aws proton wait environment-template-version-registered \
-    	--template-name "vpc-ecs-environment" \
-    	--major-version "1" --minor-version "0"
-    ```
+        --template-name "vpc-ecs-environment" \
+        --major-version "1" --minor-version "0"
 
-    ```bash
+    # Publish the template version
     aws proton update-environment-template-version \
-    	--template-name "vpc-ecs-environment" \
-    	--major-version "1" --minor-version "0" \
-    	--status "PUBLISHED"
+        --template-name "vpc-ecs-environment" \
+        --major-version "1" --minor-version "0" \
+        --status "PUBLISHED"
+
+    echo "✅ Environment template version published"
     ```
 
-22. **Register the service template**:
+23. **Register the service template**:
 
     ```bash
     aws proton create-service-template \
-    	--name "fargate-web-service" \
-    	--display-name "Fargate Web Service" \
-    	--description "Web service running on Fargate with load balancer"
+        --name "fargate-web-service" \
+        --display-name "Fargate Web Service" \
+        --description "Web service running on Fargate with load balancer"
+
+    echo "✅ Service template registered"
     ```
 
-23. **Create service template version**:
+24. **Create service template version**:
 
     ```bash
     aws proton create-service-template-version \
-    	--template-name "fargate-web-service" \
-    	--description "Initial version with Fargate and ALB" \
-    	--source s3="{bucket=${TEMPLATE_BUCKET},key=service-template-v1.tar.gz}" \
-    	--compatible-environment-templates templateName="vpc-ecs-environment",majorVersion="1"
+        --template-name "fargate-web-service" \
+        --description "Initial version with Fargate and ALB" \
+        --source s3="{bucket=${TEMPLATE_BUCKET},key=service-template-v1.tar.gz}" \
+        --compatible-environment-templates templateName="vpc-ecs-environment",majorVersion="1"
+
+    echo "✅ Service template version created"
     ```
 
-24. **Publish service template version**:
+25. **Publish service template version**:
 
     ```bash
+    # Wait for registration
     aws proton wait service-template-version-registered \
-    	--template-name "fargate-web-service" \
-    	--major-version "1" --minor-version "0"
-    ```
+        --template-name "fargate-web-service" \
+        --major-version "1" --minor-version "0"
 
-    ```bash
+    # Publish the template
     aws proton update-service-template-version \
-    	--template-name "fargate-web-service" \
-    	--major-version "1" --minor-version "0" \
-    	--status "PUBLISHED"
+        --template-name "fargate-web-service" \
+        --major-version "1" --minor-version "0" \
+        --status "PUBLISHED"
+
+    echo "✅ Service template version published"
     ```
 
 > **Note**: AWS Proton uses environment templates to define shared infrastructure like VPCs, clusters, and networking that multiple services can leverage. Learn more about [Proton template architecture](https://docs.aws.amazon.com/proton/latest/userguide/ag-environments.html).
@@ -563,15 +734,15 @@ graph TB
      "environment_name": "development"
    }
    EOF
-   ```
 
-   ```bash
    aws proton create-environment \
-   	--name "dev-environment" \
-   	--template-name "vpc-ecs-environment" \
-   	--template-major-version "1" \
-   	--spec file://dev-environment-spec.json \
-   	--proton-service-role-arn $PROTON_SERVICE_ROLE_ARN
+       --name "dev-environment" \
+       --template-name "vpc-ecs-environment" \
+       --template-major-version "1" \
+       --spec file://dev-environment-spec.json \
+       --proton-service-role-arn $PROTON_SERVICE_ROLE_ARN
+
+   echo "✅ Development environment creation initiated"
    ```
 
 2. Monitor environment deployment:
@@ -584,6 +755,7 @@ graph TB
 
    ```bash
    aws proton wait environment-deployed --name "dev-environment"
+   echo "✅ Development environment deployed successfully"
    ```
 
 ### Test Service Deployment
@@ -604,32 +776,34 @@ graph TB
      "health_check_path": "/"
    }
    EOF
-   ```
 
-   ```bash
    aws proton create-service \
-   	--name "test-web-service" \
-   	--template-name "fargate-web-service" \
-   	--template-major-version "1" \
-   	--spec file://test-service-spec.json
+       --name "test-web-service" \
+       --template-name "fargate-web-service" \
+       --template-major-version "1" \
+       --spec file://test-service-spec.json
+
+   echo "✅ Test service created"
    ```
 
 2. Create service instance in the development environment:
 
    ```bash
    aws proton create-service-instance \
-   	--service-name "test-web-service" \
-   	--name "dev-instance" \
-   	--environment-name "dev-environment" \
-   	--spec file://test-service-spec.json
+       --service-name "test-web-service" \
+       --name "dev-instance" \
+       --environment-name "dev-environment" \
+       --spec file://test-service-spec.json
+
+   echo "✅ Service instance deployment initiated"
    ```
 
 3. Monitor service instance deployment:
 
    ```bash
    aws proton get-service-instance \
-   	--service-name "test-web-service" \
-   	--name "dev-instance"
+       --service-name "test-web-service" \
+       --name "dev-instance"
    ```
 
 ### Expected Results
@@ -647,19 +821,20 @@ graph TB
 1. Delete service instances and services:
 
    ```bash
+   # Delete service instance
    aws proton delete-service-instance \
-   	--service-name "test-web-service" \
-   	--name "dev-instance"
-   ```
+       --service-name "test-web-service" \
+       --name "dev-instance"
 
-   ```bash
+   # Wait for deletion
    aws proton wait service-instance-deleted \
-   	--service-name "test-web-service" \
-   	--name "dev-instance"
-   ```
+       --service-name "test-web-service" \
+       --name "dev-instance"
 
-   ```bash
+   # Delete service
    aws proton delete-service --name "test-web-service"
+
+   echo "✅ Services cleaned up"
    ```
 
 2. Delete environments:
@@ -667,32 +842,34 @@ graph TB
    ```bash
    aws proton delete-environment --name "dev-environment"
    aws proton wait environment-deleted --name "dev-environment"
+
+   echo "✅ Environment deleted"
    ```
 
 3. Delete service template versions and templates:
 
    ```bash
    aws proton delete-service-template-version \
-   	--template-name "fargate-web-service" \
-   	--major-version "1" --minor-version "0"
-   ```
+       --template-name "fargate-web-service" \
+       --major-version "1" --minor-version "0"
 
-   ```bash
    aws proton delete-service-template \
-   	--name "fargate-web-service"
+       --name "fargate-web-service"
+
+   echo "✅ Service templates cleaned up"
    ```
 
 4. Delete environment template versions and templates:
 
    ```bash
    aws proton delete-environment-template-version \
-   	--template-name "vpc-ecs-environment" \
-   	--major-version "1" --minor-version "0"
-   ```
+       --template-name "vpc-ecs-environment" \
+       --major-version "1" --minor-version "0"
 
-   ```bash
    aws proton delete-environment-template \
-   	--name "vpc-ecs-environment"
+       --name "vpc-ecs-environment"
+
+   echo "✅ Environment templates cleaned up"
    ```
 
 5. Delete S3 bucket and contents:
@@ -700,18 +877,20 @@ graph TB
    ```bash
    aws s3 rm s3://${TEMPLATE_BUCKET} --recursive
    aws s3api delete-bucket --bucket $TEMPLATE_BUCKET
+
+   echo "✅ S3 bucket deleted"
    ```
 
 6. Delete IAM role:
 
    ```bash
    aws iam detach-role-policy \
-   	--role-name $PROTON_SERVICE_ROLE_NAME \
-   	--policy-arn arn:aws:iam::aws:policy/service-role/AWSProtonServiceRole
-   ```
+       --role-name $PROTON_SERVICE_ROLE_NAME \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSProtonServiceRole
 
-   ```bash
    aws iam delete-role --role-name $PROTON_SERVICE_ROLE_NAME
+
+   echo "✅ IAM role deleted"
    ```
 
 7. Clean up local files:
@@ -721,6 +900,8 @@ graph TB
    rm -rf proton-environment-template proton-service-template
    rm -rf environment-template service-template
    rm -f *.json *.tar.gz
+
+   echo "✅ Local files cleaned up"
    ```
 
 ## Discussion
@@ -733,6 +914,8 @@ CDK's integration with Proton provides several benefits over traditional CloudFo
 
 For production implementations, consider extending this foundation with additional capabilities such as integration with AWS Organizations for multi-account deployments, custom constructs that encode your organization's specific patterns, integration with AWS Config for compliance monitoring, and advanced networking patterns for hybrid connectivity. You might also implement template testing strategies using CDK's built-in testing capabilities and establish CI/CD pipelines for template development and deployment.
 
+> **Warning**: This configuration follows AWS Well-Architected Framework principles for operational excellence and security. Ensure proper IAM permissions are configured before proceeding to avoid access denied errors. Review [AWS IAM best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html) for additional security guidance.
+
 Sources:
 
 - [AWS Proton User Guide](https://docs.aws.amazon.com/proton/latest/userguide/Welcome.html)  
@@ -741,8 +924,15 @@ Sources:
 
 ## Challenge
 
-Extend this automation platform to support multiple infrastructure patterns by creating additional service templates for different application types (e.g., serverless Lambda functions, batch processing jobs, or data pipelines). Implement a template testing framework that validates infrastructure deployments in isolated environments before publishing. Consider adding custom CDK constructs that encapsulate your organization's specific compliance and security requirements.
+Extend this automation platform to support multiple infrastructure patterns by creating additional service templates for different application types (e.g., serverless Lambda functions, batch processing jobs, or data pipelines). Implement a template testing framework that validates infrastructure deployments in isolated environments before publishing. Consider adding custom CDK constructs that encapsulate your organization's specific compliance and security requirements, and establish CI/CD pipelines for automated template testing and deployment across multiple AWS accounts.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

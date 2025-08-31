@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: CodeBuild, Systems Manager, SNS, S3
 estimated-time: 75 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: codebuild, quality-gates, cicd, testing, sonarqube, security
 recipe-generator-version: 1.3
 ---
 
 # Code Quality Gates with CodeBuild
-
 
 ## Problem
 
@@ -252,7 +251,7 @@ echo "✅ Created S3 bucket: ${BUCKET_NAME}"
          java: corretto21
        commands:
          - echo "Installing dependencies and tools..."
-         - apt-get update && apt-get install -y curl unzip
+         - apt-get update && apt-get install -y curl unzip jq
          - curl -sSL https://github.com/SonarSource/sonar-scanner-cli/releases/download/4.8.0.2856/sonar-scanner-cli-4.8.0.2856-linux.zip -o sonar-scanner.zip
          - unzip sonar-scanner.zip
          - export PATH=$PATH:$(pwd)/sonar-scanner-4.8.0.2856-linux/bin
@@ -381,7 +380,7 @@ echo "✅ Created S3 bucket: ${BUCKET_NAME}"
            <dependency>
                <groupId>org.junit.jupiter</groupId>
                <artifactId>junit-jupiter</artifactId>
-               <version>5.9.2</version>
+               <version>5.11.3</version>
                <scope>test</scope>
            </dependency>
        </dependencies>
@@ -391,13 +390,13 @@ echo "✅ Created S3 bucket: ${BUCKET_NAME}"
                <plugin>
                    <groupId>org.apache.maven.plugins</groupId>
                    <artifactId>maven-surefire-plugin</artifactId>
-                   <version>3.0.0-M9</version>
+                   <version>3.5.2</version>
                </plugin>
                
                <plugin>
                    <groupId>org.jacoco</groupId>
                    <artifactId>jacoco-maven-plugin</artifactId>
-                   <version>0.8.8</version>
+                   <version>0.8.12</version>
                    <executions>
                        <execution>
                            <goals>
@@ -565,7 +564,7 @@ echo "✅ Created S3 bucket: ${BUCKET_NAME}"
        },
        "environment": {
            "type": "LINUX_CONTAINER",
-           "image": "aws/codebuild/amazonlinux2-x86_64-standard:4.0",
+           "image": "aws/codebuild/amazonlinux-x86_64-standard:5.0",
            "computeType": "BUILD_GENERAL1_MEDIUM",
            "environmentVariables": [
                {
@@ -590,7 +589,7 @@ echo "✅ Created S3 bucket: ${BUCKET_NAME}"
    echo "✅ Created CodeBuild project: ${PROJECT_NAME}"
    ```
 
-   The CodeBuild project is now configured to execute quality gates with appropriate compute resources and security permissions. The project uses the Amazon Linux 2 standard image which includes pre-installed development tools and supports the Java runtime required for our Maven-based application. S3 caching improves build performance by persisting Maven dependencies between builds, reducing both build time and network bandwidth usage.
+   The CodeBuild project is now configured to execute quality gates with appropriate compute resources and security permissions. The project uses the Amazon Linux 2023 standard image which includes pre-installed development tools and supports the Java runtime required for our Maven-based application. S3 caching improves build performance by persisting Maven dependencies between builds, reducing both build time and network bandwidth usage.
 
 7. **Create Quality Gate Dashboard with CloudWatch**:
 
@@ -847,7 +846,7 @@ This comprehensive quality gates implementation demonstrates how to enforce code
 
 The architecture leverages AWS-native services to create a robust and scalable quality assurance pipeline. Systems Manager Parameter Store provides centralized configuration management for quality thresholds, allowing teams to adjust standards without modifying buildspec files. CloudWatch integration enables comprehensive monitoring and alerting, while SNS notifications ensure immediate awareness of quality gate failures. The use of S3 for artifact storage and caching optimizes build performance and provides audit trails for compliance requirements.
 
-The buildspec implementation showcases advanced CI/CD patterns including fail-fast mechanisms, comprehensive reporting, and integration with external quality tools. The solution demonstrates how to balance automation with flexibility, allowing teams to customize quality gates based on project requirements while maintaining consistent enforcement across the organization. This approach significantly reduces manual review overhead while improving overall code quality and security posture.
+The buildspec implementation showcases advanced CI/CD patterns including fail-fast mechanisms, comprehensive reporting, and integration with external quality tools. The solution demonstrates how to balance automation with flexibility, allowing teams to customize quality gates based on project requirements while maintaining consistent enforcement across the organization. This approach significantly reduces manual review overhead while improving overall code quality and security posture. For more information about AWS Well-Architected quality practices, see the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
 > **Tip**: Consider implementing different quality gate profiles for different types of projects (e.g., strict gates for production libraries, moderate gates for internal tools) using environment-specific parameter configurations.
 
@@ -867,4 +866,11 @@ Extend this solution by implementing these advanced enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

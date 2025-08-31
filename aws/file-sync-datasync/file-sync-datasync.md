@@ -4,12 +4,12 @@ id: 4e7a1c9f
 category: storage
 difficulty: 200
 subject: aws
-services: datasync,efs,s3
+services: datasync,efs,s3,iam
 estimated-time: 60 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: storage,file-sync,datasync,efs,data-transfer
 recipe-generator-version: 1.3
@@ -30,8 +30,8 @@ AWS DataSync provides a fully managed data transfer service that automates file 
 ```mermaid
 graph TB
     subgraph "Source Environment"
-        SRC[Source File System<br/>On-Premises NFS]
-        AGENT[DataSync Agent<br/>EC2 Instance]
+        SRC[Source File System<br/>S3 Bucket]
+        
     end
     
     subgraph "AWS Cloud"
@@ -42,20 +42,17 @@ graph TB
         
         DATASYNC[DataSync Service]
         EFS[Amazon EFS<br/>Target File System]
-        S3[S3 Bucket<br/>Optional Archive]
+        ROLE[IAM Role<br/>DataSync Permissions]
         
         subgraph "Monitoring"
             CW[CloudWatch<br/>Metrics & Logs]
-            SNS[SNS Topic<br/>Notifications]
         end
     end
     
-    SRC --> AGENT
-    AGENT --> DATASYNC
+    SRC --> DATASYNC
     DATASYNC --> EFS
-    DATASYNC --> S3
     DATASYNC --> CW
-    CW --> SNS
+    ROLE --> DATASYNC
     
     EFS --> SUBNET
     SUBNET --> SG
@@ -63,18 +60,19 @@ graph TB
     style DATASYNC fill:#FF9900
     style EFS fill:#3F8624
     style CW fill:#FF4444
+    style ROLE fill:#9932CC
 ```
 
 ## Prerequisites
 
-1. AWS account with administrative permissions for DataSync, EFS, VPC, and IAM services
+1. AWS account with administrative permissions for DataSync, EFS, VPC, EC2, and IAM services
 2. AWS CLI v2 installed and configured (or AWS CloudShell access)
 3. Basic understanding of file systems, networking concepts, and AWS VPC
 4. Source file system or S3 bucket containing data to synchronize
-5. VPC with private subnets and appropriate routing for EFS access
-6. Estimated cost: $0.10-0.30 per GB transferred plus EFS storage costs ($0.30/GB-month for Standard class)
+5. Understanding of NFS protocols and POSIX file permissions
+6. Estimated cost: $0.0125 per GB transferred (standard mode) plus EFS storage costs ($0.30/GB-month for Standard class)
 
-> **Note**: DataSync charges per GB of data transferred. Review [AWS DataSync pricing](https://aws.amazon.com/datasync/pricing/) before proceeding with large datasets.
+> **Note**: DataSync charges per GB of data transferred in addition to AWS service costs. Review [AWS DataSync pricing](https://aws.amazon.com/datasync/pricing/) before proceeding with large datasets.
 
 ## Preparation
 
@@ -134,15 +132,14 @@ echo "✅ Security group configured: ${SG_ID}"
 
 1. **Create Amazon EFS File System**:
 
-   Amazon EFS provides a fully managed, scalable network file system that can be accessed simultaneously from multiple compute instances. EFS automatically scales storage capacity up or down based on file additions and deletions, eliminating the need for pre-provisioning storage. This makes it ideal as a synchronization target since it can handle varying data volumes while maintaining high availability across multiple Availability Zones.
+   Amazon EFS provides a fully managed, scalable network file system that can be accessed simultaneously from multiple compute instances. EFS automatically scales storage capacity up or down based on file additions and deletions, eliminating the need for pre-provisioning storage. This makes it ideal as a synchronization target since it can handle varying data volumes while maintaining high availability across multiple Availability Zones with up to 99.999999999% (11 9's) durability.
 
    ```bash
    # Create EFS file system with encryption at rest
    EFS_ID=$(aws efs create-file-system \
        --creation-token ${EFS_NAME} \
        --performance-mode generalPurpose \
-       --throughput-mode provisioned \
-       --provisioned-throughput-in-mibps 100 \
+       --throughput-mode bursting \
        --encrypted \
        --tags Key=Name,Value=${EFS_NAME} \
        --query 'FileSystemId' --output text)
@@ -150,11 +147,11 @@ echo "✅ Security group configured: ${SG_ID}"
    echo "✅ EFS file system created: ${EFS_ID}"
    ```
 
-   The encrypted EFS file system is now ready to serve as our synchronization target. Encryption at rest ensures data security, while the provisioned throughput mode provides consistent performance for file transfer operations. This foundation enables reliable, scalable file storage that can grow with your synchronization needs.
+   The encrypted EFS file system is now ready to serve as our synchronization target. Encryption at rest ensures data security using AWS managed keys, while the general purpose performance mode provides low-latency access with up to 7,000 file operations per second. This foundation enables reliable, scalable file storage that can grow with your synchronization needs.
 
 2. **Create EFS Mount Target**:
 
-   Mount targets enable EC2 instances and other AWS services to access EFS file systems through standard NFS protocols. Each mount target provides a network interface in a specific subnet, allowing secure communication between DataSync and EFS within your VPC. This network isolation ensures data transfer security while maintaining high-performance access to the file system.
+   Mount targets enable EC2 instances and other AWS services to access EFS file systems through standard NFSv4.1 protocols. Each mount target provides a network interface in a specific subnet, allowing secure communication between DataSync and EFS within your VPC. This network isolation ensures data transfer security while maintaining high-performance access to the file system.
 
    ```bash
    # Create mount target in the private subnet
@@ -171,11 +168,11 @@ echo "✅ Security group configured: ${SG_ID}"
    echo "✅ EFS mount target created and available: ${MOUNT_TARGET_ID}"
    ```
 
-   The mount target establishes the network pathway for DataSync to access EFS securely within your VPC. This configuration ensures that file transfers remain within AWS's internal network, providing both security and optimal performance for synchronization operations.
+   The mount target establishes the network pathway for DataSync to access EFS securely within your VPC. This configuration ensures that file transfers remain within AWS's internal network, providing both security and optimal performance for synchronization operations while supporting concurrent access from multiple DataSync agents.
 
 3. **Create Source S3 Bucket for Testing**:
 
-   For demonstration purposes, we'll create an S3 bucket with sample data to serve as our synchronization source. S3 provides durable object storage that can serve as either a source or destination for DataSync operations. This flexibility allows you to synchronize data between various storage types including on-premises file systems, S3, and EFS.
+   For demonstration purposes, we'll create an S3 bucket with sample data to serve as our synchronization source. S3 provides 99.999999999% (11 9's) durability and can serve as either a source or destination for DataSync operations. This flexibility allows you to synchronize data between various storage types including on-premises file systems, S3, and EFS while maintaining data integrity throughout the process.
 
    ```bash
    # Create S3 bucket for source data
@@ -196,11 +193,11 @@ echo "✅ Security group configured: ${SG_ID}"
    echo "✅ Source S3 bucket created with sample data: ${SOURCE_BUCKET}"
    ```
 
-   The S3 bucket now contains structured test data that demonstrates DataSync's ability to handle both individual files and directory structures. This setup simulates real-world scenarios where you need to synchronize complex file hierarchies between different storage systems.
+   The S3 bucket now contains structured test data that demonstrates DataSync's ability to handle both individual files and directory structures. This setup simulates real-world scenarios where you need to synchronize complex file hierarchies between different storage systems while preserving directory structure and file metadata.
 
 4. **Create IAM Role for DataSync**:
 
-   DataSync requires specific IAM permissions to access both source and destination storage systems. The service role enables DataSync to read from S3, write to EFS, and create necessary log entries for monitoring transfer operations. This role follows the principle of least privilege by granting only the permissions required for successful file synchronization.
+   DataSync requires specific IAM permissions to access both source and destination storage systems following the AWS Well-Architected Framework's security pillar. The service role enables DataSync to read from S3, write to EFS, and create necessary log entries for monitoring transfer operations. This role follows the principle of least privilege by granting only the permissions required for successful file synchronization.
 
    ```bash
    # Create trust policy for DataSync service
@@ -234,11 +231,11 @@ echo "✅ Security group configured: ${SG_ID}"
    echo "✅ DataSync IAM role created: ${DATASYNC_ROLE_NAME}"
    ```
 
-   The IAM role provides DataSync with secure, temporary credentials to access your storage resources. This authentication mechanism ensures that only authorized DataSync tasks can access your data while maintaining full audit trails of all access attempts.
+   The IAM role provides DataSync with secure, temporary credentials to access your storage resources through AWS Security Token Service (STS). This authentication mechanism ensures that only authorized DataSync tasks can access your data while maintaining full audit trails of all access attempts through AWS CloudTrail integration.
 
 5. **Create DataSync S3 Location**:
 
-   DataSync locations define the endpoints for data transfer operations. The S3 location specifies the source bucket and includes configuration for data access patterns, storage classes, and transfer optimization. This location serves as the starting point for our synchronization workflow, enabling DataSync to efficiently read and transfer data from S3 to EFS.
+   DataSync locations define the endpoints for data transfer operations with specific configuration for data access patterns, storage classes, and transfer optimization. The S3 location specifies the source bucket and includes configuration for efficient data reading with support for various S3 storage classes. This location serves as the starting point for our synchronization workflow, enabling DataSync to efficiently read and transfer data from S3 to EFS.
 
    ```bash
    # Get the DataSync role ARN
@@ -257,11 +254,11 @@ echo "✅ Security group configured: ${SG_ID}"
    echo "✅ DataSync S3 location created: ${S3_LOCATION_ARN}"
    ```
 
-   The S3 location is now configured and ready to serve as the source for file transfers. DataSync can now securely access your S3 bucket and efficiently transfer files while maintaining data integrity and providing detailed transfer logging.
+   The S3 location is now configured and ready to serve as the source for file transfers. DataSync can now securely access your S3 bucket and efficiently transfer files while maintaining data integrity and providing detailed transfer logging through CloudWatch integration for comprehensive monitoring.
 
 6. **Create DataSync EFS Location**:
 
-   The EFS location specifies the target file system for synchronization operations. This location configuration includes network access details, security group settings, and file system access points. DataSync uses this information to establish secure, high-performance connections to your EFS file system for data transfer operations.
+   The EFS location specifies the target file system for synchronization operations with comprehensive network access configuration. This location configuration includes network access details, security group settings, and file system access points. DataSync uses this information to establish secure, high-performance connections to your EFS file system for data transfer operations within your VPC's private network.
 
    ```bash
    # Create EFS location for DataSync
@@ -276,11 +273,11 @@ echo "✅ Security group configured: ${SG_ID}"
    echo "✅ DataSync EFS location created: ${EFS_LOCATION_ARN}"
    ```
 
-   The EFS location establishes the secure network pathway for data transfer within your VPC. This configuration ensures that all file transfers occur through encrypted connections while maintaining optimal performance for large-scale synchronization operations.
+   The EFS location establishes the secure network pathway for data transfer within your VPC infrastructure. This configuration ensures that all file transfers occur through encrypted NFSv4.1 connections while maintaining optimal performance for large-scale synchronization operations and preserving POSIX file system semantics.
 
 7. **Create DataSync Task**:
 
-   DataSync tasks define the complete synchronization workflow including source and destination locations, transfer options, scheduling, and data validation settings. The task configuration controls how files are transferred, what happens to existing files, and how the service handles errors or conflicts during synchronization operations.
+   DataSync tasks define the complete synchronization workflow including source and destination locations, transfer options, scheduling, and comprehensive data validation settings. The task configuration controls how files are transferred, what happens to existing files, how the service handles errors or conflicts, and ensures data integrity through point-in-time consistency verification during synchronization operations.
 
    ```bash
    # Create DataSync task for S3 to EFS synchronization
@@ -307,11 +304,11 @@ echo "✅ Security group configured: ${SG_ID}"
    echo "✅ DataSync task created: ${TASK_ARN}"
    ```
 
-   The synchronization task is now configured with optimal settings for data integrity and performance. The task will verify data consistency, preserve file metadata, and provide detailed logging for monitoring transfer operations. This comprehensive configuration ensures reliable file synchronization while maintaining data fidelity.
+   The synchronization task is now configured with optimal settings for data integrity and performance following AWS best practices. The task will verify data consistency through checksums, preserve file metadata including timestamps and permissions, and provide detailed logging for monitoring transfer operations. This comprehensive configuration ensures reliable file synchronization while maintaining data fidelity across different storage systems.
 
 8. **Execute DataSync Task**:
 
-   Task execution initiates the actual data transfer process with real-time monitoring and progress reporting. DataSync performs the synchronization operation while providing detailed metrics on transfer rates, file counts, and any errors encountered during the process. This execution phase validates the entire synchronization workflow and confirms successful data transfer.
+   Task execution initiates the actual data transfer process with real-time monitoring and comprehensive progress reporting. DataSync performs the synchronization operation while providing detailed metrics on transfer rates, file counts, data validation results, and any errors encountered during the process. This execution phase validates the entire synchronization workflow and confirms successful data transfer with built-in retry logic for resilience.
 
    ```bash
    # Start the DataSync task execution
@@ -341,9 +338,9 @@ echo "✅ Security group configured: ${SG_ID}"
    done
    ```
 
-   The file synchronization is now complete with real-time status monitoring. DataSync has transferred all files from the S3 source to the EFS destination while maintaining data integrity and providing detailed execution logs for audit and troubleshooting purposes.
+   The file synchronization is now complete with real-time status monitoring and comprehensive logging. DataSync has transferred all files from the S3 source to the EFS destination while maintaining data integrity through built-in verification processes and providing detailed execution logs for audit and troubleshooting purposes.
 
-> **Warning**: Monitor DataSync costs during large transfers, as charges apply per GB transferred. Consider using CloudWatch alarms to track transfer volumes and costs.
+> **Warning**: Monitor DataSync costs during large transfers, as charges apply per GB transferred ($0.0125/GB for standard mode). Consider using CloudWatch alarms to track transfer volumes and costs.
 
 ## Validation & Testing
 
@@ -379,10 +376,7 @@ echo "✅ Security group configured: ${SG_ID}"
 3. **Test EFS Mount and File Access**:
 
    ```bash
-   # Create a test EC2 instance to mount and verify EFS contents
-   # (This would require launching an instance and mounting EFS)
-   # For validation, check EFS metrics instead
-   
+   # Check EFS CloudWatch metrics for data activity
    aws cloudwatch get-metric-statistics \
        --namespace AWS/EFS \
        --metric-name DataReadIOBytes \
@@ -395,7 +389,7 @@ echo "✅ Security group configured: ${SG_ID}"
 
    Expected output: CloudWatch metrics should show data read activity indicating successful file transfers.
 
-> **Tip**: Use EFS Access Points to provide application-specific access to different directories within your file system, improving security and access control.
+> **Tip**: Use EFS Access Points to provide application-specific access to different directories within your file system, improving security and access control. See the [EFS Access Points documentation](https://docs.aws.amazon.com/efs/latest/ug/efs-access-points.html) for implementation guidance.
 
 ## Cleanup
 
@@ -462,30 +456,37 @@ echo "✅ Security group configured: ${SG_ID}"
 
 ## Discussion
 
-AWS DataSync provides enterprise-grade file synchronization capabilities that address the complex challenges of maintaining data consistency across distributed storage systems. The service automatically handles network optimization, data validation, and encryption during transfer operations, eliminating the operational overhead typically associated with custom synchronization solutions. DataSync's integration with AWS storage services like EFS enables organizations to build scalable, hybrid cloud architectures that seamlessly bridge on-premises and cloud environments.
+AWS DataSync provides enterprise-grade file synchronization capabilities that address the complex challenges of maintaining data consistency across distributed storage systems following the AWS Well-Architected Framework principles. The service automatically handles network optimization, data validation, and encryption during transfer operations, eliminating the operational overhead typically associated with custom synchronization solutions. DataSync's integration with AWS storage services like EFS enables organizations to build scalable, hybrid cloud architectures that seamlessly bridge on-premises and cloud environments while maintaining security and compliance requirements.
 
-The combination of DataSync and EFS offers significant advantages for workloads requiring shared file access across multiple compute instances. EFS provides POSIX-compliant file system semantics with automatic scaling and high availability, while DataSync ensures reliable data transfer with built-in retry logic and comprehensive monitoring. This architecture pattern is particularly valuable for content management systems, development environments, and data analytics workflows that require consistent file access across distributed teams and applications.
+The combination of DataSync and EFS offers significant advantages for workloads requiring shared file access across multiple compute instances. EFS provides POSIX-compliant file system semantics with automatic scaling and high availability, while DataSync ensures reliable data transfer with built-in retry logic and comprehensive monitoring through CloudWatch integration. This architecture pattern is particularly valuable for content management systems, development environments, and data analytics workflows that require consistent file access across distributed teams and applications with sub-millisecond latency requirements.
 
-When implementing production synchronization workflows, consider establishing scheduled task execution using CloudWatch Events to maintain regular data consistency. DataSync supports both one-time and recurring synchronization patterns, allowing you to optimize data transfer costs by scheduling transfers during off-peak hours. Additionally, implementing CloudWatch alarms for transfer failures and data validation errors ensures proactive monitoring of your synchronization infrastructure.
+When implementing production synchronization workflows, consider establishing scheduled task execution using Amazon EventBridge (formerly CloudWatch Events) to maintain regular data consistency. DataSync supports both one-time and recurring synchronization patterns, allowing you to optimize data transfer costs by scheduling transfers during off-peak hours when network bandwidth costs may be lower. Additionally, implementing CloudWatch alarms for transfer failures and data validation errors ensures proactive monitoring of your synchronization infrastructure with automatic notifications through Amazon SNS.
 
-For security-sensitive environments, DataSync supports end-to-end encryption using AWS KMS keys and integrates with AWS CloudTrail for comprehensive audit logging. The service also provides bandwidth throttling capabilities to prevent synchronization operations from impacting production network performance. These features make DataSync suitable for regulated industries that require strict data governance and compliance reporting.
+For security-sensitive environments, DataSync supports end-to-end encryption using AWS KMS keys and integrates with AWS CloudTrail for comprehensive audit logging of all API calls and data access patterns. The service also provides bandwidth throttling capabilities to prevent synchronization operations from impacting production network performance, ensuring business continuity during large-scale data migrations. These features make DataSync suitable for regulated industries that require strict data governance and compliance reporting capabilities.
 
-> **Note**: Consider implementing DataSync task filters to exclude temporary files or system directories from synchronization, reducing transfer costs and improving performance. See [AWS DataSync documentation](https://docs.aws.amazon.com/datasync/latest/userguide/filtering.html) for advanced filtering options.
+> **Note**: Consider implementing DataSync task filters to exclude temporary files or system directories from synchronization, reducing transfer costs and improving performance. See the [AWS DataSync filtering documentation](https://docs.aws.amazon.com/datasync/latest/userguide/filtering.html) for advanced filtering options and best practices.
 
 ## Challenge
 
 Extend this file synchronization solution by implementing these enhancements:
 
-1. **Multi-Region Synchronization**: Configure DataSync tasks to replicate data across multiple AWS regions for disaster recovery, implementing cross-region EFS replication with automated failover mechanisms.
+1. **Multi-Region Synchronization**: Configure DataSync tasks to replicate data across multiple AWS regions for disaster recovery, implementing cross-region EFS replication with automated failover mechanisms using Route 53 health checks.
 
-2. **Intelligent Data Tiering**: Integrate S3 Intelligent-Tiering with lifecycle policies to automatically move infrequently accessed files to lower-cost storage classes while maintaining EFS access for active data.
+2. **Intelligent Data Tiering**: Integrate S3 Intelligent-Tiering with lifecycle policies to automatically move infrequently accessed files to lower-cost storage classes while maintaining EFS access for active data through automated archival workflows.
 
-3. **Real-Time Monitoring Dashboard**: Build a CloudWatch dashboard with custom metrics for transfer performance, data validation results, and cost tracking, including SNS notifications for transfer failures or performance degradation.
+3. **Real-Time Monitoring Dashboard**: Build a CloudWatch dashboard with custom metrics for transfer performance, data validation results, and cost tracking, including SNS notifications for transfer failures or performance degradation with automated remediation.
 
-4. **Automated Conflict Resolution**: Implement Lambda functions triggered by DataSync events to handle file conflicts, perform data validation, and execute custom business logic during synchronization operations.
+4. **Automated Conflict Resolution**: Implement Lambda functions triggered by DataSync events to handle file conflicts, perform data validation, and execute custom business logic during synchronization operations with error handling and retry mechanisms.
 
-5. **Hybrid Cloud Integration**: Deploy DataSync agents on-premises to synchronize data between corporate file servers and AWS EFS, implementing network acceleration and bandwidth optimization for large-scale enterprise environments.
+5. **Hybrid Cloud Integration**: Deploy DataSync agents on-premises to synchronize data between corporate file servers and AWS EFS, implementing network acceleration and bandwidth optimization for large-scale enterprise environments with VPN or Direct Connect connectivity.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

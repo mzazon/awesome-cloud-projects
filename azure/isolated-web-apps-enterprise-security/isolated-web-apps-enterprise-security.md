@@ -6,10 +6,10 @@ difficulty: 400
 subject: azure
 services: Azure App Service Environment v3, Azure Private DNS, Azure NAT Gateway, Azure Virtual Network
 estimated-time: 150 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: enterprise, isolation, private-dns, networking, security, app-service-environment, nat-gateway
 recipe-generator-version: 1.3
@@ -245,7 +245,7 @@ echo "✅ Environment variables configured for enterprise deployment"
 
 4. **Deploy Azure App Service Environment v3**:
 
-   Azure App Service Environment v3 provides a completely isolated, single-tenant deployment of Azure App Service within your virtual network. This eliminates the shared infrastructure concerns of multi-tenant App Service while providing dedicated compute resources, custom networking, and enterprise-grade security. ASEv3 supports both internal and external load balancer configurations, with internal being preferred for enterprise security scenarios.
+   Azure App Service Environment v3 provides a completely isolated, single-tenant deployment of Azure App Service within your virtual network. This eliminates the shared infrastructure concerns of multi-tenant App Service while providing dedicated compute resources, custom networking, and enterprise-grade security. ASEv3 automatically manages front-end scaling to meet application needs without requiring manual configuration of scale factors.
 
    ```bash
    # Create App Service Environment v3 with internal load balancer
@@ -256,7 +256,6 @@ echo "✅ Environment variables configured for enterprise deployment"
        --vnet-name ${VNET_NAME} \
        --kind ASEv3 \
        --virtual-ip-type Internal \
-       --front-end-scale-factor 15 \
        --tags purpose=enterprise-isolation tier=compute
    
    echo "✅ App Service Environment v3 deployment initiated"
@@ -637,4 +636,9 @@ Extend this enterprise-grade isolated hosting solution by implementing these adv
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

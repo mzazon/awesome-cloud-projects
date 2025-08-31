@@ -6,17 +6,16 @@ difficulty: 400
 subject: aws
 services: eventbridge,dynamodb,lambda
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cqrs,event-sourcing,eventbridge,dynamodb,lambda
 recipe-generator-version: 1.3
 ---
 
 # CQRS and Event Sourcing with EventBridge
-
 
 ## Problem
 
@@ -303,11 +302,12 @@ echo "✅ Environment configured with project: ${PROJECT_NAME}"
 import json
 import boto3
 import uuid
+import os
 from datetime import datetime
 from decimal import Decimal
+from botocore.exceptions import ClientError
 
 dynamodb = boto3.resource('dynamodb')
-eventbridge = boto3.client('events')
 
 def lambda_handler(event, context):
     try:
@@ -347,20 +347,29 @@ def lambda_handler(event, context):
         # Event payload based on command type
         event_data = create_event_from_command(command_type, command, aggregate_id)
         
-        # Store event in event store
-        table.put_item(
-            Item={
-                'AggregateId': aggregate_id,
-                'Version': new_version,
-                'EventId': event_id,
-                'EventType': event_data['eventType'],
-                'Timestamp': timestamp,
-                'EventData': event_data['data'],
-                'CommandId': command.get('commandId', str(uuid.uuid4())),
-                'CorrelationId': command.get('correlationId', str(uuid.uuid4()))
-            },
-            ConditionExpression='attribute_not_exists(AggregateId) AND attribute_not_exists(Version)'
-        )
+        # Store event in event store with proper concurrency control
+        try:
+            table.put_item(
+                Item={
+                    'AggregateId': aggregate_id,
+                    'Version': new_version,
+                    'EventId': event_id,
+                    'EventType': event_data['eventType'],
+                    'Timestamp': timestamp,
+                    'EventData': event_data['data'],
+                    'CommandId': command.get('commandId', str(uuid.uuid4())),
+                    'CorrelationId': command.get('correlationId', str(uuid.uuid4()))
+                },
+                ConditionExpression='attribute_not_exists(AggregateId) OR Version = :currentVersion',
+                ExpressionAttributeValues={':currentVersion': current_version}
+            )
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                return {
+                    'statusCode': 409,
+                    'body': json.dumps({'error': 'Concurrent modification detected'})
+                }
+            raise
         
         return {
             'statusCode': 201,
@@ -426,8 +435,6 @@ def create_event_from_command(command_type, command, aggregate_id):
     
     else:
         raise ValueError(f"Unknown command type: {command_type}")
-
-import os
 EOF
    
    # Package and deploy command handler
@@ -439,7 +446,7 @@ EOF
    
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-command-handler" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${COMMAND_ROLE_ARN} \
        --handler command_handler.lambda_handler \
        --zip-file fileb://command_handler.zip \
@@ -462,6 +469,7 @@ EOF
    cat > stream_processor.py << 'EOF'
 import json
 import boto3
+import os
 from decimal import Decimal
 
 eventbridge = boto3.client('events')
@@ -531,8 +539,6 @@ def deserialize_dynamodb_item(item):
         else:
             return {k: deserialize_dynamodb_item(v) for k, v in item.items()}
     return item
-
-import os
 EOF
    
    # Package and deploy stream processor
@@ -540,7 +546,7 @@ EOF
    
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-stream-processor" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${COMMAND_ROLE_ARN} \
        --handler stream_processor.lambda_handler \
        --zip-file fileb://stream_processor.zip \
@@ -600,6 +606,7 @@ EOF
    cat > user_projection.py << 'EOF'
 import json
 import boto3
+import os
 
 dynamodb = boto3.resource('dynamodb')
 
@@ -651,14 +658,13 @@ def lambda_handler(event, context):
     except Exception as e:
         print(f"Error in user projection: {str(e)}")
         raise
-
-import os
 EOF
    
    # Create order summary projection handler
    cat > order_projection.py << 'EOF'
 import json
 import boto3
+import os
 from decimal import Decimal
 
 dynamodb = boto3.resource('dynamodb')
@@ -706,8 +712,6 @@ def lambda_handler(event, context):
     except Exception as e:
         print(f"Error in order projection: {str(e)}")
         raise
-
-import os
 EOF
    
    # Package and deploy projection handlers
@@ -720,7 +724,7 @@ EOF
    
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-user-projection" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${PROJECTION_ROLE_ARN} \
        --handler user_projection.lambda_handler \
        --zip-file fileb://user_projection.zip \
@@ -729,7 +733,7 @@ EOF
    
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-order-projection" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${PROJECTION_ROLE_ARN} \
        --handler order_projection.lambda_handler \
        --zip-file fileb://order_projection.zip \
@@ -808,6 +812,7 @@ EOF
     cat > query_handler.py << 'EOF'
 import json
 import boto3
+import os
 from boto3.dynamodb.conditions import Key
 from decimal import Decimal
 
@@ -878,8 +883,6 @@ def decimal_encoder(obj):
     if isinstance(obj, Decimal):
         return float(obj)
     raise TypeError
-
-import os
 EOF
     
     # Package and deploy query handler
@@ -887,7 +890,7 @@ EOF
     
     aws lambda create-function \
         --function-name "${PROJECT_NAME}-query-handler" \
-        --runtime python3.9 \
+        --runtime python3.12 \
         --role ${PROJECTION_ROLE_ARN} \
         --handler query_handler.lambda_handler \
         --zip-file fileb://query_handler.zip \
@@ -1132,4 +1135,11 @@ Extend this CQRS and Event Sourcing implementation with these advanced features:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

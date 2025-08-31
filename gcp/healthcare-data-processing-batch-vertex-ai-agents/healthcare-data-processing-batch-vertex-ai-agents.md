@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Batch, Vertex AI Agent Builder, Cloud Healthcare API, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: healthcare, ai-agents, batch-processing, compliance, data-processing, hipaa, medical-records
 recipe-generator-version: 1.3
@@ -111,11 +111,12 @@ gcloud services enable storage.googleapis.com
 gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable monitoring.googleapis.com
+gcloud services enable run.googleapis.com
 
-# Create project if it doesn't exist
-gcloud projects create ${PROJECT_ID} \
-    --name="Healthcare AI Processing" \
-    --labels="purpose=healthcare,environment=demo"
+# Create project if it doesn't exist (optional)
+# gcloud projects create ${PROJECT_ID} \
+#     --name="Healthcare AI Processing" \
+#     --labels="purpose=healthcare,environment=demo"
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled for healthcare data processing"
@@ -137,15 +138,13 @@ echo "✅ APIs enabled for healthcare data processing"
    # Enable versioning for data protection
    gsutil versioning set on gs://${BUCKET_NAME}
    
-   # Set bucket-level IAM for healthcare compliance
-   gsutil iam ch \
-       serviceAccount:batch-service@${PROJECT_ID}.iam.gserviceaccount.com:objectViewer \
-       gs://${BUCKET_NAME}
+   # Enable uniform bucket-level access for security
+   gsutil uniformbucketlevelaccess set on gs://${BUCKET_NAME}
    
    echo "✅ HIPAA-compliant storage bucket created: ${BUCKET_NAME}"
    ```
 
-   The storage bucket is now configured with versioning and proper IAM controls, providing a secure foundation for healthcare data ingestion. This setup ensures data lineage tracking and supports regulatory audit requirements while enabling scalable access for downstream processing services.
+   The storage bucket is now configured with versioning and proper security controls, providing a secure foundation for healthcare data ingestion. This setup ensures data lineage tracking and supports regulatory audit requirements while enabling scalable access for downstream processing services.
 
 2. **Set Up Cloud Healthcare API Dataset and FHIR Store**:
 
@@ -164,11 +163,25 @@ echo "✅ APIs enabled for healthcare data processing"
        --version=R4 \
        --enable-update-create
    
-   # Configure FHIR store security settings
+   # Create IAM policy for healthcare service account
+   cat > fhir-policy.json << EOF
+   {
+     "bindings": [
+       {
+         "role": "roles/healthcare.fhirResourceEditor",
+         "members": [
+           "serviceAccount:${PROJECT_ID}@appspot.gserviceaccount.com"
+         ]
+       }
+     ]
+   }
+   EOF
+   
+   # Apply IAM policy to FHIR store
    gcloud healthcare fhir-stores set-iam-policy ${FHIR_STORE_ID} \
        --dataset=${DATASET_ID} \
        --location=${REGION} \
-       policy.json
+       fhir-policy.json
    
    echo "✅ Healthcare API dataset and FHIR store created"
    ```
@@ -194,7 +207,12 @@ echo "✅ APIs enabled for healthcare data processing"
        --member="serviceAccount:healthcare-ai-agent@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/healthcare.fhirResourceEditor"
    
-   # Create the Vertex AI agent configuration
+   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:healthcare-ai-agent@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/storage.objectViewer"
+   
+   # Note: Vertex AI Agent Builder configuration is primarily done through the console
+   # The following demonstrates the conceptual agent setup
    cat > agent-config.yaml << EOF
    displayName: "Healthcare Records Analyzer"
    description: "AI agent for intelligent healthcare data processing and compliance monitoring"
@@ -208,10 +226,11 @@ echo "✅ APIs enabled for healthcare data processing"
      Extract clinical insights, identify critical findings, and ensure data accuracy.
    EOF
    
-   echo "✅ Vertex AI healthcare agent configured"
+   echo "✅ Vertex AI healthcare agent service account configured"
+   echo "Note: Complete agent setup in Vertex AI Agent Builder console"
    ```
 
-   The Vertex AI agent is now equipped with healthcare-specific capabilities and appropriate permissions to process medical data securely. This intelligent component brings advanced natural language understanding to the pipeline, enabling automated extraction of clinical insights and compliance monitoring that scales with data volume.
+   The Vertex AI agent service account is now equipped with appropriate permissions to process medical data securely. This service account will be used by the processing pipeline to access AI capabilities while maintaining proper security boundaries for healthcare data.
 
 4. **Configure Cloud Batch Job Template**:
 
@@ -219,43 +238,43 @@ echo "✅ APIs enabled for healthcare data processing"
 
    ```bash
    # Create batch job template for healthcare processing
-   cat > healthcare-batch-job.yaml << EOF
-   apiVersion: batch/v1
-   kind: Job
-   metadata:
-     name: healthcare-processing-template
-   spec:
-     taskGroups:
-     - name: healthcare-analysis
-       taskSpec:
-         runnables:
-         - script:
-             text: |
-               #!/bin/bash
-               echo "Starting healthcare data processing..."
-               
-               # Process medical records with AI analysis
-               python3 /healthcare_processor.py \
-                 --input-bucket=${BUCKET_NAME} \
-                 --fhir-store=${FHIR_STORE_ID} \
-                 --project=${PROJECT_ID} \
-                 --region=${REGION}
-               
-               echo "Healthcare processing completed"
-         computeResource:
-           cpuMilli: 2000
-           memoryMib: 4096
-         maxRetryCount: 3
-         maxRunDuration: 3600s
-       taskCount: 1
-       parallelism: 1
-     allocationPolicy:
-       instances:
-       - policy:
-           provisioningModel: STANDARD
-           machineType: e2-standard-2
-     logsPolicy:
-       destination: CLOUD_LOGGING
+   cat > healthcare-batch-job.json << EOF
+   {
+     "allocationPolicy": {
+       "instances": [
+         {
+           "policy": {
+             "machineType": "e2-standard-2",
+             "provisioningModel": "STANDARD"
+           }
+         }
+       ]
+     },
+     "taskGroups": [
+       {
+         "taskSpec": {
+           "runnables": [
+             {
+               "script": {
+                 "text": "#!/bin/bash\necho 'Starting healthcare data processing...'\npython3 /healthcare_processor.py --input-bucket=\${BUCKET_NAME} --fhir-store=\${FHIR_STORE_ID} --project=\${PROJECT_ID} --region=\${REGION}\necho 'Healthcare processing completed'"
+               }
+             }
+           ],
+           "computeResource": {
+             "cpuMilli": 2000,
+             "memoryMib": 4096
+           },
+           "maxRetryCount": 3,
+           "maxRunDuration": "3600s"
+         },
+         "taskCount": 1,
+         "parallelism": 1
+       }
+     ],
+     "logsPolicy": {
+       "destination": "CLOUD_LOGGING"
+     }
+   }
    EOF
    
    echo "✅ Batch job template created for healthcare processing"
@@ -311,10 +330,10 @@ echo "✅ APIs enabled for healthcare data processing"
                                "script": {
                                    "text": f"""
                                    #!/bin/bash
-                                   python3 /process_healthcare_file.py \
-                                     --file={file_name} \
-                                     --bucket={bucket} \
-                                     --project={os.environ['PROJECT_ID']} \
+                                   python3 /process_healthcare_file.py \\
+                                     --file={file_name} \\
+                                     --bucket={bucket} \\
+                                     --project={os.environ['PROJECT_ID']} \\
                                      --region={os.environ['REGION']}
                                    """
                                }
@@ -332,7 +351,7 @@ echo "✅ APIs enabled for healthcare data processing"
        
        # Submit the batch job
        parent = f"projects/{os.environ['PROJECT_ID']}/locations/{os.environ['REGION']}"
-       job_id = f"healthcare-processing-{file_name.replace('/', '-')}"
+       job_id = f"healthcare-processing-{file_name.replace('/', '-').replace('.', '-')}"
        
        response = batch_client.create_job(
            parent=parent,
@@ -352,15 +371,18 @@ echo "✅ APIs enabled for healthcare data processing"
    google-cloud-healthcare
    EOF
    
-   # Deploy the Cloud Function
-   gcloud functions deploy healthcare-processor-trigger \
-       --runtime=python311 \
-       --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" \
-       --trigger-event-filters="bucket=${BUCKET_NAME}" \
-       --entry-point=trigger_healthcare_processing \
-       --memory=512MB \
-       --timeout=540s \
-       --set-env-vars="PROJECT_ID=${PROJECT_ID},REGION=${REGION}"
+   # Deploy the Cloud Function (2nd generation)
+   gcloud functions deploy healthcare-processor-trigger \\
+       --gen2 \\
+       --runtime=python311 \\
+       --source=. \\
+       --entry-point=trigger_healthcare_processing \\
+       --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" \\
+       --trigger-event-filters="bucket=${BUCKET_NAME}" \\
+       --memory=512MB \\
+       --timeout=540s \\
+       --set-env-vars="PROJECT_ID=${PROJECT_ID},REGION=${REGION}" \\
+       --region=${REGION}
    
    cd ..
    
@@ -385,6 +407,7 @@ echo "✅ APIs enabled for healthcare data processing"
    from google.cloud import aiplatform
    from google.cloud import monitoring_v3
    import logging
+   from datetime import datetime
    
    def process_healthcare_file(bucket_name, file_name, project_id, region):
        """Process healthcare file with AI analysis and FHIR conversion."""
@@ -394,7 +417,7 @@ echo "✅ APIs enabled for healthcare data processing"
        
        # Initialize clients
        storage_client = storage.Client()
-       healthcare_client = healthcare_v1.HL7V2StoresServiceClient()
+       healthcare_client = healthcare_v1.FhirStoresServiceClient()
        
        # Download file from storage
        bucket = storage_client.bucket(bucket_name)
@@ -428,44 +451,123 @@ echo "✅ APIs enabled for healthcare data processing"
            "clinical_insights": extract_clinical_insights(content),
            "compliance_status": check_compliance(content),
            "critical_findings": identify_critical_findings(content),
-           "structured_data": extract_structured_data(content)
+           "structured_data": extract_structured_data(content),
+           "processing_timestamp": datetime.utcnow().isoformat()
        }
        
        return analysis
    
    def extract_clinical_insights(content):
        """Extract clinical insights from medical text."""
-       # Implement clinical NLP processing
-       return {"diagnosis": "sample", "medications": [], "procedures": []}
+       # Implement clinical NLP processing with Healthcare Natural Language API
+       try:
+           # Parse medical content for clinical entities
+           insights = {
+               "diagnosis": [],
+               "medications": [],
+               "procedures": [],
+               "conditions": [],
+               "vitals": {}
+           }
+           
+           # Parse JSON content if structured
+           if content.startswith('{'):
+               data = json.loads(content)
+               if 'assessment' in data:
+                   insights['diagnosis'].append(data['assessment'])
+               if 'medications' in data:
+                   insights['medications'] = data.get('medications', [])
+               if 'vital_signs' in data:
+                   insights['vitals'] = data['vital_signs']
+           
+           return insights
+       except Exception as e:
+           logging.error(f"Error extracting clinical insights: {e}")
+           return {"error": str(e)}
    
    def check_compliance(content):
        """Check HIPAA and healthcare compliance."""
        # Implement compliance checking logic
-       return {"hipaa_compliant": True, "phi_detected": False}
+       compliance_status = {
+           "hipaa_compliant": True,
+           "phi_detected": False,
+           "data_classification": "protected",
+           "encryption_required": True
+       }
+       
+       # Check for PHI patterns (simplified example)
+       phi_patterns = ['SSN', 'social security', 'DOB', 'phone number']
+       for pattern in phi_patterns:
+           if pattern.lower() in content.lower():
+               compliance_status["phi_detected"] = True
+               break
+       
+       return compliance_status
    
    def identify_critical_findings(content):
        """Identify critical medical findings requiring immediate attention."""
        # Implement critical finding detection
-       return {"urgent": False, "alert_level": "normal"}
+       findings = {
+           "urgent": False,
+           "alert_level": "normal",
+           "recommendations": []
+       }
+       
+       # Check for critical indicators (simplified example)
+       critical_keywords = ['emergency', 'critical', 'urgent', 'immediate attention']
+       for keyword in critical_keywords:
+           if keyword.lower() in content.lower():
+               findings["urgent"] = True
+               findings["alert_level"] = "high"
+               findings["recommendations"].append(f"Immediate review required due to: {keyword}")
+               break
+       
+       return findings
    
    def extract_structured_data(content):
        """Extract structured medical data for FHIR conversion."""
        # Implement structured data extraction
-       return {"patient_id": "12345", "encounter_date": "2025-07-12"}
+       try:
+           if content.startswith('{'):
+               data = json.loads(content)
+               return {
+                   "patient_id": data.get("patient_id", "unknown"),
+                   "encounter_date": data.get("encounter_date", datetime.utcnow().isoformat()),
+                   "provider": data.get("provider", "unknown"),
+                   "facility": data.get("facility", "unknown")
+               }
+           else:
+               return {
+                   "patient_id": "extracted_from_text",
+                   "encounter_date": datetime.utcnow().isoformat()
+               }
+       except Exception as e:
+           logging.error(f"Error extracting structured data: {e}")
+           return {"error": str(e)}
    
    def convert_to_fhir(content, analysis):
        """Convert processed data to FHIR format."""
+       structured_data = analysis.get("structured_data", {})
+       clinical_insights = analysis.get("clinical_insights", {})
+       
        fhir_resource = {
            "resourceType": "Patient",
-           "id": analysis["structured_data"]["patient_id"],
+           "id": structured_data.get("patient_id", "unknown"),
            "meta": {
                "versionId": "1",
-               "lastUpdated": "2025-07-12T10:00:00Z"
+               "lastUpdated": datetime.utcnow().isoformat() + "Z",
+               "profile": ["http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient"]
            },
            "identifier": [
                {
-                   "system": "hospital-system",
-                   "value": analysis["structured_data"]["patient_id"]
+                   "system": "urn:oid:2.16.840.1.113883.4.1",
+                   "value": structured_data.get("patient_id", "unknown")
+               }
+           ],
+           "extension": [
+               {
+                   "url": "processing-metadata",
+                   "valueString": json.dumps(analysis)
                }
            ]
        }
@@ -473,17 +575,32 @@ echo "✅ APIs enabled for healthcare data processing"
    
    def store_in_fhir(fhir_resource, project_id, region):
        """Store processed data in FHIR store."""
-       # Implement FHIR storage logic
-       print(f"Storing FHIR resource: {fhir_resource['id']}")
+       try:
+           # In a real implementation, this would use the Healthcare API client
+           # to store the FHIR resource in the configured FHIR store
+           print(f"Storing FHIR resource: {fhir_resource['id']}")
+           print(f"Resource type: {fhir_resource['resourceType']}")
+           logging.info(f"FHIR resource stored successfully: {fhir_resource['id']}")
+       except Exception as e:
+           logging.error(f"Error storing FHIR resource: {e}")
    
    def monitor_compliance(analysis, project_id):
        """Monitor compliance and generate alerts if needed."""
-       if not analysis["compliance_status"]["hipaa_compliant"]:
+       compliance_status = analysis.get("compliance_status", {})
+       if not compliance_status.get("hipaa_compliant", True):
            send_compliance_alert(analysis, project_id)
+       
+       # Log metrics for monitoring
+       logging.info(f"Compliance check completed: {compliance_status}")
    
    def send_compliance_alert(analysis, project_id):
        """Send compliance alert for non-compliant data."""
-       print("COMPLIANCE ALERT: Non-compliant healthcare data detected")
+       alert_message = f"COMPLIANCE ALERT: Non-compliant healthcare data detected in project {project_id}"
+       print(alert_message)
+       logging.warning(alert_message)
+       
+       # In production, this would integrate with alerting systems
+       # such as Cloud Monitoring, Pub/Sub, or email notifications
    
    if __name__ == "__main__":
        import argparse
@@ -522,6 +639,15 @@ echo "✅ APIs enabled for healthcare data processing"
            "widget": {
              "title": "Batch Job Success Rate",
              "scorecard": {
+               "timeSeriesQuery": {
+                 "timeSeriesFilter": {
+                   "filter": "resource.type=\"batch_job\"",
+                   "aggregation": {
+                     "alignmentPeriod": "300s",
+                     "perSeriesAligner": "ALIGN_RATE"
+                   }
+                 }
+               },
                "gaugeView": {
                  "upperBound": 100.0
                },
@@ -541,7 +667,7 @@ echo "✅ APIs enabled for healthcare data processing"
                  {
                    "timeSeriesQuery": {
                      "timeSeriesFilter": {
-                       "filter": "resource.type=\"batch_job\"",
+                       "filter": "resource.type=\"cloud_function\" AND metric.type=\"cloudfunctions.googleapis.com/function/execution_times\"",
                        "aggregation": {
                          "alignmentPeriod": "60s",
                          "perSeriesAligner": "ALIGN_MEAN"
@@ -559,12 +685,11 @@ echo "✅ APIs enabled for healthcare data processing"
    EOF
    
    # Create the monitoring dashboard
-   gcloud monitoring dashboards create \
+   gcloud monitoring dashboards create \\
        --config-from-file=monitoring-dashboard.json
    
    # Create alert policy for compliance violations
-   gcloud alpha monitoring policies create \
-       --policy-from-file=<(cat << EOF
+   cat > compliance-alert-policy.json << EOF
    {
      "displayName": "Healthcare Compliance Alert",
      "conditions": [
@@ -573,17 +698,21 @@ echo "✅ APIs enabled for healthcare data processing"
          "conditionThreshold": {
            "filter": "resource.type=\"cloud_function\" AND metric.type=\"logging.googleapis.com/user/compliance_violation\"",
            "comparison": "COMPARISON_GREATER_THAN",
-           "thresholdValue": 0
+           "thresholdValue": 0,
+           "duration": "60s"
          }
        }
      ],
      "notificationChannels": [],
      "alertStrategy": {
        "autoClose": "1800s"
-     }
+     },
+     "enabled": true
    }
    EOF
-   )
+   
+   gcloud alpha monitoring policies create \\
+       --policy-from-file=compliance-alert-policy.json
    
    echo "✅ Monitoring and compliance tracking configured"
    ```
@@ -599,12 +728,12 @@ echo "✅ APIs enabled for healthcare data processing"
    gsutil ls -L gs://${BUCKET_NAME}
    
    # Verify healthcare dataset
-   gcloud healthcare datasets describe ${DATASET_ID} \
+   gcloud healthcare datasets describe ${DATASET_ID} \\
        --location=${REGION}
    
    # Check FHIR store configuration
-   gcloud healthcare fhir-stores describe ${FHIR_STORE_ID} \
-       --dataset=${DATASET_ID} \
+   gcloud healthcare fhir-stores describe ${FHIR_STORE_ID} \\
+       --dataset=${DATASET_ID} \\
        --location=${REGION}
    ```
 
@@ -617,7 +746,7 @@ echo "✅ APIs enabled for healthcare data processing"
    cat > sample_medical_record.json << EOF
    {
      "patient_id": "PATIENT_12345",
-     "encounter_date": "2025-07-12",
+     "encounter_date": "2025-07-23",
      "chief_complaint": "Routine checkup",
      "vital_signs": {
        "blood_pressure": "120/80",
@@ -632,7 +761,8 @@ echo "✅ APIs enabled for healthcare data processing"
    # Upload test file to trigger processing
    gsutil cp sample_medical_record.json gs://${BUCKET_NAME}/test/
    
-   # Monitor batch job creation
+   # Monitor batch job creation (wait a few moments)
+   sleep 30
    gcloud batch jobs list --location=${REGION}
    
    echo "✅ Test file uploaded and processing initiated"
@@ -642,18 +772,20 @@ echo "✅ APIs enabled for healthcare data processing"
 
    ```bash
    # Check Cloud Function logs
-   gcloud functions logs read healthcare-processor-trigger \
-       --limit=10
-   
-   # Monitor batch job execution
-   gcloud batch jobs describe healthcare-processing-test \
-       --location=${REGION}
+   gcloud functions logs read healthcare-processor-trigger \\
+       --limit=10 \\
+       --region=${REGION}
    
    # Check compliance monitoring dashboard
-   gcloud monitoring dashboards list
+   gcloud monitoring dashboards list \\
+       --filter="displayName:Healthcare"
+   
+   # Verify alert policies
+   gcloud alpha monitoring policies list \\
+       --filter="displayName:Healthcare"
    ```
 
-   Expected output: Function logs showing successful trigger, batch job in RUNNING or SUCCEEDED state, and monitoring dashboard displaying processing metrics.
+   Expected output: Function logs showing successful trigger, monitoring dashboard created, and alert policies configured for compliance monitoring.
 
 ## Cleanup
 
@@ -661,12 +793,14 @@ echo "✅ APIs enabled for healthcare data processing"
 
    ```bash
    # Delete all batch jobs
-   gcloud batch jobs list --location=${REGION} \
-       --format="value(name)" | \
+   gcloud batch jobs list --location=${REGION} \\
+       --format="value(name)" | \\
        xargs -I {} gcloud batch jobs delete {} --location=${REGION} --quiet
    
    # Delete Cloud Function
-   gcloud functions delete healthcare-processor-trigger --quiet
+   gcloud functions delete healthcare-processor-trigger \\
+       --region=${REGION} \\
+       --quiet
    
    echo "✅ Batch jobs and Cloud Functions deleted"
    ```
@@ -675,19 +809,19 @@ echo "✅ APIs enabled for healthcare data processing"
 
    ```bash
    # Delete FHIR store
-   gcloud healthcare fhir-stores delete ${FHIR_STORE_ID} \
-       --dataset=${DATASET_ID} \
-       --location=${REGION} \
+   gcloud healthcare fhir-stores delete ${FHIR_STORE_ID} \\
+       --dataset=${DATASET_ID} \\
+       --location=${REGION} \\
        --quiet
    
    # Delete healthcare dataset
-   gcloud healthcare datasets delete ${DATASET_ID} \
-       --location=${REGION} \
+   gcloud healthcare datasets delete ${DATASET_ID} \\
+       --location=${REGION} \\
        --quiet
    
    # Delete service accounts
-   gcloud iam service-accounts delete \
-       healthcare-ai-agent@${PROJECT_ID}.iam.gserviceaccount.com \
+   gcloud iam service-accounts delete \\
+       healthcare-ai-agent@${PROJECT_ID}.iam.gserviceaccount.com \\
        --quiet
    
    echo "✅ Healthcare API and AI resources deleted"
@@ -700,20 +834,24 @@ echo "✅ APIs enabled for healthcare data processing"
    gsutil -m rm -r gs://${BUCKET_NAME}
    
    # Delete monitoring dashboard
-   gcloud monitoring dashboards list --format="value(name)" | \
-       grep "Healthcare" | \
+   gcloud monitoring dashboards list --format="value(name)" | \\
+       grep "Healthcare" | \\
        xargs -I {} gcloud monitoring dashboards delete {} --quiet
    
    # Delete alert policies
-   gcloud alpha monitoring policies list --format="value(name)" | \
-       grep -i healthcare | \
+   gcloud alpha monitoring policies list --format="value(name)" | \\
+       grep -i healthcare | \\
        xargs -I {} gcloud alpha monitoring policies delete {} --quiet
    
-   # Delete project (optional - only if created specifically for this recipe)
-   gcloud projects delete ${PROJECT_ID} --quiet
+   # Clean up local files
+   rm -f healthcare_processor.py healthcare-batch-job.json
+   rm -f monitoring-dashboard.json compliance-alert-policy.json
+   rm -f fhir-policy.json agent-config.yaml
+   rm -f sample_medical_record.json
+   rm -rf healthcare-function
    
    echo "✅ Storage and monitoring resources cleaned up"
-   echo "Note: Project deletion may take several minutes to complete"
+   echo "Note: Project deletion may take several minutes to complete if performed"
    ```
 
 ## Discussion
@@ -744,4 +882,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

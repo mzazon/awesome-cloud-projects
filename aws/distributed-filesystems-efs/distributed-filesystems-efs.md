@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: efs,ec2,vpc
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: efs,ec2,vpc,storage
 recipe-generator-version: 1.3
@@ -275,10 +275,10 @@ echo "✅ Key pair created: $KEY_PAIR_NAME"
    Distributing EC2 instances across multiple Availability Zones ensures high availability and demonstrates EFS's ability to serve concurrent clients from different AZs. The user data script installs amazon-efs-utils, which provides the EFS mount helper for optimized mounting with encryption in transit and IAM authentication. CloudWatch agent installation enables monitoring of instance-level metrics.
 
    ```bash
-   # Get Amazon Linux 2 AMI ID
+   # Get Amazon Linux 2023 AMI ID
    export AMI_ID=$(aws ec2 describe-images \
        --owners amazon \
-       --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" \
+       --filters "Name=name,Values=al2023-ami-*-x86_64" \
        --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
        --output text)
 
@@ -599,7 +599,7 @@ EOF
     aws efs describe-file-system-policy \
         --file-system-id $EFS_ID \
         --query 'Policy' --output text > /dev/null 2>&1 || \
-    aws efs create-file-system-policy \
+    aws efs put-file-system-policy \
         --file-system-id $EFS_ID \
         --policy file:///tmp/file-system-policy.json
 
@@ -805,4 +805,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud IoT Core, Cloud Dataprep, BigQuery, Cloud Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, real-time, data-processing, analytics, sensors
 recipe-generator-version: 1.3
@@ -67,12 +67,12 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and Owner permissions
-2. gcloud CLI v2.400.0+ installed and configured (or Cloud Shell)
+2. gcloud CLI v2.450.0+ installed and configured (or Cloud Shell)
 3. Basic understanding of IoT protocols (MQTT) and data analytics concepts
-4. Python 3.7+ for device simulation scripts
+4. Python 3.8+ for device simulation scripts
 5. Estimated cost: $15-25 for running this recipe (Cloud IoT Core, Pub/Sub, Dataflow, BigQuery)
 
-> **Note**: Cloud IoT Core is transitioning to partner solutions. For production use, consider [Google's recommended IoT partners](https://cloud.google.com/iot-core/docs/how-to/devices). This recipe uses Cloud IoT Core for educational purposes.
+> **Warning**: Cloud IoT Core was deprecated on August 16, 2023. This recipe is provided for educational purposes to demonstrate IoT data processing patterns. For production use, consider [Google's recommended IoT partners](https://cloud.google.com/iot-core/docs/how-to/devices) or alternative MQTT brokers like Cloud Run with Mosquitto.
 
 ## Preparation
 
@@ -120,7 +120,7 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
 
 1. **Create Cloud Pub/Sub Topic and Subscription**:
 
-   Cloud Pub/Sub provides the messaging backbone for IoT data streams, offering at-least-once delivery guarantees and automatic scaling to handle thousands of messages per second. This asynchronous messaging pattern decouples device data ingestion from processing, enabling resilient and scalable IoT architectures.
+   Cloud Pub/Sub provides the messaging backbone for IoT data streams, offering at-least-once delivery guarantees and automatic scaling to handle thousands of messages per second. This asynchronous messaging pattern decouples device data ingestion from processing, enabling resilient and scalable IoT architectures that can handle sudden traffic spikes without data loss.
 
    ```bash
    # Create Pub/Sub topic for IoT telemetry data
@@ -138,11 +138,11 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
    echo "✅ Pub/Sub topic and subscription created successfully"
    ```
 
-   The Pub/Sub infrastructure is now ready to handle high-throughput IoT data streams with built-in message persistence and retry logic. This foundation ensures no sensor data is lost during processing pipeline updates or temporary service interruptions.
+   The Pub/Sub infrastructure is now ready to handle high-throughput IoT data streams with built-in message persistence and retry logic. This foundation ensures no sensor data is lost during processing pipeline updates or temporary service interruptions, providing the reliability required for mission-critical IoT applications.
 
 2. **Create Cloud IoT Core Registry and Device**:
 
-   Cloud IoT Core provides secure device authentication and management capabilities, supporting both symmetric and asymmetric key authentication. The device registry acts as a central control plane for managing device configurations, credentials, and telemetry routing to Pub/Sub topics.
+   Cloud IoT Core provides secure device authentication and management capabilities, supporting both symmetric and asymmetric key authentication. The device registry acts as a central control plane for managing device configurations, credentials, and telemetry routing to Pub/Sub topics, ensuring secure communication between edge devices and cloud infrastructure.
 
    ```bash
    # Create IoT Core device registry
@@ -164,11 +164,11 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
    echo "✅ IoT Core registry and device configured with secure authentication"
    ```
 
-   The device registry now provides secure, scalable device management with automatic telemetry routing to Pub/Sub. Each device uses certificate-based authentication, ensuring data integrity and preventing unauthorized access to the IoT pipeline.
+   The device registry now provides secure, scalable device management with automatic telemetry routing to Pub/Sub. Each device uses certificate-based authentication following industry standards, ensuring data integrity and preventing unauthorized access to the IoT pipeline while maintaining the performance needed for real-time telemetry streams.
 
 3. **Create BigQuery Dataset and Table Schema**:
 
-   BigQuery serves as the analytical data warehouse for processed IoT data, providing serverless analytics capabilities that automatically scale from gigabytes to petabytes. The columnar storage format and partitioning features optimize query performance for time-series IoT data analysis.
+   BigQuery serves as the analytical data warehouse for processed IoT data, providing serverless analytics capabilities that automatically scale from gigabytes to petabytes. The columnar storage format and partitioning features optimize query performance for time-series IoT data analysis, enabling sub-second responses for complex analytical queries across historical sensor data.
 
    ```bash
    # Create BigQuery dataset for IoT analytics
@@ -190,11 +190,11 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
    echo "✅ BigQuery dataset and table created with time-series optimization"
    ```
 
-   The BigQuery table is now configured with automatic date partitioning and an optimized schema for IoT analytics. This setup enables cost-effective storage and lightning-fast queries across historical sensor data, supporting both real-time dashboards and machine learning workflows.
+   The BigQuery table is now configured with automatic date partitioning and an optimized schema for IoT analytics. This setup enables cost-effective storage and lightning-fast queries across historical sensor data, supporting both real-time dashboards and machine learning workflows that require immediate access to processed telemetry data.
 
 4. **Configure Cloud Dataprep Data Pipeline**:
 
-   Cloud Dataprep uses machine learning to automatically identify data quality issues and suggest transformations, significantly reducing the manual effort required for data cleansing. The visual interface enables analysts to build complex data preparation workflows without coding, while the underlying Dataflow engine provides enterprise-scale processing.
+   Cloud Dataprep uses machine learning to automatically identify data quality issues and suggest transformations, significantly reducing the manual effort required for data cleansing. The visual interface enables analysts to build complex data preparation workflows without coding, while the underlying Dataflow engine provides enterprise-scale processing with automatic scaling based on data volume.
 
    ```bash
    # Create service account for Dataprep operations
@@ -217,11 +217,11 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
    echo "✅ Dataprep service account configured with appropriate permissions"
    ```
 
-   The Dataprep service account now has the necessary permissions to read from Pub/Sub, process data through Dataflow, and write results to BigQuery. This security configuration follows the principle of least privilege while enabling seamless data pipeline operations.
+   The Dataprep service account now has the necessary permissions to read from Pub/Sub, process data through Dataflow, and write results to BigQuery. This security configuration follows the principle of least privilege while enabling seamless data pipeline operations that can automatically adapt to changing data patterns and quality issues.
 
 5. **Create IoT Device Simulator**:
 
-   Simulating realistic IoT device behavior is essential for testing data pipeline performance and data quality processing. This simulator generates sensor readings with intentional data quality issues including missing values, outliers, and formatting inconsistencies that mirror real-world IoT challenges.
+   Simulating realistic IoT device behavior is essential for testing data pipeline performance and data quality processing. This simulator generates sensor readings with intentional data quality issues including missing values, outliers, and formatting inconsistencies that mirror real-world IoT challenges, providing a comprehensive test environment for the data processing pipeline.
 
    ```bash
    # Create Python script for IoT device simulation
@@ -234,12 +234,13 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
    import datetime
    from google.cloud import iot_v1
    import paho.mqtt.client as mqtt
+   import os
    
-   # Device configuration
-   project_id = "${PROJECT_ID}"
-   registry_id = "${IOT_REGISTRY_ID}"
-   device_id = "${DEVICE_ID}"
-   region = "${REGION}"
+   # Device configuration from environment variables
+   project_id = os.environ.get('PROJECT_ID')
+   registry_id = os.environ.get('IOT_REGISTRY_ID')
+   device_id = os.environ.get('DEVICE_ID')
+   region = os.environ.get('REGION')
    
    def create_jwt_token():
        """Generate JWT token for device authentication"""
@@ -287,7 +288,8 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
    
    def publish_telemetry():
        """Publish sensor data to Cloud IoT Core"""
-       client = mqtt.Client(client_id=f'projects/{project_id}/locations/{region}/registries/{registry_id}/devices/{device_id}')
+       client_id = f'projects/{project_id}/locations/{region}/registries/{registry_id}/devices/{device_id}'
+       client = mqtt.Client(client_id=client_id)
        
        # Configure SSL/TLS
        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
@@ -324,11 +326,11 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
    echo "✅ IoT device simulator created with realistic data patterns"
    ```
 
-   The simulator creates authentic IoT data streams with realistic sensor values and intentional data quality issues that Cloud Dataprep will automatically detect and correct. This approach provides hands-on experience with real-world IoT data challenges and demonstrates the power of automated data preparation.
+   The simulator creates authentic IoT data streams with realistic sensor values and intentional data quality issues that Cloud Dataprep will automatically detect and correct. This approach provides hands-on experience with real-world IoT data challenges and demonstrates the power of automated data preparation in handling unpredictable sensor data patterns.
 
 6. **Set Up Cloud Dataprep Flow**:
 
-   Cloud Dataprep's visual interface enables rapid development of data transformation workflows through point-and-click operations. The machine learning-powered suggestion engine automatically identifies data quality issues and recommends appropriate transformations, dramatically reducing the time required for data preparation.
+   Cloud Dataprep's visual interface enables rapid development of data transformation workflows through point-and-click operations. The machine learning-powered suggestion engine automatically identifies data quality issues and recommends appropriate transformations, dramatically reducing the time required for data preparation while maintaining high data quality standards.
 
    ```bash
    # Create Cloud Storage bucket for Dataprep working files
@@ -339,9 +341,9 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
    
    # Create sample data file for Dataprep flow configuration
    cat > sample_iot_data.json << 'EOF'
-   {"device_id": "sensor-001", "timestamp": "2025-07-12T10:00:00Z", "temperature": 23.5, "humidity": 45.2, "pressure": 1013.25, "location": "warehouse_a", "data_quality_score": 0.95}
-   {"device_id": "sensor-001", "timestamp": "2025-07-12T10:01:00Z", "temperature": null, "humidity": 47.8, "pressure": 1012.80, "location": "warehouse_a", "data_quality_score": 0.70}
-   {"device_id": "sensor-001", "timestamp": "2025-07-12T10:02:00Z", "temperature": 85.5, "humidity": 46.1, "pressure": 1013.10, "location": "warehouse_a", "data_quality_score": 0.60}
+   {"device_id": "sensor-001", "timestamp": "2025-07-23T10:00:00Z", "temperature": 23.5, "humidity": 45.2, "pressure": 1013.25, "location": "warehouse_a", "data_quality_score": 0.95}
+   {"device_id": "sensor-001", "timestamp": "2025-07-23T10:01:00Z", "temperature": null, "humidity": 47.8, "pressure": 1012.80, "location": "warehouse_a", "data_quality_score": 0.70}
+   {"device_id": "sensor-001", "timestamp": "2025-07-23T10:02:00Z", "temperature": 85.5, "humidity": 46.1, "pressure": 1013.10, "location": "warehouse_a", "data_quality_score": 0.60}
    EOF
    
    # Upload sample data to Cloud Storage
@@ -355,11 +357,11 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
    echo "   4. Configure output to BigQuery table: ${BIGQUERY_DATASET}.${BIGQUERY_TABLE}"
    ```
 
-   The sample data file demonstrates common IoT data quality issues including missing values and outliers that Dataprep will automatically detect. In the Dataprep console, users can visually build transformation flows that handle these issues and prepare clean data for analytics.
+   The sample data file demonstrates common IoT data quality issues including missing values and outliers that Dataprep will automatically detect. In the Dataprep console, users can visually build transformation flows that handle these issues and prepare clean data for analytics, leveraging machine learning suggestions to identify optimal cleaning strategies.
 
 7. **Start IoT Data Simulation**:
 
-   Running the IoT simulator creates realistic sensor data streams that flow through the entire pipeline, demonstrating how Cloud IoT Core handles device authentication and message routing. The simulated data includes various data quality scenarios that trigger Dataprep's automatic cleansing capabilities.
+   Running the IoT simulator creates realistic sensor data streams that flow through the entire pipeline, demonstrating how Cloud IoT Core handles device authentication and message routing. The simulated data includes various data quality scenarios that trigger Dataprep's automatic cleansing capabilities, providing a comprehensive test of the pipeline's ability to handle real-world data challenges.
 
    ```bash
    # Run the IoT device simulator
@@ -376,11 +378,11 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
    echo "✅ Sensor readings flowing through Pub/Sub to processing pipeline"
    ```
 
-   The simulator now generates continuous sensor data with realistic patterns and quality issues. This data flows through Cloud IoT Core to Pub/Sub, where it's available for Dataprep processing and eventual analysis in BigQuery.
+   The simulator now generates continuous sensor data with realistic patterns and quality issues. This data flows through Cloud IoT Core to Pub/Sub, where it's available for Dataprep processing and eventual analysis in BigQuery, demonstrating the end-to-end capabilities of the IoT data processing pipeline.
 
 8. **Configure Data Quality Monitoring**:
 
-   Cloud Monitoring provides comprehensive observability for IoT pipelines, tracking message throughput, processing latency, and data quality metrics. Setting up proactive monitoring ensures early detection of device connectivity issues or data processing bottlenecks.
+   Cloud Monitoring provides comprehensive observability for IoT pipelines, tracking message throughput, processing latency, and data quality metrics. Setting up proactive monitoring ensures early detection of device connectivity issues or data processing bottlenecks, enabling rapid response to pipeline issues before they impact business operations.
 
    ```bash
    # Create monitoring dashboard for IoT pipeline
@@ -439,7 +441,7 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
    echo "✅ Monitoring dashboard and alerts configured for IoT pipeline"
    ```
 
-   The monitoring infrastructure now tracks pipeline health and performance metrics, providing visibility into data flow rates and processing efficiency. Automated alerts ensure immediate notification of potential issues in the IoT data processing pipeline.
+   The monitoring infrastructure now tracks pipeline health and performance metrics, providing visibility into data flow rates and processing efficiency. Automated alerts ensure immediate notification of potential issues in the IoT data processing pipeline, enabling proactive maintenance and optimization of the system.
 
 ## Validation & Testing
 
@@ -590,30 +592,35 @@ echo "✅ APIs enabled and ready for IoT pipeline setup"
 
 ## Discussion
 
-This IoT data processing pipeline demonstrates the power of Google Cloud's managed services for handling real-time sensor data at scale. [Cloud IoT Core](https://cloud.google.com/iot-core/docs) provides enterprise-grade device management with automatic authentication and secure communication protocols, while [Cloud Pub/Sub](https://cloud.google.com/pubsub/docs) offers guaranteed message delivery and automatic scaling to handle millions of IoT messages per second.
+This IoT data processing pipeline demonstrates the power of Google Cloud's managed services for handling real-time sensor data at scale. [Cloud IoT Core](https://cloud.google.com/iot-core/docs) provided enterprise-grade device management with automatic authentication and secure communication protocols, while [Cloud Pub/Sub](https://cloud.google.com/pubsub/docs) offers guaranteed message delivery and automatic scaling to handle millions of IoT messages per second. Although Cloud IoT Core was deprecated in August 2023, this pattern remains valuable for understanding IoT data processing architecture.
 
-The integration with [Cloud Dataprep](https://cloud.google.com/dataprep/docs) represents a significant advancement in automated data quality management. Rather than writing complex ETL code to handle missing values, outliers, and format inconsistencies, Dataprep's machine learning algorithms automatically identify and suggest corrections for data quality issues. This approach reduces data preparation time from weeks to hours while improving data reliability and consistency.
+The integration with [Cloud Dataprep](https://cloud.google.com/dataprep/docs) represents a significant advancement in automated data quality management. Rather than writing complex ETL code to handle missing values, outliers, and format inconsistencies, Dataprep's machine learning algorithms automatically identify and suggest corrections for data quality issues. This approach reduces data preparation time from weeks to hours while improving data reliability and consistency across diverse sensor data sources.
 
 [BigQuery's serverless architecture](https://cloud.google.com/bigquery/docs) provides the foundation for real-time IoT analytics, with automatic scaling and columnar storage optimization that enables sub-second queries across billions of sensor readings. The integration with [Cloud Monitoring](https://cloud.google.com/monitoring/docs) ensures comprehensive observability throughout the pipeline, with customizable dashboards and proactive alerting for system health monitoring.
 
-The architecture follows Google Cloud's [Well-Architected Framework](https://cloud.google.com/architecture/framework) principles, emphasizing operational excellence through automation, security through managed authentication, reliability through redundant messaging, and cost optimization through serverless compute models. This design pattern scales from prototype IoT projects to enterprise deployments handling millions of devices.
+The architecture follows Google Cloud's [Well-Architected Framework](https://cloud.google.com/architecture/framework) principles, emphasizing operational excellence through automation, security through managed authentication, reliability through redundant messaging, and cost optimization through serverless compute models. This design pattern scales from prototype IoT projects to enterprise deployments handling millions of devices, providing a robust foundation for IoT analytics platforms.
 
-> **Tip**: For production deployments, implement [Cloud KMS](https://cloud.google.com/kms/docs) for enhanced key management and consider [Dataflow](https://cloud.google.com/dataflow/docs) templates for consistent data processing pipelines across multiple environments.
+> **Tip**: For production deployments, implement [Cloud KMS](https://cloud.google.com/kms/docs) for enhanced key management and consider [Dataflow](https://cloud.google.com/dataflow/docs) templates for consistent data processing pipelines across multiple environments. Since Cloud IoT Core is deprecated, explore alternatives like [Google Cloud's IoT partner solutions](https://cloud.google.com/iot-core/docs/how-to/devices) or self-managed MQTT brokers on Cloud Run.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Add Machine Learning Predictions**: Integrate [Vertex AI](https://cloud.google.com/vertex-ai/docs) to build predictive maintenance models that analyze sensor patterns and predict equipment failures before they occur.
+1. **Add Machine Learning Predictions**: Integrate [Vertex AI](https://cloud.google.com/vertex-ai/docs) to build predictive maintenance models that analyze sensor patterns and predict equipment failures before they occur using AutoML or custom training pipelines.
 
-2. **Implement Edge Computing**: Deploy [Cloud IoT Edge](https://cloud.google.com/iot-edge) capabilities to perform local data processing and reduce bandwidth usage for remote IoT deployments.
+2. **Implement Alternative IoT Connectivity**: Deploy a containerized MQTT broker using [Cloud Run](https://cloud.google.com/run/docs) with Eclipse Mosquitto to replace the deprecated Cloud IoT Core service while maintaining the same data processing architecture.
 
-3. **Create Advanced Visualizations**: Build interactive dashboards using [Looker Studio](https://cloud.google.com/looker-studio) with real-time sensor data visualization and automated anomaly detection alerts.
+3. **Create Advanced Visualizations**: Build interactive dashboards using [Looker Studio](https://cloud.google.com/looker-studio) with real-time sensor data visualization and automated anomaly detection alerts based on statistical analysis.
 
-4. **Scale to Multi-Region**: Implement [multi-region BigQuery datasets](https://cloud.google.com/bigquery/docs/locations) and [global Pub/Sub topics](https://cloud.google.com/pubsub/docs/admin#creating_topics) to support IoT deployments across multiple geographic regions.
+4. **Scale to Multi-Region**: Implement [multi-region BigQuery datasets](https://cloud.google.com/bigquery/docs/locations) and [global Pub/Sub topics](https://cloud.google.com/pubsub/docs/admin#creating_topics) to support IoT deployments across multiple geographic regions with data residency compliance.
 
-5. **Add Advanced Security**: Implement [Binary Authorization](https://cloud.google.com/binary-authorization/docs) for IoT device firmware validation and [VPC Service Controls](https://cloud.google.com/vpc-service-controls/docs) for enhanced data perimeter security.
+5. **Add Advanced Security**: Implement [Binary Authorization](https://cloud.google.com/binary-authorization/docs) for IoT device firmware validation and [VPC Service Controls](https://cloud.google.com/vpc-service-controls/docs) for enhanced data perimeter security to protect sensitive sensor data.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

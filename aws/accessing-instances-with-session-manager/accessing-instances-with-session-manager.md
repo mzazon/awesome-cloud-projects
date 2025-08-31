@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: Systems Manager, EC2, IAM, CloudWatch
 estimated-time: 60 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, remote-access, session-manager, zero-trust, bastion-replacement
 recipe-generator-version: 1.3
@@ -77,9 +77,10 @@ graph TB
 
 1. AWS account with administrative permissions to create IAM roles and policies
 2. AWS CLI installed and configured (version 2.0 or later)
-3. Basic understanding of IAM roles and EC2 instance management
-4. EC2 instance running Amazon Linux 2 or Windows Server (for testing)
-5. Estimated cost: $0.50-$2.00 per hour for EC2 instances (depends on instance type)
+3. Session Manager plugin installed for AWS CLI (for interactive sessions)
+4. Basic understanding of IAM roles and EC2 instance management
+5. EC2 instance running Amazon Linux 2 or Windows Server (for testing)
+6. Estimated cost: $0.50-$2.00 per hour for EC2 instances (depends on instance type)
 
 > **Note**: Session Manager requires no additional charges beyond standard EC2 instance costs and CloudWatch/S3 logging fees.
 
@@ -260,10 +261,16 @@ echo "✅ Resource suffix: ${RANDOM_SUFFIX}"
    }
    EOF
    
-   # Apply logging configuration using Systems Manager preferences
-   aws ssm put-preference \
-       --name "SessionManagerLoggingPreferences" \
-       --value file://logging-config.json
+   # Apply logging configuration using Session Manager preferences
+   aws ssm update-document \
+       --name "SSM-SessionManagerRunShell" \
+       --content file://logging-config.json \
+       --document-version "\$LATEST" || \
+   aws ssm create-document \
+       --name "SessionManagerLoggingDocument-${RANDOM_SUFFIX}" \
+       --document-type "Session" \
+       --document-format "JSON" \
+       --content file://logging-config.json
    
    echo "✅ Session Manager logging configured"
    ```
@@ -531,11 +538,6 @@ echo "✅ Resource suffix: ${RANDOM_SUFFIX}"
 5. **Remove Logging Resources**:
 
    ```bash
-   # Remove Session Manager logging preferences
-   aws ssm delete-preference \
-       --name "SessionManagerLoggingPreferences" \
-       --preference-type "Custom"
-   
    # Delete CloudWatch log group
    aws logs delete-log-group \
        --log-group-name ${LOG_GROUP_NAME}
@@ -576,4 +578,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

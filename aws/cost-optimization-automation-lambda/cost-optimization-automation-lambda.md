@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: lambda,trusted-advisor,sns,cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-optimization,automation,lambda,trusted-advisor
 recipe-generator-version: 1.3
 ---
 
 # Cost Optimization Automation with Lambda
-
 
 ## Problem
 
@@ -31,7 +30,6 @@ Build an automated cost optimization system using AWS Lambda functions that leve
 ```mermaid
 graph TB
     subgraph "Monitoring & Triggering"
-        CW[CloudWatch Events]
         SCHEDULER[EventBridge Scheduler]
     end
     
@@ -84,7 +82,7 @@ graph TB
 1. AWS account with Business or Enterprise support plan (required for [Trusted Advisor API access](https://docs.aws.amazon.com/awssupport/latest/user/get-started-with-aws-trusted-advisor-api.html))
 2. AWS CLI v2 installed and configured with appropriate IAM permissions
 3. IAM permissions for Lambda, Trusted Advisor, SNS, CloudWatch, EC2, RDS, and S3 services
-4. Python 3.9 or higher for local development and testing
+4. Python 3.12 or higher for local development and testing
 5. Estimated cost: $50-100/month for Lambda execution, storage, and notifications
 
 > **Note**: Business or Enterprise support plan is required to access Trusted Advisor APIs programmatically. Basic support plan only provides limited web console access.
@@ -113,6 +111,11 @@ export COST_OPT_TOPIC="cost-optimization-alerts-${RANDOM_SUFFIX}"
 
 # Create S3 bucket for reports and Lambda deployment
 aws s3 mb s3://${COST_OPT_BUCKET} --region ${AWS_REGION}
+
+# Enable bucket versioning for audit trail
+aws s3api put-bucket-versioning \
+    --bucket ${COST_OPT_BUCKET} \
+    --versioning-configuration Status=Enabled
 
 # Create DynamoDB table for tracking optimization actions
 aws dynamodb create-table \
@@ -197,6 +200,7 @@ echo "✅ Foundation resources created successfully"
                    "ec2:ModifyInstanceAttribute",
                    "ec2:DescribeVolumes",
                    "ec2:ModifyVolume",
+                   "ec2:CreateSnapshot",
                    "rds:DescribeDBInstances",
                    "rds:ModifyDBInstance",
                    "rds:StopDBInstance",
@@ -233,6 +237,7 @@ echo "✅ Foundation resources created successfully"
    import os
    from datetime import datetime, timedelta
    from decimal import Decimal
+   import re
    
    def lambda_handler(event, context):
        """
@@ -242,7 +247,7 @@ echo "✅ Foundation resources created successfully"
        
        # Initialize AWS clients
        support_client = boto3.client('support', region_name='us-east-1')
-       ce_client = boto3.client('ce')
+       ce_client = boto3.client('ce', region_name='us-east-1')
        dynamodb = boto3.resource('dynamodb')
        lambda_client = boto3.client('lambda')
        
@@ -367,13 +372,12 @@ echo "✅ Foundation resources created successfully"
                if '$' in str(item) and any(keyword in str(item).lower() 
                                         for keyword in ['save', 'saving', 'cost']):
                    # Extract numeric value
-                   import re
                    savings_match = re.search(r'\$[\d,]+\.?\d*', str(item))
                    if savings_match:
                        return float(savings_match.group().replace('$', '').replace(',', ''))
            
            return 0.0
-       except:
+       except Exception:
            return 0.0
    
    def store_optimization_opportunity(table, opportunity):
@@ -416,13 +420,13 @@ echo "✅ Foundation resources created successfully"
    def should_auto_remediate(opportunity):
        """Determine if opportunity should be auto-remediated"""
        auto_remediate_checks = [
-           'EC2 instances stopped',
-           'EBS volumes unattached',
-           'RDS idle DB instances'
+           'Amazon EC2 instances stopped',
+           'Amazon EBS unattached volumes',
+           'Amazon RDS idle DB instances'
        ]
        
        # Only auto-remediate for specific checks with high confidence
-       return (opportunity['check_name'] in auto_remediate_checks and 
+       return (any(check in opportunity['check_name'] for check in auto_remediate_checks) and 
                opportunity['status'] == 'warning')
    
    def generate_cost_optimization_report(opportunities, cost_insights, auto_remediations):
@@ -651,7 +655,7 @@ echo "✅ Foundation resources created successfully"
        
        try:
            if 'idle' in check_name.lower():
-               # For idle RDS instances, recommend stopping or deletion
+               # For idle RDS instances, recommend stopping
                if action == 'auto_remediate':
                    # Stop the RDS instance
                    rds_client.stop_db_instance(
@@ -839,7 +843,7 @@ echo "✅ Foundation resources created successfully"
    # Deploy cost analysis function
    aws lambda create-function \
        --function-name cost-optimization-analysis \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/CostOptimizationLambdaRole \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://cost-analysis-function.zip \
@@ -859,7 +863,7 @@ echo "✅ Foundation resources created successfully"
    # Deploy remediation function
    aws lambda create-function \
        --function-name cost-optimization-remediation \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/CostOptimizationLambdaRole \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://remediation-function.zip \
@@ -954,6 +958,8 @@ echo "✅ Foundation resources created successfully"
        "widgets": [
            {
                "type": "metric",
+               "width": 12,
+               "height": 6,
                "properties": {
                    "metrics": [
                        ["AWS/Lambda", "Duration", "FunctionName", "cost-optimization-analysis"],
@@ -970,8 +976,10 @@ echo "✅ Foundation resources created successfully"
            },
            {
                "type": "log",
+               "width": 12,
+               "height": 6,
                "properties": {
-                   "query": "SOURCE '/aws/lambda/cost-optimization-analysis'\n| fields @timestamp, @message\n| filter @message like /optimization/\n| sort @timestamp desc\n| limit 100",
+                   "query": "SOURCE '/aws/lambda/cost-optimization-analysis'\\n| fields @timestamp, @message\\n| filter @message like /optimization/\\n| sort @timestamp desc\\n| limit 100",
                    "region": "${AWS_REGION}",
                    "title": "Cost Optimization Analysis Logs"
                }
@@ -988,7 +996,7 @@ echo "✅ Foundation resources created successfully"
    echo "✅ CloudWatch dashboard created successfully"
    ```
 
-   The monitoring dashboard is now operational and provides comprehensive visibility into the cost optimization system's performance and health. This centralized monitoring approach enables proactive issue detection and system optimization, ensuring the cost optimization automation continues to deliver value while maintaining operational reliability. The dashboard supports both real-time monitoring and historical analysis for continuous improvement. Configure CloudWatch alarms with appropriate thresholds to balance between early warning and false positive alerts.
+   The monitoring dashboard is now operational and provides comprehensive visibility into the cost optimization system's performance and health. This centralized monitoring approach enables proactive issue detection and system optimization, ensuring the cost optimization automation continues to deliver value while maintaining operational reliability. The dashboard supports both real-time monitoring and historical analysis for continuous improvement.
 
 8. **Test the Cost Optimization System**:
 
@@ -1187,4 +1195,11 @@ Extend this cost optimization solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

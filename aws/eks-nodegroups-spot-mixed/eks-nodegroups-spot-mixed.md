@@ -1,22 +1,21 @@
 ---
-title: EKS Node Groups with Spot Instances
+title: Cost-Optimized EKS Node Groups with Spot and Mixed Instances
 id: 59259fc4
 category: compute
 difficulty: 300
 subject: aws
-services: eks
+services: eks, ec2, iam, cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
-tags: eks
+tags: eks, spot-instances, cost-optimization, mixed-instances
 recipe-generator-version: 1.3
 ---
 
-# EKS Node Groups with Spot Instances
-
+# Cost-Optimized EKS Node Groups with Spot and Mixed Instances
 
 ## Problem
 
@@ -55,7 +54,7 @@ graph TB
     
     subgraph "Supporting Services"
         CA[Cluster Autoscaler]
-        CSI[AWS Node Termination Handler]
+        NTH[AWS Node Termination Handler]
         CW[CloudWatch Metrics]
     end
     
@@ -75,7 +74,7 @@ graph TB
     
     CA --> ASG1
     CA --> ASG2
-    CSI --> ASG1
+    NTH --> ASG1
     CW --> ASG1
     CW --> ASG2
     
@@ -113,8 +112,8 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --output text --query RandomPassword 2>/dev/null || \
     echo $(date +%s | tail -c 6))
 
-# Set cluster and node group names
-export CLUSTER_NAME="cost-optimized-eks-${RANDOM_SUFFIX}"
+# Set cluster and node group names (update CLUSTER_NAME to existing cluster)
+export CLUSTER_NAME="your-existing-cluster-name"
 export SPOT_NODE_GROUP_NAME="spot-mixed-nodegroup"
 export ONDEMAND_NODE_GROUP_NAME="ondemand-backup-nodegroup"
 
@@ -268,7 +267,7 @@ rm -f node-group-trust-policy.json
 
    ```bash
    # Install AWS Node Termination Handler to gracefully handle spot interruptions
-   kubectl apply -f https://github.com/aws/aws-node-termination-handler/releases/download/v1.21.0/all-resources.yaml
+   kubectl apply -f https://github.com/aws/aws-node-termination-handler/releases/download/v1.25.2/all-resources.yaml
    
    # Verify the installation
    kubectl get daemonset aws-node-termination-handler \
@@ -391,12 +390,12 @@ rm -f node-group-trust-policy.json
 
    The application is now running exclusively on Spot instances, demonstrating the proper configuration patterns for cost-optimized workloads. The Pod Disruption Budget created earlier will protect against simultaneous termination of all replicas during node interruptions, while the tolerations ensure the application can leverage the significant cost savings of Spot capacity.
 
-8. **Install and Configure Cluster Autoscaler**:
+8. **Create IAM Role for Cluster Autoscaler**:
 
-   The Cluster Autoscaler requires specific IAM permissions to manage Auto Scaling Groups and EC2 instances on behalf of the EKS cluster. These permissions follow the principle of least privilege, granting only the minimum access needed for autoscaling operations. The service account annotation leverages IAM Roles for Service Accounts (IRSA), which provides secure, temporary credentials without embedding long-term access keys in pod configurations. This approach aligns with AWS security best practices for [EKS autoscaling](https://docs.aws.amazon.com/eks/latest/userguide/autoscaling.html).
+   The Cluster Autoscaler requires specific IAM permissions to manage Auto Scaling Groups and EC2 instances on behalf of the EKS cluster. These permissions follow the principle of least privilege, granting only the minimum access needed for autoscaling operations. IAM Roles for Service Accounts (IRSA) provides secure, temporary credentials without embedding long-term access keys in pod configurations. This approach aligns with AWS security best practices for [EKS autoscaling](https://docs.aws.amazon.com/eks/latest/userguide/autoscaling.html).
 
    ```bash
-   # Create cluster autoscaler service account and role
+   # Create cluster autoscaler IAM policy
    cat > cluster-autoscaler-policy.json << EOF
    {
        "Version": "2012-10-17",
@@ -423,6 +422,48 @@ rm -f node-group-trust-policy.json
        --policy-name "ClusterAutoscalerPolicy-${RANDOM_SUFFIX}" \
        --policy-document file://cluster-autoscaler-policy.json
    
+   # Create trust policy for IRSA
+   cat > autoscaler-trust-policy.json << EOF
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Principal": {
+           "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/$(aws eks describe-cluster --name ${CLUSTER_NAME} --query cluster.identity.oidc.issuer --output text | sed 's|https://||')"
+         },
+         "Action": "sts:AssumeRoleWithWebIdentity",
+         "Condition": {
+           "StringEquals": {
+             "$(aws eks describe-cluster --name ${CLUSTER_NAME} --query cluster.identity.oidc.issuer --output text | sed 's|https://||'):sub": "system:serviceaccount:kube-system:cluster-autoscaler",
+             "$(aws eks describe-cluster --name ${CLUSTER_NAME} --query cluster.identity.oidc.issuer --output text | sed 's|https://||'):aud": "sts.amazonaws.com"
+           }
+         }
+       }
+     ]
+   }
+   EOF
+   
+   # Create IAM role for cluster autoscaler
+   aws iam create-role \
+       --role-name "ClusterAutoscalerRole-${RANDOM_SUFFIX}" \
+       --assume-role-policy-document file://autoscaler-trust-policy.json
+   
+   # Attach policy to role
+   aws iam attach-role-policy \
+       --role-name "ClusterAutoscalerRole-${RANDOM_SUFFIX}" \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/ClusterAutoscalerPolicy-${RANDOM_SUFFIX}
+   
+   echo "✅ Cluster autoscaler IAM role created"
+   ```
+
+   The IAM role and policy are now configured to enable secure autoscaling operations using temporary credentials through IRSA. This setup follows AWS security best practices and ensures the Cluster Autoscaler can manage node groups without permanent access keys.
+
+9. **Deploy Cluster Autoscaler**:
+
+   The Cluster Autoscaler deployment uses the `least-waste` expander strategy, which selects node groups that minimize resource waste after pod scheduling. This optimization is particularly valuable for mixed instance types because it can intelligently choose the most cost-effective instance family for current workload patterns. The auto-discovery feature automatically detects node groups tagged for autoscaling, eliminating the need for manual configuration. This approach follows [Cluster Autoscaler best practices](https://docs.aws.amazon.com/eks/latest/best-practices/cas.html) for optimal resource utilization and cost management.
+
+   ```bash
    # Create service account for cluster autoscaler
    kubectl create serviceaccount cluster-autoscaler \
        --namespace kube-system
@@ -432,20 +473,10 @@ rm -f node-group-trust-policy.json
        --namespace kube-system \
        eks.amazonaws.com/role-arn=arn:aws:iam::${AWS_ACCOUNT_ID}:role/ClusterAutoscalerRole-${RANDOM_SUFFIX}
    
-   echo "✅ Cluster autoscaler IAM policy created"
-   ```
-
-   The IAM policy and service account are now configured to enable secure autoscaling operations. The Cluster Autoscaler can now query Auto Scaling Groups, monitor resource utilization, and make scaling decisions based on pod scheduling requirements and resource availability across both Spot and On-Demand node groups.
-
-9. **Deploy Cluster Autoscaler**:
-
-   The Cluster Autoscaler deployment uses the `least-waste` expander strategy, which selects node groups that minimize resource waste after pod scheduling. This optimization is particularly valuable for mixed instance types because it can intelligently choose the most cost-effective instance family for current workload patterns. The auto-discovery feature automatically detects node groups tagged for autoscaling, eliminating the need for manual configuration. This approach follows [Cluster Autoscaler best practices](https://docs.aws.amazon.com/eks/latest/best-practices/cluster-autoscaling.html) for optimal resource utilization and cost management.
-
-   ```bash
    # Deploy cluster autoscaler
    kubectl apply -f https://raw.githubusercontent.com/kubernetes/autoscaler/master/cluster-autoscaler/cloudprovider/aws/examples/cluster-autoscaler-autodiscover.yaml
    
-   # Patch the deployment to use the correct cluster name
+   # Patch the deployment to use the correct cluster name and configurations
    kubectl patch deployment cluster-autoscaler \
        --namespace kube-system \
        --patch '{"spec":{"template":{"spec":{"containers":[{"name":"cluster-autoscaler","command":["./cluster-autoscaler","--v=4","--stderrthreshold=info","--cloud-provider=aws","--skip-nodes-with-local-storage=false","--expander=least-waste","--node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled,k8s.io/cluster-autoscaler/'${CLUSTER_NAME}'"]}]}}}}'
@@ -463,30 +494,29 @@ rm -f node-group-trust-policy.json
     Effective cost monitoring enables proactive management of Spot instance economics and operational health. CloudWatch alarms provide early warning when interruption rates exceed normal thresholds, indicating potential issues with instance type selection or market conditions. This visibility helps optimize instance diversification strategies and maintain application availability.
 
     ```bash
-    # Create CloudWatch metric filter for spot instance interruptions
+    # Create CloudWatch log group for monitoring
     aws logs create-log-group \
-        --log-group-name "/aws/eks/${CLUSTER_NAME}/spot-interruptions" \
+        --log-group-name "/aws/eks/${CLUSTER_NAME}/spot-monitoring" \
         --region ${AWS_REGION}
     
     # Create CloudWatch alarm for high spot interruption rate
     aws cloudwatch put-metric-alarm \
         --alarm-name "EKS-${CLUSTER_NAME}-HighSpotInterruptions" \
-        --alarm-description "High spot instance interruption rate" \
-        --metric-name SpotInterruptionRate \
-        --namespace AWS/EKS \
+        --alarm-description "High spot instance interruption rate detected" \
+        --metric-name SpotInstanceTerminating \
+        --namespace AWS/EC2 \
         --statistic Sum \
         --period 300 \
-        --threshold 5 \
+        --threshold 3 \
         --comparison-operator GreaterThanThreshold \
-        --evaluation-periods 2 \
-        --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:eks-alerts
+        --evaluation-periods 2
     
     echo "✅ Cost monitoring and alerts configured"
     ```
 
-    The monitoring infrastructure now tracks Spot interruption patterns and will alert when rates indicate potential availability concerns, enabling proactive adjustments to instance type strategies.
+    The monitoring infrastructure now tracks Spot interruption patterns and provides visibility into instance lifecycle events, enabling proactive adjustments to instance type strategies.
 
-> **Warning**: This alarm requires an existing SNS topic for notifications. Configure appropriate notification channels to receive interruption alerts and cost optimization insights.
+> **Warning**: Configure appropriate SNS topics for alarm notifications to receive alerts about Spot interruptions and operational events.
 
 ## Validation & Testing
 
@@ -536,10 +566,12 @@ rm -f node-group-trust-policy.json
 
    ```bash
    # Check node termination handler pods
-   kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-node-termination-handler
+   kubectl get pods -n kube-system \
+       -l app.kubernetes.io/name=aws-node-termination-handler
    
    # Check logs for proper configuration
-   kubectl logs -n kube-system -l app.kubernetes.io/name=aws-node-termination-handler --tail=50
+   kubectl logs -n kube-system \
+       -l app.kubernetes.io/name=aws-node-termination-handler --tail=50
    ```
 
 5. **Verify Cluster Autoscaler Configuration**:
@@ -614,9 +646,16 @@ rm -f node-group-trust-policy.json
        --role-name "EKSNodeGroupRole-${RANDOM_SUFFIX}" \
        --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
    
-   # Delete IAM role
+   # Delete IAM roles
    aws iam delete-role \
        --role-name "EKSNodeGroupRole-${RANDOM_SUFFIX}"
+   
+   aws iam detach-role-policy \
+       --role-name "ClusterAutoscalerRole-${RANDOM_SUFFIX}" \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/ClusterAutoscalerPolicy-${RANDOM_SUFFIX}
+   
+   aws iam delete-role \
+       --role-name "ClusterAutoscalerRole-${RANDOM_SUFFIX}"
    
    # Delete cluster autoscaler policy
    aws iam delete-policy \
@@ -629,7 +668,7 @@ rm -f node-group-trust-policy.json
 
    ```bash
    # Remove AWS node termination handler
-   kubectl delete -f https://github.com/aws/aws-node-termination-handler/releases/download/v1.21.0/all-resources.yaml
+   kubectl delete -f https://github.com/aws/aws-node-termination-handler/releases/download/v1.25.2/all-resources.yaml
    
    # Remove cluster autoscaler
    kubectl delete -f https://raw.githubusercontent.com/kubernetes/autoscaler/master/cluster-autoscaler/cloudprovider/aws/examples/cluster-autoscaler-autodiscover.yaml
@@ -641,7 +680,8 @@ rm -f node-group-trust-policy.json
 
    ```bash
    # Remove temporary files
-   rm -f spot-demo-app.yaml spot-pdb.yaml cluster-autoscaler-policy.json
+   rm -f spot-demo-app.yaml spot-pdb.yaml \
+       cluster-autoscaler-policy.json autoscaler-trust-policy.json
    
    # Clear environment variables
    unset CLUSTER_NAME SPOT_NODE_GROUP_NAME ONDEMAND_NODE_GROUP_NAME
@@ -656,7 +696,7 @@ This recipe demonstrates a comprehensive approach to cost optimization in Amazon
 
 The mixed instance type strategy provides several critical benefits. First, it increases the likelihood of successful Spot instance fulfillment by spreading requests across multiple instance families (m5, m5a, c5, c5a). Second, it reduces the risk of simultaneous interruptions affecting all nodes, as different instance types typically have different interruption patterns based on supply and demand dynamics. The AWS Node Termination Handler ensures graceful handling of Spot interruptions by draining nodes before termination, preventing abrupt workload failures.
 
-The combination of Spot instances for fault-tolerant workloads and On-Demand instances for critical systems creates a balanced approach to cost optimization. Organizations can achieve significant cost savings (up to 90% on compute costs) while maintaining reliability for essential services. The Cluster Autoscaler automatically adjusts node group sizes based on workload demands, ensuring optimal resource utilization without manual intervention. This architecture follows AWS best practices for [mixed instance Auto Scaling groups](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-mixed-instances-groups.html) and cost-effective container orchestration.
+The combination of Spot instances for fault-tolerant workloads and On-Demand instances for critical systems creates a balanced approach to cost optimization. Organizations can achieve significant cost savings (up to 90% on compute costs) while maintaining reliability for essential services. The Cluster Autoscaler automatically adjusts node group sizes based on workload demands, ensuring optimal resource utilization without manual intervention. This architecture follows AWS best practices for [mixed instance Auto Scaling groups](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-mixed-instances-groups.html) and the [Cluster Autoscaler best practices guide](https://docs.aws.amazon.com/eks/latest/best-practices/cas.html).
 
 > **Tip**: Consider using the `capacity-optimized` allocation strategy for Spot instances to maximize availability and reduce interruption frequency by selecting instances from pools with optimal capacity. This strategy is recommended in the [AWS EC2 Spot best practices guide](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-best-practices.html) for production workloads.
 
@@ -676,4 +716,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

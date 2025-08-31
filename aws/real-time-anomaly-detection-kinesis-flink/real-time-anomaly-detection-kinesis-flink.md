@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: kinesis-data-streams, managed-service-for-apache-flink, cloudwatch, sns
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: analytics, streaming, anomaly-detection, flink, real-time, machine-learning
 recipe-generator-version: 1.3
@@ -87,7 +87,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with permissions for Kinesis Data Streams, Managed Service for Apache Flink, CloudWatch, SNS, Lambda, and S3
+1. AWS account with permissions for Kinesis Data Streams, Managed Service for Apache Flink, CloudWatch, SNS, Lambda, IAM, and S3
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Knowledge of streaming data concepts and basic Java/SQL programming
 4. Understanding of statistical anomaly detection concepts
@@ -116,9 +116,20 @@ export FLINK_APP_NAME="anomaly-detector-${RANDOM_SUFFIX}"
 export S3_BUCKET_NAME="anomaly-detection-data-${RANDOM_SUFFIX}"
 export SNS_TOPIC_NAME="anomaly-alerts-${RANDOM_SUFFIX}"
 export LAMBDA_FUNCTION_NAME="anomaly-processor-${RANDOM_SUFFIX}"
+export LAMBDA_ROLE_NAME="anomaly-lambda-role-${RANDOM_SUFFIX}"
 
 # Create S3 bucket for data storage and application artifacts
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
+
+# Enable S3 bucket versioning and encryption
+aws s3api put-bucket-versioning \
+    --bucket ${S3_BUCKET_NAME} \
+    --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+    --bucket ${S3_BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
 
 # Create SNS topic for alerting
 aws sns create-topic --name ${SNS_TOPIC_NAME} \
@@ -224,7 +235,75 @@ echo "✅ Environment prepared with unique identifiers"
 
    These permissions establish a secure execution environment for our Flink application. The role can now read streaming data, emit operational metrics, and access its deployment artifacts while maintaining isolation from other AWS resources.
 
-3. **Create Java application for anomaly detection**:
+3. **Create Lambda execution role for anomaly processing**:
+
+   AWS Lambda requires an execution role with appropriate permissions to interact with CloudWatch for metrics publishing and SNS for alert notifications. Following the principle of least privilege, this role grants only the specific permissions needed for anomaly processing tasks while ensuring secure access to required AWS services.
+
+   ```bash
+   # Create trust policy for Lambda service
+   cat > lambda-trust-policy.json << 'EOF'
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Principal": {
+                   "Service": "lambda.amazonaws.com"
+               },
+               "Action": "sts:AssumeRole"
+           }
+       ]
+   }
+   EOF
+   
+   # Create Lambda execution role
+   aws iam create-role \
+       --role-name ${LAMBDA_ROLE_NAME} \
+       --assume-role-policy-document file://lambda-trust-policy.json
+   
+   # Attach basic execution policy for CloudWatch Logs
+   aws iam attach-role-policy \
+       --role-name ${LAMBDA_ROLE_NAME} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   # Create policy for CloudWatch and SNS access
+   cat > lambda-permissions-policy.json << EOF
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "cloudwatch:PutMetricData"
+               ],
+               "Resource": "*"
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "sns:Publish"
+               ],
+               "Resource": "${SNS_TOPIC_ARN}"
+           }
+       ]
+   }
+   EOF
+   
+   aws iam put-role-policy \
+       --role-name ${LAMBDA_ROLE_NAME} \
+       --policy-name LambdaAnomalyProcessingPolicy \
+       --policy-document file://lambda-permissions-policy.json
+   
+   export LAMBDA_ROLE_ARN=$(aws iam get-role \
+       --role-name ${LAMBDA_ROLE_NAME} \
+       --query 'Role.Arn' --output text)
+   
+   echo "✅ Lambda execution role created"
+   ```
+
+   The Lambda execution role now has the minimum required permissions to process anomaly alerts and publish metrics, ensuring secure and compliant operation.
+
+4. **Create Java application for anomaly detection**:
 
    Apache Flink provides a powerful framework for stateful stream processing with event-time semantics and exactly-once processing guarantees. Our anomaly detection application leverages Flink's windowing capabilities to analyze transaction patterns over time, using ProcessWindowFunction for complex event processing that can maintain state across multiple transactions. This approach enables sophisticated pattern recognition while maintaining low latency, making it ideal for real-time fraud detection where every millisecond counts.
 
@@ -245,8 +324,10 @@ echo "✅ Environment prepared with unique identifiers"
    import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
    import org.apache.flink.streaming.api.windowing.time.Time;
    import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
-   import org.apache.flink.streaming.connectors.kinesis.FlinkKinesisConsumer;
-   import org.apache.flink.streaming.connectors.kinesis.config.ConsumerConfigConstants;
+   import org.apache.flink.connector.kinesis.source.KinesisSource;
+   import org.apache.flink.connector.kinesis.source.enumerator.KinesisShardSplitEnumerator;
+   import org.apache.flink.connector.kinesis.source.enumerator.KinesisStreamsSourceEnumeratorConfiguration;
+   import org.apache.flink.connector.aws.config.AWSConfigConstants;
    import org.apache.flink.util.Collector;
    import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
    import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
@@ -259,15 +340,21 @@ echo "✅ Environment prepared with unique identifiers"
        public static void main(String[] args) throws Exception {
            final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
            
-           // Configure Kinesis source
+           // Configure Kinesis source properties
            Properties kinesisConsumerConfig = new Properties();
-           kinesisConsumerConfig.setProperty(ConsumerConfigConstants.AWS_REGION, "us-east-1");
-           kinesisConsumerConfig.setProperty(ConsumerConfigConstants.STREAM_INITIAL_POSITION, "LATEST");
+           kinesisConsumerConfig.setProperty(AWSConfigConstants.AWS_REGION, 
+               System.getProperty("aws.region", "us-east-1"));
            
-           FlinkKinesisConsumer<String> kinesisSource = new FlinkKinesisConsumer<>(
-               "transaction-stream", new SimpleStringSchema(), kinesisConsumerConfig);
+           // Create Kinesis source
+           KinesisSource<String> kinesisSource = KinesisSource.<String>builder()
+               .setStreamName(System.getProperty("stream.name", "transaction-stream"))
+               .setDeserializationSchema(new SimpleStringSchema())
+               .setKinesisConsumerConfig(kinesisConsumerConfig)
+               .build();
            
-           DataStream<String> kinesisStream = env.addSource(kinesisSource);
+           DataStream<String> kinesisStream = env.fromSource(kinesisSource, 
+               org.apache.flink.api.common.eventtime.WatermarkStrategy.noWatermarks(), 
+               "Kinesis Source");
            
            // Parse JSON and extract transaction data
            DataStream<Tuple3<String, Double, Long>> transactions = kinesisStream
@@ -305,30 +392,45 @@ echo "✅ Environment prepared with unique identifiers"
                double sum = 0.0;
                int count = 0;
                double max = Double.MIN_VALUE;
+               double min = Double.MAX_VALUE;
                
                for (Tuple3<String, Double, Long> element : elements) {
                    sum += element.f1;
                    count++;
                    max = Math.max(max, element.f1);
+                   min = Math.min(min, element.f1);
                }
                
                if (count > 0) {
                    double avg = sum / count;
-                   double threshold = avg * 3; // Simple threshold-based anomaly detection
+                   double stdDev = calculateStandardDeviation(elements, avg);
+                   double threshold = avg + (2.5 * stdDev); // Statistical anomaly detection
                    
-                   if (max > threshold) {
+                   if (max > threshold && count >= 3) {
                        String anomaly = String.format(
-                           "ANOMALY DETECTED: User %s has transaction of %.2f (avg: %.2f, threshold: %.2f)",
-                           key, max, avg, threshold);
+                           "ANOMALY DETECTED: User %s has transaction of %.2f " +
+                           "(avg: %.2f, stddev: %.2f, threshold: %.2f, count: %d)",
+                           key, max, avg, stdDev, threshold, count);
                        out.collect(anomaly);
                    }
                }
+           }
+           
+           private double calculateStandardDeviation(
+               Iterable<Tuple3<String, Double, Long>> elements, double mean) {
+               double sum = 0.0;
+               int count = 0;
+               for (Tuple3<String, Double, Long> element : elements) {
+                   sum += Math.pow(element.f1 - mean, 2);
+                   count++;
+               }
+               return count > 1 ? Math.sqrt(sum / (count - 1)) : 0.0;
            }
        }
    }
    EOF
    
-   # Create Maven pom.xml
+   # Create Maven pom.xml with updated dependencies
    cat > anomaly-detection-app/pom.xml << 'EOF'
    <?xml version="1.0" encoding="UTF-8"?>
    <project xmlns="http://maven.apache.org/POM/4.0.0"
@@ -344,8 +446,8 @@ echo "✅ Environment prepared with unique identifiers"
        <properties>
            <maven.compiler.source>11</maven.compiler.source>
            <maven.compiler.target>11</maven.compiler.target>
-           <flink.version>1.17.1</flink.version>
-           <kinesis.version>1.15.4</kinesis.version>
+           <flink.version>1.19.1</flink.version>
+           <aws.connector.version>4.3.0</aws.connector.version>
        </properties>
        
        <dependencies>
@@ -353,16 +455,22 @@ echo "✅ Environment prepared with unique identifiers"
                <groupId>org.apache.flink</groupId>
                <artifactId>flink-streaming-java</artifactId>
                <version>${flink.version}</version>
+               <scope>provided</scope>
            </dependency>
            <dependency>
                <groupId>org.apache.flink</groupId>
-               <artifactId>flink-connector-kinesis</artifactId>
-               <version>${kinesis.version}</version>
+               <artifactId>flink-connector-aws-kinesis-streams</artifactId>
+               <version>${aws.connector.version}</version>
            </dependency>
            <dependency>
-               <groupId>com.amazonaws</groupId>
-               <artifactId>aws-java-sdk-kinesis</artifactId>
-               <version>1.12.261</version>
+               <groupId>org.apache.flink</groupId>
+               <artifactId>flink-connector-base</artifactId>
+               <version>${flink.version}</version>
+           </dependency>
+           <dependency>
+               <groupId>com.fasterxml.jackson.core</groupId>
+               <artifactId>jackson-databind</artifactId>
+               <version>2.15.2</version>
            </dependency>
        </dependencies>
        
@@ -371,13 +479,20 @@ echo "✅ Environment prepared with unique identifiers"
                <plugin>
                    <groupId>org.apache.maven.plugins</groupId>
                    <artifactId>maven-shade-plugin</artifactId>
-                   <version>3.2.4</version>
+                   <version>3.4.1</version>
                    <executions>
                        <execution>
                            <phase>package</phase>
                            <goals>
                                <goal>shade</goal>
                            </goals>
+                           <configuration>
+                               <transformers>
+                                   <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                       <mainClass>com.example.AnomalyDetectionApp</mainClass>
+                                   </transformer>
+                               </transformers>
+                           </configuration>
                        </execution>
                    </executions>
                </plugin>
@@ -386,12 +501,12 @@ echo "✅ Environment prepared with unique identifiers"
    </project>
    EOF
    
-   echo "✅ Flink application code created"
+   echo "✅ Flink application code created with updated dependencies"
    ```
 
-   The application implements a sliding window approach that analyzes user transaction patterns over 5-minute intervals. The ProcessWindowFunction enables complex aggregations and threshold-based anomaly detection, while maintaining state for each user to track their typical spending behavior.
+   The application implements a more sophisticated statistical anomaly detection approach using standard deviation to identify outliers. This sliding window analysis enables detection of transactions that deviate significantly from a user's normal spending patterns while reducing false positives through statistical rigor.
 
-4. **Build and upload the application**:
+5. **Build and upload the application**:
 
    The Maven build process compiles our Flink application and packages all dependencies into a single JAR file using the shade plugin. This "fat JAR" approach ensures that all required libraries are available at runtime within the Managed Service for Apache Flink environment. Storing the application in S3 enables version control and provides a durable deployment artifact that can be referenced by multiple Flink applications or versions.
 
@@ -413,14 +528,15 @@ echo "✅ Environment prepared with unique identifiers"
        
        # For demo purposes, create a placeholder
        echo "placeholder" > temp-app.jar
-       aws s3 cp temp-app.jar s3://${S3_BUCKET_NAME}/applications/anomaly-detection-1.0-SNAPSHOT.jar
+       aws s3 cp temp-app.jar \
+           s3://${S3_BUCKET_NAME}/applications/anomaly-detection-1.0-SNAPSHOT.jar
        rm temp-app.jar
    fi
    ```
 
    The application artifact is now stored in S3 and ready for deployment. The shaded JAR contains all Flink connectors and dependencies needed for Kinesis integration and stream processing.
 
-5. **Create Managed Service for Apache Flink application**:
+6. **Create Managed Service for Apache Flink application**:
 
    Managed Service for Apache Flink abstracts away the complexity of cluster management, automatic scaling, and fault recovery while providing enterprise-grade features like checkpointing and metrics collection. The application configuration defines runtime parameters including parallelism settings, checkpoint intervals, and monitoring levels. Proper configuration ensures optimal performance and reliability for continuous stream processing workloads.
 
@@ -435,7 +551,7 @@ echo "✅ Environment prepared with unique identifiers"
    {
        "ApplicationName": "${FLINK_APP_NAME}",
        "ApplicationDescription": "Real-time anomaly detection for transaction data",
-       "RuntimeEnvironment": "FLINK-1_17",
+       "RuntimeEnvironment": "FLINK-1_19",
        "ServiceExecutionRole": "${FLINK_ROLE_ARN}",
        "ApplicationConfiguration": {
            "ApplicationCodeConfiguration": {
@@ -452,8 +568,8 @@ echo "✅ Environment prepared with unique identifiers"
                    {
                        "PropertyGroupId": "kinesis.analytics.flink.run.options",
                        "PropertyMap": {
-                           "python.fn-execution.bundle.size": "1000",
-                           "python.fn-execution.bundle.time": "1000"
+                           "stream.name": "${STREAM_NAME}",
+                           "aws.region": "${AWS_REGION}"
                        }
                    }
                ]
@@ -488,9 +604,9 @@ echo "✅ Environment prepared with unique identifiers"
    echo "✅ Managed Service for Apache Flink application created"
    ```
 
-   The Flink application is now deployed and ready to process streaming data. The configuration enables automatic checkpointing every 60 seconds, ensuring fault tolerance and exactly-once processing guarantees even during system failures.
+   The Flink application is now deployed with the latest runtime environment (Flink 1.19) and ready to process streaming data. The configuration enables automatic checkpointing every 60 seconds, ensuring fault tolerance and exactly-once processing guarantees even during system failures.
 
-6. **Create Lambda function for anomaly alerting**:
+7. **Create Lambda function for anomaly alerting**:
 
    AWS Lambda provides a serverless compute platform perfect for event-driven anomaly response processing. This function acts as an intelligent router that receives anomaly notifications, enriches them with additional context, publishes metrics to CloudWatch for operational monitoring, and distributes alerts through SNS to appropriate stakeholders. The serverless model ensures cost-effective scaling and eliminates infrastructure management overhead.
 
@@ -522,7 +638,13 @@ echo "✅ Environment prepared with unique identifiers"
                            'MetricName': 'AnomalyCount',
                            'Value': 1,
                            'Unit': 'Count',
-                           'Timestamp': datetime.utcnow()
+                           'Timestamp': datetime.utcnow(),
+                           'Dimensions': [
+                               {
+                                   'Name': 'Source',
+                                   'Value': 'FlinkApp'
+                               }
+                           ]
                        }
                    ]
                )
@@ -545,23 +667,26 @@ echo "✅ Environment prepared with unique identifiers"
    # Create deployment package
    zip anomaly-processor.zip anomaly-processor.py
    
+   # Wait for role to be fully created
+   sleep 10
+   
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
-       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
+       --runtime python3.11 \
+       --role ${LAMBDA_ROLE_ARN} \
        --handler anomaly-processor.lambda_handler \
        --zip-file fileb://anomaly-processor.zip \
        --environment Variables="{SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}" \
        --timeout 60 \
-       --region ${AWS_REGION} || echo "Lambda creation failed - continuing with demo"
+       --region ${AWS_REGION}
    
    echo "✅ Lambda function for anomaly processing created"
    ```
 
    The Lambda function now serves as an intelligent anomaly processor, automatically converting detected anomalies into actionable alerts and operational metrics. This serverless approach ensures reliable alert delivery while maintaining cost efficiency.
 
-7. **Set up CloudWatch anomaly detection**:
+8. **Set up CloudWatch anomaly detection**:
 
    CloudWatch provides comprehensive monitoring and alerting capabilities essential for production anomaly detection systems. The anomaly detector uses machine learning algorithms to automatically establish baseline patterns for normal system behavior, while CloudWatch alarms trigger immediate notifications when thresholds are exceeded. This layered monitoring approach ensures both automated response to detected anomalies and operational visibility into system health and performance.
 
@@ -577,7 +702,7 @@ echo "✅ Environment prepared with unique identifiers"
    # Create CloudWatch alarm based on anomaly detection
    aws cloudwatch put-metric-alarm \
        --alarm-name "AnomalyDetectionAlarm" \
-       --alarm-description "Alarm for anomaly detection" \
+       --alarm-description "Alarm for anomaly detection threshold" \
        --metric-name "AnomalyCount" \
        --namespace "AnomalyDetection" \
        --statistic Sum \
@@ -586,6 +711,7 @@ echo "✅ Environment prepared with unique identifiers"
        --comparison-operator GreaterThanThreshold \
        --evaluation-periods 1 \
        --alarm-actions ${SNS_TOPIC_ARN} \
+       --dimensions Name=Source,Value=FlinkApp \
        --region ${AWS_REGION}
    
    echo "✅ CloudWatch anomaly detection and alarms configured"
@@ -593,7 +719,7 @@ echo "✅ Environment prepared with unique identifiers"
 
    The monitoring infrastructure now provides both real-time alerting and historical analysis capabilities. CloudWatch will automatically learn normal patterns and alert when anomaly detection rates deviate from expected baselines.
 
-8. **Create data generator for testing**:
+9. **Create data generator for testing**:
 
    Realistic test data is crucial for validating anomaly detection systems and ensuring proper alert thresholds. Our test data generator simulates typical e-commerce transaction patterns with a mix of normal and anomalous transactions, enabling comprehensive testing of the entire detection pipeline. The generator includes realistic transaction amounts, user distributions, and controlled anomaly injection to verify that our system can effectively distinguish between normal business fluctuations and genuine security threats.
 
@@ -662,29 +788,29 @@ echo "✅ Environment prepared with unique identifiers"
 
    The test data generator now provides controlled transaction streams with built-in anomaly patterns. This enables thorough testing of detection accuracy and alert timing under realistic conditions.
 
-9. **Start the Flink application**:
+10. **Start the Flink application**:
 
-   Starting the Flink application initiates real-time stream processing with automatic resource allocation and fault tolerance mechanisms. The AllowNonRestoredState configuration enables the application to start without requiring previous checkpoint data, which is essential for initial deployments. Once running, the application begins consuming data from Kinesis streams and processing transactions through our anomaly detection algorithms with sub-second latency.
+    Starting the Flink application initiates real-time stream processing with automatic resource allocation and fault tolerance mechanisms. The AllowNonRestoredState configuration enables the application to start without requiring previous checkpoint data, which is essential for initial deployments. Once running, the application begins consuming data from Kinesis streams and processing transactions through our anomaly detection algorithms with sub-second latency.
 
-   ```bash
-   # Start the Flink application
-   aws kinesisanalyticsv2 start-application \
-       --application-name ${FLINK_APP_NAME} \
-       --run-configuration '{"FlinkRunConfiguration": {"AllowNonRestoredState": true}}' \
-       --region ${AWS_REGION}
-   
-   # Check application status
-   aws kinesisanalyticsv2 describe-application \
-       --application-name ${FLINK_APP_NAME} \
-       --query 'ApplicationDetail.ApplicationStatus' \
-       --output text --region ${AWS_REGION}
-   
-   echo "✅ Flink application started"
-   ```
+    ```bash
+    # Start the Flink application
+    aws kinesisanalyticsv2 start-application \
+        --application-name ${FLINK_APP_NAME} \
+        --run-configuration '{"FlinkRunConfiguration": {"AllowNonRestoredState": true}}' \
+        --region ${AWS_REGION}
+    
+    # Check application status
+    aws kinesisanalyticsv2 describe-application \
+        --application-name ${FLINK_APP_NAME} \
+        --query 'ApplicationDetail.ApplicationStatus' \
+        --output text --region ${AWS_REGION}
+    
+    echo "✅ Flink application started"
+    ```
 
-   The anomaly detection system is now actively processing streaming transaction data. The application will automatically scale based on throughput and maintain processing state across any infrastructure failures.
+    The anomaly detection system is now actively processing streaming transaction data. The application will automatically scale based on throughput and maintain processing state across any infrastructure failures.
 
-10. **Subscribe to SNS notifications**:
+11. **Subscribe to SNS notifications**:
 
     SNS provides reliable, scalable message delivery for critical security alerts, ensuring that anomaly notifications reach appropriate stakeholders immediately regardless of system load. Email subscriptions offer a convenient way to receive alerts, but SNS also supports SMS, mobile push notifications, and webhook endpoints for integration with incident management systems. Proper subscription management ensures that security teams can respond quickly to potential threats while avoiding alert fatigue through appropriate filtering and escalation policies.
 
@@ -748,6 +874,7 @@ echo "✅ Environment prepared with unique identifiers"
        --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
        --period 300 \
        --statistics Sum \
+       --dimensions Name=Source,Value=FlinkApp \
        --region ${AWS_REGION}
    
    echo "✅ Metrics retrieved from CloudWatch"
@@ -774,6 +901,9 @@ echo "✅ Environment prepared with unique identifiers"
    aws kinesisanalyticsv2 stop-application \
        --application-name ${FLINK_APP_NAME} \
        --region ${AWS_REGION}
+   
+   # Wait for application to stop
+   sleep 30
    
    # Delete the application
    aws kinesisanalyticsv2 delete-application \
@@ -833,13 +963,24 @@ echo "✅ Environment prepared with unique identifiers"
        --topic-arn ${SNS_TOPIC_ARN} \
        --region ${AWS_REGION}
    
-   # Delete IAM role and policy
+   # Delete IAM role policies and roles
    aws iam delete-role-policy \
        --role-name FlinkAnomalyDetectionRole \
        --policy-name FlinkAnomalyDetectionPolicy
    
    aws iam delete-role \
        --role-name FlinkAnomalyDetectionRole
+   
+   aws iam delete-role-policy \
+       --role-name ${LAMBDA_ROLE_NAME} \
+       --policy-name LambdaAnomalyProcessingPolicy
+   
+   aws iam detach-role-policy \
+       --role-name ${LAMBDA_ROLE_NAME} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   aws iam delete-role \
+       --role-name ${LAMBDA_ROLE_NAME}
    
    echo "✅ SNS topic and IAM resources deleted"
    ```
@@ -860,30 +1001,37 @@ echo "✅ Environment prepared with unique identifiers"
 
 ## Discussion
 
-This real-time anomaly detection solution demonstrates the power of streaming analytics for identifying unusual patterns in high-velocity data streams. The architecture leverages AWS Managed Service for Apache Flink, which provides a fully managed environment for Apache Flink applications, eliminating the need to manage infrastructure while providing enterprise-grade features like automatic scaling, fault tolerance, and state management.
+This real-time anomaly detection solution demonstrates the power of streaming analytics for identifying unusual patterns in high-velocity data streams. The architecture leverages AWS Managed Service for Apache Flink, which provides a fully managed environment for Apache Flink applications, eliminating the need to manage infrastructure while providing enterprise-grade features like automatic scaling, fault tolerance, and state management. The updated implementation uses the latest Flink 1.19 runtime environment with improved Kinesis connectors for better performance and reliability.
 
-The anomaly detection implementation uses a simple statistical approach based on moving averages and thresholds, but can be enhanced with more sophisticated machine learning models. Apache Flink's ProcessWindowFunction allows for complex event processing and temporal pattern recognition, making it suitable for detecting various types of anomalies including point anomalies, contextual anomalies, and collective anomalies. The windowing approach enables the system to adapt to changing baseline patterns while maintaining low latency.
+The anomaly detection implementation uses a statistical approach based on standard deviation and dynamic thresholds, providing more sophisticated detection than simple threshold-based methods. Apache Flink's ProcessWindowFunction allows for complex event processing and temporal pattern recognition, making it suitable for detecting various types of anomalies including point anomalies, contextual anomalies, and collective anomalies. The windowing approach enables the system to adapt to changing baseline patterns while maintaining low latency through continuous processing.
 
-The integration with CloudWatch provides comprehensive monitoring and alerting capabilities, while SNS ensures that critical anomalies are immediately communicated to appropriate stakeholders. The solution's modular design allows for easy extension to support additional data sources, more complex detection algorithms, or different notification mechanisms. For production deployments, consider implementing data encryption, more granular access controls, and comprehensive logging for compliance requirements.
+The integration with CloudWatch provides comprehensive monitoring and alerting capabilities, while SNS ensures that critical anomalies are immediately communicated to appropriate stakeholders. The solution's modular design allows for easy extension to support additional data sources, more complex detection algorithms, or different notification mechanisms. For production deployments, consider implementing data encryption, more granular access controls, and comprehensive logging for compliance requirements as outlined in the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
-Cost optimization can be achieved by right-sizing the Flink application parallelism based on throughput requirements and using Kinesis Data Streams' on-demand scaling capabilities. The solution scales automatically based on data volume, making it suitable for businesses with varying transaction patterns.
+Cost optimization can be achieved by right-sizing the Flink application parallelism based on throughput requirements and using Kinesis Data Streams' on-demand scaling capabilities. The solution scales automatically based on data volume, making it suitable for businesses with varying transaction patterns. The improved Lambda execution role follows AWS security best practices by implementing least privilege access principles.
 
-> **Tip**: For production deployments, implement circuit breakers and backpressure handling to prevent system overload during traffic spikes. Consider using Kinesis Data Firehose for automatic data archiving to S3 for historical analysis and compliance requirements. See [AWS Kinesis Data Analytics Best Practices](https://docs.aws.amazon.com/kinesisanalytics/latest/java/best-practices.html) for additional optimization guidance.
+> **Tip**: For production deployments, implement circuit breakers and backpressure handling to prevent system overload during traffic spikes. Consider using Kinesis Data Firehose for automatic data archiving to S3 for historical analysis and compliance requirements. See [AWS Managed Service for Apache Flink Best Practices](https://docs.aws.amazon.com/managed-flink/latest/java/best-practices.html) for additional optimization guidance and the latest runtime environment features.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Advanced ML-based anomaly detection**: Integrate Amazon SageMaker to train and deploy custom anomaly detection models using algorithms like Isolation Forest or autoencoders, replacing the simple threshold-based approach.
+1. **Advanced ML-based anomaly detection**: Integrate Amazon SageMaker to train and deploy custom anomaly detection models using algorithms like Isolation Forest or autoencoders, replacing the statistical threshold-based approach with more sophisticated machine learning techniques.
 
-2. **Multi-dimensional anomaly detection**: Enhance the detection logic to consider multiple attributes simultaneously (amount, frequency, location, merchant type) and detect complex patterns that simple univariate methods might miss.
+2. **Multi-dimensional anomaly detection**: Enhance the detection logic to consider multiple attributes simultaneously (amount, frequency, location, merchant type, time patterns) and detect complex patterns that simple univariate methods might miss, utilizing Flink's CEP (Complex Event Processing) library.
 
-3. **Real-time dashboards**: Create interactive dashboards using Amazon QuickSight or Grafana that display real-time anomaly detection metrics, trends, and alert statistics with drill-down capabilities.
+3. **Real-time dashboards**: Create interactive dashboards using Amazon QuickSight or Amazon Managed Grafana that display real-time anomaly detection metrics, trends, and alert statistics with drill-down capabilities and automated refresh.
 
-4. **Automated response system**: Implement AWS Step Functions workflows that automatically respond to different types of anomalies, such as temporarily freezing accounts, triggering additional authentication, or escalating to human operators.
+4. **Automated response system**: Implement AWS Step Functions workflows that automatically respond to different types of anomalies, such as temporarily freezing accounts, triggering additional authentication, or escalating to human operators based on severity levels.
 
-5. **Cross-account detection**: Extend the architecture to support anomaly detection across multiple AWS accounts using cross-account IAM roles and centralized monitoring, enabling enterprise-wide fraud detection capabilities.
+5. **Cross-account detection**: Extend the architecture to support anomaly detection across multiple AWS accounts using cross-account IAM roles and centralized monitoring with AWS Control Tower, enabling enterprise-wide fraud detection capabilities.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

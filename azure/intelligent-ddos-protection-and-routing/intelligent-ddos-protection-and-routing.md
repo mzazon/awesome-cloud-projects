@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure DDoS Protection, Azure Route Server, Azure Network Watcher, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: network-security, ddos-protection, route-server, bgp, adaptive-routing, network-monitoring
 recipe-generator-version: 1.3
@@ -86,9 +86,9 @@ graph TB
 2. Azure CLI v2.50.0 or later installed and configured (or Azure Cloud Shell)
 3. Basic understanding of Azure networking concepts (VNets, subnets, BGP routing)
 4. Familiarity with network security principles and DDoS attack patterns
-5. Estimated cost: $150-200 per month for DDoS Protection Standard plus compute and networking costs
+5. Estimated cost: $2,944 per month for DDoS Network Protection plus compute and networking costs
 
-> **Note**: Azure DDoS Protection Standard pricing includes a monthly fixed fee plus per-protected public IP costs. Review the [Azure DDoS Protection pricing](https://azure.microsoft.com/pricing/details/ddos-protection/) before deployment.
+> **Note**: Azure DDoS Protection Network Protection pricing includes a monthly fixed fee that covers up to 100 protected public IP addresses. Review the [Azure DDoS Protection pricing](https://azure.microsoft.com/pricing/details/ddos-protection/) before deployment.
 
 ## Preparation
 
@@ -129,7 +129,7 @@ echo "✅ Resource providers registered"
 
 1. **Create DDoS Protection Plan**:
 
-   Azure DDoS Protection Standard provides enhanced DDoS mitigation capabilities beyond the basic protection included with Azure platform. It offers always-on traffic monitoring, adaptive real-time tuning, and DDoS mitigation analytics with cost protection and attack analytics. This managed service automatically scales protection based on traffic patterns and provides detailed telemetry for security analysis.
+   Azure DDoS Protection Network Protection provides enhanced DDoS mitigation capabilities beyond the basic protection included with Azure platform. It offers always-on traffic monitoring, adaptive real-time tuning, and DDoS mitigation analytics with cost protection and attack analytics. This managed service automatically scales protection based on traffic patterns and provides detailed telemetry for security analysis.
 
    ```bash
    # Create DDoS Protection Plan
@@ -189,7 +189,7 @@ echo "✅ Resource providers registered"
    echo "✅ Hub VNet created with DDoS Protection enabled"
    ```
 
-   The hub virtual network is now configured with DDoS Protection Standard and specialized subnets for network services. This architecture provides centralized security monitoring and control while enabling dynamic routing capabilities through Azure Route Server.
+   The hub virtual network is now configured with DDoS Protection Network Protection and specialized subnets for network services. This architecture provides centralized security monitoring and control while enabling dynamic routing capabilities through Azure Route Server.
 
 3. **Create Spoke Virtual Network and Application Resources**:
 
@@ -322,7 +322,6 @@ echo "✅ Resource providers registered"
        --name "allow-web-traffic" \
        --protocols TCP \
        --resource-group ${RESOURCE_GROUP} \
-       --rule-type NetworkRule \
        --source-addresses 10.1.0.0/16 \
        --action Allow \
        --priority 100
@@ -362,7 +361,7 @@ echo "✅ Resource providers registered"
    Network Watcher provides network monitoring, diagnostics, and analytics capabilities that are essential for understanding traffic patterns and detecting anomalies. Flow logs capture detailed information about network traffic, enabling security analysis and compliance reporting.
 
    ```bash
-   # Enable Network Watcher
+   # Enable Network Watcher (automatically enabled per region)
    az network watcher configure \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
@@ -377,31 +376,38 @@ echo "✅ Resource providers registered"
        --sku Standard_LRS \
        --kind StorageV2
    
-   # Get Network Security Group ID for spoke network
-   NSG_ID=$(az network nsg list \
+   # Create Network Security Group for spoke subnet
+   az network nsg create \
+       --name "nsg-spoke-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
-       --query "[?contains(name,'${SPOKE_VNET_NAME}')].id" \
-       --output tsv)
+       --location ${LOCATION}
    
-   # Configure flow logs if NSG exists
-   if [ ! -z "$NSG_ID" ]; then
-       az network watcher flow-log create \
-           --name "flowlog-${RANDOM_SUFFIX}" \
-           --resource-group ${RESOURCE_GROUP} \
-           --location ${LOCATION} \
-           --nsg ${NSG_ID} \
-           --storage-account ${STORAGE_ACCOUNT} \
-           --workspace ${WORKSPACE_ID} \
-           --enabled true \
-           --format JSON \
-           --log-version 2
-       
-       echo "✅ Flow logs configured for network monitoring"
-   else
-       echo "ℹ️ No NSG found, skipping flow log configuration"
-   fi
+   # Associate NSG with spoke application subnet
+   az network vnet subnet update \
+       --name ApplicationSubnet \
+       --resource-group ${RESOURCE_GROUP} \
+       --vnet-name ${SPOKE_VNET_NAME} \
+       --network-security-group "nsg-spoke-${RANDOM_SUFFIX}"
    
-   echo "✅ Network Watcher enabled and configured"
+   # Get Network Security Group ID
+   NSG_ID=$(az network nsg show \
+       --name "nsg-spoke-${RANDOM_SUFFIX}" \
+       --resource-group ${RESOURCE_GROUP} \
+       --query id --output tsv)
+   
+   # Configure flow logs
+   az network watcher flow-log create \
+       --name "flowlog-${RANDOM_SUFFIX}" \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --nsg ${NSG_ID} \
+       --storage-account ${STORAGE_ACCOUNT} \
+       --workspace ${WORKSPACE_ID} \
+       --enabled true \
+       --format JSON \
+       --log-version 2
+   
+   echo "✅ Network Watcher and flow logs configured"
    ```
 
    Network Watcher is now active and capturing detailed network telemetry. This provides comprehensive visibility into network traffic patterns and enables advanced security analytics for threat detection and response.
@@ -418,9 +424,9 @@ echo "✅ Resource providers registered"
        --short-name "ddos-ag" \
        --tags purpose=ddos-alerting
    
-   # Get DDoS Protection Plan resource ID
-   DDOS_RESOURCE_ID=$(az network ddos-protection show \
-       --name ${DDOS_PLAN_NAME} \
+   # Get public IP resource ID for monitoring
+   PUBLIC_IP_ID=$(az network public-ip show \
+       --name "pip-${FIREWALL_NAME}" \
        --resource-group ${RESOURCE_GROUP} \
        --query id --output tsv)
    
@@ -428,8 +434,8 @@ echo "✅ Resource providers registered"
    az monitor metrics alert create \
        --name "DDoS-Attack-Alert" \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes ${DDOS_RESOURCE_ID} \
-       --condition "avg DDoSAttack > 0" \
+       --scopes ${PUBLIC_IP_ID} \
+       --condition "avg 'Under DDoS attack or not' > 0" \
        --window-size 5m \
        --evaluation-frequency 1m \
        --severity 1 \
@@ -440,8 +446,8 @@ echo "✅ Resource providers registered"
    az monitor metrics alert create \
        --name "High-Traffic-Volume-Alert" \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes ${DDOS_RESOURCE_ID} \
-       --condition "avg PacketsInboundTotal > 100000" \
+       --scopes ${PUBLIC_IP_ID} \
+       --condition "avg 'Packets inbound DDoS' > 100000" \
        --window-size 5m \
        --evaluation-frequency 1m \
        --severity 2 \
@@ -485,14 +491,15 @@ echo "✅ Resource providers registered"
        --query "provisioningState" \
        --output table
    
-   # List Route Server learned routes
-   az network routeserver peering list-learned-routes \
+   # Get Route Server details for BGP configuration
+   az network routeserver show \
        --name ${ROUTE_SERVER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --peering-name "bgp-peer" || echo "No BGP peers configured yet"
+       --query "{ASN:virtualRouterAsn,IPs:virtualRouterIps}" \
+       --output table
    ```
 
-   Expected output: `ProvisioningState: Succeeded`
+   Expected output: `ProvisioningState: Succeeded` with BGP ASN and IP addresses displayed
 
 3. **Validate Network Monitoring**:
 
@@ -500,6 +507,7 @@ echo "✅ Resource providers registered"
    # Check Network Watcher status
    az network watcher show \
        --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
        --query "provisioningState" \
        --output table
    
@@ -641,11 +649,11 @@ echo "✅ Resource providers registered"
 
 ## Discussion
 
-Azure DDoS Protection Standard and Azure Route Server create a powerful combination for adaptive network security that automatically responds to evolving threats. This architecture provides always-on traffic monitoring with machine learning-based attack detection that can distinguish between legitimate traffic spikes and malicious DDoS attacks. The integration with Azure Route Server enables dynamic traffic routing through security appliances, allowing the network to adapt routing policies based on real-time threat intelligence and network conditions. For comprehensive guidance on DDoS protection strategies, see the [Azure DDoS Protection documentation](https://docs.microsoft.com/en-us/azure/ddos-protection/) and [Azure Route Server best practices](https://docs.microsoft.com/en-us/azure/route-server/route-server-faq).
+Azure DDoS Protection Network Protection and Azure Route Server create a powerful combination for adaptive network security that automatically responds to evolving threats. This architecture provides always-on traffic monitoring with machine learning-based attack detection that can distinguish between legitimate traffic spikes and malicious DDoS attacks. The integration with Azure Route Server enables dynamic traffic routing through security appliances, allowing the network to adapt routing policies based on real-time threat intelligence and network conditions. For comprehensive guidance on DDoS protection strategies, see the [Azure DDoS Protection documentation](https://docs.microsoft.com/en-us/azure/ddos-protection/) and [Azure Route Server configuration guide](https://docs.microsoft.com/en-us/azure/route-server/configure-route-server).
 
 The BGP-based routing capabilities of Azure Route Server provide significant advantages for network security operations by enabling automatic route propagation and network convergence during security incidents. When DDoS attacks are detected, the system can automatically reroute traffic through additional security appliances or redirect traffic to scrubbing centers. This approach follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/security/) principles of defense in depth and automated response to security threats.
 
-From a cost optimization perspective, Azure DDoS Protection Standard provides cost protection guarantees that can offset the monthly service fees during large-scale attacks. The service includes DDoS Rapid Response support and detailed attack analytics that provide valuable insights for improving security posture. Azure Route Server eliminates the operational overhead of manually managing route tables and enables more efficient use of network virtual appliances through dynamic load balancing. For detailed cost analysis and optimization strategies, review the [Azure DDoS Protection pricing guide](https://azure.microsoft.com/pricing/details/ddos-protection/) and [Azure Route Server pricing](https://azure.microsoft.com/pricing/details/route-server/).
+From a cost optimization perspective, Azure DDoS Protection Network Protection provides cost protection guarantees that can offset the monthly service fees during large-scale attacks. The service includes DDoS Rapid Response support and detailed attack analytics that provide valuable insights for improving security posture. Azure Route Server eliminates the operational overhead of manually managing route tables and enables more efficient use of network virtual appliances through dynamic load balancing. For detailed cost analysis and optimization strategies, review the [Azure DDoS Protection pricing guide](https://azure.microsoft.com/pricing/details/ddos-protection/) and [Azure Route Server pricing](https://azure.microsoft.com/pricing/details/route-server/).
 
 > **Tip**: Use Azure Network Watcher and Azure Monitor to continuously analyze traffic patterns and fine-tune DDoS protection policies. The [Azure Network Watcher documentation](https://docs.microsoft.com/en-us/azure/network-watcher/) provides comprehensive guidance on network monitoring and diagnostic capabilities that complement your adaptive security architecture.
 
@@ -655,9 +663,9 @@ Extend this adaptive network security solution by implementing these enhancement
 
 1. **Multi-Region Deployment**: Deploy the solution across multiple Azure regions with cross-region traffic routing and failover capabilities for enhanced resilience during large-scale attacks.
 
-2. **Integration with Azure Sentinel**: Connect DDoS Protection logs and Route Server telemetry to Azure Sentinel for advanced threat hunting and security orchestration with automated response playbooks.
+2. **Integration with Microsoft Sentinel**: Connect DDoS Protection logs and Route Server telemetry to Microsoft Sentinel for advanced threat hunting and security orchestration with automated response playbooks.
 
-3. **Custom BGP Routing Logic**: Implement custom network virtual appliances that dynamically adjust BGP route advertisements based on security threat levels and traffic analysis.
+3. **Custom BGP Routing Logic**: Implement custom network virtual appliances that dynamically adjust BGP route advertisements based on security threat levels and traffic analysis using Azure Route Server peering.
 
 4. **Application-Layer Protection**: Integrate Azure Web Application Firewall and Azure Front Door with your adaptive routing architecture to provide comprehensive protection across all layers of the network stack.
 
@@ -665,4 +673,9 @@ Extend this adaptive network security solution by implementing these enhancement
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

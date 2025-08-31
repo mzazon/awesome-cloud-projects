@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: API Gateway, Lambda, IAM, CloudWatch
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: api-gateway, lambda, authorizers, serverless, security, authentication, authorization
 recipe-generator-version: 1.3
@@ -250,7 +250,7 @@ echo "Request Authorizer: $REQUEST_AUTH_FUNCTION"
    # Create token authorizer Lambda function
    aws lambda create-function \
        --function-name $TOKEN_AUTH_FUNCTION \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $ROLE_ARN \
        --handler token_authorizer.lambda_handler \
        --zip-file fileb://token-authorizer.zip \
@@ -363,7 +363,7 @@ echo "Request Authorizer: $REQUEST_AUTH_FUNCTION"
    # Create request authorizer Lambda function
    aws lambda create-function \
        --function-name $REQUEST_AUTH_FUNCTION \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $ROLE_ARN \
        --handler request_authorizer.lambda_handler \
        --zip-file fileb://request-authorizer.zip \
@@ -465,7 +465,7 @@ echo "Request Authorizer: $REQUEST_AUTH_FUNCTION"
    zip protected-api.zip protected_api.py
    aws lambda create-function \
        --function-name $PROTECTED_FUNCTION \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $ROLE_ARN \
        --handler protected_api.lambda_handler \
        --zip-file fileb://protected-api.zip \
@@ -475,7 +475,7 @@ echo "Request Authorizer: $REQUEST_AUTH_FUNCTION"
    zip public-api.zip public_api.py
    aws lambda create-function \
        --function-name $PUBLIC_FUNCTION \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $ROLE_ARN \
        --handler public_api.lambda_handler \
        --zip-file fileb://public-api.zip \
@@ -701,23 +701,42 @@ echo "Request Authorizer: $REQUEST_AUTH_FUNCTION"
     
     # Test public endpoint (no authorization required)
     echo "=== Testing Public Endpoint ==="
-    curl -s "$API_URL/public" | jq .
+    curl -s "$API_URL/public" | jq . || (
+        echo "jq not available, showing raw output:"
+        curl -s "$API_URL/public"
+    )
     
     # Test protected endpoint with valid token
     echo "=== Testing Protected Endpoint with Valid Token ==="
-    curl -s -H "Authorization: Bearer user-token" "$API_URL/protected" | jq .
+    curl -s -H "Authorization: Bearer user-token" "$API_URL/protected" | \
+        jq . || (
+        echo "jq not available, showing raw output:"
+        curl -s -H "Authorization: Bearer user-token" "$API_URL/protected"
+    )
     
     # Test protected endpoint with admin token
     echo "=== Testing Protected Endpoint with Admin Token ==="
-    curl -s -H "Authorization: Bearer admin-token" "$API_URL/protected" | jq .
+    curl -s -H "Authorization: Bearer admin-token" "$API_URL/protected" | \
+        jq . || (
+        echo "jq not available, showing raw output:"
+        curl -s -H "Authorization: Bearer admin-token" "$API_URL/protected"
+    )
     
     # Test admin endpoint with API key
     echo "=== Testing Admin Endpoint with API Key ==="
-    curl -s "$API_URL/protected/admin?api_key=secret-api-key-123" | jq .
+    curl -s "$API_URL/protected/admin?api_key=secret-api-key-123" | \
+        jq . || (
+        echo "jq not available, showing raw output:"
+        curl -s "$API_URL/protected/admin?api_key=secret-api-key-123"
+    )
     
     # Test admin endpoint with custom header
     echo "=== Testing Admin Endpoint with Custom Header ==="
-    curl -s -H "X-Custom-Auth: custom-auth-value" "$API_URL/protected/admin" | jq .
+    curl -s -H "X-Custom-Auth: custom-auth-value" "$API_URL/protected/admin" | \
+        jq . || (
+        echo "jq not available, showing raw output:"
+        curl -s -H "X-Custom-Auth: custom-auth-value" "$API_URL/protected/admin"
+    )
     
     # Test unauthorized access
     echo "=== Testing Unauthorized Access ==="
@@ -833,13 +852,13 @@ This recipe demonstrates sophisticated API authorization patterns using Lambda a
 
 **Caching Strategy** is critical for production performance, as API Gateway caches authorizer responses based on the identity source configuration. The TTL setting balances security freshness with performance optimization. For TOKEN authorizers, the cache key is the token value, while REQUEST authorizers use a combination of all identity source values. Understanding this caching behavior is essential for designing effective authorization patterns.
 
-The combination of these patterns with Lambda's serverless execution model provides scalable, cost-effective API security that can handle varying load patterns without infrastructure management overhead. The solution integrates seamlessly with AWS monitoring and logging services, enabling comprehensive security audit trails and performance optimization.
+The combination of these patterns with Lambda's serverless execution model provides scalable, cost-effective API security that can handle varying load patterns without infrastructure management overhead. The solution integrates seamlessly with AWS monitoring and logging services, enabling comprehensive security audit trails and performance optimization. This approach aligns with AWS Well-Architected Framework security principles by implementing defense-in-depth strategies and following least-privilege access patterns throughout the authorization workflow.
 
 > **Note**: Lambda authorizers support context passing, allowing you to inject user attributes, permissions, and custom data into downstream Lambda functions. See the [API Gateway Lambda Authorizer documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-lambda-authorizer-lambda-function-create.html) for advanced context usage patterns.
 
 > **Tip**: Use different TTL values for different security levels - shorter TTL for high-security endpoints and longer TTL for less sensitive resources to optimize performance.
 
-> **Warning**: Always validate tokens cryptographically in production environments. The simplified validation in this recipe is for demonstration purposes only.
+> **Warning**: Always validate tokens cryptographically in production environments. The simplified validation in this recipe is for demonstration purposes only. See the [AWS Lambda authorizer input and output documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-lambda-authorizer-input.html) for proper token validation patterns.
 
 ## Challenge
 
@@ -857,4 +876,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

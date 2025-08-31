@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AWS Glue DataBrew, Amazon EventBridge, Amazon S3, AWS Lambda
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-quality, automation, etl, event-driven, analytics
 recipe-generator-version: 1.3
@@ -352,10 +352,10 @@ echo "✅ S3 bucket and sample data created successfully"
    # Wait for role propagation
    sleep 10
    
-   # Create Lambda function
+   # Create Lambda function with current Python runtime
    LAMBDA_FUNCTION_ARN=$(aws lambda create-function \
        --function-name DataQualityProcessor-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda-function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
@@ -660,4 +660,11 @@ Extend this solution by implementing these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

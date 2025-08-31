@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure API Center, Azure AI Services, Azure API Management, Azure Monitor
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: api-management, ai-integration, lifecycle-management, anomaly-detection
 recipe-generator-version: 1.3
@@ -74,17 +74,18 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions to create resources
-2. Azure CLI v2.55.0 or later installed and configured (or use Azure Cloud Shell)
-3. Basic understanding of API management concepts and REST APIs
-4. Azure API Management instance (optional, for runtime integration)
-5. Estimated cost: ~$50-100/month for minimal production setup
+2. Azure CLI v2.57.0 or later installed and configured (or use Azure Cloud Shell)
+3. Azure CLI API Center extension (apic-extension) - automatically installed on first use
+4. Basic understanding of API management concepts and REST APIs
+5. Azure API Management instance (optional, for runtime integration)
+6. Estimated cost: ~$50-100/month for minimal production setup
 
 > **Note**: Azure API Center offers both Free and Standard plans. This recipe uses the Free plan for demonstration, but production workloads should use the Standard plan for advanced features.
 
 ## Preparation
 
 ```bash
-# Set environment variables
+# Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-api-lifecycle-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
@@ -115,13 +116,13 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
    ```bash
    # Create API Center instance (Free tier)
-   az apic service create \
+   az apic create \
        --name ${API_CENTER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION}
    
    # Store API Center resource ID
-   API_CENTER_ID=$(az apic service show \
+   API_CENTER_ID=$(az apic show \
        --name ${API_CENTER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query id --output tsv)
@@ -137,10 +138,11 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
    ```bash
    # Create custom metadata schema for API classification
-   az apic metadata-schema create \
+   az apic metadata create \
        --resource-group ${RESOURCE_GROUP} \
        --service-name ${API_CENTER_NAME} \
-       --metadata-schema-name "api-lifecycle" \
+       --metadata-name "api-lifecycle" \
+       --assignments '[{"entity":"api","required":true,"deprecated":false}]' \
        --schema '{
          "type": "object",
          "properties": {
@@ -162,6 +164,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ Metadata schema configured for lifecycle management"
    ```
 
+   The metadata schema now enables consistent API classification across your organization. This standardization facilitates better API discovery and governance by allowing developers to filter and search APIs based on their specific requirements and access levels.
+
 3. **Deploy Azure OpenAI for Documentation Generation**:
 
    Azure OpenAI Service provides advanced language models that can automatically generate and enhance API documentation based on OpenAPI specifications. This AI-powered approach ensures documentation stays current with API changes and maintains consistency across all APIs. The GPT-4 model excels at understanding API structures and generating human-readable descriptions.
@@ -182,9 +186,10 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --resource-group ${RESOURCE_GROUP} \
        --deployment-name "gpt-4" \
        --model-name "gpt-4" \
-       --model-version "0613" \
+       --model-version "turbo-2024-04-09" \
        --model-format OpenAI \
-       --scale-settings-scale-type "Standard"
+       --sku-capacity "10" \
+       --sku-name "Standard"
    
    # Get OpenAI endpoint and key
    OPENAI_ENDPOINT=$(az cognitiveservices account show \
@@ -229,6 +234,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ Monitoring infrastructure deployed"
    ```
 
+   Azure Monitor and Application Insights are now configured to provide comprehensive observability for your API ecosystem. This monitoring foundation enables proactive performance management and automated anomaly detection across all your APIs.
+
 5. **Register Sample APIs in API Center**:
 
    Registering APIs in API Center creates a comprehensive inventory that includes API definitions, versions, and deployment information. This registration process supports various API specification formats including OpenAPI, GraphQL, and gRPC. Each API can have multiple versions and deployments, reflecting real-world API evolution and multi-environment scenarios.
@@ -259,14 +266,12 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --api-id "customer-api" \
        --version-id "v1" \
        --definition-id "openapi" \
-       --title "OpenAPI Definition" \
-       --specification '{
-         "name": "openapi",
-         "version": "3.0.0"
-       }'
+       --title "OpenAPI Definition"
    
    echo "✅ Sample API registered in API Center"
    ```
+
+   The sample API is now registered in your API Center with proper versioning and definition management. This demonstrates how APIs can be catalogued and governed throughout their lifecycle, from initial design to production deployment.
 
 6. **Configure API Import from Azure API Management**:
 
@@ -282,12 +287,38 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --publisher-name "Contoso" \
        --sku-name Consumption
    
+   # Enable system-assigned managed identity for API Center
+   az apic update \
+       --name ${API_CENTER_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --identity '{"type": "SystemAssigned"}'
+   
+   # Get the principal ID of the identity
+   APIC_PRINCIPAL_ID=$(az apic show \
+       --name ${API_CENTER_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query "identity.principalId" --output tsv)
+   
+   # Get API Management resource ID
+   APIM_ID=$(az apim show \
+       --name ${APIM_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query "id" --output tsv)
+   
+   # Assign API Management Service Reader role
+   az role assignment create \
+       --role "API Management Service Reader Role" \
+       --assignee-object-id ${APIC_PRINCIPAL_ID} \
+       --assignee-principal-type ServicePrincipal \
+       --scope ${APIM_ID}
+   
    # Import APIs from API Management to API Center
    az apic import-from-apim \
-       --resource-group ${RESOURCE_GROUP} \
        --service-name ${API_CENTER_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
        --apim-name ${APIM_NAME} \
-       --apim-resource-group ${RESOURCE_GROUP}
+       --apim-resource-group ${RESOURCE_GROUP} \
+       --apim-apis '*'
    
    echo "✅ API Management integration configured"
    ```
@@ -321,6 +352,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ API Portal infrastructure prepared"
    ```
 
+   The portal infrastructure is now configured to support API discovery and self-service consumption. Developers can use this portal to explore available APIs, understand their capabilities, and access documentation and usage examples.
+
 8. **Implement Anomaly Detection for API Metrics**:
 
    Azure Anomaly Detector uses advanced machine learning to identify unusual patterns in API performance metrics without requiring manual threshold configuration. This proactive monitoring approach helps identify issues like traffic spikes, latency increases, or error rate anomalies before they impact API consumers. The service learns from historical patterns to provide increasingly accurate detection.
@@ -332,8 +365,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --kind AnomalyDetector \
-       --sku F0 \
-       --custom-domain "anomaly-${RANDOM_SUFFIX}"
+       --sku F0
    
    # Configure metric alerts with anomaly detection
    az monitor metrics alert create \
@@ -348,49 +380,58 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ Anomaly detection configured for API monitoring"
    ```
 
+   Anomaly detection is now configured to proactively monitor your API metrics and identify performance issues before they impact users. This intelligent monitoring complements traditional threshold-based alerts with machine learning-powered insights.
+
 9. **Set Up Automated Documentation Pipeline**:
 
    Automation ensures API documentation remains synchronized with API definitions and includes AI-enhanced descriptions. This pipeline monitors API definition changes and triggers documentation regeneration using Azure OpenAI. The automated approach eliminates manual documentation maintenance while ensuring consistency and completeness across all APIs.
 
    ```bash
-   # Create Logic App for documentation automation
+   # Create a simple Logic App workflow definition file
    LOGIC_APP_NAME="logic-${RANDOM_SUFFIX}"
+   
+   # Create workflow definition file
+   cat > workflow-definition.json << 'EOF'
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {},
+  "triggers": {
+    "manual": {
+      "type": "Request",
+      "kind": "Http",
+      "inputs": {
+        "schema": {}
+      }
+    }
+  },
+  "actions": {
+    "Generate_Documentation": {
+      "type": "Http",
+      "inputs": {
+        "method": "POST",
+        "uri": "https://example.com/webhook",
+        "body": {
+          "message": "API documentation update triggered"
+        }
+      }
+    }
+  },
+  "outputs": {}
+}
+EOF
+   
+   # Create Logic App with workflow definition
    az logic workflow create \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --definition '{
-         "definition": {
-           "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-           "triggers": {
-             "When_API_Updated": {
-               "type": "ApiConnection",
-               "inputs": {
-                 "host": {
-                   "connection": {
-                     "name": "@parameters('\''$connections'\'')['\''apicenter'\''].connectionId"
-                   }
-                 }
-               }
-             }
-           },
-           "actions": {
-             "Generate_Documentation": {
-               "type": "Http",
-               "inputs": {
-                 "method": "POST",
-                 "uri": "@concat('\''https://api.openai.com/v1/completions'\'')",
-                 "headers": {
-                   "Authorization": "Bearer @{parameters('\''OpenAIKey'\'')}"
-                 }
-               }
-             }
-           }
-         }
-       }'
+       --definition "@workflow-definition.json"
    
    echo "✅ Documentation automation pipeline created"
    ```
+
+   The automated documentation pipeline is now configured to trigger when API definitions change. This ensures that documentation remains current and consistent across all APIs in your organization.
 
 ## Validation & Testing
 
@@ -416,12 +457,17 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 2. Test Azure OpenAI documentation generation:
 
    ```bash
-   # Test OpenAI endpoint
-   curl -X POST ${OPENAI_ENDPOINT}/openai/deployments/gpt-4/completions \
+   # Test OpenAI endpoint using the new Chat Completions API
+   curl -X POST "${OPENAI_ENDPOINT}/openai/deployments/gpt-4/chat/completions?api-version=2024-02-15-preview" \
        -H "Content-Type: application/json" \
        -H "api-key: ${OPENAI_KEY}" \
        -d '{
-         "prompt": "Generate API documentation for a customer management endpoint",
+         "messages": [
+           {
+             "role": "user",
+             "content": "Generate API documentation for a customer management endpoint"
+           }
+         ],
          "max_tokens": 100
        }'
    ```
@@ -463,15 +509,19 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    az group exists --name ${RESOURCE_GROUP}
    ```
 
-3. Clean up local environment variables:
+3. Clean up local environment variables and temporary files:
 
    ```bash
    # Unset environment variables
    unset RESOURCE_GROUP LOCATION API_CENTER_NAME
    unset OPENAI_NAME MONITOR_WORKSPACE APIM_NAME
-   unset RANDOM_SUFFIX API_CENTER_ID
+   unset RANDOM_SUFFIX API_CENTER_ID APIC_PRINCIPAL_ID APIM_ID
+   unset OPENAI_ENDPOINT OPENAI_KEY APP_INSIGHTS_CONNECTION
    
-   echo "✅ Environment variables cleaned up"
+   # Remove temporary workflow definition file
+   rm -f workflow-definition.json
+   
+   echo "✅ Environment variables and temporary files cleaned up"
    ```
 
 ## Discussion
@@ -500,4 +550,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

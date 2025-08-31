@@ -4,12 +4,12 @@ id: d7852541
 category: containers
 difficulty: 300
 subject: aws
-services: eks,app,mesh,cloudwatch,ecr
+services: EKS, App Mesh, ECR, CloudWatch
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: eks,app-mesh,microservices,service-mesh,containers,kubernetes,observability
 recipe-generator-version: 1.3
@@ -19,7 +19,7 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Enterprise organizations with distributed microservices face increasing complexity in managing service-to-service communication, observability, and security. Traditional monolithic applications that have been decomposed into dozens of microservices create operational challenges including network latency issues, service discovery complexity, and lack of visibility into traffic patterns and failures. Without proper service mesh infrastructure, teams struggle to implement consistent security policies, traffic management, and observability across their microservices architecture.
+Enterprise organizations with distributed microservices face increasing complexity in managing service-to-service communication, observability, and security. Traditional monolithic applications decomposed into dozens of microservices create operational challenges including network latency issues, service discovery complexity, and lack of visibility into traffic patterns and failures. Without proper service mesh infrastructure, teams struggle to implement consistent security policies, traffic management, and observability across their microservices architecture.
 
 ## Solution
 
@@ -102,17 +102,17 @@ graph TB
 ## Prerequisites
 
 1. AWS account with appropriate permissions for EKS, App Mesh, IAM, and CloudWatch
-2. AWS CLI v2 installed and configured (minimum version 2.0.38)
-3. kubectl client installed and configured
-4. eksctl CLI tool installed (version 0.100.0 or later)
-5. Helm v3 installed (version 3.0 or later)
+2. AWS CLI v2 installed and configured (minimum version 2.15.0)
+3. kubectl client installed and configured (version 1.28+)
+4. eksctl CLI tool installed (version 0.170.0 or later)
+5. Helm v3 installed (version 3.8 or later)
 6. Docker installed for building container images
 7. Basic understanding of Kubernetes concepts and microservices architecture
 8. Estimated cost: $150-200 for 4 hours of testing (EKS cluster $0.10/hour, EC2 instances $0.50-1.00/hour depending on instance types)
 
-> **Note**: This recipe creates an EKS cluster with managed node groups and deploys multiple microservices with App Mesh, which will incur charges for compute resources, load balancers, and data transfer. See the [EKS pricing documentation](https://aws.amazon.com/eks/pricing/) for detailed cost information.
-
 > **Warning**: App Mesh will reach end of support on September 30, 2026. AWS recommends migrating to Amazon ECS Service Connect for container workloads or evaluating third-party service mesh solutions like Istio for Kubernetes environments. Plan your migration strategy accordingly to avoid service disruption.
+
+> **Note**: This recipe creates an EKS cluster with managed node groups and deploys multiple microservices with App Mesh, which will incur charges for compute resources, load balancers, and data transfer. See the [EKS pricing documentation](https://aws.amazon.com/eks/pricing/) for detailed cost information.
 
 > **Tip**: Monitor service mesh performance using CloudWatch Container Insights and set up automated scaling policies based on application metrics rather than just CPU utilization. This provides more accurate scaling decisions for microservices workloads.
 
@@ -166,7 +166,7 @@ echo "✅ ECR repositories created successfully"
    metadata:
      name: ${CLUSTER_NAME}
      region: ${AWS_REGION}
-     version: "1.28"
+     version: "1.30"
    
    managedNodeGroups:
      - name: microservices-nodes
@@ -235,7 +235,7 @@ echo "✅ ECR repositories created successfully"
    echo "✅ App Mesh controller installed successfully"
    ```
 
-   The App Mesh controller is now watching for CRD changes and can automatically provision AWS resources. The IRSA configuration enables secure, token-based authentication to AWS services, following security best practices by avoiding static credentials. This setup allows the controller to manage service mesh resources dynamically as applications are deployed.
+   The App Mesh controller is now watching for CRD changes and can automatically provision AWS resources. The IRSA configuration enables secure, token-based authentication to AWS services, following [AWS IAM best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html) by avoiding static credentials. This setup allows the controller to manage service mesh resources dynamically as applications are deployed.
 
 3. **Create App Mesh and Namespace**:
 
@@ -303,7 +303,7 @@ echo "✅ ECR repositories created successfully"
    
    # Create Dockerfile for Service A
    cat > Dockerfile-service-a << 'EOF'
-   FROM python:3.9-slim
+   FROM python:3.11-slim
    WORKDIR /app
    COPY service-a.py .
    RUN pip install flask requests
@@ -337,7 +337,7 @@ echo "✅ ECR repositories created successfully"
    
    # Create Dockerfile for Service B
    cat > Dockerfile-service-b << 'EOF'
-   FROM python:3.9-slim
+   FROM python:3.11-slim
    WORKDIR /app
    COPY service-b.py .
    RUN pip install flask requests
@@ -362,7 +362,7 @@ echo "✅ ECR repositories created successfully"
    
    # Create Dockerfile for Service C
    cat > Dockerfile-service-c << 'EOF'
-   FROM python:3.9-slim
+   FROM python:3.11-slim
    WORKDIR /app
    COPY service-c.py .
    RUN pip install flask
@@ -377,7 +377,7 @@ echo "✅ ECR repositories created successfully"
 
 5. **Build and Push Container Images**:
 
-   Amazon ECR provides secure, private container image storage with integration to IAM for access control. The build process creates optimized container images using multi-stage builds and minimal base images to reduce attack surface. Each service gets its own repository following container security best practices for isolation and access management.
+   Amazon ECR provides secure, private container image storage with integration to IAM for access control. The build process creates optimized container images using minimal base images to reduce attack surface. Each service gets its own repository following container security best practices for isolation and access management.
 
    ```bash
    # Login to ECR
@@ -390,21 +390,24 @@ echo "✅ ECR repositories created successfully"
      -f Dockerfile-service-a .
    docker tag ${ECR_REPO_PREFIX}-service-a:latest \
      ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_PREFIX}-service-a:latest
-   docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_PREFIX}-service-a:latest
+   docker push \
+     ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_PREFIX}-service-a:latest
    
    # Build and push Service B
    docker build -t ${ECR_REPO_PREFIX}-service-b:latest \
      -f Dockerfile-service-b .
    docker tag ${ECR_REPO_PREFIX}-service-b:latest \
      ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_PREFIX}-service-b:latest
-   docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_PREFIX}-service-b:latest
+   docker push \
+     ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_PREFIX}-service-b:latest
    
    # Build and push Service C
    docker build -t ${ECR_REPO_PREFIX}-service-c:latest \
      -f Dockerfile-service-c .
    docker tag ${ECR_REPO_PREFIX}-service-c:latest \
      ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_PREFIX}-service-c:latest
-   docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_PREFIX}-service-c:latest
+   docker push \
+     ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_PREFIX}-service-c:latest
    
    echo "✅ Container images built and pushed successfully"
    ```
@@ -720,8 +723,8 @@ echo "✅ ECR repositories created successfully"
    The AWS Load Balancer Controller enables native integration between Kubernetes Ingress resources and AWS Application Load Balancers. This provides internet-facing access to the service mesh while maintaining security through targeted routing. The ALB integrates with AWS WAF, Shield, and Certificate Manager for comprehensive web application protection.
 
    ```bash
-   # Install AWS Load Balancer Controller
-   curl -o iam_policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.4.4/docs/install/iam_policy.json
+   # Download AWS Load Balancer Controller IAM policy
+   curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.2/docs/install/iam_policy.json
    
    aws iam create-policy \
      --policy-name AWSLoadBalancerControllerIAMPolicy \
@@ -737,6 +740,7 @@ echo "✅ ECR repositories created successfully"
    
    # Install AWS Load Balancer Controller using Helm
    helm repo add eks https://aws.github.io/eks-charts
+   helm repo update
    helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
      -n kube-system \
      --set clusterName=${CLUSTER_NAME} \
@@ -751,10 +755,10 @@ echo "✅ ECR repositories created successfully"
      name: service-a-ingress
      namespace: ${NAMESPACE}
      annotations:
-       kubernetes.io/ingress.class: alb
        alb.ingress.kubernetes.io/scheme: internet-facing
        alb.ingress.kubernetes.io/target-type: ip
    spec:
+     ingressClassName: alb
      rules:
      - http:
          paths:
@@ -783,10 +787,21 @@ echo "✅ ECR repositories created successfully"
     curl -O https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/quickstart/cwagent-fluentd-quickstart.yaml
     
     # Replace cluster name in the file
-    sed -i "s/{{cluster_name}}/${CLUSTER_NAME}/g" cwagent-fluentd-quickstart.yaml
-    sed -i "s/{{region_name}}/${AWS_REGION}/g" cwagent-fluentd-quickstart.yaml
+    sed -i.bak "s/{{cluster_name}}/${CLUSTER_NAME}/g" \
+      cwagent-fluentd-quickstart.yaml
+    sed -i.bak "s/{{region_name}}/${AWS_REGION}/g" \
+      cwagent-fluentd-quickstart.yaml
     
     kubectl apply -f cwagent-fluentd-quickstart.yaml
+    
+    # Create IAM role for X-Ray daemon
+    eksctl create iamserviceaccount \
+      --cluster=${CLUSTER_NAME} \
+      --namespace=${NAMESPACE} \
+      --name=xray-daemon \
+      --attach-policy-arn=arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess \
+      --override-existing-serviceaccounts \
+      --approve
     
     # Enable X-Ray tracing for App Mesh
     cat > xray-daemon.yaml << EOF
@@ -827,7 +842,10 @@ echo "✅ ECR repositories created successfully"
           - name: xray-daemon
             image: public.ecr.aws/xray/aws-xray-daemon:latest
             command:
-            - /xray -o -b xray-service:2000
+            - /xray
+            - -o
+            - -b
+            - xray-service:2000
             resources:
               limits:
                 memory: 32Mi
@@ -841,44 +859,7 @@ echo "✅ ECR repositories created successfully"
             - name: xray-tcp
               containerPort: 2000
               protocol: TCP
-    ---
-    apiVersion: v1
-    kind: ServiceAccount
-    metadata:
-      name: xray-daemon
-      namespace: ${NAMESPACE}
-      annotations:
-        eks.amazonaws.com/role-arn: arn:aws:iam::${AWS_ACCOUNT_ID}:role/xray-daemon-role
     EOF
-    
-    # Create IAM role for X-Ray daemon
-    cat > xray-trust-policy.json << EOF
-    {
-      "Version": "2012-10-17",
-      "Statement": [
-        {
-          "Effect": "Allow",
-          "Principal": {
-            "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/$(aws eks describe-cluster --name ${CLUSTER_NAME} --query 'cluster.identity.oidc.issuer' --output text | cut -d'/' -f3-)"
-          },
-          "Action": "sts:AssumeRoleWithWebIdentity",
-          "Condition": {
-            "StringEquals": {
-              "$(aws eks describe-cluster --name ${CLUSTER_NAME} --query 'cluster.identity.oidc.issuer' --output text | cut -d'/' -f3-):sub": "system:serviceaccount:${NAMESPACE}:xray-daemon"
-            }
-          }
-        }
-      ]
-    }
-    EOF
-    
-    aws iam create-role \
-      --role-name xray-daemon-role \
-      --assume-role-policy-document file://xray-trust-policy.json
-    
-    aws iam attach-role-policy \
-      --role-name xray-daemon-role \
-      --policy-arn arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
     
     kubectl apply -f xray-daemon.yaml
     
@@ -939,11 +920,15 @@ echo "✅ ECR repositories created successfully"
 
    ```bash
    # Check that pods have Envoy sidecars
-   kubectl get pods -n ${NAMESPACE} -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].name}{"\n"}{end}'
+   kubectl get pods -n ${NAMESPACE} \
+     -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].name}{"\n"}{end}'
    
    # Check Envoy proxy stats
-   kubectl exec -it $(kubectl get pods -n ${NAMESPACE} -l app=service-a -o jsonpath='{.items[0].metadata.name}') \
-     -c envoy -- curl -s localhost:9901/stats | grep -E "cluster.*upstream.*cx_total"
+   kubectl exec -it \
+     $(kubectl get pods -n ${NAMESPACE} -l app=service-a \
+       -o jsonpath='{.items[0].metadata.name}') \
+     -c envoy -- curl -s localhost:9901/stats | \
+     grep -E "cluster.*upstream.*cx_total"
    ```
 
 4. **Test Traffic Management**:
@@ -1021,7 +1006,7 @@ echo "✅ ECR repositories created successfully"
 
 3. **Remove Observability Components**:
 
-   Removing observability components stops metric collection and log forwarding, preventing unnecessary data ingestion charges. The IAM role cleanup ensures no orphaned permissions remain that could pose security risks.
+   Removing observability components stops metric collection and log forwarding, preventing unnecessary data ingestion charges. The service account cleanup ensures no orphaned permissions remain that could pose security risks.
 
    ```bash
    # Delete X-Ray daemon
@@ -1029,13 +1014,6 @@ echo "✅ ECR repositories created successfully"
    
    # Delete CloudWatch agent
    kubectl delete -f cwagent-fluentd-quickstart.yaml
-   
-   # Delete IAM role
-   aws iam detach-role-policy \
-     --role-name xray-daemon-role \
-     --policy-arn arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
-   
-   aws iam delete-role --role-name xray-daemon-role
    
    echo "✅ Observability components deleted"
    ```
@@ -1090,7 +1068,7 @@ echo "✅ ECR repositories created successfully"
    
    # Clean up local files
    cd .. && rm -rf microservices-demo
-   rm -f cluster-config.yaml iam_policy.json xray-trust-policy.json
+   rm -f cluster-config.yaml iam_policy.json
    
    echo "✅ ECR repositories and local files cleaned up"
    ```
@@ -1101,9 +1079,11 @@ AWS App Mesh provides a powerful service mesh solution that addresses the comple
 
 The integration with Amazon EKS leverages Kubernetes Custom Resource Definitions (CRDs) to manage App Mesh resources declaratively. The App Mesh controller watches for changes to these CRDs and automatically configures the corresponding App Mesh resources through the AWS API. This native Kubernetes integration allows teams to manage their service mesh configuration using familiar kubectl commands and GitOps workflows. The controller also handles the automatic injection of Envoy sidecar containers into pods based on namespace labels, reducing operational overhead.
 
-Service mesh architecture provides several key benefits for microservices deployments. Traffic management capabilities include sophisticated routing rules, circuit breakers, retries, and timeouts that improve application resilience. Security features like mutual TLS (mTLS) encryption and fine-grained access policies help secure service-to-service communication. Observability improvements include distributed tracing, metrics collection, and traffic visualization that provide deep insights into application behavior. These capabilities are particularly valuable in complex microservices environments where traditional networking approaches become unwieldy.
+Service mesh architecture provides several key benefits for microservices deployments following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html). Traffic management capabilities include sophisticated routing rules, circuit breakers, retries, and timeouts that improve application resilience. Security features like mutual TLS (mTLS) encryption and fine-grained access policies help secure service-to-service communication. Observability improvements include distributed tracing, metrics collection, and traffic visualization that provide deep insights into application behavior. These capabilities are particularly valuable in complex microservices environments where traditional networking approaches become unwieldy.
 
-The observability stack combining CloudWatch Container Insights and AWS X-Ray provides comprehensive monitoring for containerized applications. Container Insights collects and aggregates container metrics, logs, and performance data, while X-Ray enables distributed tracing across service boundaries. This combination allows teams to correlate application performance issues with infrastructure metrics, enabling faster troubleshooting and root cause analysis. The service mesh proxy automatically generates telemetry data, providing visibility into request patterns, error rates, and latency distributions without requiring application instrumentation.
+The observability stack combining CloudWatch Container Insights and AWS X-Ray provides comprehensive monitoring for containerized applications. Container Insights collects and aggregates container metrics, logs, and performance data, while X-Ray enables distributed tracing across service boundaries. This combination allows teams to correlate application performance issues with infrastructure metrics, enabling faster troubleshooting and root cause analysis. The service mesh proxy automatically generates telemetry data, providing visibility into request patterns, error rates, and latency distributions without requiring application instrumentation. For detailed monitoring guidance, refer to the [CloudWatch Container Insights documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html).
+
+> **Note**: Consider migrating to alternatives like Istio or Amazon ECS Service Connect before App Mesh reaches end of support in September 2026. This timeline allows for gradual migration planning and testing.
 
 ## Challenge
 
@@ -1121,4 +1101,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,21 @@
+date,product,region,sales_amount,quantity,customer_segment
+2024-01-01,Widget A,North,1250.50,25,Enterprise
+2024-01-02,Widget B,South,890.75,18,SMB
+2024-01-03,Widget A,East,2150.25,43,Enterprise
+2024-01-04,Widget C,West,567.30,12,Startup
+2024-01-05,Widget B,North,1875.60,38,Enterprise
+2024-01-06,Widget A,South,1320.45,26,SMB
+2024-01-07,Widget C,East,745.20,15,Startup
+2024-01-08,Widget B,West,2340.80,47,Enterprise
+2024-01-09,Widget A,North,998.15,20,SMB
+2024-01-10,Widget C,South,1456.70,29,Enterprise
+2024-01-11,Widget A,East,1789.30,36,Enterprise
+2024-01-12,Widget B,North,1123.45,22,SMB
+2024-01-13,Widget C,West,892.60,18,Startup
+2024-01-14,Widget A,South,2045.85,41,Enterprise
+2024-01-15,Widget B,East,1534.20,31,SMB
+2024-01-16,Widget C,North,678.90,14,Startup
+2024-01-17,Widget A,West,1923.75,38,Enterprise
+2024-01-18,Widget B,South,1287.40,26,SMB
+2024-01-19,Widget C,East,954.65,19,Startup
+2024-01-20,Widget A,North,2189.55,44,Enterprise

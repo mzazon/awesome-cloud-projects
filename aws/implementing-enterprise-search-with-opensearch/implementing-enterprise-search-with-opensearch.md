@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: OpenSearch Service, Lambda, S3, IAM
 estimated-time: 240 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: search, opensearch, elasticsearch, analytics, indexing, full-text-search, machine-learning, enterprise-search, semantic-search, real-time-analytics, multi-az, dedicated-masters
 recipe-generator-version: 1.3
@@ -136,7 +136,7 @@ echo "✅ Environment variables set and S3 bucket created"
 
 1. **Create IAM role for OpenSearch Service access**:
 
-   IAM roles provide secure, temporary credential delegation that enables AWS services to interact with each other without hardcoding access keys. For OpenSearch Service, proper IAM configuration is essential for security, compliance, and operational excellence. This role establishes the security foundation that enables fine-grained access controls and integrates with your existing identity management strategy.
+   IAM roles provide secure, temporary credential delegation that enables AWS services to interact with each other without hardcoding access keys. For OpenSearch Service, proper IAM configuration is essential for security, compliance, and operational excellence following the [AWS Security Pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html). This role establishes the security foundation that enables fine-grained access controls and integrates with your existing identity management strategy.
 
    ```bash
    # Create trust policy for OpenSearch Service
@@ -172,7 +172,7 @@ echo "✅ Environment variables set and S3 bucket created"
 
 2. **Create OpenSearch Service domain**:
 
-   OpenSearch Service requires log groups to be created before enabling logging. We're creating a production-ready domain with dedicated master nodes for cluster management, which provides better stability and performance isolation from data nodes.
+   OpenSearch Service requires log groups to be created before enabling logging. We're creating a production-ready domain with dedicated master nodes for cluster management, which provides better stability and performance isolation from data nodes following AWS Well-Architected [Reliability Pillar](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) principles.
 
    ```bash
    # Create CloudWatch log groups for OpenSearch logs
@@ -188,7 +188,7 @@ echo "✅ Environment variables set and S3 bucket created"
    cat > domain-config.json << EOF
    {
      "DomainName": "${DOMAIN_NAME}",
-     "OpenSearchVersion": "OpenSearch_2.11",
+     "OpenSearchVersion": "OpenSearch_2.15",
      "ClusterConfig": {
        "InstanceType": "m6g.large.search",
        "InstanceCount": 3,
@@ -351,7 +351,7 @@ echo "✅ Environment variables set and S3 bucket created"
 
 5. **Create index mapping for optimal search performance**:
 
-   Index mappings define how documents and their fields are stored and indexed. Proper mapping configuration is crucial for search performance and functionality. We're using both `text` and `keyword` field types - `text` for full-text search and `keyword` for exact matches, aggregations, and sorting.
+   Index mappings define how documents and their fields are stored and indexed in OpenSearch. Proper mapping configuration is crucial for search performance and functionality following AWS [Performance Efficiency Pillar](https://docs.aws.amazon.com/wellarchitected/latest/performance-efficiency-pillar/welcome.html) principles. We're using both `text` and `keyword` field types - `text` for full-text search and `keyword` for exact matches, aggregations, and sorting.
 
    ```bash
    # Create index mapping for products
@@ -474,10 +474,10 @@ echo "✅ Environment variables set and S3 bucket created"
 
 7. **Create Lambda function for automated data indexing**:
 
-   Automated indexing through Lambda functions enables real-time data processing and keeps your search index synchronized with changing data sources. This serverless approach provides cost-effective, event-driven indexing that scales automatically with data volume. The Lambda function demonstrates integration patterns for S3-triggered indexing workflows that are essential for maintaining current search results in dynamic environments.
+   Automated indexing through Lambda functions enables real-time data processing and keeps your search index synchronized with changing data sources. This serverless approach provides cost-effective, event-driven indexing that scales automatically with data volume following AWS [Cost Optimization Pillar](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html) principles. The Lambda function demonstrates integration patterns for S3-triggered indexing workflows that are essential for maintaining current search results in dynamic environments.
 
    ```bash
-   # Create Lambda function code
+   # Create Lambda function code with authentication
    cat > lambda-indexer.py << 'EOF'
    import json
    import boto3
@@ -486,8 +486,10 @@ echo "✅ Environment variables set and S3 bucket created"
    import os
    
    def lambda_handler(event, context):
-       # OpenSearch endpoint from environment variable
+       # OpenSearch endpoint and credentials from environment variables
        os_endpoint = os.environ['OPENSEARCH_ENDPOINT']
+       username = os.environ.get('OPENSEARCH_USERNAME', 'admin')
+       password = os.environ.get('OPENSEARCH_PASSWORD', 'TempPassword123!')
        
        # Process S3 event (if triggered by S3)
        if 'Records' in event:
@@ -504,7 +506,7 @@ echo "✅ Environment variables set and S3 bucket created"
                # Parse JSON data
                products = json.loads(content)
                
-               # Index each product
+               # Index each product with authentication
                for product in products:
                    doc_id = product['id']
                    index_url = f"https://{os_endpoint}/products/_doc/{doc_id}"
@@ -512,7 +514,9 @@ echo "✅ Environment variables set and S3 bucket created"
                    response = requests.put(
                        index_url,
                        headers={'Content-Type': 'application/json'},
-                       data=json.dumps(product)
+                       auth=HTTPBasicAuth(username, password),
+                       data=json.dumps(product),
+                       verify=True
                    )
                    
                    print(f"Indexed product {doc_id}: {response.status_code}")
@@ -551,6 +555,30 @@ echo "✅ Environment variables set and S3 bucket created"
        --role-name LambdaOpenSearchRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
+   # Create and attach S3 access policy to Lambda role
+   cat > lambda-s3-policy.json << 'EOF'
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": [
+           "s3:GetObject"
+         ],
+         "Resource": "arn:aws:s3:::*/*"
+       }
+     ]
+   }
+   EOF
+   
+   aws iam create-policy \
+       --policy-name LambdaS3AccessPolicy-${RANDOM_SUFFIX} \
+       --policy-document file://lambda-s3-policy.json
+   
+   aws iam attach-role-policy \
+       --role-name LambdaOpenSearchRole-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/LambdaS3AccessPolicy-${RANDOM_SUFFIX}
+   
    # Get Lambda role ARN
    export LAMBDA_ROLE_ARN=$(aws iam get-role \
        --role-name LambdaOpenSearchRole-${RANDOM_SUFFIX} \
@@ -562,11 +590,11 @@ echo "✅ Environment variables set and S3 bucket created"
    # Create Lambda function
    aws lambda create-function \
        --function-name $LAMBDA_FUNCTION_NAME \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler lambda-indexer.lambda_handler \
        --zip-file fileb://lambda-indexer.zip \
-       --environment Variables="{OPENSEARCH_ENDPOINT=$OS_ENDPOINT}" \
+       --environment Variables="{OPENSEARCH_ENDPOINT=$OS_ENDPOINT,OPENSEARCH_USERNAME=admin,OPENSEARCH_PASSWORD=TempPassword123!}" \
        --timeout 60
    
    echo "✅ Created Lambda function for automated indexing"
@@ -779,7 +807,7 @@ echo "✅ Environment variables set and S3 bucket created"
 
 12. **Set up advanced monitoring and alerting**:
 
-    Comprehensive monitoring and alerting provide operational visibility and proactive issue detection for your search infrastructure. CloudWatch integration delivers detailed metrics on cluster health, performance characteristics, and resource utilization that enable data-driven capacity planning and optimization. Automated alerting ensures rapid response to performance degradation or availability issues, maintaining optimal user experience and system reliability.
+    Comprehensive monitoring and alerting provide operational visibility and proactive issue detection for your search infrastructure following AWS [Operational Excellence Pillar](https://docs.aws.amazon.com/wellarchitected/latest/operational-excellence-pillar/welcome.html) principles. CloudWatch integration delivers detailed metrics on cluster health, performance characteristics, and resource utilization that enable data-driven capacity planning and optimization. Automated alerting ensures rapid response to performance degradation or availability issues, maintaining optimal user experience and system reliability.
 
     ```bash
     # Create CloudWatch dashboard for OpenSearch metrics
@@ -951,10 +979,17 @@ echo "✅ Environment variables set and S3 bucket created"
    # Delete Lambda function
    aws lambda delete-function --function-name $LAMBDA_FUNCTION_NAME
    
-   # Delete IAM roles
+   # Delete IAM roles and policies
    aws iam detach-role-policy \
        --role-name LambdaOpenSearchRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   aws iam detach-role-policy \
+       --role-name LambdaOpenSearchRole-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/LambdaS3AccessPolicy-${RANDOM_SUFFIX}
+   
+   aws iam delete-policy \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/LambdaS3AccessPolicy-${RANDOM_SUFFIX}
    
    aws iam delete-role --role-name LambdaOpenSearchRole-${RANDOM_SUFFIX}
    aws iam delete-role --role-name OpenSearchServiceRole-${RANDOM_SUFFIX}
@@ -989,6 +1024,7 @@ echo "✅ Environment variables set and S3 bucket created"
    rm -f domain-config.json product-mapping.json index-template.json
    rm -f sample-products.json lambda-indexer.py lambda-indexer.zip
    rm -f ml-search-analytics.json cloudwatch-dashboard.json
+   rm -f lambda-s3-policy.json
    
    # Clean up environment variables
    unset DOMAIN_NAME S3_BUCKET_NAME LAMBDA_FUNCTION_NAME
@@ -1007,9 +1043,9 @@ The **multi-AZ architecture with dedicated master nodes** provides fault toleran
 
 **Performance optimization strategies** implemented include custom analyzers, optimized field mappings, and efficient shard allocation across availability zones. The architecture supports horizontal scaling to handle increasing data volumes and query loads while maintaining consistent performance. Advanced query optimization techniques leverage OpenSearch's distributed computing capabilities for complex aggregations and real-time analytics.
 
-Integration with AWS services creates a comprehensive data pipeline that automatically processes, indexes, and analyzes large-scale datasets. The **CloudWatch integration** provides deep visibility into cluster performance, enabling data-driven decisions for capacity planning and optimization. This architecture serves as a foundation for building sophisticated search applications that can handle enterprise-scale requirements.
+The implementation follows AWS Well-Architected Framework principles including the [Security Pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html) with encryption at rest and in transit, the [Reliability Pillar](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) with multi-AZ deployment, and the [Performance Efficiency Pillar](https://docs.aws.amazon.com/wellarchitected/latest/performance-efficiency-pillar/welcome.html) with dedicated master nodes and optimized storage configurations. Integration with AWS services creates a comprehensive data pipeline that automatically processes, indexes, and analyzes large-scale datasets.
 
-> **Tip**: Use OpenSearch ML plugins to implement semantic search capabilities with vector embeddings for more intelligent and context-aware search results.
+> **Tip**: Use OpenSearch ML plugins to implement semantic search capabilities with vector embeddings for more intelligent and context-aware search results. Reference the [OpenSearch ML documentation](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/ml.html) for implementation guidance.
 
 ## Challenge
 
@@ -1024,4 +1060,11 @@ Extend this search solution by implementing these advanced enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Monitor Workbooks, Azure Functions, Azure Event Grid, Azure Logic Apps
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: monitoring, automation, alerting, workbooks, functions, eventgrid, logicapps, intelligent-response
 recipe-generator-version: 1.3
@@ -75,7 +75,7 @@ graph TB
 ## Prerequisites
 
 1. Azure account with appropriate permissions for creating Monitor, Functions, Event Grid, and Logic Apps resources
-2. Azure CLI v2.57.0 or later installed and configured (or Azure Cloud Shell)
+2. Azure CLI v2.69.0 or later installed and configured (or Azure Cloud Shell)
 3. Basic understanding of Azure monitoring concepts, serverless functions, and event-driven architectures
 4. Familiarity with KQL (Kusto Query Language) for log analytics and workbook queries
 5. Estimated cost: $15-30 per month for development/testing (varies by region and usage patterns)
@@ -92,6 +92,12 @@ export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
+
+# Validate resource names don't exceed Azure limits
+if [ ${#STORAGE_ACCOUNT} -gt 24 ]; then
+    echo "Error: Storage account name too long. Adjusting..."
+    STORAGE_ACCOUNT="stint${RANDOM_SUFFIX}"
+fi
 
 # Set resource names with unique suffix
 export STORAGE_ACCOUNT="stintelligent${RANDOM_SUFFIX}"
@@ -136,18 +142,20 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS}"
        --kind StorageV2 \
        --https-only true
    
-   # Create Key Vault for secure configuration
+   # Create Key Vault for secure configuration with RBAC
    az keyvault create \
        --name ${KEY_VAULT} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --sku standard \
-       --enable-rbac-authorization true
+       --enable-rbac-authorization true \
+       --enable-soft-delete true \
+       --retention-days 7
    
    echo "✅ Storage account and Key Vault created successfully"
    ```
 
-   The storage account now supports Function App operations with secure HTTPS-only access, while Key Vault provides centralized secret management with RBAC authorization. This security-first approach ensures alert processing functions can access required credentials while maintaining compliance with enterprise security policies.
+   The storage account now supports Function App operations with secure HTTPS-only access, while Key Vault provides centralized secret management with RBAC authorization and soft-delete protection. This security-first approach ensures alert processing functions can access required credentials while maintaining compliance with enterprise security policies and data protection requirements.
 
 2. **Create Cosmos DB for Alert State Management**:
 
@@ -214,7 +222,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS}"
    Azure Functions provide serverless compute for processing alerts, executing remediation logic, and generating dynamic responses. The consumption plan ensures cost-effective scaling during varying alert volumes while maintaining sub-second cold start times for critical alert processing scenarios.
 
    ```bash
-   # Create Function App
+   # Create Function App with system-assigned managed identity
    az functionapp create \
        --name ${FUNCTION_APP} \
        --resource-group ${RESOURCE_GROUP} \
@@ -223,7 +231,8 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS}"
        --runtime python \
        --runtime-version 3.11 \
        --functions-version 4 \
-       --os-type Linux
+       --os-type Linux \
+       --assign-identity [system]
    
    # Configure Function App settings
    az functionapp config appsettings set \
@@ -414,12 +423,18 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS}"
        --endpoint "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Web/sites/${FUNCTION_APP}/functions/ProcessAlert" \
        --included-event-types Microsoft.AlertManagement.Alert.Activated Microsoft.AlertManagement.Alert.Resolved
    
+   # Get Logic App trigger URL for webhook subscription
+   LOGIC_APP_TRIGGER_URL=$(az logic workflow show \
+       --name ${LOGIC_APP} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query "accessEndpoint" --output tsv)
+   
    # Create subscription for Logic App notifications
    az eventgrid event-subscription create \
        --name "alerts-to-logic" \
        --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventGrid/topics/${EVENT_GRID_TOPIC}" \
        --endpoint-type webhook \
-       --endpoint "${LOGIC_APP_URL}" \
+       --endpoint "${LOGIC_APP_TRIGGER_URL}" \
        --included-event-types Microsoft.AlertManagement.Alert.Activated \
        --advanced-filter data.severity StringIn high critical
    
@@ -433,6 +448,11 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS}"
    Azure Monitor Workbooks provide interactive dashboards for visualizing alert patterns, system health metrics, and response effectiveness. This workbook combines multiple data sources to create comprehensive views of the intelligent alert system's performance and operational insights.
 
    ```bash
+   # Generate UUID for workbook name (required by Azure CLI)
+   WORKBOOK_UUID=$(python3 -c "import uuid; print(str(uuid.uuid4()))") || \
+   WORKBOOK_UUID=$(uuidgen | tr '[:upper:]' '[:lower:]') 2>/dev/null || \
+   WORKBOOK_UUID="$(openssl rand -hex 16 | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/')"
+   
    # Create workbook template JSON
    cat > /tmp/alert-workbook.json << 'EOF'
    {
@@ -472,15 +492,16 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS}"
    }
    EOF
    
-   # Create the workbook
-   az monitor workbook create \
-       --name "Intelligent Alert Dashboard" \
+   # Create the workbook using Application Insights workbook command
+   az monitor app-insights workbook create \
+       --name "${WORKBOOK_UUID}" \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --category "monitoring" \
        --serialized-data "@/tmp/alert-workbook.json" \
        --display-name "Intelligent Alert Response Dashboard" \
-       --description "Comprehensive dashboard for intelligent alert response system"
+       --description "Comprehensive dashboard for intelligent alert response system" \
+       --kind shared
    
    echo "✅ Monitor Workbook created successfully"
    ```
@@ -510,47 +531,63 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS}"
        --name "eventgrid-key" \
        --value "${EVENT_GRID_KEY}"
    
-   # Grant Function App access to Key Vault
+   # Wait for Function App managed identity to be fully created
+   echo "Waiting for managed identity propagation..."
+   sleep 45
+   
+   # Get Function App managed identity principal ID
    FUNCTION_IDENTITY=$(az functionapp identity show \
        --name ${FUNCTION_APP} \
        --resource-group ${RESOURCE_GROUP} \
        --query principalId --output tsv)
    
-   az keyvault set-policy \
-       --name ${KEY_VAULT} \
-       --object-id ${FUNCTION_IDENTITY} \
-       --secret-permissions get list
+   # Verify the identity was created successfully
+   if [ -z "${FUNCTION_IDENTITY}" ]; then
+       echo "Error: Function App managed identity not found"
+       exit 1
+   fi
+   
+   # Assign Key Vault Secrets User role to Function App (RBAC-based access)
+   az role assignment create \
+       --role "Key Vault Secrets User" \
+       --assignee ${FUNCTION_IDENTITY} \
+       --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.KeyVault/vaults/${KEY_VAULT}" \
+       --assignee-object-id ${FUNCTION_IDENTITY} \
+       --assignee-principal-type ServicePrincipal
    
    echo "✅ Key Vault secrets configured with secure access"
    ```
 
-   Key Vault now securely stores all sensitive configuration data with appropriate access policies. The Function App can access required secrets through managed identity, eliminating the need for hardcoded credentials while maintaining security compliance and enabling automated credential management.
+   Key Vault now securely stores all sensitive configuration data with RBAC-based access control and soft-delete protection. The Function App can access required secrets through its system-assigned managed identity, eliminating the need for hardcoded credentials while maintaining security compliance and enabling automated credential rotation through Azure's identity management services.
 
 10. **Create Sample Alert Rule for Testing**:
 
     A test alert rule validates the intelligent response system by generating controlled alert scenarios. This rule monitors resource health and triggers the complete alert response workflow, enabling verification of event routing, function processing, workbook updates, and notification delivery.
 
     ```bash
-    # Create action group for testing
+    # Create action group for testing with Event Grid webhook
     az monitor action-group create \
         --name "test-alert-actions" \
         --resource-group ${RESOURCE_GROUP} \
         --short-name "testalert" \
-        --action email "test@example.com" \
-        --action webhook "${EVENT_GRID_ENDPOINT}" \
-        --webhook-properties "key1=${EVENT_GRID_KEY}"
+        --action email admin test@example.com \
+        --action webhook test-webhook "${EVENT_GRID_ENDPOINT}" \
+        --tags environment=demo purpose=testing
     
-    # Create test alert rule
+    # Create test alert rule for Function App CPU monitoring
+    FUNCTION_APP_RESOURCE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Web/sites/${FUNCTION_APP}"
+    
     az monitor metrics alert create \
         --name "test-cpu-alert" \
         --resource-group ${RESOURCE_GROUP} \
-        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}" \
-        --condition "avg Percentage CPU > 80" \
+        --scopes "${FUNCTION_APP_RESOURCE_ID}" \
+        --condition "avg CpuPercentage > 80" \
         --window-size 5m \
         --evaluation-frequency 1m \
         --action "test-alert-actions" \
         --description "Test alert rule for intelligent response system" \
-        --severity 2
+        --severity 2 \
+        --enabled true
     
     echo "✅ Test alert rule created for system validation"
     ```
@@ -611,33 +648,40 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS}"
          }
        ]'
    
-   # Check Function App logs
-   az monitor app-insights events show \
-       --app $(az functionapp show --name ${FUNCTION_APP} --resource-group ${RESOURCE_GROUP} --query "appServicePlanId" --output tsv) \
-       --event traces \
-       --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
-       --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ)
+   # Check Function App logs via Log Analytics
+   sleep 60  # Wait for logs to be available
+   
+   # Query Function App logs from Log Analytics workspace
+   LOG_WORKSPACE_ID=$(az monitor log-analytics workspace show \
+       --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${LOG_ANALYTICS} \
+       --query customerId --output tsv)
+   
+   az monitor log-analytics query \
+       --workspace ${LOG_WORKSPACE_ID} \
+       --analytics-query "FunctionAppLogs | where TimeGenerated > ago(10m) | where Message contains 'Processing alert' | project TimeGenerated, Message, Level | order by TimeGenerated desc | limit 20" \
+       --output table
    ```
 
-   Expected output: Function logs should show successful event processing and Cosmos DB storage operations.
+   Expected output: Function logs should show successful event processing, Cosmos DB operations, and Event Grid message handling. Look for log entries confirming alert state storage and workbook update triggers.
 
 3. **Validate Workbook Functionality**:
 
    ```bash
-   # Get workbook details
-   az monitor workbook show \
-       --name "Intelligent Alert Dashboard" \
+   # Get workbook details using Application Insights command
+   az monitor app-insights workbook show \
+       --name "${WORKBOOK_UUID}" \
        --resource-group ${RESOURCE_GROUP} \
        --query "{name:name, category:category, displayName:displayName}" \
        --output table
    
    # Check if workbook is accessible
-   WORKBOOK_URL=$(az monitor workbook show \
-       --name "Intelligent Alert Dashboard" \
+   WORKBOOK_RESOURCE_ID=$(az monitor app-insights workbook show \
+       --name "${WORKBOOK_UUID}" \
        --resource-group ${RESOURCE_GROUP} \
        --query "id" --output tsv)
    
-   echo "Workbook URL: https://portal.azure.com/#@${SUBSCRIPTION_ID}/resource${WORKBOOK_URL}"
+   echo "Workbook URL: https://portal.azure.com/#@${SUBSCRIPTION_ID}/resource${WORKBOOK_RESOURCE_ID}"
    ```
 
    Expected output: Workbook should be accessible through the Azure portal with alert visualization components.
@@ -678,13 +722,17 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS}"
 
    ```bash
    # Delete Event Grid subscriptions
+   echo "Removing Event Grid subscriptions..."
+   
    az eventgrid event-subscription delete \
        --name "alerts-to-function" \
-       --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventGrid/topics/${EVENT_GRID_TOPIC}"
+       --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventGrid/topics/${EVENT_GRID_TOPIC}" \
+       --yes
    
    az eventgrid event-subscription delete \
        --name "alerts-to-logic" \
-       --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventGrid/topics/${EVENT_GRID_TOPIC}"
+       --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventGrid/topics/${EVENT_GRID_TOPIC}" \
+       --yes
    
    echo "✅ Event Grid subscriptions deleted"
    ```
@@ -701,22 +749,29 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS}"
    echo "✅ Resource group deletion initiated: ${RESOURCE_GROUP}"
    echo "Note: Deletion may take several minutes to complete"
    
-   # Clean up local files
+   # Clean up local files and environment variables
    rm -rf /tmp/alert-functions
    rm -f /tmp/alert-workbook.json
+   
+   # Clear environment variables
+   unset RESOURCE_GROUP LOCATION SUBSCRIPTION_ID RANDOM_SUFFIX
+   unset STORAGE_ACCOUNT FUNCTION_APP EVENT_GRID_TOPIC LOGIC_APP
+   unset COSMOS_DB KEY_VAULT LOG_ANALYTICS WORKBOOK_UUID
+   
+   echo "✅ Cleanup completed successfully"
    ```
 
 ## Discussion
 
-The intelligent alert response system demonstrates the power of Azure's event-driven architecture for creating automated, contextual monitoring solutions. By combining Azure Monitor Workbooks with Functions, Event Grid, and Logic Apps, organizations can transform reactive alert handling into proactive, intelligent response systems. This architecture follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of reliability, security, and operational excellence.
+The intelligent alert response system demonstrates the power of Azure's event-driven architecture for creating automated, contextual monitoring solutions. By combining Azure Monitor Workbooks with Functions, Event Grid, and Logic Apps, organizations can transform reactive alert handling into proactive, intelligent response systems. This architecture follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of reliability, security, and operational excellence, while leveraging Azure's serverless compute capabilities for cost-effective scaling.
 
 The event-driven design enables horizontal scaling during high-volume alert scenarios while maintaining low latency for critical alert processing. Azure Functions provide cost-effective serverless compute that scales automatically based on alert volume, while Event Grid ensures reliable event delivery with built-in retry mechanisms. The integration with Cosmos DB enables persistent state management and historical analytics, supporting continuous improvement of alert response strategies. For comprehensive guidance on serverless architectures, review the [Azure Functions documentation](https://docs.microsoft.com/en-us/azure/azure-functions/) and [Event Grid best practices](https://docs.microsoft.com/en-us/azure/event-grid/security-authentication).
 
-From a security perspective, the solution implements defense-in-depth principles through Key Vault integration, managed identity authentication, and RBAC-based access control. This approach ensures sensitive credentials are never exposed in code or configuration files while maintaining compliance with enterprise security policies. The workbook component provides real-time visualization without requiring direct access to underlying data sources, enabling secure monitoring dashboards for operations teams.
+From a security perspective, the solution implements defense-in-depth principles through Key Vault integration with RBAC authorization, system-assigned managed identity authentication, and Azure Active Directory-based access control. This approach ensures sensitive credentials are never exposed in code or configuration files while maintaining compliance with enterprise security policies and zero-trust principles. The workbook component provides real-time visualization without direct access to underlying data sources, with queries executed through Azure Resource Graph for secure, read-only access to alert metadata.
 
 The system's extensibility allows for integration with external ITSM tools, communication platforms, and custom remediation scripts. Logic Apps provide visual workflow orchestration for complex scenarios such as escalation chains, approval processes, and multi-step remediation procedures. This flexibility ensures the solution can adapt to diverse organizational requirements while maintaining operational consistency. For monitoring and optimization guidance, see the [Azure Monitor best practices documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/best-practices).
 
-> **Tip**: Use Azure Monitor Application Insights to track function performance and identify optimization opportunities. The [monitoring documentation](https://docs.microsoft.com/en-us/azure/azure-functions/functions-monitoring) provides comprehensive guidance on tracking metrics, setting up alerts, and optimizing serverless alert processing workflows.
+> **Tip**: Use Azure Monitor Application Insights to track function performance and identify optimization opportunities. Enable distributed tracing and custom metrics to gain deeper insights into alert processing latency and success rates. The [Azure Functions monitoring documentation](https://docs.microsoft.com/en-us/azure/azure-functions/functions-monitoring) provides comprehensive guidance on performance optimization.
 
 ## Challenge
 
@@ -734,4 +789,9 @@ Extend this intelligent alert response system by implementing these enhancements
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

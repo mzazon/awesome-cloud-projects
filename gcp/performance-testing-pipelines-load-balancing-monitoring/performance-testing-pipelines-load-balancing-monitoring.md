@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Load Balancing, Cloud Monitoring, Cloud Functions, Cloud Scheduler
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: performance-testing, load-balancing, monitoring, automation, devops
 recipe-generator-version: 1.3
@@ -281,9 +281,9 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
    requests==2.31.0
-   google-cloud-monitoring==2.16.0
-   google-cloud-storage==2.10.0
-   concurrent.futures
+   google-cloud-monitoring==2.19.0
+   google-cloud-storage==2.13.0
+   functions-framework==3.5.0
    EOF
    
    # Create main.py with load generation logic
@@ -414,7 +414,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    
    # Deploy Cloud Function
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python311 \
+       --runtime python312 \
        --trigger http \
        --entry-point load_test_function \
        --service-account ${SERVICE_ACCOUNT_EMAIL} \
@@ -929,4 +929,9 @@ Extend this automated performance testing solution by implementing these advance
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

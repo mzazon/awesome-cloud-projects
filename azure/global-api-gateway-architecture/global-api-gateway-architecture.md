@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure API Management, Azure Cosmos DB, Azure Traffic Manager, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: multi-region, api-gateway, global-distribution, high-availability, disaster-recovery
 recipe-generator-version: 1.3
@@ -90,7 +90,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Owner or Contributor access to create resources
-2. Azure CLI v2.50.0 or later installed and configured (or use Azure Cloud Shell)
+2. Azure CLI v2.69.0 or later installed and configured (or use Azure Cloud Shell)
 3. Basic understanding of API management concepts and RESTful APIs
 4. Familiarity with Azure networking and DNS concepts
 5. Estimated cost: ~$5,000/month for Premium API Management (3 regions, 1 unit each) + Cosmos DB + Traffic Manager
@@ -105,6 +105,7 @@ export PRIMARY_REGION="eastus"
 export SECONDARY_REGION_1="westeurope"
 export SECONDARY_REGION_2="southeastasia"
 export RESOURCE_GROUP="rg-global-api-gateway"
+export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for globally unique names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -251,6 +252,8 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
        --query documentEndpoint --output tsv)
    ```
 
+   The managed identity configuration now enables API Management to securely access Cosmos DB without storing sensitive connection strings. This approach follows Azure security best practices and provides automatic credential rotation through Azure's identity platform.
+
 4. **Add Secondary Regions to API Management**:
 
    Multi-region deployment in API Management creates independent gateway infrastructure in each region while maintaining centralized management. Each regional deployment includes dedicated compute resources, local caching, and regional endpoints, ensuring optimal performance for local users. The synchronization mechanism automatically replicates all API configurations, policies, and certificates across regions within seconds, maintaining consistency without manual intervention.
@@ -350,6 +353,8 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
    echo "✅ Sample API created and imported"
    ```
 
+   The sample API demonstrates how API Management handles multi-region deployments with consistent API definitions. The OpenAPI specification is automatically synchronized across all regions, ensuring uniform API behavior regardless of the regional endpoint accessed by consumers.
+
 6. **Configure Global Rate Limiting Policy**:
 
    The global rate limiting policy leverages API Management's policy expressions to interact with Cosmos DB, creating a distributed rate limiting system that works across all regions. This advanced pattern uses the send-request policy to query and update rate limit counters stored in Cosmos DB, with built-in retry logic and fallback mechanisms to handle network latency or temporary failures. The policy ensures API consumers can't exceed their quotas by making requests in different regions.
@@ -360,12 +365,13 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
    <policies>
      <inbound>
        <base />
-       <set-variable name="clientId" value="@(context.Subscription?.Key ?? "anonymous")" />
+       <set-variable name="clientId" 
+                     value="@(context.Subscription?.Key ?? "anonymous")" />
        <cache-lookup-value key="@("rate-limit-" + context.Variables["clientId"])" 
                            variable-name="remainingCalls" />
        <choose>
          <when condition="@(context.Variables.ContainsKey("remainingCalls") && 
-                            (int)context.Variables["remainingCalls"] <= 0)">
+                           (int)context.Variables["remainingCalls"] <= 0)">
            <return-response>
              <set-status code="429" reason="Too Many Requests" />
              <set-header name="Retry-After" exists-action="override">
@@ -424,6 +430,8 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
    echo "Note: Update COSMOS_ENDPOINT_PLACEHOLDER in production deployment"
    ```
 
+   The rate limiting policy template demonstrates advanced API Management capabilities for distributed systems. In production, you would replace the placeholder with the actual Cosmos DB endpoint and apply this policy to specific APIs or operations that require global rate limiting.
+
 7. **Configure Azure Traffic Manager**:
 
    Azure Traffic Manager provides DNS-based global load balancing, automatically routing users to the nearest healthy API Management endpoint based on network latency. The performance routing method continuously monitors endpoint health and latency, ensuring optimal user experience even during regional outages. This configuration creates a single global endpoint that abstracts the complexity of multi-region deployment from API consumers.
@@ -474,11 +482,11 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
        --endpoint-location ${SECONDARY_REGION_2} \
        --priority 3
    
-   echo "✅ Traffic Manager endpoints configured"
-   
    # Display the global endpoint
    echo "Global API endpoint: https://${TRAFFIC_MANAGER}.trafficmanager.net"
    ```
+
+   Traffic Manager now provides a single global endpoint that intelligently routes requests to the nearest healthy API Management region. The Performance routing method uses real-time latency measurements to ensure optimal user experience, while health checks ensure failed regions are automatically bypassed.
 
 8. **Configure Multi-Region Monitoring**:
 
@@ -673,9 +681,11 @@ echo "✅ Log Analytics workspace created: ${WORKSPACE_NAME}"
 
 Implementing a multi-region API gateway with Azure API Management and Cosmos DB creates a globally distributed platform that delivers consistent sub-second latency to users worldwide while maintaining 99.999% availability. This architecture leverages Azure's global infrastructure to automatically handle regional failures, scale based on demand, and provide comprehensive observability across all regions. According to the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/), this design exemplifies the reliability and performance efficiency pillars by eliminating single points of failure and optimizing for global reach.
 
-The combination of API Management's built-in Traffic Manager integration with Cosmos DB's multi-region replication creates a unique synergy for global API platforms. While each API Management region operates independently with its own compute and caching infrastructure, Cosmos DB ensures that critical shared state like rate limiting counters and custom configuration remains synchronized globally within milliseconds. This pattern is particularly valuable for scenarios requiring strict API quotas, custom routing rules, or dynamic configuration updates that must be consistent across all regions. The [API Management multi-region deployment guide](https://docs.microsoft.com/en-us/azure/api-management/api-management-howto-deploy-multi-region) provides additional patterns for advanced scenarios.
+The combination of API Management's built-in multi-region capabilities with Cosmos DB's global distribution creates a unique synergy for enterprise API platforms. While each API Management region operates independently with its own compute and caching infrastructure, Cosmos DB ensures that critical shared state like rate limiting counters and custom configuration remains synchronized globally within milliseconds. This pattern is particularly valuable for scenarios requiring strict API quotas, custom routing rules, or dynamic configuration updates that must be consistent across all regions. The [API Management multi-region deployment guide](https://docs.microsoft.com/en-us/azure/api-management/api-management-howto-deploy-multi-region) provides additional patterns for advanced scenarios.
 
 From a cost optimization perspective, this architecture allows granular control over regional capacity while maintaining global availability. You can scale each region independently based on local demand, use Azure Advisor recommendations to right-size deployments, and leverage reserved capacity pricing for predictable workloads. The built-in caching in each API Management region reduces backend load and Cosmos DB request units, while the automatic failover capabilities eliminate the need for expensive standby infrastructure. For detailed cost analysis and optimization strategies, refer to the [Azure Cost Management best practices](https://docs.microsoft.com/en-us/azure/cost-management-billing/costs/best-practices-cost-management).
+
+The monitoring and observability foundation provided by Azure Monitor and Application Insights enables comprehensive visibility into the global API platform. By correlating metrics, logs, and traces across all regions, you can identify performance bottlenecks, predict capacity requirements, and proactively respond to regional issues before they impact users. This data-driven approach to operations aligns with the Azure Well-Architected Framework's operational excellence pillar and provides the insights needed for continuous improvement of the global API platform.
 
 > **Tip**: Enable Azure API Management's built-in response caching in each region to dramatically reduce latency and backend load. Configure different cache durations based on API volatility and use cache-vary-by-headers for personalized responses. See the [API Management caching policies](https://docs.microsoft.com/en-us/azure/api-management/caching-policies) documentation for implementation details.
 
@@ -691,4 +701,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure VM Image Builder, Azure Private DNS Resolver, Azure DevOps, Azure Compute Gallery
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: devops, automation, golden-image, vm-image-builder, dns, hybrid-cloud, infrastructure
 recipe-generator-version: 1.3
@@ -121,6 +121,7 @@ az group create \
 az provider register --namespace Microsoft.VirtualMachineImages --wait
 az provider register --namespace Microsoft.Network --wait
 az provider register --namespace Microsoft.Compute --wait
+az provider register --namespace Microsoft.ContainerInstance --wait
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 echo "✅ Resource providers registered successfully"
@@ -148,11 +149,17 @@ echo "✅ Resource providers registered successfully"
        --vnet-name ${HUB_VNET_NAME} \
        --address-prefixes 10.0.2.0/24
    
+   # Get virtual network resource ID for DNS resolver
+   HUB_VNET_ID=$(az network vnet show \
+       --name ${HUB_VNET_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query id --output tsv)
+   
    # Create Azure Private DNS Resolver
    az dns-resolver create \
        --name ${PRIVATE_DNS_RESOLVER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --vnet ${HUB_VNET_NAME} \
+       --vnet-id ${HUB_VNET_ID} \
        --location ${LOCATION}
    
    echo "✅ Hub virtual network and Private DNS Resolver created"
@@ -354,7 +361,7 @@ EOF
    cat > image-template.json << EOF
 {
     "type": "Microsoft.VirtualMachineImages/imageTemplates",
-    "apiVersion": "2022-02-14",
+    "apiVersion": "2024-02-01",
     "location": "${LOCATION}",
     "dependsOn": [],
     "tags": {
@@ -449,32 +456,35 @@ EOF
    echo "✅ VM Image Builder template created"
    ```
 
-   The VM Image Builder template defines a comprehensive image creation process that includes system updates, security hardening, monitoring tools installation, and compliance configuration. This template ensures consistent, repeatable image creation with corporate security standards and required software components.
+   The VM Image Builder template defines a comprehensive image creation process that includes system updates, security hardening, monitoring tools installation, and compliance configuration. This template ensures consistent, repeatable image creation with corporate security standards and required software components using the latest stable API version 2024-02-01.
 
 7. **Deploy and Execute Image Builder Template**:
 
    Deploying the VM Image Builder template initiates the automated image creation process. The service creates a temporary build VM in the specified virtual network, executes the defined customization steps, and distributes the resulting image to the Compute Gallery for organizational use.
 
    ```bash
-   # Deploy the image template
+   # Deploy the image template using Azure Resource Manager
    az deployment group create \
        --resource-group ${RESOURCE_GROUP} \
        --template-file image-template.json \
        --parameters imageTemplateName=${IMAGE_TEMPLATE_NAME}
    
    # Start the image build process
-   az image builder run \
+   az resource invoke-action \
+       --resource-group ${RESOURCE_GROUP} \
+       --resource-type Microsoft.VirtualMachineImages/imageTemplates \
        --name ${IMAGE_TEMPLATE_NAME} \
-       --resource-group ${RESOURCE_GROUP}
+       --action Run
    
    # Monitor build progress
    echo "Image build started. Monitoring progress..."
    
    # Wait for build completion (this can take 20-40 minutes)
    while true; do
-       BUILD_STATUS=$(az image builder show \
-           --name ${IMAGE_TEMPLATE_NAME} \
+       BUILD_STATUS=$(az resource show \
            --resource-group ${RESOURCE_GROUP} \
+           --resource-type Microsoft.VirtualMachineImages/imageTemplates \
+           --name ${IMAGE_TEMPLATE_NAME} \
            --query properties.lastRunStatus.runState \
            --output tsv)
        
@@ -564,9 +574,11 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          az image builder run \
+          az resource invoke-action \
+            --resource-group \$(resourceGroup) \
+            --resource-type Microsoft.VirtualMachineImages/imageTemplates \
             --name \$(imageTemplateName) \
-            --resource-group \$(resourceGroup)
+            --action Run
 
     - task: AzureCLI@2
       displayName: 'Monitor Build Progress'
@@ -576,9 +588,10 @@ stages:
         scriptLocation: 'inlineScript'
         inlineScript: |
           while true; do
-            BUILD_STATUS=\$(az image builder show \
-              --name \$(imageTemplateName) \
+            BUILD_STATUS=\$(az resource show \
               --resource-group \$(resourceGroup) \
+              --resource-type Microsoft.VirtualMachineImages/imageTemplates \
+              --name \$(imageTemplateName) \
               --query properties.lastRunStatus.runState \
               --output tsv)
             
@@ -646,9 +659,10 @@ EOF
 
    ```bash
    # Verify image template status
-   az image builder show \
-       --name ${IMAGE_TEMPLATE_NAME} \
+   az resource show \
        --resource-group ${RESOURCE_GROUP} \
+       --resource-type Microsoft.VirtualMachineImages/imageTemplates \
+       --name ${IMAGE_TEMPLATE_NAME} \
        --query "{Name:name, Status:properties.lastRunStatus.runState}" \
        --output table
    
@@ -706,9 +720,10 @@ EOF
 
    ```bash
    # Delete image template
-   az image builder delete \
-       --name ${IMAGE_TEMPLATE_NAME} \
-       --resource-group ${RESOURCE_GROUP}
+   az resource delete \
+       --resource-group ${RESOURCE_GROUP} \
+       --resource-type Microsoft.VirtualMachineImages/imageTemplates \
+       --name ${IMAGE_TEMPLATE_NAME}
    
    echo "✅ Image template deleted"
    ```
@@ -737,7 +752,7 @@ Azure VM Image Builder combined with Azure Private DNS Resolver creates a powerf
 
 The integration of Private DNS Resolver eliminates the operational overhead of maintaining custom DNS forwarder virtual machines while providing secure, bidirectional DNS resolution between Azure and on-premises environments. This managed service approach reduces complexity and improves reliability compared to traditional hybrid DNS solutions. For comprehensive guidance on hybrid DNS architectures, see the [Azure Private DNS Resolver documentation](https://docs.microsoft.com/azure/dns/private-resolver-overview) and [hybrid DNS best practices](https://docs.microsoft.com/azure/dns/private-resolver-hybrid-dns).
 
-VM Image Builder's integration with Azure Compute Gallery enables centralized image lifecycle management, versioning, and global distribution capabilities. This combination supports enterprise-scale image management with proper governance, compliance tracking, and automated distribution workflows. The service's infrastructure-as-code approach through ARM templates and Azure DevOps integration ensures repeatable, auditable image creation processes that align with modern DevOps practices.
+VM Image Builder's integration with Azure Compute Gallery enables centralized image lifecycle management, versioning, and global distribution capabilities. This combination supports enterprise-scale image management with proper governance, compliance tracking, and automated distribution workflows. The service's infrastructure-as-code approach through ARM templates and Azure DevOps integration ensures repeatable, auditable image creation processes that align with modern DevOps practices. The solution now uses the latest stable API version 2024-02-01, which provides enhanced features including isolated image builds via Azure Container Instances for improved security and transparency.
 
 The solution's network isolation model provides security boundaries while maintaining necessary connectivity for image customization. The build virtual network's peering relationship with the hub network containing the DNS resolver ensures that image building processes can access corporate resources without exposing build infrastructure to external networks. This architecture supports zero-trust network principles while enabling practical hybrid cloud operations.
 
@@ -749,7 +764,7 @@ Extend this solution by implementing these enhancements:
 
 1. **Multi-Region Image Distribution**: Configure the Compute Gallery to replicate images across multiple Azure regions and implement region-specific customizations based on compliance requirements.
 
-2. **Automated Security Scanning**: Integrate vulnerability scanning tools into the image build process using Azure Security Center or third-party security solutions to validate image compliance before distribution.
+2. **Automated Security Scanning**: Integrate vulnerability scanning tools into the image build process using Microsoft Defender for Cloud or third-party security solutions to validate image compliance before distribution.
 
 3. **Advanced DevOps Integration**: Implement automated testing of golden images using Azure DevTest Labs or Azure Container Instances to validate functionality and performance before production deployment.
 
@@ -759,4 +774,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

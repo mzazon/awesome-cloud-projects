@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: sagemaker,s3,iam,lambda
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: forecasting,sagemaker,automl,machine-learning
 recipe-generator-version: 1.3
@@ -167,7 +167,7 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
 
 1. **Generate Comprehensive Training Dataset**:
 
-   Building effective forecasting models requires high-quality training data that captures real-world patterns and seasonality. This step creates a synthetic dataset that mimics e-commerce sales behavior with multiple complexity factors including seasonal trends, promotional effects, holiday impacts, and regional variations.
+   Amazon SageMaker AutoML requires high-quality training data that captures real-world patterns and seasonality to build effective forecasting models. This synthetic dataset mimics e-commerce sales behavior with multiple complexity factors including seasonal trends, promotional effects, holiday impacts, and regional variations, providing the comprehensive data foundation AutoML needs to learn complex relationships and produce accurate forecasts.
 
    ```bash
    # Create realistic e-commerce sales data with complex patterns
@@ -309,11 +309,11 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
    echo "✅ Training data generated and uploaded to S3"
    ```
 
-   The generated dataset now contains realistic patterns that challenge forecasting algorithms with multiple seasonalities, trend variations, and external factors. This comprehensive data foundation ensures the AutoML process can learn complex relationships and produce accurate forecasts for diverse business scenarios.
+   The generated dataset contains realistic patterns that challenge forecasting algorithms with multiple seasonalities, trend variations, and external factors. This comprehensive data foundation ensures the AutoML process can learn complex relationships and produce accurate forecasts for diverse business scenarios across different product categories and regional markets.
 
 2. **Prepare Data for SageMaker AutoML**:
 
-   SageMaker AutoML requires data in a specific format with mandatory columns for timestamp, target values, and item identifiers. This transformation step ensures the dataset meets AutoML requirements while preserving the business context and feature information needed for accurate forecasting.
+   SageMaker AutoML requires data in a specific format with mandatory columns (timestamp, target_value, item_id) and optional related time series features. This transformation step ensures the dataset meets AutoML requirements while preserving business context and feature information needed for accurate time series forecasting.
 
    ```bash
    # Create AutoML-compatible dataset with proper schema
@@ -385,11 +385,11 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
    echo "✅ AutoML-compatible data uploaded to S3"
    ```
 
-   The data is now properly structured with training and validation splits that preserve temporal order, ensuring the AutoML process can accurately evaluate model performance on unseen future data. The schema file provides AutoML with essential metadata about forecast frequency and target variables.
+   The data is properly structured with training and validation splits that preserve temporal order, ensuring the AutoML process can accurately evaluate model performance on unseen future data. The schema configuration provides AutoML with essential metadata about forecast frequency and target variables for optimal algorithm selection.
 
 3. **Create SageMaker AutoML Job for Time Series Forecasting**:
 
-   AutoML jobs automate the complex process of algorithm selection, hyperparameter tuning, and model ensembling. This configuration specifies time series forecasting parameters including forecast horizon, quantiles for uncertainty estimation, and algorithm candidates that AutoML will evaluate and combine.
+   SageMaker AutoML jobs automate the complex process of algorithm selection, hyperparameter tuning, and model ensembling specifically for time series forecasting. This configuration specifies forecasting parameters including forecast horizon, quantiles for uncertainty estimation, and algorithm candidates (CNN-QR, DeepAR, Prophet, NPTS, ARIMA, ETS) that AutoML will evaluate and combine.
 
    ```bash
    # Get SageMaker execution role ARN
@@ -471,11 +471,11 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
    echo "✅ AutoML job created: ${AUTOML_JOB_NAME}"
    ```
 
-   The AutoML job is now configured to evaluate multiple algorithms including CNN-QR, DeepAR, Prophet, and traditional statistical methods. It will automatically select the best performing combination based on the MAPE metric, creating an ensemble model that leverages the strengths of different forecasting approaches.
+   The AutoML job evaluates multiple algorithms including CNN-QR for capturing complex temporal patterns, DeepAR for handling seasonality, Prophet for trend detection, and traditional statistical methods. It automatically selects the best performing combination based on the MAPE metric, creating an ensemble model that leverages the strengths of different forecasting approaches.
 
 4. **Monitor AutoML Job Progress**:
 
-   AutoML jobs for time series forecasting typically require 2-4 hours to complete as they evaluate multiple algorithms, perform hyperparameter optimization, and create ensemble models. Monitoring progress ensures you can respond quickly to any issues and track the training pipeline's advancement.
+   SageMaker AutoML jobs for time series forecasting typically require 2-4 hours to complete as they evaluate multiple algorithms, perform hyperparameter optimization, and create ensemble models. Real-time monitoring ensures you can respond quickly to any issues and track the training pipeline's advancement through different phases.
 
    ```bash
    # Function to check job status
@@ -515,11 +515,11 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
        --query '{Status: AutoMLJobStatus, BestCandidate: BestCandidate.CandidateName, ObjectiveScore: BestCandidate.FinalAutoMLJobObjectiveMetric.Value}'
    ```
 
-   The monitoring loop provides real-time updates on training progress, allowing you to track the AutoML process as it evaluates different algorithms and builds the final ensemble model. Upon completion, you'll have access to the best performing candidate and its accuracy metrics.
+   The monitoring loop provides real-time updates on training progress, allowing you to track the AutoML process as it evaluates different algorithms and builds the final ensemble model. Upon completion, you'll have access to the best performing candidate and its accuracy metrics for production deployment.
 
 5. **Extract Best Model and Create Endpoint**:
 
-   Once AutoML completes, the best performing model must be deployed to a real-time inference endpoint. This process extracts the winning candidate from the AutoML job and creates the necessary SageMaker resources for production forecasting, including model registration, endpoint configuration, and deployment.
+   Once AutoML completes model training and evaluation, the best performing model must be deployed to a real-time inference endpoint. This process extracts the winning candidate from the AutoML job and creates the necessary SageMaker resources for production forecasting, including model registration, endpoint configuration, and deployment with appropriate instance sizing.
 
    ```bash
    # Get best candidate information
@@ -562,11 +562,11 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
    echo "Endpoint name: ${ENDPOINT_NAME}"
    ```
 
-   The best performing model is now deployed as a real-time inference endpoint, ready to generate forecasts on demand. The endpoint provides low-latency access to the trained ensemble model, enabling both batch and real-time forecasting capabilities for business applications.
+   The best performing ensemble model is now deployed as a real-time inference endpoint, ready to generate forecasts on demand. The endpoint provides low-latency access to the trained model, enabling both batch and real-time forecasting capabilities for business applications with configurable confidence intervals.
 
 6. **Generate Forecasts and Evaluate Performance**:
 
-   With the endpoint deployed, you can now generate forecasts and evaluate model performance against actual data. This step creates a comprehensive testing framework that validates forecast accuracy using multiple metrics and provides insights into model behavior across different items and time periods.
+   With the SageMaker endpoint deployed, you can generate forecasts and evaluate model performance against validation data. This comprehensive testing framework validates forecast accuracy using multiple metrics and provides insights into model behavior across different items and time periods with proper error handling.
 
    ```bash
    # Wait for endpoint to be in service
@@ -644,7 +644,7 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
    EOF
    
    # Add endpoint name to script
-   sed -i '' "s/endpoint_name/'${ENDPOINT_NAME}'/g" generate_automl_forecasts.py
+   sed -i.bak "s/endpoint_name/'${ENDPOINT_NAME}'/g" generate_automl_forecasts.py
    
    # Generate forecasts
    python generate_automl_forecasts.py
@@ -652,11 +652,11 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
    echo "✅ Forecasts generated"
    ```
 
-   The forecasting process generates probabilistic predictions with confidence intervals, providing not just point forecasts but also uncertainty estimates. This comprehensive output enables risk-aware decision making and helps identify items with high forecast confidence versus those requiring additional attention.
+   The forecasting process generates probabilistic predictions with confidence intervals, providing not just point forecasts but also uncertainty estimates. This comprehensive output enables risk-aware decision making and helps identify items with high forecast confidence versus those requiring additional attention or data collection.
 
 7. **Create Forecast Accuracy Dashboard**:
 
-   Forecast accuracy analysis is crucial for understanding model performance and identifying areas for improvement. This step implements multiple accuracy metrics including MAPE, MAE, RMSE, and MASE to provide a comprehensive view of forecasting quality across different items and business segments.
+   Forecast accuracy analysis is crucial for understanding model performance and identifying areas for improvement. This implementation calculates multiple accuracy metrics including MAPE, MAE, RMSE, and MASE to provide a comprehensive view of forecasting quality across different items and business segments with statistical significance testing.
 
    ```bash
    # Create comprehensive accuracy analysis
@@ -801,11 +801,11 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
    echo "✅ Accuracy analysis completed"
    ```
 
-   The accuracy analysis provides detailed performance metrics that enable data-driven decisions about model deployment and improvement opportunities. These metrics help identify which products or segments achieve the best forecast accuracy and where additional data or feature engineering might be beneficial.
+   The accuracy analysis provides detailed performance metrics that enable data-driven decisions about model deployment and improvement opportunities. These metrics help identify which products or segments achieve the best forecast accuracy and where additional data collection or feature engineering might be beneficial for model enhancement.
 
 8. **Create Real-time Forecast API**:
 
-   Business applications require real-time access to forecasts through REST APIs. This Lambda function creates a scalable, serverless API that wraps the SageMaker endpoint, providing standardized forecast requests and responses for integration with business systems like ERP, inventory management, and planning tools.
+   Business applications require real-time access to forecasts through REST APIs for integration with ERP, inventory management, and planning tools. This AWS Lambda function creates a scalable, serverless API that wraps the SageMaker endpoint, providing standardized forecast requests and responses with proper error handling and CORS support.
 
    ```bash
    # Create Lambda function for real-time forecasting
@@ -917,11 +917,11 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
    echo "✅ Lambda function created: ${LAMBDA_FUNCTION_NAME}"
    ```
 
-   The Lambda function now provides a production-ready API for real-time forecasting, enabling business applications to request forecasts on demand. This serverless approach ensures cost-effective scaling and integrates seamlessly with existing AWS infrastructure and security policies.
+   The Lambda function provides a production-ready API for real-time forecasting, enabling business applications to request forecasts on demand. This serverless approach ensures cost-effective scaling and integrates seamlessly with existing AWS infrastructure and security policies while maintaining low latency for operational decision making.
 
 9. **Set Up Model Monitoring and Alerts**:
 
-   Production ML models require continuous monitoring to detect performance degradation, service issues, and usage patterns. This monitoring setup creates CloudWatch dashboards and alarms that track endpoint health, response times, and error rates, enabling proactive maintenance and optimization.
+   Production ML models require continuous monitoring to detect performance degradation, service issues, and usage patterns following AWS Well-Architected Framework principles. This monitoring setup creates CloudWatch dashboards and alarms that track endpoint health, response times, and error rates, enabling proactive maintenance and optimization.
 
    ```bash
    # Create CloudWatch dashboard for monitoring
@@ -967,11 +967,11 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
    echo "✅ Monitoring dashboard and alarms created"
    ```
 
-   The monitoring infrastructure now provides real-time visibility into model performance and system health. CloudWatch alarms will trigger notifications when error rates exceed thresholds, enabling rapid response to issues that could impact business operations or forecast quality.
+   The monitoring infrastructure provides real-time visibility into model performance and system health following AWS operational excellence practices. CloudWatch alarms will trigger notifications when error rates exceed thresholds, enabling rapid response to issues that could impact business operations or forecast quality.
 
 10. **Create Batch Forecasting Pipeline**:
 
-    Large-scale forecasting operations require batch processing capabilities to generate forecasts for thousands of items efficiently. This pipeline enables scheduled batch operations, parallel processing, and automated result distribution, supporting strategic planning and inventory optimization workflows.
+    Large-scale forecasting operations require batch processing capabilities to generate forecasts for thousands of items efficiently. This pipeline enables scheduled batch operations, parallel processing, and automated result distribution, supporting strategic planning and inventory optimization workflows at enterprise scale.
 
     ```bash
     # Create batch forecasting script
@@ -1093,17 +1093,18 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
     echo "✅ Batch forecasting pipeline created"
     ```
 
-    The batch processing pipeline now enables efficient forecasting for large product catalogs, automatically handling data preparation, model inference, and result aggregation. This capability supports enterprise-scale forecasting operations with optimized resource utilization and cost management.
+    The batch processing pipeline enables efficient forecasting for large product catalogs, automatically handling data preparation, model inference, and result aggregation. This capability supports enterprise-scale forecasting operations with optimized resource utilization and cost management for strategic planning workflows.
 
 11. **Implement Model Governance and Versioning**:
 
-    Production ML systems require robust governance frameworks to track model versions, performance metrics, and deployment history. This implementation creates a model registry that maintains version control, enables rollback capabilities, and provides audit trails for compliance and model lifecycle management.
+    Production ML systems require robust governance frameworks to track model versions, performance metrics, and deployment history following AWS security best practices. This implementation creates a SageMaker Model Registry that maintains version control, enables rollback capabilities, and provides audit trails for compliance and model lifecycle management.
 
     ```bash
     # Create model registry and versioning
     cat > model_governance.py << 'EOF'
     import boto3
     import json
+    import os
     from datetime import datetime
     
     def register_model_version(model_name, endpoint_name, accuracy_metrics):
@@ -1165,11 +1166,11 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
     echo "✅ Model governance and versioning implemented"
     ```
 
-    The model registry now provides comprehensive version control and governance capabilities, enabling teams to track model performance over time, compare different versions, and maintain audit trails for regulatory compliance. This foundation supports continuous improvement and risk management in production forecasting systems.
+    The SageMaker Model Registry provides comprehensive version control and governance capabilities, enabling teams to track model performance over time, compare different versions, and maintain audit trails for regulatory compliance. This foundation supports continuous improvement and risk management in production forecasting systems.
 
 12. **Create Business Intelligence Integration**:
 
-    Forecasting insights must be accessible to business stakeholders through familiar BI tools and dashboards. This integration creates standardized reports and data formats that connect forecasting outputs with existing business intelligence infrastructure, enabling data-driven decision making across the organization.
+    Forecasting insights must be accessible to business stakeholders through familiar BI tools and dashboards following AWS data analytics best practices. This integration creates standardized reports and data formats that connect forecasting outputs with existing business intelligence infrastructure, enabling data-driven decision making across the organization.
 
     ```bash
     # Create BI dashboard configuration
@@ -1266,7 +1267,7 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
     echo "✅ Business Intelligence integration created"
     ```
 
-    The BI integration now provides business stakeholders with actionable forecasting insights through familiar reporting interfaces. Automated report generation and data visualization enable teams to identify trends, plan inventory, and optimize business operations based on reliable demand forecasts.
+    The BI integration provides business stakeholders with actionable forecasting insights through familiar reporting interfaces. Automated report generation and data visualization enable teams to identify trends, plan inventory, and optimize business operations based on reliable demand forecasts with confidence intervals and risk assessments.
 
 ## Validation & Testing
 
@@ -1398,7 +1399,7 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
    ```bash
    # Clean up generated files
    rm -f ecommerce_sales_data.csv automl_*.csv
-   rm -f *.json *.py *.zip
+   rm -f *.json *.py *.zip *.bak
    rm -f response.json
    
    echo "✅ Local files cleaned up"
@@ -1406,32 +1407,39 @@ echo "✅ IAM role created: ${SAGEMAKER_ROLE_NAME}"
 
 ## Discussion
 
-This advanced forecasting solution leverages Amazon SageMaker AutoML to address the deprecation of Amazon Forecast while providing superior performance and cost efficiency. SageMaker AutoML for time series forecasting automatically evaluates multiple algorithms including CNN-QR, DeepAR, Prophet, NPTS, ARIMA, and ETS, creating an ensemble model that combines the strengths of different approaches to optimize forecast accuracy for your specific dataset characteristics.
+This advanced forecasting solution leverages Amazon SageMaker AutoML to address the deprecation of Amazon Forecast while providing superior performance and cost efficiency. SageMaker AutoML for time series forecasting automatically evaluates multiple algorithms including CNN-QR for complex temporal patterns, DeepAR for handling seasonality and trends, Prophet for robust trend detection, NPTS for neural prophet modeling, ARIMA for traditional statistical forecasting, and ETS for exponential smoothing—creating an ensemble model that combines the strengths of different approaches to optimize forecast accuracy for your specific dataset characteristics.
 
-> **Warning**: AutoML training jobs can run for 2-4 hours and incur significant costs. Monitor your [AWS billing dashboard](https://console.aws.amazon.com/billing/) and set up budget alerts to avoid unexpected charges during experimentation.
+The AutoML approach significantly reduces the complexity of building forecasting models by automating algorithm selection, hyperparameter tuning, and model evaluation following AWS Well-Architected Framework principles. Unlike traditional forecasting methods that require extensive domain expertise and manual tuning, AutoML democratizes access to advanced forecasting capabilities while maintaining the flexibility to incorporate domain-specific features and business constraints through categorical variables and dynamic features.
 
-The AutoML approach significantly reduces the complexity of building forecasting models by automating algorithm selection, hyperparameter tuning, and model evaluation. Unlike traditional forecasting methods that require extensive domain expertise and manual tuning, AutoML democratizes access to advanced forecasting capabilities while maintaining the flexibility to incorporate domain-specific features and business constraints through categorical variables and dynamic features.
+> **Warning**: AutoML training jobs can run for 2-4 hours and incur significant costs ($75-200 for this recipe). Monitor your [AWS billing dashboard](https://console.aws.amazon.com/billing/) and set up budget alerts to avoid unexpected charges during experimentation.
 
-The solution's architecture enables both batch and real-time forecasting scenarios, supporting strategic planning through large-scale batch processing and operational decision-making through real-time API endpoints. The comprehensive monitoring and governance framework ensures model performance remains optimal over time, with automated alerts for accuracy degradation and streamlined retraining workflows.
+The solution's architecture enables both batch and real-time forecasting scenarios, supporting strategic planning through large-scale batch processing and operational decision-making through real-time API endpoints. The comprehensive monitoring and governance framework ensures model performance remains optimal over time, with automated CloudWatch alerts for accuracy degradation and streamlined retraining workflows using SageMaker Model Registry for version control and audit trails.
 
-> **Tip**: For production deployments, implement champion-challenger testing by running multiple AutoML jobs with different configurations and comparing their performance on out-of-sample data before selecting the final model.
+> **Tip**: For production deployments, implement champion-challenger testing by running multiple AutoML jobs with different configurations and comparing their performance on out-of-sample data before selecting the final model. Use SageMaker Experiments for systematic comparison of model variants.
 
-The business intelligence integration provides actionable insights beyond simple point forecasts, including demand volatility analysis, inventory optimization recommendations, and confidence interval-based risk assessments. This enables data-driven decision making across supply chain, marketing, and financial planning functions while maintaining transparency into model behavior and performance.
+The business intelligence integration provides actionable insights beyond simple point forecasts, including demand volatility analysis, inventory optimization recommendations, and confidence interval-based risk assessments. This enables data-driven decision making across supply chain, marketing, and financial planning functions while maintaining transparency into model behavior and performance through explainability features and comprehensive accuracy metrics. For more information on SageMaker AutoML capabilities, see the [SageMaker AutoML documentation](https://docs.aws.amazon.com/sagemaker/latest/dg/autopilot-create-experiment-timeseries-forecasting.html).
 
 ## Challenge
 
 Extend this forecasting solution by implementing these advanced capabilities:
 
-1. **Multi-Horizon Forecasting**: Implement separate models for different forecast horizons (daily, weekly, monthly) to optimize accuracy for different planning cycles and business use cases.
+1. **Multi-Horizon Forecasting**: Implement separate AutoML jobs for different forecast horizons (daily, weekly, monthly) using [SageMaker Pipelines](https://docs.aws.amazon.com/sagemaker/latest/dg/pipelines.html) to optimize accuracy for different planning cycles and business use cases.
 
 2. **Hierarchical Forecasting Reconciliation**: Use [Amazon SageMaker Processing](https://docs.aws.amazon.com/sagemaker/latest/dg/processing-job.html) to implement top-down and bottom-up reconciliation ensuring forecasts are consistent across product hierarchies and geographic regions.
 
-3. **Causal Inference Integration**: Incorporate [Amazon SageMaker Clarify](https://docs.aws.amazon.com/sagemaker/latest/dg/clarify-feature-attribute-shap-baselines.html) to quantify the impact of external factors like promotions, weather, and economic indicators on forecast accuracy.
+3. **Causal Inference Integration**: Incorporate [Amazon SageMaker Clarify](https://docs.aws.amazon.com/sagemaker/latest/dg/clarify-feature-attribute-shap-baselines.html) to quantify the impact of external factors like promotions, weather, and economic indicators on forecast accuracy with SHAP explanations.
 
-4. **Real-Time Data Streaming**: Integrate with [Amazon Kinesis Data Streams](https://docs.aws.amazon.com/kinesis/latest/dev/introduction.html) to enable continuous model updates with real-time sales data and dynamic retraining triggers.
+4. **Real-Time Data Streaming**: Integrate with [Amazon Kinesis Data Streams](https://docs.aws.amazon.com/kinesis/latest/dev/introduction.html) to enable continuous model updates with real-time sales data and dynamic retraining triggers based on forecast drift detection.
 
-5. **Advanced Ensemble Methods**: Implement custom ensemble techniques combining AutoML results with domain-specific models using [Amazon SageMaker Pipelines](https://docs.aws.amazon.com/sagemaker/latest/dg/pipelines.html) for model orchestration and automated A/B testing.
+5. **Advanced Ensemble Methods**: Implement custom ensemble techniques combining AutoML results with domain-specific models using [Amazon SageMaker Pipelines](https://docs.aws.amazon.com/sagemaker/latest/dg/pipelines.html) for model orchestration and automated A/B testing with champion-challenger frameworks.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

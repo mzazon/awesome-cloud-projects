@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Event Grid, Managed Identity, Resource Manager, Monitor
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: event-driven, security, governance, compliance, automation, identity
 recipe-generator-version: 1.3
@@ -196,7 +196,7 @@ echo "✅ Log Analytics workspace created with ID: ${WORKSPACE_ID}"
        --storage-account ${STORAGE_ACCOUNT} \
        --consumption-plan-location ${LOCATION} \
        --runtime python \
-       --runtime-version 3.9 \
+       --runtime-version 3.11 \
        --functions-version 4 \
        --assign-identity \
        --tags purpose=security-automation compliance=required
@@ -396,7 +396,7 @@ echo "✅ Log Analytics workspace created with ID: ${WORKSPACE_ID}"
        --short-name "SecAlert" \
        --email-receivers name="SecurityTeam" email="security@company.com"
    
-   # Create alert rule for security violations
+   # Create alert rule for security violations using correct syntax
    az monitor metrics alert create \
        --name "SecurityViolationAlert" \
        --resource-group ${RESOURCE_GROUP} \
@@ -404,7 +404,7 @@ echo "✅ Log Analytics workspace created with ID: ${WORKSPACE_ID}"
        --condition "count FunctionExecutionCount > 5" \
        --window-size 5m \
        --evaluation-frequency 1m \
-       --action-groups ${ACTION_GROUP} \
+       --action ${ACTION_GROUP} \
        --description "Alert when security violations exceed threshold" \
        --severity 2
    
@@ -416,7 +416,7 @@ echo "✅ Log Analytics workspace created with ID: ${WORKSPACE_ID}"
        --condition "count FunctionExecutionFailures > 0" \
        --window-size 5m \
        --evaluation-frequency 1m \
-       --action-groups ${ACTION_GROUP} \
+       --action ${ACTION_GROUP} \
        --description "Alert when security function executions fail" \
        --severity 1
    
@@ -595,4 +595,9 @@ Extend this security governance solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: cost-explorer,savings-plans,lambda,s3
 estimated-time: 60 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-optimization,savings-plans,cost-explorer,financial-management,automation
 recipe-generator-version: 1.3
@@ -291,7 +291,7 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler savings_analyzer.lambda_handler \
        --zip-file fileb://savings-analyzer.zip \
@@ -308,9 +308,12 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
    Cost Explorer provides programmatic access to your AWS billing and usage data, enabling automated analysis of spending patterns over time. This verification step ensures your account has the necessary data history and API access required for Savings Plans analysis. Cost Explorer's APIs offer granular insights into service-level usage, which is essential for generating accurate commitment recommendations. The test query retrieves a sample of your historical costs grouped by service, validating that sufficient data exists for meaningful analysis.
 
    ```bash
-   # Test basic Cost Explorer access
+   # Test basic Cost Explorer access with current date range
+   START_DATE=$(date -d '2 months ago' +%Y-%m-01)
+   END_DATE=$(date -d '1 month ago' +%Y-%m-01)
+   
    aws ce get-cost-and-usage \
-       --time-period Start=2024-01-01,End=2024-01-31 \
+       --time-period Start=${START_DATE},End=${END_DATE} \
        --granularity MONTHLY \
        --metrics BlendedCost \
        --group-by Type=DIMENSION,Key=SERVICE \
@@ -399,9 +402,11 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
        --query 'SavingsPlans[*].[SavingsPlanId,SavingsPlanType,Commitment,TermDurationInSeconds]' \
        --output table
    
-   # Create comprehensive cost report
+   # Create comprehensive cost report with current year
+   CURRENT_YEAR=$(date +%Y)
+   
    aws ce get-cost-and-usage \
-       --time-period Start=2024-01-01,End=2024-12-31 \
+       --time-period Start=${CURRENT_YEAR}-01-01,End=${CURRENT_YEAR}-12-31 \
        --granularity MONTHLY \
        --metrics BlendedCost UnblendedCost \
        --group-by Type=DIMENSION,Key=PURCHASE_TYPE \
@@ -628,28 +633,35 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
 
 ## Discussion
 
-This solution provides a comprehensive approach to cost optimization through automated Savings Plans analysis. The Cost Explorer API enables programmatic access to AWS usage patterns, allowing organizations to make data-driven decisions about commitment-based pricing. By analyzing different Savings Plans types (Compute, EC2 Instance, and SageMaker), the solution covers the most common AWS compute workloads.
+This solution provides a comprehensive approach to cost optimization through automated Savings Plans analysis. The Cost Explorer API enables programmatic access to AWS usage patterns, allowing organizations to make data-driven decisions about commitment-based pricing. By analyzing different Savings Plans types (Compute, EC2 Instance, and SageMaker), the solution covers the most common AWS compute workloads, following AWS Well-Architected Framework cost optimization principles.
 
-The Lambda-based architecture ensures scalability and cost-effectiveness, as the analysis function only runs when needed. The automated scheduling through EventBridge provides continuous monitoring without manual intervention. The S3 integration enables historical tracking of recommendations and decision-making processes for compliance and audit purposes.
+The Lambda-based architecture ensures scalability and cost-effectiveness, as the analysis function only runs when needed. The automated scheduling through EventBridge provides continuous monitoring without manual intervention. The S3 integration enables historical tracking of recommendations and decision-making processes for compliance and audit purposes. This approach aligns with AWS best practices for serverless architectures and event-driven design patterns.
 
-Key benefits include reduced manual effort in cost analysis, improved accuracy through automated calculations, and consistent evaluation of optimization opportunities. The solution also provides flexibility to analyze different commitment scenarios (payment options and terms) to find the optimal balance between upfront costs and long-term savings.
+Key benefits include reduced manual effort in cost analysis, improved accuracy through automated calculations, and consistent evaluation of optimization opportunities. The solution also provides flexibility to analyze different commitment scenarios (payment options and terms) to find the optimal balance between upfront costs and long-term savings. For more information on AWS Cost Explorer best practices, see the [AWS Cost Management User Guide](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-api-best-practices.html).
 
-> **Tip**: Run the analysis monthly to capture seasonal usage patterns and ensure recommendations reflect current workload characteristics.
+> **Tip**: Run the analysis monthly to capture seasonal usage patterns and ensure recommendations reflect current workload characteristics, as recommended in the [AWS Savings Plans User Guide](https://docs.aws.amazon.com/savingsplans/latest/userguide/what-is-savings-plans.html).
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Account Analysis**: Modify the Lambda function to analyze Savings Plans recommendations across multiple AWS accounts in an organization using AWS Organizations APIs.
+1. **Multi-Account Analysis**: Modify the Lambda function to analyze Savings Plans recommendations across multiple AWS accounts in an organization using AWS Organizations APIs for centralized cost optimization.
 
-2. **ROI Threshold Automation**: Add logic to automatically filter recommendations based on minimum ROI thresholds and create purchase recommendations only for high-value opportunities.
+2. **ROI Threshold Automation**: Add logic to automatically filter recommendations based on minimum ROI thresholds and create purchase recommendations only for high-value opportunities exceeding predefined criteria.
 
-3. **Integration with AWS Budgets**: Connect the recommendations to AWS Budgets API to automatically create budget alerts when potential savings exceed predefined thresholds.
+3. **Integration with AWS Budgets**: Connect the recommendations to AWS Budgets API to automatically create budget alerts when potential savings exceed predefined thresholds or when utilization drops below expected levels.
 
-4. **Slack/Teams Integration**: Build notification workflows that send formatted Savings Plans recommendations to collaboration platforms with approval workflows for purchase decisions.
+4. **Slack/Teams Integration**: Build notification workflows that send formatted Savings Plans recommendations to collaboration platforms with approval workflows for purchase decisions and automated reporting.
 
-5. **Cost Anomaly Integration**: Combine with AWS Cost Anomaly Detection to identify unusual spending patterns that might affect Savings Plans utilization and recommendations.
+5. **Cost Anomaly Integration**: Combine with AWS Cost Anomaly Detection to identify unusual spending patterns that might affect Savings Plans utilization and adjust recommendations accordingly.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

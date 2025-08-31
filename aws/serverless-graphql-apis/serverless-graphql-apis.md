@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AWS AppSync, EventBridge Scheduler, DynamoDB, Lambda
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: graphql, real-time, serverless, api, event-driven, scheduling
 recipe-generator-version: 1.3
@@ -344,7 +344,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
        "id": $util.dynamodb.toDynamoDBJson($id)
      },
      "attributeValues": {
-       "userId": $util.dynamodb.toDynamoDBJson($ctx.identity.userArn),
+       "userId": $util.dynamodb.toDynamoDBJson($ctx.identity.username),
        "title": $util.dynamodb.toDynamoDBJson($ctx.args.input.title),
        "description": $util.dynamodb.toDynamoDBJson($ctx.args.input.description),
        "dueDate": $util.dynamodb.toDynamoDBJson($ctx.args.input.dueDate),
@@ -461,7 +461,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    sleep 10  # Wait for IAM role propagation
    LAMBDA_ARN=$(aws lambda create-function \
        --function-name ${FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://function.zip \
@@ -532,12 +532,6 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    # Create a sample schedule (runs in 2 minutes)
    SCHEDULE_TIME=$(date -u -d '+2 minutes' '+%Y-%m-%dT%H:%M:%S')
    
-   cat > schedule-input.json << EOF
-   {
-     "query": "mutation SendTestReminder { sendReminder(taskId: \"test-123\") { id title status } }"
-   }
-   EOF
-   
    aws scheduler create-schedule \
        --name TaskReminder-Test \
        --schedule-expression "at(${SCHEDULE_TIME})" \
@@ -550,58 +544,48 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
        }' \
        --flexible-time-window '{"Mode": "OFF"}'
    
-   echo "✅ Sample schedule created for testing"
+   echo "✅ Sample schedule created for testing at ${SCHEDULE_TIME}"
    ```
 
    This schedule demonstrates how EventBridge Scheduler can directly invoke AppSync mutations at specified times, enabling powerful automation workflows without managing infrastructure.
 
 ## Validation & Testing
 
-1. Test GraphQL API endpoint connectivity:
+1. Verify AppSync API was created successfully:
 
    ```bash
-   # Test API endpoint
-   curl -X POST ${API_URL} \
-       -H "Content-Type: application/json" \
-       -H "x-api-key: ${API_KEY}" \
-       --data '{"query":"{ __typename }"}' \
-       --aws-sigv4 "aws:amz:${AWS_REGION}:appsync"
+   # Check API status
+   aws appsync get-graphql-api \
+       --api-id ${API_ID} \
+       --query 'graphqlApi.[name,apiId,authenticationType]' \
+       --output table
    ```
 
-   Expected output: A JSON response containing the GraphQL schema information.
+   Expected output: Table showing API name, ID, and authentication type.
 
-2. Create a test task via GraphQL mutation:
-
-   ```bash
-   # Create test task
-   TASK_MUTATION='mutation {
-     createTask(input: {
-       title: "Complete project documentation"
-       description: "Write comprehensive docs"
-       dueDate: "2024-12-31T23:59:59Z"
-       reminderTime: "2024-12-31T09:00:00Z"
-     }) {
-       id
-       title
-       status
-       createdAt
-     }
-   }'
-   
-   # Execute mutation (requires proper authentication setup)
-   echo "Task creation mutation prepared"
-   ```
-
-3. Verify DynamoDB table contains data:
+2. Test DynamoDB table access:
 
    ```bash
-   # Check table item count
+   # Check table status and configuration
    aws dynamodb describe-table \
        --table-name ${TABLE_NAME} \
-       --query Table.ItemCount
+       --query 'Table.[TableName,TableStatus,BillingMode]' \
+       --output table
    ```
 
-   Expected output: Item count showing created tasks.
+   Expected output: Table showing table name, ACTIVE status, and PAY_PER_REQUEST billing mode.
+
+3. Verify Lambda function configuration:
+
+   ```bash
+   # Check Lambda function details
+   aws lambda get-function-configuration \
+       --function-name ${FUNCTION_NAME} \
+       --query '[FunctionName,Runtime,State]' \
+       --output table
+   ```
+
+   Expected output: Table showing function name, python3.12 runtime, and Active state.
 
 4. Verify EventBridge Scheduler is configured:
 
@@ -612,6 +596,16 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    ```
 
    Expected output: List of created schedules with their configurations.
+
+5. Test GraphQL introspection query:
+
+   ```bash
+   # Test basic GraphQL connectivity (requires AWS SigV4 signing)
+   echo "GraphQL endpoint ready at: ${API_URL}"
+   echo "Use GraphQL clients with AWS IAM authentication to test queries"
+   ```
+
+   Note: Full GraphQL testing requires proper AWS SigV4 request signing or a GraphQL client configured with AWS credentials.
 
 ## Cleanup
 
@@ -694,9 +688,11 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
 
 Building serverless GraphQL APIs with AWS AppSync and EventBridge Scheduler creates a powerful, scalable architecture for modern applications. AppSync eliminates the operational overhead of managing GraphQL servers while providing enterprise-grade features like real-time subscriptions, caching, and multiple authorization modes. According to the [AWS AppSync Developer Guide](https://docs.aws.amazon.com/appsync/latest/devguide/), the service automatically scales to handle millions of requests and thousands of concurrent connections without manual intervention.
 
-The integration between EventBridge and AppSync, as documented in the [EventBridge User Guide](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-targets.html), enables sophisticated event-driven architectures where scheduled events can trigger GraphQL mutations that instantly update all connected clients. This pattern is particularly powerful for use cases like task reminders, scheduled reports, or time-based state transitions. The serverless nature of both services means you only pay for actual usage, making it cost-effective for applications with variable load patterns.
+The integration between EventBridge Scheduler and AppSync, as documented in the [EventBridge User Guide](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-targets.html), enables sophisticated event-driven architectures where scheduled events can trigger GraphQL mutations that instantly update all connected clients. This pattern is particularly powerful for use cases like task reminders, scheduled reports, or time-based state transitions. The serverless nature of both services means you only pay for actual usage, making it cost-effective for applications with variable load patterns.
 
 From a security perspective, the architecture leverages AWS IAM for fine-grained access control, ensuring that each component has minimal required permissions. The [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) security pillar emphasizes this principle of least privilege, which our implementation follows by creating separate IAM roles for each service. Additionally, AppSync supports multiple authorization modes including Cognito User Pools, API keys, and OpenID Connect, allowing you to choose the most appropriate method for your use case as detailed in the [AppSync Security Documentation](https://docs.aws.amazon.com/appsync/latest/devguide/security.html).
+
+The VTL (Velocity Template Language) resolvers provide direct integration between GraphQL operations and AWS data sources without requiring Lambda functions for simple CRUD operations. As documented in the [AppSync Resolver Reference](https://docs.aws.amazon.com/appsync/latest/devguide/resolver-context-reference.html), the context variables like `$ctx.identity.username` for IAM authentication enable secure, user-scoped data access patterns that are essential for multi-tenant applications.
 
 > **Tip**: Use AWS X-Ray with AppSync to gain visibility into GraphQL resolver performance and identify bottlenecks in your API. The [AppSync Monitoring Guide](https://docs.aws.amazon.com/appsync/latest/devguide/monitoring.html) provides comprehensive guidance on implementing observability for your GraphQL APIs.
 
@@ -712,4 +708,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

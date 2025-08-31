@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: rekognition, stepfunctions, lambda, s3
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: media-services,video-analysis,content-moderation,machine-learning,step-functions,rekognition
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Media companies and content creators need to analyze thousands of hours of video
 
 ## Solution
 
-This solution creates an automated video content analysis pipeline using Amazon Rekognition's MediaAnalysis capabilities, orchestrated by AWS Step Functions. The system processes video files stored in Amazon S3, performs comprehensive content analysis including moderation, scene detection, and metadata extraction, then stores structured results for downstream applications. The workflow scales automatically to handle large volumes of video content while providing consistent, accurate analysis results.
+This solution creates an automated video content analysis pipeline using Amazon Rekognition's video analysis capabilities, orchestrated by AWS Step Functions. The system processes video files stored in Amazon S3, performs comprehensive content analysis including moderation, scene detection, and metadata extraction, then stores structured results for downstream applications. The workflow scales automatically to handle large volumes of video content while providing consistent, accurate analysis results.
 
 ## Architecture Diagram
 
@@ -37,19 +37,19 @@ graph TB
     subgraph "Storage Layer"
         S3_SOURCE[S3 Source Bucket]
         S3_RESULTS[S3 Results Bucket]
-        S3_TEMP[S3 Temp Bucket]
     end
     
     subgraph "Processing Layer"
         SF[Step Functions Workflow]
         LAMBDA_TRIGGER[Trigger Lambda]
-        LAMBDA_PROCESS[Processing Lambda]
-        LAMBDA_AGGREGATE[Aggregation Lambda]
+        LAMBDA_INIT[Init Lambda]
+        LAMBDA_MOD[Moderation Lambda]
+        LAMBDA_SEG[Segment Lambda]
+        LAMBDA_AGG[Aggregation Lambda]
     end
     
     subgraph "Analysis Services"
-        REKOGNITION[Amazon Rekognition]
-        MEDIACONVERT[MediaConvert]
+        REKOGNITION[Amazon Rekognition Video]
     end
     
     subgraph "Notification Layer"
@@ -66,12 +66,14 @@ graph TB
     VIDEO-->S3_SOURCE
     S3_SOURCE-->LAMBDA_TRIGGER
     LAMBDA_TRIGGER-->SF
-    SF-->LAMBDA_PROCESS
-    LAMBDA_PROCESS-->REKOGNITION
-    REKOGNITION-->MEDIACONVERT
-    MEDIACONVERT-->LAMBDA_AGGREGATE
-    LAMBDA_AGGREGATE-->DYNAMODB
-    LAMBDA_AGGREGATE-->S3_RESULTS
+    SF-->LAMBDA_INIT
+    LAMBDA_INIT-->LAMBDA_MOD
+    LAMBDA_INIT-->LAMBDA_SEG
+    LAMBDA_MOD-->REKOGNITION
+    LAMBDA_SEG-->REKOGNITION
+    REKOGNITION-->LAMBDA_AGG
+    LAMBDA_AGG-->DYNAMODB
+    LAMBDA_AGG-->S3_RESULTS
     SF-->SNS
     SNS-->SQS
     SF-->CLOUDWATCH
@@ -84,17 +86,13 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for Rekognition, Step Functions, Lambda, S3, DynamoDB, and SNS
+1. AWS account with appropriate permissions for Rekognition, Step Functions, Lambda, S3, DynamoDB, SNS, IAM, and CloudWatch
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of video processing workflows and content analysis concepts
 4. Familiarity with AWS Step Functions and Lambda functions
 5. Estimated cost: $50-100 for processing 10 hours of video content (varies by video resolution and analysis depth)
 
-> **Note**: Amazon Rekognition video analysis pricing is based on the number of minutes of video processed. Review current pricing at https://aws.amazon.com/rekognition/pricing/
-
-> **Warning**: Ensure your Lambda functions have sufficient timeout values for large video files. Content moderation and segment detection can take several minutes to complete for long videos, requiring appropriate timeout configuration.
-
-> **Tip**: Consider implementing Lambda layers for shared dependencies across your video analysis functions. This approach reduces deployment package sizes and improves cold start performance. See the [AWS Lambda Layers documentation](https://docs.aws.amazon.com/lambda/latest/dg/configuration-layers.html) for implementation guidance.
+> **Note**: Amazon Rekognition video analysis pricing is based on the number of minutes of video processed. Review current pricing at the [Amazon Rekognition pricing page](https://aws.amazon.com/rekognition/pricing/).
 
 ## Preparation
 
@@ -111,10 +109,8 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --output text --query RandomPassword)
 
 # Set resource names
-export VIDEO_ANALYSIS_STACK="video-analysis-${RANDOM_SUFFIX}"
 export SOURCE_BUCKET="video-source-${RANDOM_SUFFIX}"
 export RESULTS_BUCKET="video-results-${RANDOM_SUFFIX}"
-export TEMP_BUCKET="video-temp-${RANDOM_SUFFIX}"
 export ANALYSIS_TABLE="video-analysis-results-${RANDOM_SUFFIX}"
 export SNS_TOPIC="video-analysis-notifications-${RANDOM_SUFFIX}"
 export SQS_QUEUE="video-analysis-queue-${RANDOM_SUFFIX}"
@@ -122,9 +118,8 @@ export SQS_QUEUE="video-analysis-queue-${RANDOM_SUFFIX}"
 # Create S3 buckets for video processing
 aws s3 mb s3://${SOURCE_BUCKET} --region ${AWS_REGION}
 aws s3 mb s3://${RESULTS_BUCKET} --region ${AWS_REGION}
-aws s3 mb s3://${TEMP_BUCKET} --region ${AWS_REGION}
 
-# Apply bucket policies to restrict access
+# Apply security policies to enforce HTTPS
 aws s3api put-bucket-policy --bucket ${SOURCE_BUCKET} --policy '{
     "Version": "2012-10-17",
     "Statement": [
@@ -208,6 +203,28 @@ echo "✅ Created S3 buckets and configured security policies"
        --protocol sqs \
        --notification-endpoint ${SQS_QUEUE_ARN}
    
+   # Add SQS queue policy to allow SNS to send messages
+   aws sqs set-queue-attributes \
+       --queue-url ${SQS_QUEUE_URL} \
+       --attributes '{
+           "Policy": "{
+               \"Version\": \"2012-10-17\",
+               \"Statement\": [
+                   {
+                       \"Effect\": \"Allow\",
+                       \"Principal\": \"*\",
+                       \"Action\": \"sqs:SendMessage\",
+                       \"Resource\": \"'"${SQS_QUEUE_ARN}"'\",
+                       \"Condition\": {
+                           \"ArnEquals\": {
+                               \"aws:SourceArn\": \"'"${SNS_TOPIC_ARN}"'\"
+                           }
+                       }
+                   }
+               ]
+           }"
+       }'
+   
    echo "✅ Created SNS topic and SQS queue for notifications"
    ```
 
@@ -218,6 +235,43 @@ echo "✅ Created S3 buckets and configured security policies"
    Identity and Access Management (IAM) roles implement the principle of least privilege, granting Lambda functions only the minimum permissions required for their specific tasks. This security approach reduces the potential impact of compromised functions and ensures compliance with enterprise security policies. The custom policy defines granular permissions for Rekognition video analysis operations, S3 object access, and DynamoDB data management.
 
    ```bash
+   # Create service role for Rekognition to publish to SNS
+   aws iam create-role \
+       --role-name VideoAnalysisRekognitionRole \
+       --assume-role-policy-document '{
+           "Version": "2012-10-17",
+           "Statement": [
+               {
+                   "Effect": "Allow",
+                   "Principal": {
+                       "Service": "rekognition.amazonaws.com"
+                   },
+                   "Action": "sts:AssumeRole"
+               }
+           ]
+       }'
+   
+   # Create policy for Rekognition service role
+   aws iam create-policy \
+       --policy-name RekognitionSNSPublishPolicy \
+       --policy-document '{
+           "Version": "2012-10-17",
+           "Statement": [
+               {
+                   "Effect": "Allow",
+                   "Action": [
+                       "sns:Publish"
+                   ],
+                   "Resource": "'"${SNS_TOPIC_ARN}"'"
+               }
+           ]
+       }'
+   
+   # Attach policy to Rekognition role
+   aws iam attach-role-policy \
+       --role-name VideoAnalysisRekognitionRole \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/RekognitionSNSPublishPolicy
+   
    # Create Lambda execution role
    aws iam create-role \
        --role-name VideoAnalysisLambdaRole \
@@ -248,14 +302,10 @@ echo "✅ Created S3 buckets and configured security policies"
                {
                    "Effect": "Allow",
                    "Action": [
-                       "rekognition:StartMediaAnalysisJob",
-                       "rekognition:GetMediaAnalysisJob",
                        "rekognition:StartContentModeration",
                        "rekognition:GetContentModeration",
                        "rekognition:StartSegmentDetection",
-                       "rekognition:GetSegmentDetection",
-                       "rekognition:StartTextDetection",
-                       "rekognition:GetTextDetection"
+                       "rekognition:GetSegmentDetection"
                    ],
                    "Resource": "*"
                },
@@ -268,8 +318,7 @@ echo "✅ Created S3 buckets and configured security policies"
                    ],
                    "Resource": [
                        "arn:aws:s3:::'"${SOURCE_BUCKET}"'/*",
-                       "arn:aws:s3:::'"${RESULTS_BUCKET}"'/*",
-                       "arn:aws:s3:::'"${TEMP_BUCKET}"'/*"
+                       "arn:aws:s3:::'"${RESULTS_BUCKET}"'/*"
                    ]
                },
                {
@@ -292,6 +341,13 @@ echo "✅ Created S3 buckets and configured security policies"
                        "sns:Publish"
                    ],
                    "Resource": "'"${SNS_TOPIC_ARN}"'"
+               },
+               {
+                   "Effect": "Allow",
+                   "Action": [
+                       "iam:PassRole"
+                   ],
+                   "Resource": "arn:aws:iam::'"${AWS_ACCOUNT_ID}"':role/VideoAnalysisRekognitionRole"
                }
            ]
        }'
@@ -306,7 +362,7 @@ echo "✅ Created S3 buckets and configured security policies"
 
    The security foundation is now complete, with IAM roles configured to support secure service-to-service communication. Each Lambda function will assume these roles temporarily, gaining only the permissions necessary to perform video analysis operations while maintaining strict access controls.
 
-4. **Create Step Functions role and state machine**:
+4. **Create Step Functions role and state machine definition**:
 
    AWS Step Functions provides serverless workflow orchestration that coordinates the complex video analysis pipeline. The state machine handles error recovery, parallel execution, and state transitions, ensuring reliable processing even when individual components fail. This visual workflow approach simplifies debugging and monitoring compared to traditional code-based orchestration.
 
@@ -341,18 +397,6 @@ echo "✅ Created S3 buckets and configured security policies"
                    "Resource": [
                        "arn:aws:lambda:'"${AWS_REGION}"':'"${AWS_ACCOUNT_ID}"':function:VideoAnalysis*"
                    ]
-               },
-               {
-                   "Effect": "Allow",
-                   "Action": [
-                       "rekognition:StartMediaAnalysisJob",
-                       "rekognition:GetMediaAnalysisJob",
-                       "rekognition:StartContentModeration",
-                       "rekognition:GetContentModeration",
-                       "rekognition:StartSegmentDetection",
-                       "rekognition:GetSegmentDetection"
-                   ],
-                   "Resource": "*"
                },
                {
                    "Effect": "Allow",
@@ -549,7 +593,7 @@ EOF
        --zip-file fileb:///tmp/lambda-packages/moderation-function.zip \
        --timeout 60 \
        --memory-size 256 \
-       --environment Variables="{ANALYSIS_TABLE=${ANALYSIS_TABLE},SNS_TOPIC_ARN=${SNS_TOPIC_ARN},REKOGNITION_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/VideoAnalysisLambdaRole}"
+       --environment Variables="{ANALYSIS_TABLE=${ANALYSIS_TABLE},SNS_TOPIC_ARN=${SNS_TOPIC_ARN},REKOGNITION_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/VideoAnalysisRekognitionRole}"
    
    echo "✅ Created content moderation Lambda function"
    ```
@@ -647,7 +691,7 @@ EOF
        --zip-file fileb:///tmp/lambda-packages/segment-function.zip \
        --timeout 60 \
        --memory-size 256 \
-       --environment Variables="{ANALYSIS_TABLE=${ANALYSIS_TABLE},SNS_TOPIC_ARN=${SNS_TOPIC_ARN},REKOGNITION_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/VideoAnalysisLambdaRole}"
+       --environment Variables="{ANALYSIS_TABLE=${ANALYSIS_TABLE},SNS_TOPIC_ARN=${SNS_TOPIC_ARN},REKOGNITION_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/VideoAnalysisRekognitionRole}"
    
    echo "✅ Created segment detection Lambda function"
    ```
@@ -1014,6 +1058,8 @@ EOF
 
 11. **Create monitoring dashboard and alerts**:
 
+    CloudWatch provides comprehensive monitoring and alerting capabilities for the video analysis pipeline. The dashboard visualizes key metrics including Lambda function performance, Step Functions execution status, and processing throughput. Automated alerts notify operators when failures occur, enabling rapid response to processing issues.
+
     ```bash
     # Create CloudWatch dashboard
     aws cloudwatch put-dashboard \
@@ -1070,10 +1116,15 @@ EOF
 
 12. **Upload sample video for testing**:
 
+    Testing the complete pipeline with a sample video validates the entire workflow from upload through analysis completion. This step demonstrates the end-to-end functionality and provides immediate feedback on system performance and accuracy.
+
     ```bash
-    # Download a sample video file (replace with your own video)
-    curl -L "https://sample-videos.com/zip/10/mp4/360/SampleVideo_360x240_1mb.mp4" \
-        -o /tmp/sample-video.mp4
+    # Create a small test video file if curl fails
+    if ! curl -L "https://sample-videos.com/zip/10/mp4/360/SampleVideo_360x240_1mb.mp4" \
+        -o /tmp/sample-video.mp4; then
+        echo "Sample video download failed. Creating dummy file for testing..."
+        touch /tmp/sample-video.mp4
+    fi
     
     # Upload to S3 source bucket to trigger analysis
     aws s3 cp /tmp/sample-video.mp4 s3://${SOURCE_BUCKET}/sample-video.mp4
@@ -1123,11 +1174,21 @@ EOF
 4. **Test content moderation functionality**:
 
    ```bash
-   # Check for moderation labels in results
-   aws s3 cp s3://${RESULTS_BUCKET}/analysis-results/$(aws s3 ls s3://${RESULTS_BUCKET}/analysis-results/ --recursive | head -1 | awk '{print $4}') /tmp/test-results.json
+   # Get the first results file for examination
+   RESULTS_FILE=$(aws s3 ls s3://${RESULTS_BUCKET}/analysis-results/ \
+       --recursive | head -1 | awk '{print $4}')
    
-   # Display moderation results
-   cat /tmp/test-results.json | jq '.moderation.labels'
+   if [ ! -z "$RESULTS_FILE" ]; then
+       # Download and examine results
+       aws s3 cp s3://${RESULTS_BUCKET}/${RESULTS_FILE} /tmp/test-results.json
+       
+       # Display moderation results if jq is available
+       if command -v jq &> /dev/null; then
+           cat /tmp/test-results.json | jq '.moderation.labels'
+       else
+           echo "Results file downloaded to /tmp/test-results.json"
+       fi
+   fi
    ```
 
 5. **Monitor workflow execution**:
@@ -1184,11 +1245,9 @@ EOF
    # Empty and delete S3 buckets
    aws s3 rm s3://${SOURCE_BUCKET} --recursive
    aws s3 rm s3://${RESULTS_BUCKET} --recursive
-   aws s3 rm s3://${TEMP_BUCKET} --recursive
    
    aws s3 rb s3://${SOURCE_BUCKET}
    aws s3 rb s3://${RESULTS_BUCKET}
-   aws s3 rb s3://${TEMP_BUCKET}
    
    echo "✅ Deleted S3 buckets"
    ```
@@ -1209,13 +1268,19 @@ EOF
        --role-name VideoAnalysisStepFunctionsRole \
        --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/VideoAnalysisStepFunctionsPolicy
    
+   aws iam detach-role-policy \
+       --role-name VideoAnalysisRekognitionRole \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/RekognitionSNSPublishPolicy
+   
    # Delete roles
    aws iam delete-role --role-name VideoAnalysisLambdaRole
    aws iam delete-role --role-name VideoAnalysisStepFunctionsRole
+   aws iam delete-role --role-name VideoAnalysisRekognitionRole
    
    # Delete custom policies
    aws iam delete-policy --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/VideoAnalysisPolicy
    aws iam delete-policy --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/VideoAnalysisStepFunctionsPolicy
+   aws iam delete-policy --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/RekognitionSNSPublishPolicy
    
    echo "✅ Deleted IAM roles and policies"
    ```
@@ -1242,8 +1307,8 @@ EOF
    aws cloudwatch delete-alarms --alarm-names VideoAnalysisFailedExecutions
    
    # Clean up environment variables
-   unset AWS_REGION AWS_ACCOUNT_ID RANDOM_SUFFIX VIDEO_ANALYSIS_STACK
-   unset SOURCE_BUCKET RESULTS_BUCKET TEMP_BUCKET ANALYSIS_TABLE
+   unset AWS_REGION AWS_ACCOUNT_ID RANDOM_SUFFIX
+   unset SOURCE_BUCKET RESULTS_BUCKET ANALYSIS_TABLE
    unset SNS_TOPIC SQS_QUEUE SNS_TOPIC_ARN SQS_QUEUE_URL SQS_QUEUE_ARN
    unset STATE_MACHINE_ARN
    
@@ -1252,15 +1317,15 @@ EOF
 
 ## Discussion
 
-This comprehensive video content analysis solution demonstrates how to leverage Amazon Rekognition's advanced video analysis capabilities alongside AWS Step Functions for orchestrating complex media processing workflows. The architecture provides several key benefits for organizations dealing with large volumes of video content.
+This comprehensive video content analysis solution demonstrates how to leverage Amazon Rekognition's advanced video analysis capabilities alongside AWS Step Functions for orchestrating complex media processing workflows. The architecture provides several key benefits for organizations dealing with large volumes of video content, following AWS Well-Architected Framework principles of operational excellence, security, reliability, performance efficiency, and cost optimization.
 
-The solution uses Amazon Rekognition's MediaAnalysis APIs to perform multiple types of analysis simultaneously. Content moderation automatically detects inappropriate content using machine learning models trained on millions of images and videos, providing confidence scores for various categories like explicit content, violence, and offensive material. Segment detection identifies technical cues such as black frames, credits, and scene changes, enabling automated content preparation and ad insertion workflows.
+The solution uses Amazon Rekognition's video analysis APIs to perform multiple types of analysis simultaneously. Content moderation automatically detects inappropriate content using machine learning models trained on millions of images and videos, providing confidence scores for various categories like explicit content, violence, and offensive material. Segment detection identifies technical cues such as black frames, credits, and scene changes, enabling automated content preparation and ad insertion workflows. As documented in the [Amazon Rekognition Developer Guide](https://docs.aws.amazon.com/rekognition/latest/dg/moderation.html), this approach can reduce manual review workload to just 1-5% of total volume.
 
-The Step Functions orchestration pattern ensures reliable processing by handling failures gracefully and providing visibility into workflow execution. The parallel processing approach allows moderation and segment detection to run simultaneously, reducing overall processing time. The use of SNS and SQS provides decoupled notification handling, allowing multiple downstream systems to react to analysis completion events.
+The Step Functions orchestration pattern ensures reliable processing by handling failures gracefully and providing visibility into workflow execution. The parallel processing approach allows moderation and segment detection to run simultaneously, reducing overall processing time. The use of SNS and SQS provides decoupled notification handling, allowing multiple downstream systems to react to analysis completion events, implementing the publisher-subscriber pattern recommended in the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
-For production deployments, consider implementing additional features such as custom content moderation models for industry-specific requirements, integration with content delivery networks for processed video distribution, and enhanced security controls including VPC endpoints and encryption at rest. The solution's modular architecture makes it easy to extend with additional analysis capabilities such as face detection, text recognition, or celebrity identification.
+For production deployments, consider implementing additional features such as custom content moderation models for industry-specific requirements, integration with content delivery networks for processed video distribution, and enhanced security controls including VPC endpoints and encryption at rest. The solution's modular architecture makes it easy to extend with additional analysis capabilities such as face detection, text recognition, or celebrity identification as documented in the [Rekognition API Reference](https://docs.aws.amazon.com/rekognition/latest/APIReference/).
 
-> **Tip**: Use Amazon Rekognition's custom labels feature to train models for detecting specific objects or concepts relevant to your content domain, such as company logos or product placements.
+> **Tip**: Use Amazon Rekognition's custom labels feature to train models for detecting specific objects or concepts relevant to your content domain, such as company logos or product placements. This can significantly improve detection accuracy for industry-specific use cases.
 
 ## Challenge
 
@@ -1274,8 +1339,15 @@ Extend this solution by implementing these enhancements:
 
 4. **Advanced Metadata Extraction**: Implement Amazon Transcribe for audio-to-text conversion and Amazon Comprehend for sentiment analysis of spoken content within videos.
 
-5. **Automated Content Delivery**: Build a complete content delivery pipeline that automatically processes, analyzes, and distributes video content to multiple endpoints based on analysis results and content policies.
+5. **Automated Content Delivery**: Build a complete content delivery pipeline that automatically processes, analyzes, and distributes video content to multiple endpoints based on analysis results and content policies using Amazon CloudFront.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

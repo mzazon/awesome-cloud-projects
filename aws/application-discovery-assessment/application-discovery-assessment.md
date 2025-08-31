@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: Application Discovery Service, Migration Hub, S3, IAM
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: application-discovery, migration, assessment, discovery-service
 recipe-generator-version: 1.3
@@ -19,11 +19,11 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Organizations planning cloud migrations face significant challenges in understanding their current on-premises infrastructure and application dependencies. IT teams often lack comprehensive visibility into server configurations, performance metrics, network connections, and application relationships across their datacenter environments. Without accurate discovery data, migration planning becomes time-consuming and error-prone, leading to unexpected migration issues, extended downtime, and cost overruns. Traditional manual documentation methods are insufficient for complex enterprise environments with hundreds or thousands of servers, databases, and interdependent applications.
+Organizations planning cloud migrations face significant challenges in understanding their current on-premises infrastructure and application dependencies. IT teams often lack comprehensive visibility into server configurations, performance metrics, network connections, and application relationships across their datacenter environments. Without accurate discovery data, migration planning becomes time-consuming and error-prone, leading to unexpected migration issues, extended downtime, and cost overruns.
 
 ## Solution
 
-AWS Application Discovery Service provides automated infrastructure discovery and assessment capabilities to accelerate cloud migration planning. The service offers both agentless and agent-based discovery methods to collect detailed configuration data, performance metrics, and network dependencies from on-premises environments. By integrating with AWS Migration Hub, organizations can centralize discovery data, create comprehensive migration assessments, and develop data-driven migration strategies with accurate cost estimates and resource requirements.
+AWS Application Discovery Service provides automated infrastructure discovery and assessment capabilities to accelerate cloud migration planning. The service offers both agentless and agent-based discovery methods to collect detailed configuration data, performance metrics, and network dependencies from on-premises environments. By integrating with AWS Migration Hub, organizations can centralize discovery data and develop data-driven migration strategies with accurate cost estimates.
 
 ## Architecture Diagram
 
@@ -77,9 +77,10 @@ graph TB
 1. AWS account with appropriate permissions for Application Discovery Service, Migration Hub, S3, and IAM
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. On-premises environment with VMware vCenter (for agentless discovery) or direct server access (for agent-based discovery)
-4. Network connectivity between on-premises environment and AWS
+4. Network connectivity between on-premises environment and AWS (HTTPS port 443)
 5. Basic understanding of network topologies and server infrastructure
-6. Estimated cost: $5-15 per month for data storage and analysis services
+6. Required IAM permissions: AWSApplicationDiscoveryServiceFullAccess, AWSMigrationHubFullAccess
+7. Estimated cost: $5-15 per month for data storage and analysis services
 
 > **Note**: Application Discovery Service data collection is free, but associated AWS services (S3, Athena, QuickSight) incur standard charges.
 
@@ -137,16 +138,16 @@ echo "✅ Prerequisites configured successfully"
    AWS Migration Hub requires a designated home region to centralize migration tracking across all AWS regions and migration tools. This foundational step ensures that discovery data from Application Discovery Service, Server Migration Service, and Database Migration Service converges into a unified view. The home region acts as the central repository for migration metadata, enabling cross-service coordination and comprehensive migration progress tracking.
 
    ```bash
-   # Configure Migration Hub home region
-   aws migrationhub create-progress-update-stream \
-       --progress-update-stream-name "DiscoveryAssessment" \
-       --region ${MH_HOME_REGION}
+   # Set Migration Hub home region
+   aws migrationhub-config create-home-region-control \
+       --home-region ${MH_HOME_REGION} \
+       --target-id ${AWS_ACCOUNT_ID} \
+       --target-type ACCOUNT
    
    # Verify home region configuration
-   aws migrationhub describe-migration-task \
-       --progress-update-stream "DiscoveryAssessment" \
-       --migration-task-name "initial-setup" \
-       --region ${MH_HOME_REGION} || echo "Home region configured"
+   aws migrationhub-config describe-home-region-controls \
+       --target-id ${AWS_ACCOUNT_ID} \
+       --target-type ACCOUNT
    
    echo "✅ Migration Hub home region set to ${MH_HOME_REGION}"
    ```
@@ -185,7 +186,8 @@ echo "✅ Prerequisites configured successfully"
    
    # Install agent (example for Linux)
    echo "Linux installation commands:"
-   echo "sudo ./install -r ${AWS_REGION} -k <ACCESS_KEY> -s <SECRET_KEY>"
+   echo "tar -xzf aws-discovery-agent.tar.gz"
+   echo "sudo bash install -r ${AWS_REGION} -k <ACCESS_KEY> -s <SECRET_KEY>"
    
    # Start data collection
    echo "sudo /opt/aws/discovery/bin/aws-discovery-daemon --start"
@@ -310,15 +312,24 @@ echo "✅ Prerequisites configured successfully"
    Amazon Athena enables SQL-based analysis of discovery data exported to S3, allowing for sophisticated queries on server configurations, performance trends, and application dependencies. This serverless approach provides cost-effective analytics without managing database infrastructure.
 
    ```bash
-   # Create Athena database for discovery data
-   aws athena create-database \
-       --database-name discovery_analysis \
-       --query-execution-context Database=discovery_analysis \
-       --result-configuration OutputLocation=s3://${DISCOVERY_BUCKET}/athena-results/
+   # Create Athena workgroup and database for discovery data
+   # Create Athena workgroup for discovery analysis
+   aws athena create-work-group \
+       --name discovery-workgroup \
+       --configuration ResultConfiguration='{OutputLocation=s3://'${DISCOVERY_BUCKET}'/athena-results/}'
    
-   # Create table for server configurations
-   cat > create-servers-table.sql << 'EOF'
-   CREATE EXTERNAL TABLE IF NOT EXISTS discovery_analysis.servers (
+   # Execute CREATE DATABASE query
+   QUERY_ID=$(aws athena start-query-execution \
+       --query-string "CREATE DATABASE IF NOT EXISTS discovery_analysis" \
+       --work-group discovery-workgroup \
+       --query 'QueryExecutionId' --output text)
+   
+   # Wait for query completion
+   aws athena get-query-execution --query-execution-id ${QUERY_ID} \
+       --query 'QueryExecution.Status.State' --output text
+   
+   # Create table for server configurations (execute via Athena)
+   TABLE_QUERY="CREATE EXTERNAL TABLE IF NOT EXISTS discovery_analysis.servers (
        server_configuration_id string,
        server_hostname string,
        server_os_name string,
@@ -331,8 +342,13 @@ echo "✅ Prerequisites configured successfully"
        server_hypervisor string
    )
    STORED AS PARQUET
-   LOCATION 's3://discovery-data-bucket/continuous-export/servers/'
-   EOF
+   LOCATION 's3://${DISCOVERY_BUCKET}/continuous-export/servers/'"
+   
+   # Execute table creation query
+   TABLE_QUERY_ID=$(aws athena start-query-execution \
+       --query-string "${TABLE_QUERY}" \
+       --work-group discovery-workgroup \
+       --query 'QueryExecutionId' --output text)
    
    echo "✅ Athena analysis setup completed"
    ```
@@ -382,6 +398,7 @@ echo "✅ Prerequisites configured successfully"
     cat > discovery-automation.py << 'EOF'
     import boto3
     import json
+    import os
     
     def lambda_handler(event, context):
         discovery = boto3.client('discovery')
@@ -487,20 +504,30 @@ echo "✅ Prerequisites configured successfully"
 
    ```bash
    # Delete created applications
-   aws discovery delete-applications \
-       --configuration-ids ${APP_ID} \
+   aws discovery delete-application \
+       --configuration-id ${APP_ID} \
        --region ${AWS_REGION}
    
    echo "✅ Application groups deleted"
    ```
 
-4. **Remove CloudWatch Resources**:
+4. **Remove CloudWatch and Lambda Resources**:
 
    ```bash
    # Delete CloudWatch Events rule
-   aws events delete-rule --name "DiscoveryReportSchedule"
+   aws events delete-rule --name "DiscoveryReportSchedule" \
+       --force-delete-rule
    
-   echo "✅ CloudWatch resources removed"
+   # Delete Lambda function (if created)
+   aws lambda delete-function \
+       --function-name discovery-automation 2>/dev/null || echo "No Lambda function found"
+   
+   # Delete Athena workgroup
+   aws athena delete-work-group \
+       --work-group discovery-workgroup \
+       --recursive-delete-option
+   
+   echo "✅ CloudWatch and Lambda resources removed"
    ```
 
 5. **Clean Up S3 and IAM Resources**:
@@ -518,7 +545,6 @@ echo "✅ Prerequisites configured successfully"
    
    # Remove local files
    rm -f discovery-service-role-policy.json
-   rm -f create-servers-table.sql
    rm -f migration-assessment.json
    rm -f discovery-automation.py
    
@@ -555,4 +581,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

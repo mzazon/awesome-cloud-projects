@@ -4,12 +4,12 @@ id: a7b3c9d2
 category: artificial-intelligence
 difficulty: 300
 subject: aws
-services: Amazon Bedrock, Amazon EventBridge, AWS Lambda, AWS IAM
+services: Amazon Bedrock, Amazon EventBridge, AWS Lambda, DynamoDB
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai-agents, multi-agent, bedrock, agentcore, event-driven, orchestration
 recipe-generator-version: 1.3
@@ -244,6 +244,7 @@ import json
 import boto3
 import logging
 from datetime import datetime
+import os
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -266,7 +267,7 @@ def lambda_handler(event, context):
         logger.info(f"Processing task: {task_type} with correlation: {correlation_id}")
         
         # Store task in memory table
-        memory_table = dynamodb.Table('agent-memory-' + context.function_name.split('-')[-1])
+        memory_table = dynamodb.Table(os.environ['MEMORY_TABLE_NAME'])
         
         memory_table.put_item(
             Item={
@@ -303,7 +304,7 @@ def lambda_handler(event, context):
                     'result': agent_response,
                     'status': 'completed'
                 }),
-                'EventBusName': context.function_name.replace('coordinator', 'bus')
+                'EventBusName': os.environ['EVENT_BUS_NAME']
             }]
         )
         
@@ -327,7 +328,8 @@ def lambda_handler(event, context):
                     'correlationId': correlation_id,
                     'error': str(e),
                     'status': 'failed'
-                })
+                }),
+                'EventBusName': os.environ['EVENT_BUS_NAME']
             }]
         )
         
@@ -428,7 +430,7 @@ EOF
    The supervisor agent serves as the intelligent orchestrator for our multi-agent system, coordinating tasks across specialized agents through hierarchical delegation. This architectural pattern provides centralized planning and user interaction while enabling parallel processing and leveraging each agent's domain expertise for complex business workflows that require multiple areas of knowledge.
 
    ```bash
-   # Create Supervisor Agent
+   # Create Supervisor Agent with multi-agent collaboration capabilities
    aws bedrock-agent create-agent \
        --agent-name ${SUPERVISOR_AGENT_NAME} \
        --agent-resource-role-arn ${BEDROCK_ROLE_ARN} \
@@ -441,7 +443,8 @@ EOF
 4. Synthesizing results from multiple agents into cohesive responses
 5. Ensuring quality control and consistency across agent outputs
 Always provide clear task delegation and maintain oversight of the overall workflow progress." \
-       --idle-session-ttl-in-seconds 3600
+       --idle-session-ttl-in-seconds 3600 \
+       --agent-collaboration SUPERVISOR
 
    export SUPERVISOR_AGENT_ID=$(aws bedrock-agent list-agents \
        --query "agentSummaries[?agentName=='${SUPERVISOR_AGENT_NAME}'].agentId" \
@@ -463,7 +466,42 @@ Always provide clear task delegation and maintain oversight of the overall workf
 
    The supervisor agent now provides the central coordination point for multi-agent workflows with clear delegation responsibilities and oversight capabilities. This hierarchical approach enables efficient task distribution while maintaining centralized quality control and user interaction.
 
-6. **Configure EventBridge Integration with Lambda Coordinator**:
+6. **Configure Agent Collaboration Relationships**:
+
+   Amazon Bedrock's multi-agent collaboration feature enables the supervisor agent to work with specialized collaborator agents in a coordinated manner. This step establishes the relationships between the supervisor and each specialized agent, defining their roles and collaboration patterns for seamless multi-agent workflows.
+
+   ```bash
+   # Associate collaborator agents with supervisor
+   aws bedrock-agent associate-agent-collaborator \
+       --agent-id ${SUPERVISOR_AGENT_ID} \
+       --agent-version DRAFT \
+       --collaborator-name "FinancialSpecialist" \
+       --collaborator-agent-id ${FINANCE_AGENT_ID} \
+       --collaborator-alias-arn "arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent-alias/${FINANCE_AGENT_ID}/TSTALIASID" \
+       --collaboration-instruction "Use this agent for financial analysis, revenue calculations, profit margin analysis, and financial reporting tasks."
+
+   aws bedrock-agent associate-agent-collaborator \
+       --agent-id ${SUPERVISOR_AGENT_ID} \
+       --agent-version DRAFT \
+       --collaborator-name "SupportSpecialist" \
+       --collaborator-agent-id ${SUPPORT_AGENT_ID} \
+       --collaborator-alias-arn "arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent-alias/${SUPPORT_AGENT_ID}/TSTALIASID" \
+       --collaboration-instruction "Use this agent for customer support queries, issue resolution, and service experience improvements."
+
+   aws bedrock-agent associate-agent-collaborator \
+       --agent-id ${SUPERVISOR_AGENT_ID} \
+       --agent-version DRAFT \
+       --collaborator-name "AnalyticsSpecialist" \
+       --collaborator-agent-id ${ANALYTICS_AGENT_ID} \
+       --collaborator-alias-arn "arn:aws:bedrock:${AWS_REGION}:${AWS_ACCOUNT_ID}:agent-alias/${ANALYTICS_AGENT_ID}/TSTALIASID" \
+       --collaboration-instruction "Use this agent for data analysis, trend identification, and business intelligence insights."
+
+   echo "✅ Agent collaboration relationships configured"
+   ```
+
+   The collaboration relationships now enable the supervisor agent to intelligently delegate tasks to specialized agents based on the request context. This creates a truly collaborative multi-agent system where each agent contributes their domain expertise to complex business problems.
+
+7. **Configure EventBridge Integration with Lambda Coordinator**:
 
    Connecting EventBridge to the Lambda coordinator creates the event-driven orchestration layer that enables asynchronous agent communication and workflow management. This integration ensures reliable event processing with automatic retry logic and dead letter queue handling for failed events, providing enterprise-grade reliability for multi-agent coordination patterns.
 
@@ -500,7 +538,7 @@ Always provide clear task delegation and maintain oversight of the overall workf
 
    The EventBridge-Lambda integration now provides robust event-driven orchestration with comprehensive error handling. Failed events are automatically routed to the dead letter queue for analysis and replay, ensuring no agent tasks are lost during processing.
 
-7. **Prepare All Agents for Production Use**:
+8. **Prepare All Agents for Production Use**:
 
    Preparing agents activates them for production use and creates the necessary aliases for stable endpoint access. This step ensures all agents are fully configured and ready to handle business requests while providing version management capabilities for controlled deployments and rollbacks.
 
@@ -546,7 +584,7 @@ Always provide clear task delegation and maintain oversight of the overall workf
 
    All agents are now fully prepared for production use with stable alias endpoints. This provides the foundation for reliable multi-agent workflows with version management and controlled deployment capabilities.
 
-8. **Create Monitoring and Observability Infrastructure**:
+9. **Create Monitoring and Observability Infrastructure**:
 
    Comprehensive monitoring provides visibility into multi-agent workflows with CloudWatch metrics, X-Ray tracing, and custom dashboards. This observability infrastructure enables proactive issue detection, performance optimization, and business intelligence from agent interactions while maintaining compliance with enterprise monitoring requirements and AWS Well-Architected Framework principles.
 
@@ -650,13 +688,42 @@ EOF
 3. **Test Multi-Agent Workflow with Supervisor Agent**:
 
    ```bash
-   # Invoke supervisor agent with complex multi-domain request
-   aws bedrock-agent-runtime invoke-agent \
-       --agent-id ${SUPERVISOR_AGENT_ID} \
-       --agent-alias-id ${SUPERVISOR_ALIAS_ID} \
-       --session-id test-session-$(date +%s) \
-       --input-text "I need a comprehensive business analysis that includes: 1) Financial performance review for Q4 showing revenue trends and profit margins, 2) Customer satisfaction analysis from recent support interactions, and 3) Sales trend analytics with month-over-month comparisons. Please coordinate with your specialist team to provide a complete report." \
-       --output text --query 'completion'
+   # Create a session for the supervisor agent
+   SESSION_ID=$(date +%s)
+   
+   # Create session
+   aws bedrock-agent-runtime create-session \
+       --session-identifier ${SESSION_ID}
+
+   # Create invocation within the session
+   INVOCATION_ID=$(aws bedrock-agent-runtime create-invocation \
+       --session-identifier ${SESSION_ID} \
+       --description "Multi-agent business analysis request" \
+       --query 'invocationId' --output text)
+
+   # Send complex multi-domain request to supervisor agent
+   python3 << EOF
+import boto3
+import json
+
+client = boto3.client('bedrock-agent-runtime', region_name='${AWS_REGION}')
+
+response = client.invoke_agent(
+    agentId='${SUPERVISOR_AGENT_ID}',
+    agentAliasId='${SUPERVISOR_ALIAS_ID}',
+    sessionId='${SESSION_ID}',
+    inputText="I need a comprehensive business analysis that includes: 1) Financial performance review for Q4 showing revenue trends and profit margins, 2) Customer satisfaction analysis from recent support interactions, and 3) Sales trend analytics with month-over-month comparisons. Please coordinate with your specialist team to provide a complete report.",
+    enableTrace=True
+)
+
+completion = ""
+for event in response.get("completion"):
+    if 'chunk' in event:
+        chunk = event["chunk"]
+        completion += chunk["bytes"].decode()
+
+print(f"Agent response: {completion}")
+EOF
 
    # Check DynamoDB for memory persistence
    aws dynamodb scan \
@@ -668,14 +735,36 @@ EOF
 
 ## Cleanup
 
-1. **Delete Bedrock Agents and Aliases**:
+1. **Delete Agent Collaborations and Aliases**:
 
    ```bash
-   # Delete agent aliases first
+   # Disassociate collaborator agents
+   aws bedrock-agent disassociate-agent-collaborator \
+       --agent-id ${SUPERVISOR_AGENT_ID} \
+       --agent-version DRAFT \
+       --collaborator-id ${FINANCE_AGENT_ID}
+
+   aws bedrock-agent disassociate-agent-collaborator \
+       --agent-id ${SUPERVISOR_AGENT_ID} \
+       --agent-version DRAFT \
+       --collaborator-id ${SUPPORT_AGENT_ID}
+
+   aws bedrock-agent disassociate-agent-collaborator \
+       --agent-id ${SUPERVISOR_AGENT_ID} \
+       --agent-version DRAFT \
+       --collaborator-id ${ANALYTICS_AGENT_ID}
+
+   # Delete agent aliases
    aws bedrock-agent delete-agent-alias \
        --agent-id ${SUPERVISOR_AGENT_ID} \
        --agent-alias-id ${SUPERVISOR_ALIAS_ID}
 
+   echo "✅ Agent collaborations and aliases removed"
+   ```
+
+2. **Delete Bedrock Agents**:
+
+   ```bash
    # Delete all created agents
    aws bedrock-agent delete-agent --agent-id ${SUPERVISOR_AGENT_ID}
    aws bedrock-agent delete-agent --agent-id ${FINANCE_AGENT_ID}
@@ -685,7 +774,7 @@ EOF
    echo "✅ Bedrock agents deleted"
    ```
 
-2. **Remove EventBridge Infrastructure**:
+3. **Remove EventBridge Infrastructure**:
 
    ```bash
    # Remove EventBridge targets and rules
@@ -705,7 +794,7 @@ EOF
    echo "✅ EventBridge infrastructure removed"
    ```
 
-3. **Delete Lambda Function and IAM Roles**:
+4. **Delete Lambda Function and IAM Roles**:
 
    ```bash
    # Delete Lambda function
@@ -740,7 +829,7 @@ EOF
    echo "✅ Lambda function and IAM roles deleted"
    ```
 
-4. **Clean Up Storage and Monitoring Resources**:
+5. **Clean Up Storage and Monitoring Resources**:
 
    ```bash
    # Delete DynamoDB table
@@ -770,15 +859,15 @@ EOF
 
 ## Discussion
 
-This multi-agent AI workflow architecture leverages Amazon Bedrock's agent capabilities to create a sophisticated, enterprise-ready system for complex business task processing. The solution implements the supervisor-collaborator pattern where a central supervisor agent intelligently coordinates specialized agents, each optimized for specific business domains like financial analysis, customer support, and data analytics. This approach mirrors real-world organizational structures where complex tasks require expertise from multiple departments working in coordination, following AWS Well-Architected Framework principles for reliability and operational excellence.
+This multi-agent AI workflow architecture leverages Amazon Bedrock's native agent collaboration capabilities to create a sophisticated, enterprise-ready system for complex business task processing. The solution implements the supervisor-collaborator pattern where a central supervisor agent intelligently coordinates specialized agents, each optimized for specific business domains like financial analysis, customer support, and data analytics. This approach mirrors real-world organizational structures where complex tasks require expertise from multiple departments working in coordination, following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles for reliability and operational excellence.
 
 The event-driven architecture using Amazon EventBridge provides several key advantages for multi-agent coordination. EventBridge's managed event routing eliminates the complexity of point-to-point agent communication while providing built-in retry mechanisms, dead letter queues, and audit trails for all agent interactions. This loose coupling enables independent scaling of agent workloads and supports complex workflow patterns like parallel processing, conditional routing, and result aggregation. The integration with AWS Lambda as the central coordinator provides serverless orchestration that scales based on demand while maintaining low operational overhead and cost efficiency.
 
-Amazon Bedrock Agents provide production-ready AI capabilities with enterprise-grade security, monitoring, and governance built-in. Each specialized agent leverages Claude 3's advanced reasoning capabilities while maintaining focused domain expertise through carefully crafted instructions and role definitions. The shared memory implementation using DynamoDB enables context-aware agents that can maintain conversation history and build upon previous interactions, essential for complex multi-step business processes. This persistence layer also supports advanced coordination patterns where agents can reference each other's work and maintain consistency across the workflow.
+Amazon Bedrock's multi-agent collaboration feature enables native coordination between agents without requiring custom orchestration logic. The supervisor agent can delegate tasks to collaborator agents based on their specialized instructions and automatically synthesize responses from multiple agents. This built-in capability reduces implementation complexity while providing enterprise-grade security, monitoring, and governance. The shared memory implementation using DynamoDB enables context-aware agents that can maintain conversation history and build upon previous interactions, essential for complex multi-step business processes.
 
-The monitoring and observability implementation follows AWS operational best practices with CloudWatch dashboards providing real-time visibility into agent performance, workflow execution times, and error rates. X-Ray distributed tracing enables detailed analysis of request flows across the multi-agent system, supporting troubleshooting and performance optimization. The comprehensive logging and metrics also enable business intelligence analysis of agent interactions, task completion rates, and workflow efficiency patterns, supporting continuous improvement of the multi-agent system.
+The monitoring and observability implementation follows AWS operational best practices with CloudWatch dashboards providing real-time visibility into agent performance, workflow execution times, and error rates. X-Ray distributed tracing enables detailed analysis of request flows across the multi-agent system, supporting troubleshooting and performance optimization. The comprehensive logging and metrics also enable business intelligence analysis of agent interactions, task completion rates, and workflow efficiency patterns, supporting continuous improvement of the multi-agent system. For additional guidance on implementing robust serverless architectures, see the [AWS Lambda best practices documentation](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html).
 
-> **Tip**: Consider implementing circuit breaker patterns in your Lambda coordinator to handle agent failures gracefully. The [AWS Lambda best practices documentation](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html) provides guidance on error handling and resilience patterns for serverless architectures.
+> **Tip**: Consider implementing circuit breaker patterns in your Lambda coordinator to handle agent failures gracefully. The AWS Lambda best practices provide guidance on error handling and resilience patterns for serverless architectures, particularly important when orchestrating multiple AI agents.
 
 ## Challenge
 
@@ -786,14 +875,21 @@ Extend this multi-agent workflow solution by implementing these advanced capabil
 
 1. **Implement Dynamic Agent Scaling**: Add auto-scaling logic that creates additional specialized agents based on workload demand using Amazon Bedrock APIs and CloudWatch metrics to trigger scaling events when agent response times exceed thresholds.
 
-2. **Add Knowledge Base Integration**: Enhance each specialized agent with domain-specific knowledge bases using Amazon Bedrock Knowledge Bases to provide more accurate and up-to-date information sourced from company documents and industry best practices.
+2. **Add Knowledge Base Integration**: Enhance each specialized agent with domain-specific knowledge bases using [Amazon Bedrock Knowledge Bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html) to provide more accurate and up-to-date information sourced from company documents and industry best practices.
 
-3. **Create Advanced Workflow Orchestration**: Replace the Lambda coordinator with AWS Step Functions to support complex workflow patterns like parallel execution, conditional branching, human-in-the-loop approvals, and sophisticated error handling with automatic retries.
+3. **Create Advanced Workflow Orchestration**: Replace the Lambda coordinator with [AWS Step Functions](https://docs.aws.amazon.com/step-functions/latest/dg/welcome.html) to support complex workflow patterns like parallel execution, conditional branching, human-in-the-loop approvals, and sophisticated error handling with automatic retries.
 
-4. **Build Cross-Agent Learning Workflows**: Implement feedback loops where agents can learn from successful interaction patterns and improve their coordination effectiveness using DynamoDB streams to capture workflow success metrics.
+4. **Build Cross-Agent Learning Workflows**: Implement feedback loops where agents can learn from successful interaction patterns and improve their coordination effectiveness using DynamoDB streams to capture workflow success metrics and agent performance analytics.
 
-5. **Implement Multi-Tenant Agent Architecture**: Extend the system to support multiple organizations with isolated agent instances, tenant-specific customizations, and shared knowledge bases using VPC isolation and resource-based IAM policies for enterprise deployment.
+5. **Implement Multi-Tenant Agent Architecture**: Extend the system to support multiple organizations with isolated agent instances, tenant-specific customizations, and shared knowledge bases using VPC isolation and resource-based IAM policies for enterprise deployment scenarios.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

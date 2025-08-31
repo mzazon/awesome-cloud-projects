@@ -4,12 +4,12 @@ id: b3f7e9d1
 category: migration
 difficulty: 300
 subject: aws
-services: application-discovery-service, migration-hub, systems-manager, ec2
+services: application-discovery-service, migration-hub, s3, cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: migration, discovery, assessment, enterprise, planning
 recipe-generator-version: 1.3
@@ -75,12 +75,14 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with Administrator access or permissions for Application Discovery Service, Migration Hub, and S3
+1. AWS account with Administrator access or permissions for Application Discovery Service, Migration Hub, S3, and CloudWatch
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. On-premises servers running Windows Server 2008 R2+ or Linux (RHEL 6+, CentOS 6+, Ubuntu 12+)
 4. Network connectivity from on-premises to AWS (ports 443 HTTPS outbound)
 5. Basic understanding of enterprise infrastructure discovery and migration planning
 6. Estimated cost: $0.10-$0.50 per server per day for discovery (varies by data collection frequency)
+
+> **Note**: Application Discovery Service requires selecting a Migration Hub home region before deployment. This cannot be changed without contacting AWS Support.
 
 ## Preparation
 
@@ -107,60 +109,60 @@ aws s3api put-bucket-versioning \
     --bucket ${S3_BUCKET_NAME} \
     --versioning-configuration Status=Enabled
 
+# Enable S3 bucket encryption
+aws s3api put-bucket-encryption \
+    --bucket ${S3_BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
 echo "✅ S3 bucket created for discovery data: ${S3_BUCKET_NAME}"
 ```
 
 ## Steps
 
-1. **Enable Application Discovery Service**:
+1. **Configure Migration Hub Home Region**:
 
-   Application Discovery Service serves as the central collection point for infrastructure data from your on-premises environment. Enabling this service activates the AWS infrastructure that will receive, process, and store discovery data from your deployed agents. This foundational step establishes the secure communication channel between your on-premises infrastructure and AWS discovery services, as detailed in the [AWS Application Discovery Service User Guide](https://docs.aws.amazon.com/application-discovery/latest/userguide/what-is-appdiscovery.html).
+   AWS Migration Hub requires a designated home region where all migration tracking data is centralized. This foundational step establishes the regional endpoint for all migration tools and ensures consistent data aggregation across your enterprise migration program. The home region setting affects all subsequent Application Discovery Service operations and cannot be changed without AWS Support assistance.
 
    ```bash
-   # Enable Application Discovery Service
+   # Set Migration Hub home region (required first step)
+   aws migrationhub-config create-home-region-control \
+       --home-region ${AWS_REGION} \
+       --target aws:${AWS_ACCOUNT_ID}:account
+   
+   # Verify home region configuration
+   aws migrationhub-config get-home-region
+   
+   echo "✅ Migration Hub home region configured: ${AWS_REGION}"
+   ```
+
+   Your Migration Hub home region is now set, providing the foundation for centralized migration tracking across all AWS migration tools and enabling consistent data collection and reporting.
+
+2. **Enable Application Discovery Service**:
+
+   Application Discovery Service serves as the central collection point for infrastructure data from your on-premises environment. The service must be explicitly started to begin accepting data from deployed agents and connectors. This establishes the secure communication channel between your on-premises infrastructure and AWS discovery services, following the architecture described in the [AWS Application Discovery Service User Guide](https://docs.aws.amazon.com/application-discovery/latest/userguide/what-is-appdiscovery.html).
+
+   ```bash
+   # Start Application Discovery Service data collection
    aws discovery start-data-collection-by-agent-ids \
-       --agent-ids []  # Empty array to enable service
+       --agent-ids
    
-   # Verify service is enabled
+   # Verify service status
    aws discovery describe-configurations \
-       --configuration-type SERVER
+       --configuration-type SERVER \
+       --max-results 1
    
-   echo "✅ Application Discovery Service enabled"
+   echo "✅ Application Discovery Service enabled and ready for data collection"
    ```
 
-   The service is now active and ready to receive discovery data. This establishes the AWS-side infrastructure needed to collect, process, and analyze data from your on-premises environment, enabling comprehensive migration planning.
-
-2. **Create Migration Hub Project**:
-
-   Migration Hub provides a centralized dashboard for tracking discovery progress across multiple tools and migration waves. Creating a dedicated project organizes your discovery data and enables collaborative migration planning across teams. This centralized approach ensures all stakeholders have visibility into discovery progress and migration readiness, leveraging the capabilities described in the [AWS Migration Hub Dashboard](https://docs.aws.amazon.com/application-discovery/latest/userguide/dashboard.html).
-
-   ```bash
-   # Create Migration Hub home region (if not already set)
-   aws migrationhub create-progress-update-stream \
-       --progress-update-stream-name ${MIGRATION_PROJECT_NAME} \
-       --region us-west-2  # Migration Hub home region
-   
-   # Associate Application Discovery Service with Migration Hub
-   aws discovery put-resource-attributes \
-       --migration-task-name ${MIGRATION_PROJECT_NAME} \
-       --progress-update-stream ${MIGRATION_PROJECT_NAME}
-   
-   echo "✅ Migration Hub project created: ${MIGRATION_PROJECT_NAME}"
-   ```
-
-   Your migration project is now established in Migration Hub, providing a central location for tracking discovery progress and coordinating migration activities across your enterprise.
+   The Application Discovery Service is now active and configured to receive discovery data. This establishes the AWS-side infrastructure needed to collect, process, and analyze data from your on-premises environment for comprehensive migration planning.
 
 3. **Generate Discovery Agent Installation Package**:
 
-   The Discovery Agent provides deep visibility into server performance, processes, and network connections by running as a lightweight service on each server. Generating a customized installation package ensures agents authenticate properly with your AWS account and begin collecting data immediately upon installation.
+   The Discovery Agent provides deep visibility into server performance, processes, and network connections by running as a lightweight service on each server. The agent connects securely to your Migration Hub home region and transmits data using TLS encryption. Installation requires root/administrator privileges and supports automatic updates when new versions become available.
 
    ```bash
-   # Generate agent installation URL
-   AGENT_URL=$(aws discovery describe-export-tasks \
-       --query 'exportsInfo[0].exportRequestId' \
-       --output text 2>/dev/null || echo "new-deployment")
-   
-   # Create agent configuration
+   # Generate agent installation configuration
    cat > agent-config.json << EOF
    {
        "region": "${AWS_REGION}",
@@ -173,23 +175,21 @@ echo "✅ S3 bucket created for discovery data: ${S3_BUCKET_NAME}"
    }
    EOF
    
+   # Display agent download locations
    echo "✅ Agent configuration created"
-   echo "Download agent from: https://aws-discovery-agent.s3.amazonaws.com/windows/latest/AWSApplicationDiscoveryAgentInstaller.exe"
-   echo "Or for Linux: https://aws-discovery-agent.s3.amazonaws.com/linux/latest/aws-discovery-agent.tar.gz"
+   echo "Windows Agent: https://aws-discovery-agent.s3.amazonaws.com/windows/latest/AWSApplicationDiscoveryAgentInstaller.exe"
+   echo "Linux Agent: https://aws-discovery-agent.s3.amazonaws.com/linux/latest/aws-discovery-agent.tar.gz"
+   echo "Configuration file: agent-config.json"
    ```
 
-   The installation package is configured with your AWS credentials and collection preferences. Deploy this agent to representative servers across your infrastructure to begin comprehensive data collection.
+   The installation package is configured with your AWS credentials and collection preferences. Deploy this agent to representative servers across your infrastructure to begin comprehensive data collection including system specifications, performance metrics, and network dependencies.
 
 4. **Configure Discovery Connector for VMware Environments**:
 
-   Discovery Connector provides agentless discovery for VMware vSphere environments, collecting data through vCenter APIs without requiring individual server access. This approach is ideal for environments with strict change control processes or when agent installation is not feasible across all servers.
+   Discovery Connector provides agentless discovery for VMware vSphere environments, collecting data through vCenter APIs without requiring individual server access. This approach is ideal for environments with strict change control processes or when agent installation is not feasible across all servers. The connector deploys as a virtual appliance (OVA) within your VMware infrastructure.
 
    ```bash
-   # Download Discovery Connector OVA template
-   echo "Discovery Connector OVA download:"
-   echo "https://aws-discovery-connector.s3.amazonaws.com/VMware/latest/AWS-Discovery-Connector.ova"
-   
-   # Create connector configuration
+   # Create connector configuration for VMware deployment
    cat > connector-config.json << EOF
    {
        "connectorName": "enterprise-connector-${RANDOM_SUFFIX}",
@@ -208,92 +208,135 @@ echo "✅ S3 bucket created for discovery data: ${S3_BUCKET_NAME}"
    EOF
    
    echo "✅ Discovery Connector configuration prepared"
+   echo "Download OVA: https://aws-discovery-connector.s3.amazonaws.com/VMware/latest/AWS-Discovery-Connector.ova"
+   echo "Configuration file: connector-config.json"
    ```
 
-   Deploy the Discovery Connector OVA to your VMware environment and configure it with the generated settings. This enables comprehensive discovery of your virtualized infrastructure without individual server modifications.
+   Deploy the Discovery Connector OVA to your VMware environment and configure it with the generated settings. This enables comprehensive discovery of your virtualized infrastructure without individual server modifications, providing inventory data and performance metrics for migration planning.
 
-> **Warning**: Ensure proper vCenter permissions for the discovery user account. The account needs read-only access to virtual machines, hosts, and performance data.
+> **Warning**: Ensure proper vCenter permissions for the discovery user account. The account needs read-only access to virtual machines, hosts, and performance data as specified in the [vCenter permissions documentation](https://docs.aws.amazon.com/application-discovery/latest/userguide/agentless-collector.html).
 
-5. **Start Data Collection and Monitoring**:
+5. **Start Continuous Data Export to S3**:
 
-   Initiating data collection begins the discovery process that will gather infrastructure data over a recommended 2-week period. This duration captures usage patterns, peak loads, and application behaviors necessary for accurate migration planning and right-sizing decisions.
+   Continuous data export enables automated, ongoing transfer of discovery data to S3 for long-term storage, advanced analytics, and integration with third-party migration tools. This process ensures data availability for detailed analysis while providing backup copies of your discovery information. The export includes server configurations, performance metrics, and network connection data.
 
    ```bash
-   # Start continuous data collection
-   aws discovery start-continuous-export \
+   # Start continuous export to S3
+   EXPORT_ID=$(aws discovery start-continuous-export \
        --s3-bucket ${S3_BUCKET_NAME} \
        --s3-prefix "discovery-data/" \
-       --data-source AGENT
+       --data-source AGENT \
+       --query 'exportId' --output text)
    
-   # Enable CloudWatch monitoring for discovery progress
+   # Verify export configuration
+   aws discovery describe-continuous-exports \
+       --export-ids ${EXPORT_ID}
+   
+   echo "✅ Continuous data export started with ID: ${EXPORT_ID}"
+   ```
+
+   Continuous data export is now active and will automatically transfer discovery data to S3 as it's collected. This ensures real-time availability of infrastructure data for analysis tools and provides automated backup of your discovery information.
+
+6. **Monitor Discovery Agent Health**:
+
+   Regular monitoring of agent health ensures consistent data collection across your environment. Agents ping the Application Discovery Service every 15 minutes and report their status. Monitoring agent health helps identify connectivity issues, configuration problems, or servers that may have been decommissioned during the discovery period.
+
+   ```bash
+   # Create CloudWatch log group for discovery monitoring
    aws logs create-log-group \
        --log-group-name "/aws/discovery/${MIGRATION_PROJECT_NAME}"
    
-   # Check discovery status
+   # Check current agent status
    aws discovery describe-agents \
        --query 'agentsInfo[*].[agentId,health,version,lastHealthPingTime]' \
        --output table
    
-   echo "✅ Data collection started - monitor for 2+ weeks for comprehensive data"
+   # Set up CloudWatch alarm for agent health monitoring
+   aws cloudwatch put-metric-alarm \
+       --alarm-name "discovery-agent-health" \
+       --alarm-description "Monitor discovery agent health" \
+       --metric-name "AgentHealth" \
+       --namespace "AWS/ApplicationDiscovery" \
+       --statistic "Sum" \
+       --period 900 \
+       --threshold 1 \
+       --comparison-operator "LessThanThreshold" \
+       --evaluation-periods 2
+   
+   echo "✅ Discovery monitoring configured - agents will report every 15 minutes"
    ```
 
-   Data collection is now active and will continue gathering infrastructure metrics, application dependencies, and performance data. Monitor agent health regularly to ensure consistent data collection across your environment.
+   Discovery monitoring is now active with CloudWatch integration. Agents will report their health status every 15 minutes, and you'll receive alerts if agents stop communicating, ensuring consistent data collection throughout your discovery period.
 
-6. **Configure Discovery Data Export**:
+7. **Export Historical Discovery Data**:
 
-   Exporting discovery data to S3 enables long-term storage, advanced analytics, and integration with third-party migration planning tools. Regular exports ensure data availability for detailed analysis and provide backup copies of your discovery information.
+   On-demand data exports provide point-in-time snapshots of discovery data in CSV format for detailed analysis and reporting. Regular exports ensure data availability for migration planning tools and provide historical baselines for capacity planning and trend analysis. Exports can be filtered by agent, time period, or configuration type.
 
    ```bash
    # Export current discovery data
-   EXPORT_ID=$(aws discovery start-export-task \
+   SNAPSHOT_EXPORT_ID=$(aws discovery start-export-task \
        --export-data-format CSV \
-       --filters 'name=AgentId,values=*,condition=EQUALS' \
        --s3-bucket ${S3_BUCKET_NAME} \
-       --s3-prefix "exports/" \
+       --s3-prefix "exports/$(date +%Y-%m-%d)/" \
        --query 'exportId' --output text)
    
    # Monitor export progress
    aws discovery describe-export-tasks \
-       --export-ids ${EXPORT_ID} \
-       --query 'exportsInfo[0].exportStatus'
+       --export-ids ${SNAPSHOT_EXPORT_ID} \
+       --query 'exportsInfo[0].[exportStatus,recordsCount,s3Bucket]'
    
    # Schedule weekly exports using EventBridge
    aws events put-rule \
-       --name "weekly-discovery-export" \
+       --name "weekly-discovery-export-${RANDOM_SUFFIX}" \
        --schedule-expression "rate(7 days)" \
-       --state ENABLED
+       --state ENABLED \
+       --description "Weekly discovery data export"
    
-   echo "✅ Discovery data export configured with ID: ${EXPORT_ID}"
+   echo "✅ Discovery data export initiated with ID: ${SNAPSHOT_EXPORT_ID}"
    ```
 
-   Discovery data is now being exported to S3 for analysis and archival. Weekly automated exports ensure continuous availability of up-to-date infrastructure data for migration planning activities.
+   Discovery data export is now configured with both on-demand and scheduled capabilities. Weekly automated exports ensure continuous availability of up-to-date infrastructure data for migration planning activities and provide historical trend data for capacity analysis.
 
-7. **Set Up Migration Wave Planning**:
+8. **Set Up Migration Wave Planning Framework**:
 
-   Migration waves organize servers and applications into logical groupings based on dependencies, business priorities, and technical complexity. This structured approach reduces migration risk by ensuring dependent systems migrate together and enables parallel migration streams to accelerate timeline delivery. This methodology follows [AWS migration best practices](https://docs.aws.amazon.com/prescriptive-guidance/latest/migration-tools/discovery.html) for systematic enterprise migrations.
+   Migration waves organize servers and applications into logical groupings based on dependencies, business priorities, and technical complexity. This structured approach reduces migration risk by ensuring dependent systems migrate together and enables parallel migration streams to accelerate delivery timelines. The framework follows [AWS migration best practices](https://docs.aws.amazon.com/prescriptive-guidance/latest/migration-tools/discovery.html) for systematic enterprise migrations.
 
    ```bash
-   # Create migration wave configuration
+   # Create migration wave planning structure
    cat > migration-waves.json << EOF
    {
+       "migrationProgram": {
+           "name": "${MIGRATION_PROJECT_NAME}",
+           "totalServers": 0,
+           "estimatedTimelineMonths": 12
+       },
        "waves": [
            {
                "waveNumber": 1,
                "name": "Pilot Wave - Low Risk Applications",
-               "description": "Standalone applications with minimal dependencies",
-               "targetMigrationDate": "2024-Q2"
+               "description": "Standalone applications with minimal dependencies for migration process validation",
+               "priority": "HIGH",
+               "targetMigrationDate": "2025-Q2",
+               "estimatedServers": 10,
+               "riskLevel": "LOW"
            },
            {
                "waveNumber": 2,
                "name": "Business Applications Wave",
                "description": "Core business applications with managed dependencies",
-               "targetMigrationDate": "2024-Q3"
+               "priority": "HIGH",
+               "targetMigrationDate": "2025-Q3",
+               "estimatedServers": 50,
+               "riskLevel": "MEDIUM"
            },
            {
                "waveNumber": 3,
                "name": "Legacy Systems Wave",
-               "description": "Complex legacy systems requiring refactoring",
-               "targetMigrationDate": "2024-Q4"
+               "description": "Complex legacy systems requiring refactoring or replacement",
+               "priority": "MEDIUM",
+               "targetMigrationDate": "2025-Q4",
+               "estimatedServers": 30,
+               "riskLevel": "HIGH"
            }
        ]
    }
@@ -303,12 +346,16 @@ echo "✅ S3 bucket created for discovery data: ${S3_BUCKET_NAME}"
    aws s3 cp migration-waves.json \
        s3://${S3_BUCKET_NAME}/planning/migration-waves.json
    
-   echo "✅ Migration wave planning framework created"
+   # Create wave planning dashboard structure
+   aws s3 cp migration-waves.json \
+       s3://${S3_BUCKET_NAME}/dashboard/wave-planning.json
+   
+   echo "✅ Migration wave planning framework created and uploaded to S3"
    ```
 
-   The migration wave structure provides a framework for organizing your migration approach. Use discovery data to assign servers and applications to appropriate waves based on dependencies and business requirements.
+   The migration wave structure provides a framework for organizing your migration approach based on risk, dependencies, and business priorities. Use discovery data to assign servers and applications to appropriate waves, ensuring systematic migration execution with minimized business disruption.
 
-> **Tip**: Start with a small pilot wave of 5-10 low-risk servers to validate your migration processes before moving to larger, more complex waves.
+> **Tip**: Start with a small pilot wave of 5-10 low-risk servers to validate your migration processes and tooling before progressing to larger, more complex waves. This approach follows AWS migration methodology for risk mitigation.
 
 ## Validation & Testing
 
@@ -335,35 +382,41 @@ echo "✅ S3 bucket created for discovery data: ${S3_BUCKET_NAME}"
    # Check network connection data
    aws discovery list-configurations \
        --configuration-type NETWORK_CONNECTION \
-       --max-results 10
+       --max-results 10 \
+       --query 'configurations[*].[sourceServer,destinationServer,destinationPort]'
    ```
 
    Expected output: Server listings with accurate OS information and network connection data showing application communication patterns.
 
-3. **Test Data Export Functionality**:
+3. **Test Continuous Export Functionality**:
 
    ```bash
-   # Verify export completion
-   aws discovery describe-export-tasks \
+   # Verify continuous export status
+   aws discovery describe-continuous-exports \
        --export-ids ${EXPORT_ID} \
-       --query 'exportsInfo[0].[exportStatus,s3Bucket,recordsCount]'
+       --query 'descriptions[0].[status,dataSource,s3Bucket]'
    
    # List exported files in S3
-   aws s3 ls s3://${S3_BUCKET_NAME}/exports/ --recursive
+   aws s3 ls s3://${S3_BUCKET_NAME}/discovery-data/ --recursive \
+       --human-readable --summarize
    ```
 
-   Expected output: Export status "SUCCEEDED" with CSV files containing server, application, and network data.
+   Expected output: Export status "ACTIVE" with data files appearing in S3 containing server, application, and network data.
 
 4. **Validate Migration Hub Integration**:
 
    ```bash
-   # Check Migration Hub dashboard data
-   aws migrationhub list-migration-tasks \
-       --progress-update-stream ${MIGRATION_PROJECT_NAME} \
-       --region us-west-2
+   # Check Migration Hub home region configuration
+   aws migrationhub-config get-home-region
+   
+   # Verify discovery service integration
+   aws discovery describe-configurations \
+       --configuration-type SERVER \
+       --max-results 5 \
+       --query 'configurations[0].keys(@)'
    ```
 
-   Expected output: Migration tasks showing discovery progress and server counts.
+   Expected output: Home region confirmation and server configuration data indicating successful service integration.
 
 ## Cleanup
 
@@ -375,9 +428,13 @@ echo "✅ S3 bucket created for discovery data: ${S3_BUCKET_NAME}"
        --export-id ${EXPORT_ID}
    
    # Stop agent data collection
-   aws discovery stop-data-collection-by-agent-ids \
-       --agent-ids $(aws discovery describe-agents \
-           --query 'agentsInfo[*].agentId' --output text)
+   AGENT_IDS=$(aws discovery describe-agents \
+       --query 'agentsInfo[*].agentId' --output text)
+   
+   if [ ! -z "$AGENT_IDS" ]; then
+       aws discovery stop-data-collection-by-agent-ids \
+           --agent-ids ${AGENT_IDS}
+   fi
    
    echo "✅ Data collection stopped"
    ```
@@ -386,7 +443,7 @@ echo "✅ S3 bucket created for discovery data: ${S3_BUCKET_NAME}"
 
    ```bash
    # Uninstall agents from servers (run on each server)
-   echo "Windows: Run 'msiexec /x {APPLICATION-DISCOVERY-AGENT-GUID} /quiet'"
+   echo "Windows: Run 'msiexec /x AWSApplicationDiscoveryAgent /quiet'"
    echo "Linux: Run 'sudo /opt/aws/discovery/uninstall'"
    
    echo "✅ Agent removal instructions provided"
@@ -404,37 +461,49 @@ echo "✅ S3 bucket created for discovery data: ${S3_BUCKET_NAME}"
        --log-group-name "/aws/discovery/${MIGRATION_PROJECT_NAME}"
    
    # Remove EventBridge rule
-   aws events delete-rule --name "weekly-discovery-export"
+   aws events delete-rule \
+       --name "weekly-discovery-export-${RANDOM_SUFFIX}"
+   
+   # Remove CloudWatch alarm
+   aws cloudwatch delete-alarms \
+       --alarm-names "discovery-agent-health"
    
    echo "✅ AWS resources cleaned up"
    ```
 
 ## Discussion
 
-AWS Application Discovery Service addresses the critical challenge of infrastructure visibility that enterprise organizations face when planning cloud migrations. The service provides two complementary discovery methods: lightweight agents for detailed server-level data collection and agentless connectors for VMware environments. This dual approach ensures comprehensive coverage across diverse infrastructure landscapes while accommodating different organizational policies regarding software installation.
+AWS Application Discovery Service addresses the critical challenge of infrastructure visibility that enterprise organizations face when planning cloud migrations. The service provides two complementary discovery methods: Discovery Agents for detailed server-level data collection and Discovery Connectors for agentless VMware environment discovery. This dual approach ensures comprehensive coverage across diverse infrastructure landscapes while accommodating different organizational policies regarding software installation and change management processes.
 
-The collected data enables data-driven migration decisions by revealing application dependencies, performance patterns, and resource utilization that are often undocumented in enterprise environments. Understanding these relationships is crucial for planning migration waves that minimize downtime and avoid breaking critical business processes. The integration with Migration Hub provides centralized visibility for migration managers and enables tracking progress across multiple migration tools and phases.
+The collected data enables data-driven migration decisions by revealing application dependencies, performance patterns, and resource utilization that are often undocumented in enterprise environments. Understanding these relationships is crucial for planning migration waves that minimize downtime and avoid breaking critical business processes. The integration with Migration Hub provides centralized visibility for migration managers and enables tracking progress across multiple migration tools and project phases, following AWS Well-Architected Framework principles for operational excellence.
 
-Security considerations are paramount in enterprise environments, and Application Discovery Service addresses these through encrypted data transmission, IAM-based access controls, and the ability to configure data retention policies. The service collects metadata about applications and infrastructure without accessing actual business data, maintaining security boundaries while providing necessary migration planning information. Organizations can also configure data collection scope to exclude sensitive systems or limit the types of data collected based on compliance requirements.
+Security considerations are paramount in enterprise environments, and Application Discovery Service addresses these through encrypted data transmission using TLS, comprehensive IAM-based access controls, and configurable data retention policies. The service collects metadata about applications and infrastructure without accessing actual business data, maintaining security boundaries while providing necessary migration planning information. Organizations can configure data collection scope to exclude sensitive systems or limit data types collected based on compliance requirements, supporting frameworks like SOC 2, HIPAA, and PCI DSS.
 
-Cost optimization opportunities emerge from the detailed utilization data collected during the discovery period. Organizations frequently discover over-provisioned servers, unused applications, and opportunities for workload consolidation that can significantly reduce migration scope and ongoing cloud costs. The performance data also enables accurate right-sizing decisions, ensuring migrated workloads run efficiently in the cloud without over-provisioning resources. This aligns with AWS [Cost Optimization best practices](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html) and [right-sizing guidance](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-rightsizing.html) for migration planning.
+Cost optimization opportunities emerge from the detailed utilization data collected during the discovery period. Organizations frequently discover over-provisioned servers, unused applications, and opportunities for workload consolidation that can significantly reduce migration scope and ongoing cloud costs. The performance data enables accurate right-sizing decisions, ensuring migrated workloads run efficiently in AWS without over-provisioning resources. This aligns with [AWS Cost Optimization best practices](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html) and [right-sizing guidance](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-rightsizing.html) for migration planning and ongoing cost management.
 
-> **Note**: For comprehensive discovery, maintain data collection for at least two weeks to capture weekly usage patterns and periodic workloads. See [AWS Application Discovery Service User Guide](https://docs.aws.amazon.com/application-discovery/latest/userguide/) for detailed configuration options.
+> **Note**: For comprehensive discovery, maintain data collection for at least two weeks to capture weekly usage patterns and periodic workloads. Extended collection periods provide better insights into utilization trends. See the [AWS Application Discovery Service User Guide](https://docs.aws.amazon.com/application-discovery/latest/userguide/) for detailed configuration options.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Automated Migration Readiness Assessment**: Develop Lambda functions that analyze discovery data to automatically score applications for cloud readiness and recommend appropriate migration strategies (rehost, replatform, refactor).
+1. **Automated Migration Readiness Assessment**: Develop Lambda functions that analyze discovery data to automatically score applications for cloud readiness and recommend appropriate migration strategies (rehost, replatform, refactor) based on dependency complexity and resource utilization patterns.
 
-2. **Cost Estimation Integration**: Connect discovery data with AWS Pricing APIs to generate detailed cost estimates for different migration scenarios and EC2 instance types based on actual utilization patterns.
+2. **Cost Estimation Integration**: Connect discovery data with AWS Pricing APIs and AWS Cost Explorer to generate detailed cost estimates for different migration scenarios and EC2 instance types based on actual utilization patterns and regional pricing variations.
 
-3. **Dependency Mapping Visualization**: Create a web-based dashboard using Amazon QuickSight that visualizes application dependencies and helps identify migration wave boundaries based on communication patterns.
+3. **Dependency Mapping Visualization**: Create a web-based dashboard using Amazon QuickSight or AWS Application Composer that visualizes application dependencies and helps identify migration wave boundaries based on communication patterns and business criticality.
 
-4. **Automated Compliance Reporting**: Build compliance reports that map discovered applications to regulatory requirements and identify any compliance gaps that need addressing during migration.
+4. **Automated Compliance Reporting**: Build compliance reports using AWS Config and Security Hub that map discovered applications to regulatory requirements (SOX, HIPAA, PCI DSS) and identify any compliance gaps that need addressing during migration planning.
 
-5. **Integration with Infrastructure as Code**: Develop automation that translates discovery data into Terraform or CloudFormation templates for rapid environment provisioning in AWS.
+5. **Infrastructure as Code Generation**: Develop automation using AWS CDK or CloudFormation that translates discovery data into infrastructure templates for rapid environment provisioning, including networking, security groups, and load balancer configurations based on discovered dependencies.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

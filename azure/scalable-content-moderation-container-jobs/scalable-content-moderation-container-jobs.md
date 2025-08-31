@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure AI Content Safety, Azure Container Apps Jobs, Azure Service Bus, Azure Storage Accounts
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: content-moderation, ai-safety, serverless, event-driven, compliance
 recipe-generator-version: 1.3
@@ -78,7 +78,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Owner or Contributor permissions
-2. Azure CLI v2.50.0 or later installed and configured
+2. Azure CLI v2.60.0 or later installed and configured
 3. Docker knowledge for containerized job creation
 4. Understanding of event-driven architectures and message queuing concepts
 5. Basic knowledge of REST APIs and content moderation principles
@@ -230,10 +230,10 @@ echo "✅ Resource providers registered"
    az containerapp env create \
        --name ${CONTAINER_ENV_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --enable-workload-profiles
+       --location ${LOCATION}
 
-   # Wait for environment creation
+   # Wait for environment provisioning to complete
+   echo "Waiting for Container Apps environment to be ready..."
    az containerapp env show \
        --name ${CONTAINER_ENV_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -264,18 +264,18 @@ echo "✅ Resource providers registered"
        --env-vars "CONTENT_SAFETY_ENDPOINT=${CONTENT_SAFETY_ENDPOINT}" \
                   "CONTENT_SAFETY_KEY=${CONTENT_SAFETY_KEY}" \
                   "STORAGE_CONNECTION=${STORAGE_CONNECTION}" \
+                  "SERVICE_BUS_CONNECTION=${SERVICE_BUS_CONNECTION}"
+
+   # Configure Service Bus scaling rule
+   az containerapp job update \
+       --name ${CONTAINER_JOB_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
        --scale-rule-name "service-bus-rule" \
        --scale-rule-type "azure-servicebus" \
        --scale-rule-metadata queueName=content-queue \
                             messageCount=5 \
                             namespace=${SERVICE_BUS_NAMESPACE} \
-       --scale-rule-auth connectionFromEnv=SERVICE_BUS_CONNECTION
-
-   # Set Service Bus connection for the job
-   az containerapp job update \
-       --name ${CONTAINER_JOB_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --set-env-vars "SERVICE_BUS_CONNECTION=${SERVICE_BUS_CONNECTION}"
+       --scale-rule-auth connection=SERVICE_BUS_CONNECTION
 
    echo "✅ Container job created with Service Bus event trigger"
    ```
@@ -412,12 +412,38 @@ echo "✅ Resource providers registered"
 2. **Test Service Bus message handling**:
 
    ```bash
-   # Send test message to Service Bus queue
-   az servicebus queue send \
-       --namespace-name ${SERVICE_BUS_NAMESPACE} \
-       --resource-group ${RESOURCE_GROUP} \
-       --queue-name content-queue \
-       --body '{"contentId": "test-001", "text": "Test content for moderation", "type": "text"}'
+   # Create a simple Node.js script to send test message
+   cat > send-test-message.js << 'EOF'
+   const { ServiceBusClient } = require("@azure/service-bus");
+
+   async function main() {
+       const connectionString = process.env.SERVICE_BUS_CONNECTION;
+       const queueName = "content-queue";
+       
+       const serviceBusClient = new ServiceBusClient(connectionString);
+       const sender = serviceBusClient.createSender(queueName);
+       
+       const message = {
+           body: JSON.stringify({
+               contentId: "test-001", 
+               text: "Test content for moderation", 
+               type: "text"
+           })
+       };
+       
+       await sender.sendMessages(message);
+       console.log("Test message sent to queue");
+       
+       await sender.close();
+       await serviceBusClient.close();
+   }
+
+   main().catch(console.error);
+   EOF
+
+   # Install Azure Service Bus SDK and run test
+   npm init -y && npm install @azure/service-bus
+   node send-test-message.js
 
    # Check queue metrics
    az servicebus queue show \
@@ -548,4 +574,9 @@ Extend this content moderation solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,16 +6,16 @@ difficulty: 400
 subject: aws
 services: direct-connect,vpc,transit-gateway,route-53
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: direct-connect,vpc,transit-gateway,route-53,hybrid-cloud,networking
 recipe-generator-version: 1.3
 ---
 
-# Dedicated Hybrid Cloud Connectivity
+# Dedicated Hybrid Cloud Connectivity with Direct Connect and Transit Gateway
 
 ## Problem
 
@@ -88,7 +88,7 @@ graph LR
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Established connection with Direct Connect partner or colocation facility
 4. On-premises border router supporting BGP and 802.1Q VLAN encapsulation
-5. Estimated cost: $300-1000/month for 1Gbps dedicated connection plus data transfer charges
+5. Estimated cost: $400-1200/month for 1Gbps dedicated connection plus data transfer charges
 
 > **Note**: Direct Connect requires physical connectivity setup which can take 2-4 weeks. This recipe assumes the physical connection is established.
 
@@ -175,6 +175,7 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
        --query 'TransitGateway.TransitGatewayId' --output text)
    
    # Wait for Transit Gateway to become available
+   echo "Waiting for Transit Gateway to become available..."
    aws ec2 wait transit-gateway-available \
        --transit-gateway-ids ${TRANSIT_GATEWAY_ID}
    
@@ -241,6 +242,9 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
        --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' --output text)
    
    echo "✅ VPC attachments created"
+   echo "Production attachment: ${PROD_ATTACHMENT}"
+   echo "Development attachment: ${DEV_ATTACHMENT}"
+   echo "Shared services attachment: ${SHARED_ATTACHMENT}"
    ```
 
    All three VPCs are now connected to the Transit Gateway, creating a hub-and-spoke network topology. This enables any VPC to communicate with others through the central gateway and provides the foundation for routing traffic to on-premises networks through Direct Connect.
@@ -259,13 +263,15 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
    echo "✅ Direct Connect Gateway created: ${DX_GATEWAY_ID}"
    
    # Associate Direct Connect Gateway with Transit Gateway
-   aws ec2 create-transit-gateway-direct-connect-gateway-attachment \
+   DX_TGW_ATTACHMENT_ID=$(aws ec2 create-transit-gateway-direct-connect-gateway-attachment \
        --transit-gateway-id ${TRANSIT_GATEWAY_ID} \
        --direct-connect-gateway-id ${DX_GATEWAY_ID} \
        --tag-specifications \
-           'ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=DX-TGW-Attachment-'${PROJECT_ID}'}]'
+           'ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=DX-TGW-Attachment-'${PROJECT_ID}'}]' \
+       --query 'TransitGatewayDirectConnectGatewayAttachment.TransitGatewayAttachmentId' --output text)
    
    echo "✅ DX Gateway associated with Transit Gateway"
+   echo "DX-TGW Attachment ID: ${DX_TGW_ATTACHMENT_ID}"
    ```
 
    The Direct Connect Gateway is now integrated with Transit Gateway, creating a unified routing domain that spans from on-premises to all attached VPCs. This architecture enables consistent network policies and simplified routing while maintaining the performance benefits of dedicated connectivity.
@@ -329,11 +335,14 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
        --transit-gateway-ids ${TRANSIT_GATEWAY_ID} \
        --query 'TransitGateways[0].Options.DefaultRouteTableId' --output text)
    
-   # Create route for on-premises traffic
-   aws ec2 create-route \
-       --route-table-id ${TGW_ROUTE_TABLE} \
-       --destination-cidr-block ${ON_PREM_CIDR} \
-       --transit-gateway-attachment-id ${DX_ATTACHMENT_ID:-"<DX-Attachment-ID>"}
+   echo "Transit Gateway Route Table: ${TGW_ROUTE_TABLE}"
+   
+   # Note: Route creation for DX attachment will be done after VIF is created
+   echo "📋 Route Configuration Required After VIF Creation:"
+   echo "aws ec2 create-route \\"
+   echo "    --route-table-id ${TGW_ROUTE_TABLE} \\"
+   echo "    --destination-cidr-block ${ON_PREM_CIDR} \\"
+   echo "    --transit-gateway-attachment-id ${DX_TGW_ATTACHMENT_ID}"
    
    # Update VPC route tables to route traffic through Transit Gateway
    for VPC_ID in ${PROD_VPC_ID} ${DEV_VPC_ID} ${SHARED_VPC_ID}; do
@@ -346,9 +355,11 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
            --route-table-id ${ROUTE_TABLE} \
            --destination-cidr-block ${ON_PREM_CIDR} \
            --transit-gateway-id ${TRANSIT_GATEWAY_ID}
+       
+       echo "Route added to VPC ${VPC_ID} route table ${ROUTE_TABLE}"
    done
    
-   echo "✅ Route tables configured"
+   echo "✅ VPC route tables configured"
    ```
 
    The routing configuration now provides bidirectional connectivity between all VPCs and on-premises networks. Traffic from any VPC destined for on-premises networks (10.0.0.0/8) will route through Transit Gateway to Direct Connect, while return traffic follows the reverse path through BGP route advertisements.
@@ -401,8 +412,9 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
        --query 'ResolverEndpoint.Id' --output text)
    
    echo "✅ DNS resolver endpoints created"
-   echo "Inbound Endpoint: ${INBOUND_ENDPOINT}"
-   echo "Outbound Endpoint: ${OUTBOUND_ENDPOINT}"
+   echo "Inbound Endpoint (for on-premises to query AWS): ${INBOUND_ENDPOINT}"
+   echo "Outbound Endpoint (for AWS to query on-premises): ${OUTBOUND_ENDPOINT}"
+   echo "Inbound IP for on-premises DNS forwarders: 10.3.1.100"
    ```
 
    The DNS resolver endpoints are now operational with static IP addresses (10.3.1.100 for inbound, 10.3.1.101 for outbound) that can be configured in on-premises DNS forwarders. This creates unified name resolution across the hybrid infrastructure, enabling applications to discover services regardless of their location.
@@ -418,18 +430,26 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
        "widgets": [
            {
                "type": "metric",
+               "width": 12,
+               "height": 6,
                "properties": {
                    "metrics": [
                        ["AWS/DX", "ConnectionState", "ConnectionId", "<DX-Connection-ID>"],
                        [".", "ConnectionBpsEgress", ".", "."],
                        [".", "ConnectionBpsIngress", ".", "."],
-                       [".", "ConnectionPacketsInEgress", ".", "."],
-                       [".", "ConnectionPacketsInIngress", ".", "."]
+                       [".", "ConnectionPpsEgress", ".", "."],
+                       [".", "ConnectionPpsIngress", ".", "."]
                    ],
                    "period": 300,
                    "stat": "Average",
                    "region": "${AWS_REGION}",
-                   "title": "Direct Connect Connection Metrics"
+                   "title": "Direct Connect Connection Metrics",
+                   "yAxis": {
+                       "left": {
+                           "min": 0
+                       }
+                   },
+                   "view": "timeSeries"
                }
            }
        ]
@@ -439,6 +459,11 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
    aws cloudwatch put-dashboard \
        --dashboard-name "DirectConnect-${PROJECT_ID}" \
        --dashboard-body file://dx-dashboard.json
+   
+   # Create SNS topic for alerts (optional)
+   SNS_TOPIC_ARN=$(aws sns create-topic \
+       --name "dx-alerts-${PROJECT_ID}" \
+       --query 'TopicArn' --output text)
    
    # Create CloudWatch alarms for connection monitoring
    aws cloudwatch put-metric-alarm \
@@ -451,9 +476,11 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
        --threshold 1 \
        --comparison-operator LessThanThreshold \
        --evaluation-periods 2 \
-       --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:dx-alerts-${PROJECT_ID}
+       --alarm-actions ${SNS_TOPIC_ARN}
    
    echo "✅ Monitoring and alerting configured"
+   echo "Dashboard: DirectConnect-${PROJECT_ID}"
+   echo "SNS Topic: ${SNS_TOPIC_ARN}"
    ```
 
    The monitoring infrastructure now provides real-time visibility into connection health and performance metrics. The dashboard displays connection state, bandwidth utilization, and packet statistics, while the alarm triggers within 10 minutes of connection failure, enabling rapid incident response.
@@ -465,6 +492,45 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
    Network Access Control Lists (NACLs) provide subnet-level security that complements security group rules, creating defense-in-depth protection for hybrid connectivity. VPC Flow Logs capture all network traffic for security monitoring, compliance auditing, and troubleshooting. These controls are essential for maintaining security posture across the hybrid infrastructure and meeting regulatory requirements.
 
    ```bash
+   # Create IAM role for VPC Flow Logs
+   cat > flowlogs-trust-policy.json << EOF
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Principal": {
+           "Service": "vpc-flow-logs.amazonaws.com"
+         },
+         "Action": "sts:AssumeRole"
+       }
+     ]
+   }
+   EOF
+   
+   aws iam create-role \
+       --role-name flowlogsRole-${PROJECT_ID} \
+       --assume-role-policy-document file://flowlogs-trust-policy.json
+   
+   aws iam attach-role-policy \
+       --role-name flowlogsRole-${PROJECT_ID} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/VPCFlowLogsDeliveryRolePolicy
+   
+   FLOWLOGS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/flowlogsRole-${PROJECT_ID}"
+   
+   # Create CloudWatch Log Group
+   aws logs create-log-group \
+       --log-group-name "/aws/vpc/flowlogs-${PROJECT_ID}"
+   
+   # Create VPC Flow Logs for monitoring
+   aws ec2 create-flow-logs \
+       --resource-type VPC \
+       --resource-ids ${PROD_VPC_ID} ${DEV_VPC_ID} ${SHARED_VPC_ID} \
+       --traffic-type ALL \
+       --log-destination-type cloud-watch-logs \
+       --log-group-name "/aws/vpc/flowlogs-${PROJECT_ID}" \
+       --deliver-logs-permission-arn ${FLOWLOGS_ROLE_ARN}
+   
    # Create NACLs for additional security
    SHARED_NACL=$(aws ec2 create-network-acl \
        --vpc-id ${SHARED_VPC_ID} \
@@ -489,16 +555,18 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
        --cidr-block ${ON_PREM_CIDR} \
        --rule-action allow
    
-   # Create VPC Flow Logs for monitoring
-   aws ec2 create-flow-logs \
-       --resource-type VPC \
-       --resource-ids ${PROD_VPC_ID} ${DEV_VPC_ID} ${SHARED_VPC_ID} \
-       --traffic-type ALL \
-       --log-destination-type cloud-watch-logs \
-       --log-group-name "/aws/vpc/flowlogs-${PROJECT_ID}" \
-       --deliver-logs-permission-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/flowlogsRole
+   # Allow outbound traffic
+   aws ec2 create-network-acl-entry \
+       --network-acl-id ${SHARED_NACL} \
+       --rule-number 100 \
+       --protocol -1 \
+       --cidr-block 0.0.0.0/0 \
+       --rule-action allow \
+       --egress
    
    echo "✅ Security controls implemented"
+   echo "Flow Logs Role: ${FLOWLOGS_ROLE_ARN}"
+   echo "NACL ID: ${SHARED_NACL}"
    ```
 
    The security controls now provide comprehensive monitoring and protection for hybrid traffic. NACLs restrict access to essential ports (HTTPS and SSH), while Flow Logs capture all network activity for security analysis and compliance reporting. This layered security approach protects against unauthorized access while maintaining operational visibility.
@@ -513,6 +581,7 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
     #!/bin/bash
     
     echo "Testing Hybrid Connectivity..."
+    echo "=============================="
     
     # Test 1: BGP session status
     echo "1. Checking BGP session status..."
@@ -521,21 +590,27 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
         --output table
     
     # Test 2: Route propagation
+    echo ""
     echo "2. Checking Transit Gateway route tables..."
     aws ec2 describe-transit-gateway-route-tables \
         --query 'TransitGatewayRouteTables[*].{TableId:TransitGatewayRouteTableId,State:State}' \
         --output table
     
     # Test 3: VPC connectivity
-    echo "3. Testing VPC to VPC connectivity via Transit Gateway..."
-    # This would typically involve launching test instances and performing ping tests
+    echo ""
+    echo "3. Checking Transit Gateway attachments..."
+    aws ec2 describe-transit-gateway-attachments \
+        --query 'TransitGatewayAttachments[*].{Type:ResourceType,State:State,ResourceId:ResourceId}' \
+        --output table
     
     # Test 4: DNS resolution
-    echo "4. Testing DNS resolution..."
+    echo ""
+    echo "4. Testing DNS resolver endpoints..."
     aws route53resolver list-resolver-endpoints \
         --query 'ResolverEndpoints[*].{Id:Id,Direction:Direction,Status:Status}' \
         --output table
     
+    echo ""
     echo "Connectivity tests completed."
     EOF
     
@@ -543,34 +618,62 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
     
     # Create network monitoring script
     cat > monitor-dx-metrics.py << 'EOF'
+    #!/usr/bin/env python3
     import boto3
     import datetime
+    import sys
     
-    def get_dx_metrics():
+    def get_dx_metrics(connection_id=None):
+        """Get Direct Connect connection metrics from CloudWatch"""
         cloudwatch = boto3.client('cloudwatch')
         
         end_time = datetime.datetime.utcnow()
         start_time = end_time - datetime.timedelta(hours=1)
         
-        # Get connection state metrics
-        response = cloudwatch.get_metric_statistics(
-            Namespace='AWS/DX',
-            MetricName='ConnectionState',
-            StartTime=start_time,
-            EndTime=end_time,
-            Period=300,
-            Statistics=['Maximum']
-        )
+        if not connection_id:
+            print("Warning: No connection ID specified. Using placeholder.")
+            connection_id = "dxcon-example"
         
-        print("Direct Connect Connection Metrics:")
-        for datapoint in response['Datapoints']:
-            print(f"Time: {datapoint['Timestamp']}, State: {datapoint['Maximum']}")
+        try:
+            # Get connection state metrics
+            response = cloudwatch.get_metric_statistics(
+                Namespace='AWS/DX',
+                MetricName='ConnectionState',
+                Dimensions=[
+                    {
+                        'Name': 'ConnectionId',
+                        'Value': connection_id
+                    }
+                ],
+                StartTime=start_time,
+                EndTime=end_time,
+                Period=300,
+                Statistics=['Maximum']
+            )
+            
+            print(f"Direct Connect Connection Metrics for {connection_id}:")
+            print("=" * 60)
+            
+            if response['Datapoints']:
+                for datapoint in sorted(response['Datapoints'], key=lambda x: x['Timestamp']):
+                    state = "UP" if datapoint['Maximum'] == 1 else "DOWN"
+                    print(f"Time: {datapoint['Timestamp']}, State: {state}")
+            else:
+                print("No metrics found for the specified connection.")
+                
+        except Exception as e:
+            print(f"Error retrieving metrics: {e}")
     
     if __name__ == '__main__':
-        get_dx_metrics()
+        connection_id = sys.argv[1] if len(sys.argv) > 1 else None
+        get_dx_metrics(connection_id)
     EOF
     
+    chmod +x monitor-dx-metrics.py
+    
     echo "✅ Testing and monitoring scripts created"
+    echo "Usage: ./test-hybrid-connectivity.sh"
+    echo "Usage: python3 monitor-dx-metrics.py <connection-id>"
     ```
 
     The testing and monitoring scripts are now available for ongoing connectivity validation. These tools provide automated health checks for all hybrid connectivity components and can be integrated into monitoring systems or executed as part of regular operational procedures to ensure consistent network performance.
@@ -599,6 +702,8 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
        --output table
    ```
 
+   Expected output: All attachments in "available" state
+
 3. Test route propagation:
 
    ```bash
@@ -619,18 +724,16 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
        --output table
    ```
 
+   Expected output: Both endpoints in "OPERATIONAL" status
+
 ## Cleanup
 
 1. Remove Direct Connect Gateway associations:
 
    ```bash
    # Delete Transit Gateway Direct Connect Gateway attachment
-   DX_TGW_ATTACHMENT=$(aws ec2 describe-transit-gateway-attachments \
-       --filters Name=resource-type,Values=direct-connect-gateway \
-       --query 'TransitGatewayAttachments[0].TransitGatewayAttachmentId' --output text)
-   
    aws ec2 delete-transit-gateway-direct-connect-gateway-attachment \
-       --transit-gateway-attachment-id ${DX_TGW_ATTACHMENT}
+       --transit-gateway-attachment-id ${DX_TGW_ATTACHMENT_ID}
    
    echo "✅ DX Gateway attachment deleted"
    ```
@@ -658,6 +761,7 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
    done
    
    # Wait for attachments to be deleted
+   echo "Waiting for attachments to be deleted..."
    sleep 60
    
    # Delete Transit Gateway
@@ -681,11 +785,18 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
            aws ec2 delete-subnet --subnet-id ${SUBNET}
        done
        
+       # Delete security groups (except default)
+       SECURITY_GROUPS=$(aws ec2 describe-security-groups \
+           --filters Name=vpc-id,Values=${VPC_ID} \
+           --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text)
+       
+       for SG in ${SECURITY_GROUPS}; do
+           aws ec2 delete-security-group --group-id ${SG}
+       done
+       
        # Delete VPC
        aws ec2 delete-vpc --vpc-id ${VPC_ID}
    done
-   
-   # Delete security groups and NACLs are automatically cleaned up
    
    echo "✅ VPC resources cleaned up"
    ```
@@ -701,9 +812,24 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
    aws cloudwatch delete-alarms \
        --alarm-names "DX-Connection-Down-${PROJECT_ID}"
    
+   # Delete SNS topic
+   aws sns delete-topic --topic-arn ${SNS_TOPIC_ARN}
+   
+   # Delete CloudWatch Log Group
+   aws logs delete-log-group \
+       --log-group-name "/aws/vpc/flowlogs-${PROJECT_ID}"
+   
+   # Delete IAM role
+   aws iam detach-role-policy \
+       --role-name flowlogsRole-${PROJECT_ID} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/VPCFlowLogsDeliveryRolePolicy
+   
+   aws iam delete-role --role-name flowlogsRole-${PROJECT_ID}
+   
    # Clean up local files
    rm -f bgp-config-template.txt
    rm -f dx-dashboard.json
+   rm -f flowlogs-trust-policy.json
    rm -f test-hybrid-connectivity.sh
    rm -f monitor-dx-metrics.py
    
@@ -712,30 +838,37 @@ echo "Transit Gateway: ${TRANSIT_GATEWAY_NAME}"
 
 ## Discussion
 
-AWS Direct Connect provides enterprises with a reliable, high-performance alternative to internet-based connectivity for hybrid cloud architectures. The service addresses critical limitations of VPN connections by offering dedicated bandwidth, consistent network performance, and reduced data transfer costs for high-volume workloads.
+AWS Direct Connect provides enterprises with a reliable, high-performance alternative to internet-based connectivity for hybrid cloud architectures. The service addresses critical limitations of VPN connections by offering dedicated bandwidth, consistent network performance, and reduced data transfer costs for high-volume workloads. According to current AWS pricing, a 1Gbps dedicated connection typically costs $400-1200 per month depending on location, plus data transfer charges starting at $0.02 per GB.
 
-The integration of Direct Connect Gateway with Transit Gateway creates a powerful hub-and-spoke architecture that simplifies network management while providing scalable connectivity to multiple VPCs across regions. This design eliminates the need for complex VPC peering arrangements and reduces the operational overhead of managing multiple Direct Connect connections.
+The integration of Direct Connect Gateway with Transit Gateway creates a powerful hub-and-spoke architecture that simplifies network management while providing scalable connectivity to multiple VPCs across regions. This design eliminates the need for complex VPC peering arrangements and reduces the operational overhead of managing multiple Direct Connect connections. The Transit Gateway can handle up to 50 Gbps per attachment and supports up to 5,000 total attachments, making it suitable for large enterprise deployments.
 
-Virtual interface configuration is crucial for security and performance optimization. Transit virtual interfaces enable centralized connectivity management, while private virtual interfaces provide dedicated access to specific VPC resources. The BGP routing configuration ensures optimal path selection and enables granular control over traffic flows between on-premises and cloud environments.
+Virtual interface configuration is crucial for security and performance optimization. Transit virtual interfaces enable centralized connectivity management through the Direct Connect Gateway, while private virtual interfaces provide dedicated access to specific VPC resources. The BGP routing configuration ensures optimal path selection and enables granular control over traffic flows between on-premises and cloud environments using prefix lists and route filtering.
 
-Route 53 Resolver endpoints facilitate seamless DNS resolution across hybrid environments, enabling consistent service discovery and reducing the complexity of split-brain DNS configurations. The inbound and outbound resolver endpoints ensure that both cloud and on-premises resources can resolve names efficiently.
+Route 53 Resolver endpoints facilitate seamless DNS resolution across hybrid environments, enabling consistent service discovery and reducing the complexity of split-brain DNS configurations. The inbound and outbound resolver endpoints ensure that both cloud and on-premises resources can resolve names efficiently, supporting hybrid applications that depend on service discovery across network boundaries.
 
-> **Warning**: Direct Connect provides a single point of failure. Implement redundant connections or backup VPN connectivity for mission-critical applications.
+> **Warning**: Direct Connect provides a single point of failure for hybrid connectivity. Implement redundant connections across multiple Direct Connect locations or maintain backup VPN connectivity for mission-critical applications that require 99.99% uptime. AWS recommends deploying at least two Direct Connect connections for production workloads.
 
 ## Challenge
 
 Extend this hybrid connectivity solution by implementing these enhancements:
 
-1. **Multi-Region Redundancy**: Deploy redundant Direct Connect connections across multiple AWS regions with automated failover using Route 53 health checks and BGP routing.
+1. **Multi-Region Redundancy**: Deploy redundant Direct Connect connections across multiple AWS regions with automated failover using Route 53 health checks, BGP AS-PATH prepending, and Transit Gateway inter-region peering for disaster recovery scenarios.
 
-2. **Bandwidth Auto-Scaling**: Implement CloudWatch-based monitoring that automatically provisions additional virtual interfaces when bandwidth utilization exceeds thresholds.
+2. **Bandwidth Auto-Scaling**: Implement CloudWatch-based monitoring that automatically provisions additional virtual interfaces when bandwidth utilization exceeds 80% thresholds, using Lambda functions and Direct Connect APIs for dynamic capacity management.
 
-3. **Zero-Trust Security**: Integrate AWS Private Certificate Authority and implement mutual TLS authentication for all hybrid connectivity traffic.
+3. **Zero-Trust Security**: Integrate AWS Private Certificate Authority and implement mutual TLS authentication for all hybrid connectivity traffic, including certificate-based authentication for BGP sessions and encrypted overlay networks.
 
-4. **SD-WAN Integration**: Extend the solution to integrate with software-defined WAN solutions, enabling dynamic path selection based on application requirements and network conditions.
+4. **SD-WAN Integration**: Extend the solution to integrate with software-defined WAN solutions like Cisco SD-WAN or VMware VeloCloud, enabling dynamic path selection based on application requirements, traffic type, and real-time network conditions.
 
-5. **Cost Optimization Automation**: Develop Lambda functions that analyze traffic patterns and automatically adjust virtual interface configurations to optimize data transfer costs across different pricing tiers.
+5. **Cost Optimization Automation**: Develop Lambda functions that analyze traffic patterns using VPC Flow Logs and CloudWatch metrics, automatically adjusting virtual interface configurations and implementing intelligent traffic routing to optimize data transfer costs across different Direct Connect pricing tiers and regions.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

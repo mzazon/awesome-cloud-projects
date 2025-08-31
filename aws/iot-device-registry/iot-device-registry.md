@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: iot-core, iot-device-management, lambda, cloudwatch
 estimated-time: 60 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, device-management, iot-core, device-registry
 recipe-generator-version: 1.3
@@ -19,11 +19,11 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Manufacturing companies deploying thousands of IoT sensors across production facilities struggle with device lifecycle management, secure connectivity, and real-time monitoring at scale. Traditional device management solutions lack cloud integration, making it difficult to track device health, push firmware updates, and maintain security compliance across distributed sensor networks.
+Manufacturing companies deploying thousands of IoT sensors across production facilities struggle with device lifecycle management, secure connectivity, and real-time monitoring at scale. Traditional device management solutions lack cloud integration, making it difficult to track device health, push firmware updates, and maintain security compliance across distributed sensor networks without centralized oversight and automated fleet operations.
 
 ## Solution
 
-AWS IoT Core provides a managed platform for secure device connectivity, registration, and lifecycle management through its device registry, certificate management, and rules engine. This solution establishes a scalable IoT infrastructure that automatically handles device authentication, data routing, and fleet monitoring while integrating with AWS analytics and notification services.
+AWS IoT Core provides a managed platform for secure device connectivity, registration, and lifecycle management through its device registry, certificate management, and rules engine. This solution establishes a scalable IoT infrastructure that automatically handles device authentication, data routing, and fleet monitoring while integrating with AWS analytics and notification services for comprehensive device management.
 
 ## Architecture Diagram
 
@@ -94,9 +94,15 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --password-length 6 --require-each-included-type \
     --output text --query RandomPassword)
 
+export IOT_THING_TYPE="TemperatureSensor"
 export IOT_THING_NAME="temperature-sensor-${RANDOM_SUFFIX}"
 export IOT_POLICY_NAME="device-policy-${RANDOM_SUFFIX}"
 export IOT_RULE_NAME="sensor_data_rule_${RANDOM_SUFFIX}"
+
+# Create Thing Type for device categorization
+aws iot create-thing-type \
+    --thing-type-name ${IOT_THING_TYPE} \
+    --thing-type-description "Temperature sensor devices for production monitoring"
 
 echo "Environment configured for IoT device: ${IOT_THING_NAME}"
 ```
@@ -111,12 +117,13 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
    # Create IoT Thing with device attributes
    aws iot create-thing \
        --thing-name ${IOT_THING_NAME} \
-       --thing-type-name "TemperatureSensor" \
+       --thing-type-name ${IOT_THING_TYPE} \
        --attribute-payload attributes='{
            "deviceType":"temperature",
            "manufacturer":"SensorCorp",
            "model":"TC-2000",
-           "location":"ProductionFloor-A"
+           "location":"ProductionFloor-A",
+           "firmware":"1.0.0"
        }'
    
    echo "✅ IoT Thing '${IOT_THING_NAME}' created in device registry"
@@ -156,11 +163,18 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
            {
                "Effect": "Allow",
                "Action": [
-                   "iot:Connect",
+                   "iot:Connect"
+               ],
+               "Resource": [
+                   "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:client/\${iot:Connection.Thing.ThingName}"
+               ]
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
                    "iot:Publish"
                ],
                "Resource": [
-                   "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:client/\${iot:Connection.Thing.ThingName}",
                    "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:topic/sensor/temperature/\${iot:Connection.Thing.ThingName}"
                ]
            },
@@ -170,7 +184,9 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
                    "iot:GetThingShadow",
                    "iot:UpdateThingShadow"
                ],
-               "Resource": "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:thing/\${iot:Connection.Thing.ThingName}"
+               "Resource": [
+                   "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:thing/\${iot:Connection.Thing.ThingName}"
+               ]
            }
        ]
    }
@@ -245,11 +261,15 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
        --role-name iot-lambda-role-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
+   # Wait for role to be available
+   sleep 10
+   
    # Create Lambda function code
    cat > lambda-function.py << EOF
    import json
    import boto3
    import logging
+   from datetime import datetime
    
    logger = logging.getLogger()
    logger.setLevel(logging.INFO)
@@ -260,20 +280,28 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
        # Extract device data
        device_name = event.get('device', 'unknown')
        temperature = event.get('temperature', 0)
-       timestamp = event.get('timestamp', '')
+       timestamp = event.get('timestamp', datetime.utcnow().isoformat())
        
-       # Process temperature data
+       # Process temperature data with business logic
        if temperature > 80:
            logger.warning(f"High temperature alert: {temperature}°C from {device_name}")
+           alert_level = "HIGH"
+       elif temperature > 60:
+           logger.info(f"Moderate temperature warning: {temperature}°C from {device_name}")
+           alert_level = "MEDIUM"
+       else:
+           logger.info(f"Normal temperature reading: {temperature}°C from {device_name}")
+           alert_level = "NORMAL"
            
-       # Here you could send to SNS, write to DynamoDB, etc.
-       
+       # Return processed data for downstream systems
        return {
            'statusCode': 200,
            'body': json.dumps({
                'message': 'Data processed successfully',
                'device': device_name,
-               'temperature': temperature
+               'temperature': temperature,
+               'alert_level': alert_level,
+               'processed_timestamp': datetime.utcnow().isoformat()
            })
        }
    EOF
@@ -283,16 +311,18 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
    
    aws lambda create-function \
        --function-name iot-data-processor-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/iot-lambda-role-${RANDOM_SUFFIX} \
        --handler lambda-function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
-       --description "Process IoT sensor data from temperature devices"
+       --description "Process IoT sensor data from temperature devices" \
+       --timeout 60 \
+       --memory-size 256
    
    echo "✅ Lambda function created for IoT data processing"
    ```
 
-   The Lambda function is now ready to receive and process IoT telemetry data automatically. This serverless approach scales automatically with your device fleet size and only charges for actual processing time, making it cost-effective for variable IoT workloads.
+   The Lambda function is now ready to receive and process IoT telemetry data automatically with enhanced business logic for temperature monitoring. This serverless approach scales automatically with your device fleet size and only charges for actual processing time, making it cost-effective for variable IoT workloads.
 
 7. **Create IoT Rule for Automatic Data Routing**:
 
@@ -304,8 +334,8 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
    {
        "ruleName": "${IOT_RULE_NAME}",
        "topicRulePayload": {
-           "sql": "SELECT *, topic(3) as device FROM 'sensor/temperature/+'",
-           "description": "Route temperature sensor data to Lambda for processing",
+           "sql": "SELECT *, topic(3) as device, timestamp() as aws_timestamp FROM 'sensor/temperature/+'",
+           "description": "Route temperature sensor data to Lambda for processing and alerting",
            "actions": [
                {
                    "lambda": {
@@ -313,7 +343,8 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
                    }
                }
            ],
-           "ruleDisabled": false
+           "ruleDisabled": false,
+           "awsIotSqlVersion": "2016-03-23"
        }
    }
    EOF
@@ -331,9 +362,9 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
    echo "✅ IoT rule created to route sensor data to Lambda"
    ```
 
-   The rules engine now automatically captures temperature data from any device publishing to the sensor/temperature/ topic hierarchy and routes it to your Lambda function. This pattern enables real-time data processing and can easily scale to handle thousands of concurrent device messages.
+   The rules engine now automatically captures temperature data from any device publishing to the sensor/temperature/ topic hierarchy and routes it to your Lambda function with enhanced SQL processing. This pattern enables real-time data processing and can easily scale to handle thousands of concurrent device messages.
 
-> **Warning**: Ensure Lambda function permissions are correctly configured before creating IoT rules to avoid message delivery failures and potential data loss.
+   > **Warning**: Ensure Lambda function permissions are correctly configured before creating IoT rules to avoid message delivery failures and potential data loss.
 
 8. **Configure Device Shadow for State Management**:
 
@@ -347,12 +378,14 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
            "desired": {
                "temperature_threshold": 75,
                "reporting_interval": 60,
-               "active": true
+               "active": true,
+               "alert_enabled": true
            },
            "reported": {
                "temperature": 22.5,
                "battery_level": 95,
-               "firmware_version": "1.0.0"
+               "firmware_version": "1.0.0",
+               "last_update": "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
            }
        }
    }
@@ -388,8 +421,9 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
    # Check rule details
    aws iot get-topic-rule --rule-name ${IOT_RULE_NAME}
    
-   # List all IoT rules
-   aws iot list-topic-rules --query 'rules[?ruleName==`'${IOT_RULE_NAME}'`]'
+   # List all IoT rules to verify creation
+   aws iot list-topic-rules \
+       --query 'rules[?ruleName==`'${IOT_RULE_NAME}'`]'
    ```
 
    Expected output: Rule configuration showing Lambda action and SQL statement.
@@ -400,25 +434,50 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
    # Publish test message to sensor topic
    aws iot-data publish \
        --topic sensor/temperature/${IOT_THING_NAME} \
-       --payload '{"temperature": 85.5, "humidity": 65, "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'", "device": "'${IOT_THING_NAME}'"}'
+       --payload '{
+           "temperature": 85.5, 
+           "humidity": 65, 
+           "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'",
+           "device": "'${IOT_THING_NAME}'",
+           "battery_level": 87
+       }'
    
    echo "✅ Test message published to IoT topic"
    ```
 
-4. Verify Lambda function execution:
+4. Verify Lambda function execution and logs:
 
    ```bash
    # Check Lambda function logs
    aws logs describe-log-groups \
        --log-group-name-prefix /aws/lambda/iot-data-processor-${RANDOM_SUFFIX}
    
-   # Get recent log events
-   aws logs describe-log-streams \
+   # Get recent log events to verify processing
+   LATEST_STREAM=$(aws logs describe-log-streams \
        --log-group-name /aws/lambda/iot-data-processor-${RANDOM_SUFFIX} \
-       --order-by LastEventTime --descending --max-items 1
+       --order-by LastEventTime --descending --max-items 1 \
+       --query 'logStreams[0].logStreamName' --output text)
+   
+   aws logs get-log-events \
+       --log-group-name /aws/lambda/iot-data-processor-${RANDOM_SUFFIX} \
+       --log-stream-name ${LATEST_STREAM} \
+       --limit 10
    ```
 
-   Expected output: Log groups showing Lambda function execution and processing of IoT data.
+   Expected output: Log groups showing Lambda function execution and processing of IoT data with temperature alerts.
+
+5. Verify device shadow state:
+
+   ```bash
+   # Check device shadow current state
+   aws iot-data get-thing-shadow \
+       --thing-name ${IOT_THING_NAME} \
+       shadow-output.json
+   
+   cat shadow-output.json | python3 -m json.tool
+   ```
+
+   Expected output: JSON document showing desired and reported device states.
 
 > **Tip**: Use AWS IoT Device Simulator or AWS IoT Device Tester to generate realistic device traffic for comprehensive testing of your IoT infrastructure.
 
@@ -470,13 +529,14 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
    
    # Deactivate and delete certificate
    CERT_ID=$(echo ${CERT_ARN} | cut -d'/' -f2)
-   aws iot update-certificate --certificate-id ${CERT_ID} --new-status INACTIVE
+   aws iot update-certificate \
+       --certificate-id ${CERT_ID} --new-status INACTIVE
    aws iot delete-certificate --certificate-id ${CERT_ID}
    
    echo "✅ Deleted device certificate"
    ```
 
-4. Delete IoT policy and Thing:
+4. Delete IoT policy, Thing, and Thing Type:
 
    ```bash
    # Delete IoT policy
@@ -485,7 +545,10 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
    # Delete IoT Thing
    aws iot delete-thing --thing-name ${IOT_THING_NAME}
    
-   echo "✅ Deleted IoT policy and Thing"
+   # Delete Thing Type (will only succeed if no things use it)
+   aws iot delete-thing-type --thing-type-name ${IOT_THING_TYPE}
+   
+   echo "✅ Deleted IoT policy, Thing, and Thing Type"
    ```
 
 5. Clean up local files:
@@ -495,37 +558,44 @@ echo "Environment configured for IoT device: ${IOT_THING_NAME}"
    rm -f device-cert.pem device-public-key.pem device-private-key.pem
    rm -f cert-arn.txt device-policy.json lambda-trust-policy.json
    rm -f lambda-function.py lambda-function.zip iot-rule.json
-   rm -f device-shadow.json outfile
+   rm -f device-shadow.json outfile shadow-output.json
    
    echo "✅ Cleaned up local files"
    ```
 
 ## Discussion
 
-AWS IoT Core provides a comprehensive managed platform for IoT device lifecycle management that addresses the complex challenges of connecting, securing, and managing large-scale device fleets. The Device Registry serves as the central authority for device identity and metadata, enabling efficient fleet management operations like bulk updates, device grouping, and fleet indexing. The certificate-based authentication model ensures that only authorized devices can connect while providing the cryptographic foundation for secure data transmission.
+AWS IoT Core provides a comprehensive managed platform for IoT device lifecycle management that addresses the complex challenges of connecting, securing, and managing large-scale device fleets. The Device Registry serves as the central authority for device identity and metadata, enabling efficient fleet management operations like bulk updates, device grouping, and fleet indexing through the [Fleet Indexing service](https://docs.aws.amazon.com/iot/latest/developerguide/iot-indexing.html). The certificate-based authentication model ensures that only authorized devices can connect while providing the cryptographic foundation for secure data transmission following AWS IoT security best practices.
 
-The Rules Engine represents a powerful serverless computing paradigm for IoT data processing, enabling real-time message routing and transformation without requiring complex device-side logic or expensive always-on compute resources. By using SQL-like syntax for message filtering and routing, organizations can implement sophisticated data processing workflows that automatically scale with device volume. This approach significantly reduces the operational overhead of managing IoT data pipelines while providing the flexibility to integrate with virtually any AWS service.
+The Rules Engine represents a powerful serverless computing paradigm for IoT data processing, enabling real-time message routing and transformation without requiring complex device-side logic or expensive always-on compute resources. By using SQL-like syntax for message filtering and routing, organizations can implement sophisticated data processing workflows that automatically scale with device volume. This approach significantly reduces the operational overhead of managing IoT data pipelines while providing the flexibility to integrate with virtually any AWS service through the [AWS IoT Rules Actions](https://docs.aws.amazon.com/iot/latest/developerguide/iot-rule-actions.html).
 
 Device Shadows provide a critical abstraction layer that decouples application logic from device availability and connectivity patterns. This persistent state management enables applications to configure devices and query device status regardless of network conditions, supporting use cases like remote device configuration, firmware update orchestration, and offline device management. The shadow synchronization mechanism ensures eventual consistency between desired and reported states, providing robust device management even in challenging network environments.
 
-Security considerations are paramount in IoT deployments, and AWS IoT Core's certificate-based authentication combined with fine-grained IoT policies provides enterprise-grade security controls. The policy variables enable dynamic permission scoping based on device identity, ensuring that devices can only access their authorized resources while maintaining operational flexibility.
+Security considerations are paramount in IoT deployments, and AWS IoT Core's certificate-based authentication combined with fine-grained IoT policies provides enterprise-grade security controls following the [AWS Well-Architected IoT Lens](https://docs.aws.amazon.com/wellarchitected/latest/iot-lens/welcome.html) principles. The policy variables enable dynamic permission scoping based on device identity, ensuring that devices can only access their authorized resources while maintaining operational flexibility. The updated Lambda runtime (Python 3.12) ensures long-term support and security updates for your data processing functions.
 
-> **Note**: For production deployments, consider implementing additional security measures such as certificate rotation policies, device provisioning workflows using AWS IoT Device Management, and integration with AWS IoT Device Defender for ongoing security monitoring.
+> **Note**: For production deployments, consider implementing additional security measures such as certificate rotation policies, device provisioning workflows using [AWS IoT Device Management](https://docs.aws.amazon.com/iot/latest/developerguide/device-mgmt.html), and integration with [AWS IoT Device Defender](https://docs.aws.amazon.com/iot/latest/developerguide/device-defender.html) for ongoing security monitoring and threat detection.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Fleet Management Integration**: Implement AWS IoT Device Management jobs for over-the-air firmware updates and bulk device configuration changes across your device fleet.
+1. **Fleet Management Integration**: Implement AWS IoT Device Management jobs for over-the-air firmware updates and bulk device configuration changes across your device fleet using job templates and deployment strategies.
 
-2. **Advanced Analytics Pipeline**: Add Amazon Kinesis Data Streams and Amazon Kinesis Analytics to process real-time device telemetry and detect anomalies in sensor data patterns.
+2. **Advanced Analytics Pipeline**: Add Amazon Kinesis Data Streams and Amazon Kinesis Analytics to process real-time device telemetry streams and detect anomalies in sensor data patterns using machine learning algorithms.
 
-3. **Multi-Protocol Support**: Configure AWS IoT Core's protocol gateway to support MQTT over WebSockets and HTTP for devices with different connectivity requirements.
+3. **Multi-Protocol Support**: Configure AWS IoT Core's protocol gateway to support MQTT over WebSockets and HTTP for devices with different connectivity requirements, including mobile applications and web browsers.
 
-4. **Device Provisioning Automation**: Implement AWS IoT Device Provisioning to automatically onboard new devices using just-in-time provisioning or fleet provisioning templates.
+4. **Device Provisioning Automation**: Implement AWS IoT Device Provisioning to automatically onboard new devices using just-in-time provisioning or fleet provisioning templates with pre-provisioning hooks for enhanced security.
 
-5. **Monitoring and Alerting**: Create CloudWatch dashboards and alarms for device connectivity metrics, message throughput, and error rates with SNS notifications for operational incidents.
+5. **Monitoring and Alerting**: Create CloudWatch dashboards and alarms for device connectivity metrics, message throughput, and error rates with SNS notifications for operational incidents and automated remediation workflows.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

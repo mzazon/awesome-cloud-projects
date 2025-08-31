@@ -1,0 +1,389 @@
+# Infrastructure Manager Configuration for Currency Converter API with Cloud Functions
+# This configuration deploys a complete serverless currency conversion solution
+# including Cloud Functions, Secret Manager, and IAM configurations
+
+metadata:
+  # Basic deployment metadata
+  name: currency-converter-api
+  description: "Serverless currency converter API using Cloud Functions and Secret Manager"
+  version: "1.0.0"
+  labels:
+    recipe: "currency-converter-api-functions"
+    category: "serverless"
+    difficulty: "100"
+
+# Define input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    
+  # Regional configuration
+  region:
+    type: string
+    description: "Google Cloud region for function deployment"
+    default: "us-central1"
+    
+  # Function configuration
+  function_name:
+    type: string
+    description: "Name for the Cloud Function"
+    default: "currency-converter"
+    
+  # Secret configuration
+  secret_name:
+    type: string
+    description: "Name for the Secret Manager secret storing API key"
+    
+  # Exchange rate API key
+  exchange_api_key:
+    type: string
+    description: "API key for exchange rate service (e.g., fixer.io)"
+    sensitive: true
+    
+  # Function runtime configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function"
+    default: "256Mi"
+    
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution"
+    default: "60s"
+    
+  # Deployment labels
+  deployment_labels:
+    type: map
+    description: "Additional labels for deployed resources"
+    default:
+      environment: "development"
+      managed-by: "infrastructure-manager"
+
+# Define the infrastructure resources
+resources:
+  # Enable required Google Cloud APIs
+  enable_cloudfunctions_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudfunctions.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+    metadata:
+      dependsOn: []
+
+  enable_secretmanager_api:
+    type: gcp-types/serviceusage-v1:services
+    name: secretmanager.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/secretmanager.googleapis.com
+    metadata:
+      dependsOn: []
+
+  enable_cloudbuild_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudbuild.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Create Secret Manager secret for exchange rate API key
+  exchange_api_secret:
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/${var.project_id}
+      secretId: ${var.secret_name}
+      secret:
+        replication:
+          automatic: {}
+        labels:
+          purpose: "exchange-rate-api"
+          function: ${var.function_name}
+    metadata:
+      dependsOn:
+        - enable_secretmanager_api
+
+  # Store the API key value in the secret
+  exchange_api_secret_version:
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: projects/${var.project_id}/secrets/${var.secret_name}
+      payload:
+        data: ${base64encode(var.exchange_api_key)}
+    metadata:
+      dependsOn:
+        - exchange_api_secret
+
+  # Create Cloud Storage bucket for function source code
+  function_source_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.project_id}-function-source-${random_id.bucket_suffix.hex}
+      location: ${var.region}
+      storageClass: REGIONAL
+      versioning:
+        enabled: false
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 7
+      labels:
+        purpose: "function-source-storage"
+        function: ${var.function_name}
+    metadata:
+      dependsOn: []
+
+  # Generate random suffix for bucket name uniqueness
+  random_bucket_suffix:
+    type: random_id
+    properties:
+      byte_length: 4
+
+  # Create ZIP archive of function source code
+  function_source_archive:
+    type: archive_file
+    properties:
+      type: zip
+      output_path: /tmp/currency-converter-function.zip
+      source:
+        - filename: main.py
+          content: |
+            import functions_framework
+            import requests
+            import json
+            import os
+            from google.cloud import secretmanager
+
+            # Initialize Secret Manager client
+            secret_client = secretmanager.SecretManagerServiceClient()
+
+            def get_api_key():
+                """Retrieve API key from Secret Manager"""
+                project_id = os.environ.get('GCP_PROJECT')
+                secret_name = os.environ.get('SECRET_NAME')
+                
+                name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+                response = secret_client.access_secret_version(request={"name": name})
+                return response.payload.data.decode("UTF-8")
+
+            @functions_framework.http
+            def currency_converter(request):
+                """HTTP Cloud Function for currency conversion"""
+                
+                # Set CORS headers for web browsers
+                headers = {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type'
+                }
+                
+                # Handle preflight OPTIONS request
+                if request.method == 'OPTIONS':
+                    return ('', 204, headers)
+                
+                try:
+                    # Parse request parameters
+                    if request.method == 'GET':
+                        from_currency = request.args.get('from', 'USD')
+                        to_currency = request.args.get('to', 'EUR')
+                        amount = float(request.args.get('amount', '1'))
+                    else:
+                        request_json = request.get_json()
+                        from_currency = request_json.get('from', 'USD')
+                        to_currency = request_json.get('to', 'EUR')
+                        amount = float(request_json.get('amount', '1'))
+                    
+                    # Get API key from Secret Manager
+                    api_key = get_api_key()
+                    
+                    # Call exchange rate API (use HTTPS for security)
+                    url = f"https://data.fixer.io/api/convert"
+                    params = {
+                        'access_key': api_key,
+                        'from': from_currency,
+                        'to': to_currency,
+                        'amount': amount
+                    }
+                    
+                    response = requests.get(url, params=params)
+                    data = response.json()
+                    
+                    if data.get('success'):
+                        result = {
+                            'success': True,
+                            'from': from_currency,
+                            'to': to_currency,
+                            'amount': amount,
+                            'result': data['result'],
+                            'rate': data['info']['rate'],
+                            'timestamp': data['date']
+                        }
+                    else:
+                        result = {
+                            'success': False,
+                            'error': data.get('error', {}).get('info', 'Unknown error')
+                        }
+                    
+                    return (json.dumps(result), 200, headers)
+                    
+                except Exception as e:
+                    error_result = {
+                        'success': False,
+                        'error': f'Internal error: {str(e)}'
+                    }
+                    return (json.dumps(error_result), 500, headers)
+        - filename: requirements.txt
+          content: |
+            functions-framework>=3.0.0,<4.0.0
+            google-cloud-secret-manager>=2.16.0,<3.0.0
+            requests>=2.31.0,<3.0.0
+
+  # Upload function source code to Cloud Storage
+  function_source_object:
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: ${function_source_bucket.name}
+      name: currency-converter-function.zip
+      source: ${function_source_archive.output_path}
+    metadata:
+      dependsOn:
+        - function_source_bucket
+        - function_source_archive
+
+  # Deploy the Cloud Function
+  currency_converter_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/${var.function_name}
+        description: "Serverless currency converter API with Secret Manager integration"
+        sourceArchiveUrl: gs://${function_source_bucket.name}/currency-converter-function.zip
+        entryPoint: currency_converter
+        runtime: python312
+        timeout: ${var.function_timeout}
+        availableMemoryMb: ${replace(var.function_memory, "Mi", "")}
+        
+        # HTTP trigger configuration
+        httpsTrigger: {}
+        
+        # Environment variables for function runtime
+        environmentVariables:
+          GCP_PROJECT: ${var.project_id}
+          SECRET_NAME: ${var.secret_name}
+        
+        # Labels for resource management
+        labels:
+          purpose: "currency-conversion-api"
+          deployment: "infrastructure-manager"
+        
+        # Security and networking configuration
+        ingressSettings: ALLOW_ALL
+        
+    metadata:
+      dependsOn:
+        - function_source_object
+        - enable_cloudfunctions_api
+        - enable_cloudbuild_api
+
+  # Get the Cloud Function's service account
+  function_service_account:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    action: get
+    properties:
+      name: ${currency_converter_function.name}
+    metadata:
+      dependsOn:
+        - currency_converter_function
+
+  # Grant the function's service account access to the secret
+  secret_iam_binding:
+    type: gcp-types/secretmanager-v1:projects.secrets.iam
+    properties:
+      resource: projects/${var.project_id}/secrets/${var.secret_name}
+      policy:
+        bindings:
+          - role: roles/secretmanager.secretAccessor
+            members:
+              - serviceAccount:${function_service_account.serviceAccountEmail}
+    metadata:
+      dependsOn:
+        - exchange_api_secret
+        - function_service_account
+
+  # IAM policy to allow unauthenticated invocation (for public API)
+  function_iam_policy:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.iam
+    properties:
+      resource: ${currency_converter_function.name}
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - currency_converter_function
+
+# Define outputs to provide important information after deployment
+outputs:
+  # Function endpoint URL
+  function_url:
+    description: "HTTPS URL endpoint for the currency converter API"
+    value: ${currency_converter_function.httpsTrigger.url}
+    
+  # Function name for management operations
+  function_name:
+    description: "Name of the deployed Cloud Function"
+    value: ${var.function_name}
+    
+  # Function region
+  function_region:
+    description: "Region where the function is deployed"
+    value: ${var.region}
+    
+  # Secret name for reference
+  secret_name:
+    description: "Name of the Secret Manager secret storing the API key"
+    value: ${var.secret_name}
+    
+  # Project ID
+  project_id:
+    description: "Google Cloud Project ID used for deployment"
+    value: ${var.project_id}
+    
+  # Function service account email
+  function_service_account:
+    description: "Service account email used by the Cloud Function"
+    value: ${function_service_account.serviceAccountEmail}
+    
+  # Example API call commands
+  example_usage:
+    description: "Example commands to test the deployed API"
+    value: |
+      # Test USD to EUR conversion via GET request:
+      curl "${currency_converter_function.httpsTrigger.url}?from=USD&to=EUR&amount=100"
+      
+      # Test GBP to JPY conversion via POST request:
+      curl -X POST "${currency_converter_function.httpsTrigger.url}" \
+           -H "Content-Type: application/json" \
+           -d '{"from": "GBP", "to": "JPY", "amount": 50}'
+      
+      # Test CORS headers:
+      curl -X OPTIONS "${currency_converter_function.httpsTrigger.url}" -I
+
+# Provider configuration
+providers:
+  google:
+    version: "~> 5.0"
+    project: ${var.project_id}
+    region: ${var.region}
+  
+  random:
+    version: "~> 3.1"
+  
+  archive:
+    version: "~> 2.2"

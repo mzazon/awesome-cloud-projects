@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: cloud-speech-to-text, cloud-translation, cloud-run, firestore
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: real-time, translation, speech-to-text, websockets, multilingual, communication
 recipe-generator-version: 1.3
@@ -19,11 +19,11 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Global businesses increasingly need to support real-time multilingual communication for customer service centers, international meetings, and cross-cultural collaboration. Traditional translation solutions require manual copying and pasting of text between applications, creating delays and interrupting natural conversation flow. Companies struggle with expensive on-premises speech recognition infrastructure that lacks the accuracy and language coverage needed for professional multilingual interactions.
+Global businesses increasingly need to support real-time multilingual communication for customer service centers, international meetings, and cross-cultural collaboration. Traditional translation solutions require manual copying and pasting of text between applications, creating delays and interrupting natural conversation flow. Companies struggle with expensive on-premises speech recognition infrastructure that lacks the accuracy and language coverage needed for professional multilingual interactions, while existing cloud solutions often fail to provide the low-latency performance required for natural conversations.
 
 ## Solution
 
-Build a cloud-native real-time translation platform using Google Cloud Speech-to-Text for accurate audio transcription and Cloud Translation for instant multilingual conversion. The solution leverages Cloud Run for scalable WebSocket connections and Firestore for conversation persistence, creating a seamless pipeline that transcribes spoken audio, translates it to multiple target languages, and delivers results via real-time connections to support live conversation scenarios.
+Build a cloud-native real-time translation platform using Google Cloud Speech-to-Text for accurate audio transcription and Cloud Translation for instant multilingual conversion. The solution leverages Cloud Run for scalable WebSocket connections and Firestore for conversation persistence, creating a seamless pipeline that transcribes spoken audio, translates it to multiple target languages, and delivers results via real-time connections to support live conversation scenarios with sub-second latency.
 
 ## Architecture Diagram
 
@@ -76,12 +76,12 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and project creation permissions
-2. gcloud CLI v2 installed and configured (or Google Cloud Shell)
+2. gcloud CLI v400.0+ installed and configured (or Google Cloud Shell)
 3. Basic understanding of JavaScript/Node.js for WebSocket implementation
 4. Knowledge of audio streaming concepts and WebSocket protocols
 5. Estimated cost: $5-15 for testing resources (Speech-to-Text: $0.024/minute, Translation: $20/1M characters)
 
-> **Note**: This recipe uses streaming Speech-to-Text which requires gRPC connections and has a 10MB limit per streaming request for optimal real-time performance.
+> **Note**: This recipe uses streaming Speech-to-Text which requires gRPC connections and has a 10MB limit per streaming request for optimal real-time performance. Audio should be captured at 16kHz or higher sampling rate for best accuracy.
 
 ## Preparation
 
@@ -110,12 +110,12 @@ gcloud projects create ${PROJECT_ID} \
 #     --billing-account=YOUR_BILLING_ACCOUNT_ID
 
 # Enable required APIs
-gcloud services enable speech.googleapis.com
-gcloud services enable translate.googleapis.com
-gcloud services enable run.googleapis.com
-gcloud services enable firestore.googleapis.com
-gcloud services enable pubsub.googleapis.com
-gcloud services enable cloudbuild.googleapis.com
+gcloud services enable speech.googleapis.com \
+    translate.googleapis.com \
+    run.googleapis.com \
+    firestore.googleapis.com \
+    pubsub.googleapis.com \
+    cloudbuild.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled for real-time translation services"
@@ -133,7 +133,7 @@ echo "✅ APIs enabled for real-time translation services"
        --location=${REGION} \
        --type=firestore-native
    
-   # Create indexes for conversation queries
+   # Create composite index for efficient conversation queries
    gcloud firestore indexes composite create \
        --collection-group=conversations \
        --field-config=field-path=userId,order=ascending \
@@ -175,7 +175,7 @@ echo "✅ APIs enabled for real-time translation services"
        --display-name="Real-time Translation Service" \
        --description="Service account for speech and translation APIs"
    
-   # Grant necessary permissions
+   # Grant necessary permissions with least privilege principle
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:translation-service@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/speech.client"
@@ -202,13 +202,13 @@ echo "✅ APIs enabled for real-time translation services"
    Cloud Storage provides durable, highly available storage for audio files with lifecycle management and access controls. Storing original audio files enables features like conversation replay, quality analysis, and compliance auditing, while Google's global infrastructure ensures low-latency access from anywhere in the world.
 
    ```bash
-   # Create bucket for audio file storage
+   # Create bucket for audio file storage with standard storage class
    gsutil mb -p ${PROJECT_ID} \
        -c STANDARD \
        -l ${REGION} \
        gs://${PROJECT_ID}-audio-files
    
-   # Set lifecycle policy for automatic cleanup
+   # Set lifecycle policy for automatic cleanup and cost optimization  
    cat > lifecycle.json << EOF
    {
      "lifecycle": {
@@ -231,6 +231,9 @@ echo "✅ APIs enabled for real-time translation services"
    # Enable versioning for data protection
    gsutil versioning set on gs://${PROJECT_ID}-audio-files
    
+   # Clean up temporary lifecycle file
+   rm lifecycle.json
+   
    echo "✅ Cloud Storage configured for audio file management"
    ```
 
@@ -241,11 +244,11 @@ echo "✅ APIs enabled for real-time translation services"
    The Cloud Run service handles WebSocket connections for real-time communication and integrates multiple Google Cloud AI services. This containerized approach provides automatic scaling, built-in load balancing, and seamless deployment capabilities while maintaining stateless architecture principles for reliability and performance.
 
    ```bash
-   # Create application directory
+   # Create application directory structure
    mkdir -p translation-app/src
    cd translation-app
    
-   # Create package.json for Node.js application
+   # Create package.json for Node.js application with latest dependencies
    cat > package.json << 'EOF'
    {
      "name": "real-time-translation-service",
@@ -282,7 +285,7 @@ echo "✅ APIs enabled for real-time translation services"
    The service logic orchestrates speech recognition, translation, and real-time delivery through WebSocket connections. This implementation handles streaming audio data, manages translation sessions, and provides error handling for production reliability while maintaining low-latency communication essential for real-time conversations.
 
    ```bash
-   # Create main service implementation
+   # Create main service implementation with enhanced error handling
    cat > src/index.js << 'EOF'
    const express = require('express');
    const WebSocket = require('ws');
@@ -293,7 +296,7 @@ echo "✅ APIs enabled for real-time translation services"
    const {v4: uuidv4} = require('uuid');
    const cors = require('cors');
    
-   // Initialize Google Cloud clients
+   // Initialize Google Cloud clients with error handling
    const speechClient = new speech.SpeechClient();
    const translateClient = new Translate();
    const firestore = new Firestore();
@@ -306,14 +309,21 @@ echo "✅ APIs enabled for real-time translation services"
    app.use(cors());
    app.use(express.json());
    
-   // Health check endpoint
+   // Health check endpoint for load balancer
    app.get('/health', (req, res) => {
-     res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
+     res.status(200).json({ 
+       status: 'healthy', 
+       timestamp: new Date().toISOString(),
+       version: '1.0.0'
+     });
    });
    
    // WebSocket server for real-time communication
    const server = require('http').createServer(app);
-   const wss = new WebSocket.Server({ server });
+   const wss = new WebSocket.Server({ 
+     server,
+     perMessageDeflate: false // Disable compression for lower latency
+   });
    
    // Active translation sessions
    const activeSessions = new Map();
@@ -330,16 +340,22 @@ echo "✅ APIs enabled for real-time translation services"
      }
    
      async initializeConversation() {
-       await this.conversationRef.set({
-         sessionId: this.sessionId,
-         sourceLanguage: this.sourceLanguage,
-         targetLanguages: this.targetLanguages,
-         createdAt: new Date(),
-         messages: []
-       });
+       try {
+         await this.conversationRef.set({
+           sessionId: this.sessionId,
+           sourceLanguage: this.sourceLanguage,
+           targetLanguages: this.targetLanguages,
+           createdAt: new Date(),
+           messages: []
+         });
+       } catch (error) {
+         console.error('Failed to initialize conversation:', error);
+         this.sendError('Failed to initialize conversation');
+       }
      }
    
      startSpeechRecognition() {
+       // Enhanced configuration based on Speech-to-Text best practices
        const request = {
          config: {
            encoding: 'WEBM_OPUS',
@@ -347,7 +363,8 @@ echo "✅ APIs enabled for real-time translation services"
            languageCode: this.sourceLanguage,
            enableAutomaticPunctuation: true,
            enableWordTimeOffsets: true,
-           model: 'latest_long'
+           model: 'latest_long', // Optimized for longer utterances
+           useEnhanced: true // Enable enhanced models when available
          },
          interimResults: true,
        };
@@ -357,15 +374,17 @@ echo "✅ APIs enabled for real-time translation services"
          .on('data', async (data) => {
            if (data.results[0] && data.results[0].alternatives[0]) {
              const transcript = data.results[0].alternatives[0].transcript;
+             const confidence = data.results[0].alternatives[0].confidence;
              const isFinal = data.results[0].isFinal;
              
              if (isFinal) {
-               await this.handleTranscription(transcript);
+               await this.handleTranscription(transcript, confidence);
              } else {
                // Send interim results for immediate feedback
                this.ws.send(JSON.stringify({
                  type: 'interim_transcript',
                  text: transcript,
+                 confidence: confidence,
                  sessionId: this.sessionId
                }));
              }
@@ -373,33 +392,38 @@ echo "✅ APIs enabled for real-time translation services"
          })
          .on('error', (error) => {
            console.error('Speech recognition error:', error);
-           this.ws.send(JSON.stringify({
-             type: 'error',
-             message: 'Speech recognition failed',
-             error: error.message
-           }));
+           this.sendError('Speech recognition failed', error.message);
+         })
+         .on('end', () => {
+           console.log('Speech recognition stream ended');
          });
      }
    
-     async handleTranscription(originalText) {
+     async handleTranscription(originalText, confidence) {
        try {
          const messageId = uuidv4();
          const translations = {};
          
-         // Translate to all target languages
+         // Translate to all target languages with error handling
          for (const targetLang of this.targetLanguages) {
-           const [translation] = await translateClient.translate(originalText, {
-             from: this.sourceLanguage,
-             to: targetLang,
-           });
-           translations[targetLang] = translation;
+           try {
+             const [translation] = await translateClient.translate(originalText, {
+               from: this.sourceLanguage,
+               to: targetLang,
+             });
+             translations[targetLang] = translation;
+           } catch (translationError) {
+             console.error(`Translation error for ${targetLang}:`, translationError);
+             translations[targetLang] = `[Translation failed: ${translationError.message}]`;
+           }
          }
    
-         // Store in Firestore
+         // Store in Firestore with enhanced metadata
          const messageData = {
            messageId,
            originalText,
            translations,
+           confidence,
            timestamp: new Date(),
            sourceLanguage: this.sourceLanguage
          };
@@ -415,7 +439,9 @@ echo "✅ APIs enabled for real-time translation services"
              messageId,
              sourceLanguage: this.sourceLanguage,
              targetLanguages: this.targetLanguages,
-             characterCount: originalText.length
+             characterCount: originalText.length,
+             confidence,
+             timestamp: new Date().toISOString()
            }))
          );
    
@@ -425,23 +451,29 @@ echo "✅ APIs enabled for real-time translation services"
            messageId,
            originalText,
            translations,
+           confidence,
            sessionId: this.sessionId
          }));
    
        } catch (error) {
          console.error('Translation error:', error);
-         this.ws.send(JSON.stringify({
-           type: 'error',
-           message: 'Translation failed',
-           error: error.message
-         }));
+         this.sendError('Translation failed', error.message);
        }
      }
    
      processAudioChunk(audioData) {
-       if (this.recognizeStream) {
+       if (this.recognizeStream && this.recognizeStream.writable) {
          this.recognizeStream.write(audioData);
        }
+     }
+   
+     sendError(message, details = null) {
+       this.ws.send(JSON.stringify({
+         type: 'error',
+         message,
+         details,
+         sessionId: this.sessionId
+       }));
      }
    
      endSession() {
@@ -452,7 +484,7 @@ echo "✅ APIs enabled for real-time translation services"
      }
    }
    
-   // WebSocket connection handler
+   // WebSocket connection handler with enhanced error handling
    wss.on('connection', (ws, req) => {
      console.log('New WebSocket connection established');
      
@@ -483,7 +515,7 @@ echo "✅ APIs enabled for real-time translation services"
              
            case 'audio_data':
              const activeSession = activeSessions.get(data.sessionId);
-             if (activeSession) {
+             if (activeSession && data.audio) {
                const audioBuffer = Buffer.from(data.audio, 'base64');
                activeSession.processAudioChunk(audioBuffer);
              }
@@ -519,6 +551,18 @@ echo "✅ APIs enabled for real-time translation services"
        }
        console.log('WebSocket connection closed');
      });
+     
+     ws.on('error', (error) => {
+       console.error('WebSocket error:', error);
+     });
+   });
+   
+   // Graceful shutdown handling
+   process.on('SIGTERM', () => {
+     console.log('SIGTERM received, shutting down gracefully');
+     server.close(() => {
+       console.log('Process terminated');
+     });
    });
    
    // Start server
@@ -530,25 +574,28 @@ echo "✅ APIs enabled for real-time translation services"
    echo "✅ Translation service implementation completed"
    ```
 
-   The translation service now provides comprehensive real-time functionality including streaming speech recognition, multi-language translation, conversation persistence, and WebSocket communication. This architecture supports scalable, low-latency translation for multiple concurrent users while maintaining conversation context and providing reliable error handling.
+   The translation service now provides comprehensive real-time functionality including streaming speech recognition with enhanced error handling, multi-language translation, conversation persistence, and WebSocket communication. This architecture supports scalable, low-latency translation for multiple concurrent users while maintaining conversation context and providing reliable error handling.
 
 7. **Create Dockerfile for Container Deployment**:
 
    Containerization enables consistent deployment across environments and leverages Cloud Run's automatic scaling capabilities. The Docker configuration optimizes for production use with proper security practices, efficient layer caching, and minimal attack surface while ensuring the application has access to all required dependencies.
 
    ```bash
-   # Create Dockerfile for Cloud Run deployment
+   # Create optimized Dockerfile for Cloud Run deployment
    cat > Dockerfile << 'EOF'
    # Use official Node.js runtime as base image
    FROM node:18-slim
    
+   # Install curl for health checks
+   RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+   
    # Create app directory
    WORKDIR /usr/src/app
    
-   # Copy package files
+   # Copy package files first for better layer caching
    COPY package*.json ./
    
-   # Install dependencies
+   # Install dependencies with production optimizations
    RUN npm ci --only=production && npm cache clean --force
    
    # Copy application source
@@ -562,7 +609,7 @@ echo "✅ APIs enabled for real-time translation services"
    # Expose port
    EXPOSE 8080
    
-   # Health check
+   # Health check for container orchestration
    HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
      CMD curl -f http://localhost:8080/health || exit 1
    
@@ -580,8 +627,8 @@ echo "✅ APIs enabled for real-time translation services"
    .env
    .nyc_output
    coverage
-   .nyc_output
-   .coverage
+   *.log
+   .DS_Store
    EOF
    
    echo "✅ Container configuration created for Cloud Run"
@@ -594,7 +641,7 @@ echo "✅ APIs enabled for real-time translation services"
    Cloud Run provides serverless container deployment with automatic scaling, built-in load balancing, and pay-per-use pricing. The deployment configuration ensures the translation service can handle varying loads while maintaining cost efficiency and providing the reliability needed for real-time communication applications.
 
    ```bash
-   # Build and deploy to Cloud Run
+   # Build and deploy to Cloud Run with production configuration
    gcloud run deploy ${SERVICE_NAME} \
        --source . \
        --platform managed \
@@ -606,9 +653,10 @@ echo "✅ APIs enabled for real-time translation services"
        --concurrency=1000 \
        --max-instances=10 \
        --timeout=300 \
+       --execution-environment=gen2 \
        --set-env-vars="PROJECT_ID=${PROJECT_ID}"
    
-   # Get service URL
+   # Get service URL for testing
    export SERVICE_URL=$(gcloud run services describe ${SERVICE_NAME} \
        --region ${REGION} \
        --format="value(status.url)")
@@ -627,7 +675,7 @@ echo "✅ APIs enabled for real-time translation services"
    mkdir -p ../client-test
    cd ../client-test
    
-   # Create HTML test client
+   # Create HTML test client with enhanced UI
    cat > index.html << EOF
    <!DOCTYPE html>
    <html lang="en">
@@ -636,42 +684,100 @@ echo "✅ APIs enabled for real-time translation services"
        <meta name="viewport" content="width=device-width, initial-scale=1.0">
        <title>Real-Time Translation Test</title>
        <style>
-           body { font-family: Arial, sans-serif; margin: 20px; }
-           .container { max-width: 800px; margin: 0 auto; }
-           .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
-           .success { background-color: #d4edda; color: #155724; }
-           .error { background-color: #f8d7da; color: #721c24; }
-           .transcript { margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 5px; }
-           .translation { margin: 10px 0; padding: 10px; background: #e9ecef; border-radius: 3px; }
-           button { padding: 10px 20px; margin: 5px; cursor: pointer; }
-           .recording { background-color: #dc3545; color: white; }
+           body { 
+               font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+               margin: 20px; 
+               background-color: #f5f5f5; 
+           }
+           .container { 
+               max-width: 900px; 
+               margin: 0 auto; 
+               background: white; 
+               padding: 20px; 
+               border-radius: 10px; 
+               box-shadow: 0 2px 10px rgba(0,0,0,0.1); 
+           }
+           .status { 
+               padding: 12px; 
+               border-radius: 6px; 
+               margin: 10px 0; 
+               font-weight: 500; 
+           }
+           .success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+           .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+           .transcript { 
+               margin: 20px 0; 
+               padding: 15px; 
+               background: #f8f9fa; 
+               border-radius: 8px; 
+               border-left: 4px solid #007bff; 
+           }
+           .translation { 
+               margin: 10px 0; 
+               padding: 12px; 
+               background: #e9ecef; 
+               border-radius: 6px; 
+               border-left: 3px solid #28a745; 
+           }
+           button { 
+               padding: 12px 24px; 
+               margin: 8px; 
+               cursor: pointer; 
+               border: none; 
+               border-radius: 6px; 
+               font-size: 16px; 
+               font-weight: 500; 
+               transition: all 0.3s; 
+           }
+           .start-btn { background-color: #28a745; color: white; }
+           .start-btn:hover { background-color: #218838; }
+           .recording { background-color: #dc3545; color: white; animation: pulse 1.5s infinite; }
+           .stop-btn { background-color: #6c757d; color: white; }
+           .stop-btn:hover { background-color: #5a6268; }
+           @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.7; } 100% { opacity: 1; } }
+           .config-section { 
+               background: #f8f9fa; 
+               padding: 15px; 
+               border-radius: 8px; 
+               margin: 15px 0; 
+           }
+           .config-row { margin: 10px 0; }
+           label { font-weight: 500; margin-right: 10px; }
+           select, input[type="checkbox"] { margin: 5px; }
+           .confidence { font-size: 0.9em; color: #6c757d; }
        </style>
    </head>
    <body>
        <div class="container">
-           <h1>Real-Time Translation Service Test</h1>
+           <h1>🌐 Real-Time Translation Service Test</h1>
            
-           <div>
-               <label for="sourceLanguage">Source Language:</label>
-               <select id="sourceLanguage">
-                   <option value="en-US">English (US)</option>
-                   <option value="es-ES">Spanish</option>
-                   <option value="fr-FR">French</option>
-                   <option value="de-DE">German</option>
-               </select>
+           <div class="config-section">
+               <h3>Configuration</h3>
+               <div class="config-row">
+                   <label for="sourceLanguage">Source Language:</label>
+                   <select id="sourceLanguage">
+                       <option value="en-US">English (US)</option>
+                       <option value="es-ES">Spanish (Spain)</option>
+                       <option value="fr-FR">French (France)</option>
+                       <option value="de-DE">German (Germany)</option>
+                       <option value="ja-JP">Japanese (Japan)</option>
+                       <option value="zh-CN">Chinese (Simplified)</option>
+                   </select>
+               </div>
+               
+               <div class="config-row">
+                   <label>Target Languages:</label><br>
+                   <input type="checkbox" id="es" value="es" checked> Spanish
+                   <input type="checkbox" id="fr" value="fr" checked> French
+                   <input type="checkbox" id="de" value="de" checked> German
+                   <input type="checkbox" id="ja" value="ja"> Japanese
+                   <input type="checkbox" id="zh" value="zh"> Chinese
+               </div>
            </div>
            
            <div>
-               <label>Target Languages:</label>
-               <input type="checkbox" id="es" value="es" checked> Spanish
-               <input type="checkbox" id="fr" value="fr" checked> French
-               <input type="checkbox" id="de" value="de" checked> German
-               <input type="checkbox" id="ja" value="ja"> Japanese
-           </div>
-           
-           <div>
-               <button id="startBtn">Start Recording</button>
-               <button id="stopBtn" disabled>Stop Recording</button>
+               <button id="startBtn" class="start-btn">🎤 Start Recording</button>
+               <button id="stopBtn" class="stop-btn" disabled>⏹️ Stop Recording</button>
            </div>
            
            <div id="status" class="status"></div>
@@ -708,7 +814,7 @@ echo "✅ APIs enabled for real-time translation services"
                        ws = new WebSocket(SERVICE_URL);
                        
                        ws.onopen = () => {
-                           updateStatus('Connected to translation service');
+                           updateStatus('🔗 Connected to translation service');
                            
                            // Start translation session
                            ws.send(JSON.stringify({
@@ -724,11 +830,19 @@ echo "✅ APIs enabled for real-time translation services"
                        };
                        
                        ws.onerror = (error) => {
-                           updateStatus('WebSocket error: ' + error.message, true);
+                           updateStatus('❌ WebSocket error: ' + error.message, true);
                        };
                        
-                       // Get microphone access
-                       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                       // Get microphone access with enhanced constraints
+                       const stream = await navigator.mediaDevices.getUserMedia({ 
+                           audio: {
+                               sampleRate: 48000,
+                               channelCount: 1,
+                               echoCancellation: true,
+                               noiseSuppression: true,
+                               autoGainControl: false
+                           }
+                       });
                        
                        mediaRecorder = new MediaRecorder(stream, {
                            mimeType: 'audio/webm;codecs=opus'
@@ -749,15 +863,15 @@ echo "✅ APIs enabled for real-time translation services"
                            }
                        };
                        
-                       mediaRecorder.start(100); // Send data every 100ms
+                       mediaRecorder.start(100); // Send data every 100ms for optimal latency
                        
                        document.getElementById('startBtn').disabled = true;
                        document.getElementById('stopBtn').disabled = false;
-                       document.getElementById('startBtn').textContent = 'Recording...';
+                       document.getElementById('startBtn').textContent = '🎤 Recording...';
                        document.getElementById('startBtn').className = 'recording';
                        
                    } catch (error) {
-                       updateStatus('Error starting recording: ' + error.message, true);
+                       updateStatus('❌ Error starting recording: ' + error.message, true);
                    }
                }
                
@@ -780,10 +894,10 @@ echo "✅ APIs enabled for real-time translation services"
                    
                    document.getElementById('startBtn').disabled = false;
                    document.getElementById('stopBtn').disabled = true;
-                   document.getElementById('startBtn').textContent = 'Start Recording';
-                   document.getElementById('startBtn').className = '';
+                   document.getElementById('startBtn').textContent = '🎤 Start Recording';
+                   document.getElementById('startBtn').className = 'start-btn';
                    
-                   updateStatus('Recording stopped');
+                   updateStatus('⏹️ Recording stopped');
                }
                
                function handleWebSocketMessage(data) {
@@ -792,35 +906,44 @@ echo "✅ APIs enabled for real-time translation services"
                    switch (data.type) {
                        case 'session_started':
                            sessionId = data.sessionId;
-                           updateStatus('Translation session started');
+                           updateStatus('✅ Translation session started');
                            break;
                            
                        case 'interim_transcript':
-                           updateStatus('Listening: ' + data.text);
+                           updateStatus('👂 Listening: ' + data.text + 
+                               (data.confidence ? \` (confidence: \${(data.confidence * 100).toFixed(1)}%)\` : ''));
                            break;
                            
                        case 'translation_complete':
                            const transcriptDiv = document.createElement('div');
                            transcriptDiv.className = 'transcript';
-                           transcriptDiv.innerHTML = '<strong>Original:</strong> ' + data.originalText;
+                           transcriptDiv.innerHTML = '<strong>🗣️ Original:</strong> ' + data.originalText;
+                           
+                           if (data.confidence) {
+                               const confidenceSpan = document.createElement('span');
+                               confidenceSpan.className = 'confidence';
+                               confidenceSpan.innerHTML = \` (Confidence: \${(data.confidence * 100).toFixed(1)}%)\`;
+                               transcriptDiv.appendChild(confidenceSpan);
+                           }
                            
                            Object.entries(data.translations).forEach(([lang, translation]) => {
                                const translationDiv = document.createElement('div');
                                translationDiv.className = 'translation';
-                               translationDiv.innerHTML = '<strong>' + lang.toUpperCase() + ':</strong> ' + translation;
+                               translationDiv.innerHTML = '<strong>🌍 ' + lang.toUpperCase() + ':</strong> ' + translation;
                                transcriptDiv.appendChild(translationDiv);
                            });
                            
-                           transcriptsDiv.appendChild(transcriptDiv);
-                           updateStatus('Translation completed');
+                           transcriptsDiv.insertBefore(transcriptDiv, transcriptsDiv.firstChild);
+                           updateStatus('✅ Translation completed');
                            break;
                            
                        case 'session_ended':
-                           updateStatus('Session ended');
+                           updateStatus('🔚 Session ended');
                            break;
                            
                        case 'error':
-                           updateStatus('Error: ' + data.message, true);
+                           updateStatus('❌ Error: ' + data.message + 
+                               (data.details ? \` (\${data.details})\` : ''), true);
                            break;
                    }
                }
@@ -834,10 +957,10 @@ echo "✅ APIs enabled for real-time translation services"
    sed -i "s|\${SERVICE_URL}|${SERVICE_URL}|g" index.html
    
    echo "✅ Test client created at: $(pwd)/index.html"
-   echo "Open this file in a web browser to test the translation service"
+   echo "📖 Open this file in a web browser to test the translation service"
    ```
 
-   The test client provides a complete demonstration of real-time translation functionality including microphone access, WebSocket communication, and real-time result display. This implementation serves as a reference for integrating the translation service into production applications.
+   The test client provides a complete demonstration of real-time translation functionality including microphone access, WebSocket communication, and real-time result display. This implementation serves as a reference for integrating the translation service into production applications with enhanced UI and improved audio configuration.
 
 ## Validation & Testing
 
@@ -853,15 +976,15 @@ echo "✅ APIs enabled for real-time translation services"
    curl -f "${SERVICE_URL}/health"
    ```
 
-   Expected output: JSON response with status "healthy" and current timestamp
+   Expected output: JSON response with status "healthy", current timestamp, and version information
 
 2. **Test WebSocket Connection and Translation Flow**:
 
    ```bash
-   # Install wscat for WebSocket testing
+   # Install wscat for WebSocket testing if not available
    npm install -g wscat
    
-   # Test WebSocket connection (replace with your service URL)
+   # Test WebSocket connection
    WS_URL=$(echo ${SERVICE_URL} | sed 's/https:/wss:/')
    echo "Testing WebSocket connection to: ${WS_URL}"
    
@@ -870,7 +993,7 @@ echo "✅ APIs enabled for real-time translation services"
    wscat -c ${WS_URL}
    ```
 
-   Expected output: Connection established with session_started message containing sessionId
+   Expected output: Connection established with session_started message containing sessionId and language configuration
 
 3. **Verify Firestore Data Storage**:
 
@@ -878,14 +1001,14 @@ echo "✅ APIs enabled for real-time translation services"
    # List conversations in Firestore
    gcloud firestore collections list
    
-   # Query conversation documents
+   # Query conversation documents with detailed formatting
    gcloud alpha firestore documents list \
        --collection-id=conversations \
        --limit=5 \
-       --format="table(name,createTime)"
+       --format="table(name,createTime,updateTime)"
    ```
 
-   Expected output: List of conversation documents with timestamps
+   Expected output: List of conversation documents with creation and update timestamps
 
 4. **Test Pub/Sub Message Processing**:
 
@@ -897,10 +1020,11 @@ echo "✅ APIs enabled for real-time translation services"
    # Pull messages from subscription to verify event publishing
    gcloud pubsub subscriptions pull translation-processor \
        --limit=5 \
-       --auto-ack
+       --auto-ack \
+       --format="table(message.data.decode('utf-8'),message.publishTime)"
    ```
 
-   Expected output: Translation event messages with session and character count data
+   Expected output: Translation event messages with session metadata, character counts, and timestamps
 
 ## Cleanup
 
@@ -957,30 +1081,35 @@ echo "✅ APIs enabled for real-time translation services"
 
 ## Discussion
 
-Real-time translation services represent a critical component of modern global communication infrastructure, enabling seamless cross-language interactions in business, education, and social contexts. This implementation demonstrates how Google Cloud's AI services can be orchestrated to create enterprise-grade translation platforms that handle the complexities of streaming audio, real-time processing, and multi-language output delivery.
+Real-time translation services represent a critical component of modern global communication infrastructure, enabling seamless cross-language interactions in business, education, and social contexts. This implementation demonstrates how Google Cloud's AI services can be orchestrated to create enterprise-grade translation platforms that handle the complexities of streaming audio, real-time processing, and multi-language output delivery with sub-second latency requirements.
 
-The architecture leverages Google Cloud Speech-to-Text's streaming recognition capabilities, which use advanced neural networks trained on diverse audio data to provide accurate transcription even in challenging acoustic environments. The streaming API's 10MB limit and gRPC protocol ensure optimal performance for real-time scenarios, while features like automatic punctuation and word timestamps enhance the user experience. Integration with Cloud Translation provides access to Google's neural machine translation models, supporting over 100 language pairs with contextual accuracy that surpasses traditional phrase-based translation systems.
+The architecture leverages Google Cloud Speech-to-Text's streaming recognition capabilities, which use advanced neural networks trained on diverse audio data to provide accurate transcription even in challenging acoustic environments. The streaming API's enhanced configuration includes automatic punctuation, word timestamps, and confidence scoring to improve user experience. Integration with Cloud Translation provides access to Google's neural machine translation models, supporting over 100 language pairs with contextual accuracy that surpasses traditional phrase-based translation systems. The use of enhanced models and proper audio configuration (16kHz+ sampling rate, lossless encoding) ensures optimal recognition quality.
 
-Cloud Run's serverless container platform provides the ideal hosting environment for this type of workload, automatically scaling from zero to handle varying conversation loads while maintaining WebSocket connections for real-time communication. The pay-per-use pricing model ensures cost efficiency during low-usage periods, while the managed infrastructure eliminates the operational overhead of maintaining WebSocket servers and load balancers. Firestore's real-time synchronization capabilities enable conversation persistence and cross-device access, while Pub/Sub ensures reliable event processing for analytics and compliance workflows.
+Cloud Run's serverless container platform provides the ideal hosting environment for this type of workload, automatically scaling from zero to handle varying conversation loads while maintaining WebSocket connections for real-time communication. The pay-per-use pricing model ensures cost efficiency during low-usage periods, while the managed infrastructure eliminates the operational overhead of maintaining WebSocket servers and load balancers. Firestore's real-time synchronization capabilities enable conversation persistence and cross-device access, while Pub/Sub ensures reliable event processing for analytics and compliance workflows with built-in retry mechanisms and dead letter queues.
 
-The solution addresses key enterprise requirements including conversation auditing, multi-tenant isolation, and integration extensibility. Organizations can enhance this foundation with features like speaker identification, custom vocabulary adaptation, and integration with existing communication platforms. For detailed implementation guidance, refer to the [Google Cloud Speech-to-Text documentation](https://cloud.google.com/speech-to-text/docs), [Cloud Translation best practices](https://cloud.google.com/translate/docs/best-practices), [Cloud Run WebSocket patterns](https://cloud.google.com/run/docs/tutorials/websockets), [Firestore real-time listeners](https://cloud.google.com/firestore/docs/listen), and the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) for scalable application design.
+The solution addresses key enterprise requirements including conversation auditing, multi-tenant isolation, and integration extensibility. Organizations can enhance this foundation with features like speaker identification, custom vocabulary adaptation, and integration with existing communication platforms. The implementation follows Google Cloud security best practices with service accounts, least-privilege access, and proper error handling. For detailed implementation guidance, refer to the [Google Cloud Speech-to-Text documentation](https://cloud.google.com/speech-to-text/docs), [Cloud Translation best practices](https://cloud.google.com/translate/docs/best-practices), [Cloud Run WebSocket patterns](https://cloud.google.com/run/docs/tutorials/websockets), [Firestore real-time listeners](https://cloud.google.com/firestore/docs/listen), and the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) for scalable application design.
 
-> **Tip**: Implement conversation caching using Cloud Memorystore to reduce translation costs for repeated phrases and improve response times for frequently used expressions in customer service scenarios.
+> **Tip**: Implement conversation caching using Cloud Memorystore to reduce translation costs for repeated phrases and improve response times for frequently used expressions in customer service scenarios. Consider using phrase hints in Speech-to-Text for domain-specific terminology.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Speaker Diarization and Multi-Party Conversations**: Integrate Cloud Speech-to-Text's speaker diarization feature to identify and separate multiple speakers in conference calls, creating distinct translation streams for each participant and maintaining conversation context across speaker changes.
+1. **Speaker Diarization and Multi-Party Conversations**: Integrate Cloud Speech-to-Text's speaker diarization feature to identify and separate multiple speakers in conference calls, creating distinct translation streams for each participant and maintaining conversation context across speaker changes with individual confidence tracking.
 
-2. **Custom Translation Models and Domain Adaptation**: Implement AutoML Translation to create industry-specific translation models for technical, medical, or legal terminology, improving accuracy for specialized vocabulary and maintaining consistency with organizational glossaries.
+2. **Custom Translation Models and Domain Adaptation**: Implement AutoML Translation to create industry-specific translation models for technical, medical, or legal terminology, improving accuracy for specialized vocabulary and maintaining consistency with organizational glossaries and style guides.
 
-3. **Real-Time Sentiment Analysis and Content Moderation**: Add Cloud Natural Language API integration to analyze sentiment and detect inappropriate content in real-time, providing conversation quality metrics and automatic content filtering for professional communication environments.
+3. **Real-Time Sentiment Analysis and Content Moderation**: Add Cloud Natural Language API integration to analyze sentiment and detect inappropriate content in real-time, providing conversation quality metrics and automatic content filtering for professional communication environments with customizable sensitivity levels.
 
-4. **Voice Synthesis and Audio Response Generation**: Integrate Cloud Text-to-Speech to convert translated text back to speech, creating a complete voice-to-voice translation pipeline that maintains speaker characteristics and emotional tone across languages for natural conversation flow.
+4. **Voice Synthesis and Audio Response Generation**: Integrate Cloud Text-to-Speech to convert translated text back to speech, creating a complete voice-to-voice translation pipeline that maintains speaker characteristics and emotional tone across languages for natural conversation flow with SSML markup support.
 
-5. **Advanced Analytics and Machine Learning Insights**: Implement BigQuery integration with real-time streaming to analyze conversation patterns, translation accuracy metrics, and usage analytics, providing business intelligence for improving translation quality and understanding global communication trends.
+5. **Advanced Analytics and Machine Learning Insights**: Implement BigQuery integration with real-time streaming to analyze conversation patterns, translation accuracy metrics, and usage analytics, providing business intelligence for improving translation quality and understanding global communication trends with automated reporting dashboards.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

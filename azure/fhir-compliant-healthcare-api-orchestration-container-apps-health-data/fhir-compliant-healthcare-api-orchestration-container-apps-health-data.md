@@ -4,12 +4,12 @@ id: f4h7c2d9
 category: healthcare
 difficulty: 200
 subject: azure
-services: Azure Container Apps, Azure Health Data Services, Azure API Management, Azure Communication Services
+services: Container Apps, Health Data Services, API Management, Communication Services
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: fhir, healthcare, microservices, api-orchestration, container-apps, health-data-services
 recipe-generator-version: 1.3
@@ -96,7 +96,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Healthcare APIs and Container Apps enabled
-2. Azure CLI v2.53.0 or later installed and configured
+2. Azure CLI v2.57.0 or later installed and configured
 3. Basic understanding of FHIR R4 standard and healthcare data concepts
 4. Docker knowledge for containerized application deployment
 5. Understanding of microservices architecture and API design patterns
@@ -169,18 +169,19 @@ echo "✅ Log Analytics workspace created for healthcare monitoring"
 
    ```bash
    # Deploy FHIR service with authentication and RBAC
-   az healthcareapis fhir-service create \
+   az healthcareapis workspace fhir-service create \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${HEALTH_WORKSPACE} \
        --fhir-service-name ${FHIR_SERVICE} \
        --kind fhir-R4 \
        --location ${LOCATION} \
-       --auth-config-authority "https://login.microsoftonline.com/$(az account show --query tenantId -o tsv)" \
-       --auth-config-audience "https://${HEALTH_WORKSPACE}-${FHIR_SERVICE}.fhir.azurehealthcareapis.com" \
-       --auth-config-smart-proxy-enabled true
+       --authentication-configuration \
+           authority="https://login.microsoftonline.com/$(az account show --query tenantId -o tsv)" \
+           audience="https://${HEALTH_WORKSPACE}-${FHIR_SERVICE}.fhir.azurehealthcareapis.com" \
+           smart-proxy-enabled=true
    
    # Get FHIR service endpoint for microservices configuration
-   export FHIR_ENDPOINT=$(az healthcareapis fhir-service show \
+   export FHIR_ENDPOINT=$(az healthcareapis workspace fhir-service show \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${HEALTH_WORKSPACE} \
        --fhir-service-name ${FHIR_SERVICE} \
@@ -196,19 +197,24 @@ echo "✅ Log Analytics workspace created for healthcare monitoring"
    Azure Container Apps provides a serverless container platform optimized for microservices and event-driven applications. For healthcare workloads, this service offers automatic scaling, built-in load balancing, and integration with Azure's compliance frameworks, making it ideal for variable healthcare demand patterns while maintaining security and performance.
 
    ```bash
+   # Get Log Analytics workspace ID and key for Container Apps
+   export WORKSPACE_ID=$(az monitor log-analytics workspace show \
+       --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${LOG_ANALYTICS} \
+       --query customerId --output tsv)
+   
+   export WORKSPACE_KEY=$(az monitor log-analytics workspace get-shared-keys \
+       --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${LOG_ANALYTICS} \
+       --query primarySharedKey --output tsv)
+   
    # Create Container Apps environment with healthcare monitoring
    az containerapp env create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${CONTAINER_ENV} \
        --location ${LOCATION} \
-       --logs-workspace-id $(az monitor log-analytics workspace show \
-           --resource-group ${RESOURCE_GROUP} \
-           --workspace-name ${LOG_ANALYTICS} \
-           --query customerId --output tsv) \
-       --logs-workspace-key $(az monitor log-analytics workspace get-shared-keys \
-           --resource-group ${RESOURCE_GROUP} \
-           --workspace-name ${LOG_ANALYTICS} \
-           --query primarySharedKey --output tsv)
+       --logs-workspace-id ${WORKSPACE_ID} \
+       --logs-workspace-key ${WORKSPACE_KEY}
    
    echo "✅ Container Apps environment created with healthcare monitoring"
    ```
@@ -220,20 +226,6 @@ echo "✅ Log Analytics workspace created for healthcare monitoring"
    The Patient Management microservice handles FHIR Patient resources and related operations. This service encapsulates patient data management logic, validation, and FHIR compliance while providing a clean API interface for healthcare applications. It demonstrates how to build healthcare-specific business logic on top of Azure Health Data Services.
 
    ```bash
-   # Create patient management service configuration
-   cat > patient-service-config.yaml << 'EOF'
-   properties:
-     environmentVariables:
-       - name: FHIR_ENDPOINT
-         value: "${FHIR_ENDPOINT}"
-       - name: AZURE_CLIENT_ID
-         value: "${AZURE_CLIENT_ID}"
-       - name: AZURE_TENANT_ID
-         value: "${AZURE_TENANT_ID}"
-       - name: LOG_LEVEL
-         value: "INFO"
-   EOF
-   
    # Deploy patient management container app
    az containerapp create \
        --resource-group ${RESOURCE_GROUP} \
@@ -363,7 +355,7 @@ echo "✅ Log Analytics workspace created for healthcare monitoring"
         "${FHIR_ENDPOINT}/metadata"
    
    # Verify FHIR capability statement
-   az healthcareapis fhir-service show \
+   az healthcareapis workspace fhir-service show \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${HEALTH_WORKSPACE} \
        --fhir-service-name ${FHIR_SERVICE} \
@@ -457,7 +449,7 @@ echo "✅ Log Analytics workspace created for healthcare monitoring"
 
    ```bash
    # Delete FHIR service
-   az healthcareapis fhir-service delete \
+   az healthcareapis workspace fhir-service delete \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${HEALTH_WORKSPACE} \
        --fhir-service-name ${FHIR_SERVICE} \
@@ -540,4 +532,9 @@ Extend this healthcare API orchestration platform by implementing these advanced
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Traffic Director, Cloud DNS, Cloud Load Balancing, Compute Engine
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: service-mesh, microservices, load-balancing, networking, dns, service-discovery
 recipe-generator-version: 1.3
@@ -105,7 +105,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with appropriate permissions for Compute Engine, Cloud DNS, and Traffic Director
-2. Google Cloud SDK (gcloud CLI) installed and configured
+2. Google Cloud SDK (gcloud CLI) installed and configured (version 450.0.0 or later)
 3. Basic understanding of microservices architecture and DNS concepts
 4. Knowledge of load balancing and service mesh principles
 5. Estimated cost: $50-100 for running resources during this tutorial (delete resources after completion to avoid ongoing charges)
@@ -115,7 +115,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for the project
+# Set environment variables for GCP resources
 export PROJECT_ID="intelligent-discovery-$(date +%s)"
 export REGION="us-central1"
 export ZONE_A="us-central1-a"
@@ -128,10 +128,10 @@ export SERVICE_NAME="microservice-${RANDOM_SUFFIX}"
 export DNS_ZONE_NAME="discovery-zone-${RANDOM_SUFFIX}"
 export DOMAIN_NAME="${SERVICE_NAME}.example.com"
 
-# Create the project and set it as default
-gcloud projects create ${PROJECT_ID}
+# Set default project and region
 gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
+gcloud config set compute/zone ${ZONE_A}
 
 # Enable required APIs
 gcloud services enable compute.googleapis.com \
@@ -246,9 +246,6 @@ echo "✅ APIs enabled and VPC network established"
        # Add instance endpoints to NEGs
        for instance_num in 1 2; do
            INSTANCE_NAME="${SERVICE_NAME}-${zone}-${instance_num}"
-           INTERNAL_IP=$(gcloud compute instances describe ${INSTANCE_NAME} \
-               --zone=${zone} \
-               --format="value(networkInterfaces[0].networkIP)")
            
            gcloud compute network-endpoint-groups update ${SERVICE_NAME}-neg-${zone} \
                --zone=${zone} \
@@ -569,6 +566,7 @@ echo "✅ APIs enabled and VPC network established"
    gcloud projects delete ${PROJECT_ID} --quiet
    
    echo "✅ Project ${PROJECT_ID} deletion initiated"
+   echo "Note: Project deletion may take several minutes to complete"
    ```
 
 ## Discussion
@@ -599,4 +597,9 @@ Extend this intelligent service discovery solution by implementing these advance
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

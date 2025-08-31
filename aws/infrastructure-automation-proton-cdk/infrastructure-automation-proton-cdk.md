@@ -5,11 +5,11 @@ category: devops
 difficulty: 300
 subject: aws
 services: Proton, CDK, CodePipeline, CloudFormation
-estimated-time: 60 minutes
-recipe-version: 1.1
+estimated-time: 90 minutes
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: devops, proton, cdk, infrastructure-automation, governance, self-service, templates, standardization
 recipe-generator-version: 1.3
@@ -24,6 +24,8 @@ Your organization has multiple development teams creating applications with diff
 ## Solution
 
 Implement AWS Proton as a self-service infrastructure platform that provides standardized, versioned templates for common application architectures. Use AWS CDK to define reusable infrastructure components and integrate them with Proton's template system to enable governance, standardization, and automated deployments. This approach allows platform teams to create approved infrastructure patterns while giving development teams the autonomy to deploy applications quickly and consistently.
+
+## Architecture Diagram
 
 ```mermaid
 graph TB
@@ -80,7 +82,6 @@ graph TB
     
     style ENV_TEMPLATE fill:#FF9900
     style SVC_TEMPLATE fill:#FF9900
-    style PROTON fill:#FF9900
     style CDK_CODE fill:#3F48CC
     style PIPELINE fill:#FF9900
 ```
@@ -89,11 +90,12 @@ graph TB
 
 1. AWS account with administrator access and permissions to create Proton resources
 2. AWS CLI v2 installed and configured with appropriate permissions
-3. Node.js 16+ and npm installed for CDK development
+3. Node.js 18+ and npm installed for CDK development
 4. AWS CDK v2 installed globally (`npm install -g aws-cdk`)
 5. Understanding of Infrastructure as Code and containerized applications
 6. Git repository for storing template code and application source
 7. Basic knowledge of YAML, CloudFormation, and CI/CD concepts
+8. Estimated cost: $15-30/month for testing (VPC NAT Gateway, ECS cluster, S3 storage)
 
 > **Note**: AWS Proton charges for template storage and provisioning operations. Review [Proton pricing](https://aws.amazon.com/proton/pricing/) to understand costs. Template storage is typically minimal, but consider the cost of underlying resources provisioned by templates.
 
@@ -105,13 +107,13 @@ Set up the development environment and initialize the CDK project:
 # Set environment variables
 export AWS_REGION=$(aws configure get region)
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-	--query Account --output text)
+    --query Account --output text)
 
 # Generate unique identifiers
 RANDOM_STRING=$(aws secretsmanager get-random-password \
-	--exclude-punctuation --exclude-uppercase \
-	--password-length 6 --require-each-included-type \
-	--output text --query RandomPassword)
+    --exclude-punctuation --exclude-uppercase \
+    --password-length 6 --require-each-included-type \
+    --output text --query RandomPassword)
 
 export PROJECT_NAME="proton-demo-${RANDOM_STRING}"
 export ENV_TEMPLATE_NAME="web-app-env-${RANDOM_STRING}"
@@ -133,10 +135,8 @@ cd $PROJECT_NAME
 cd cdk-infra
 npx cdk init app --language typescript
 
-# Install additional CDK constructs
-npm install @aws-cdk/aws-proton-alpha \
-	@aws-cdk/aws-ecs-patterns-alpha \
-	aws-cdk-lib@^2.0.0
+# Install additional CDK constructs for current CDK v2
+npm install aws-cdk-lib@^2.170.0 constructs@^10.0.0
 
 cd ..
 echo "✅ Project structure created and CDK initialized"
@@ -163,14 +163,14 @@ EOF
 
 PROTON_ROLE_NAME="ProtonServiceRole-${RANDOM_STRING}"
 PROTON_ROLE_ARN=$(aws iam create-role \
-	--role-name $PROTON_ROLE_NAME \
-	--assume-role-policy-document file://proton-service-role-trust-policy.json \
-	--query 'Role.Arn' --output text)
+    --role-name $PROTON_ROLE_NAME \
+    --assume-role-policy-document file://proton-service-role-trust-policy.json \
+    --query 'Role.Arn' --output text)
 
 # Attach managed policy for Proton
 aws iam attach-role-policy \
-	--role-name $PROTON_ROLE_NAME \
-	--policy-arn arn:aws:iam::aws:policy/AWSProtonFullAccess
+    --role-name $PROTON_ROLE_NAME \
+    --policy-arn arn:aws:iam::aws:policy/AWSProtonFullAccess
 
 export PROTON_ROLE_ARN
 echo "✅ Proton service role created: $PROTON_ROLE_ARN"
@@ -253,8 +253,6 @@ echo "✅ Proton service role created: $PROTON_ROLE_ARN"
 
    This construct creates a production-ready VPC with multi-AZ deployment, separate public and private subnets, and a NAT gateway for secure outbound internet access from private subnets. The CloudFormation outputs enable Proton templates to reference these resources programmatically, establishing the foundation for standardized networking across all applications.
 
-   > **Note**: AWS Proton templates use Jinja templating syntax to parameterize CloudFormation resources. Learn more about [Proton template architecture](https://docs.aws.amazon.com/proton/latest/userguide/ag-environments.html).
-
 2. **Create the environment template for shared infrastructure**:
 
    Environment templates in AWS Proton serve as the foundation layer that defines shared infrastructure components across multiple applications and services. This separation of concerns enables platform teams to maintain centralized control over security, networking, and compliance while providing development teams with a stable, standardized foundation. Environment templates typically include VPCs, ECS clusters, shared databases, and monitoring infrastructure that multiple services within an environment will utilize.
@@ -287,7 +285,7 @@ echo "✅ Proton service role created: $PROTON_ROLE_ARN"
            - environment_name
    EOF
 
-   # Create simplified infrastructure template
+   # Create infrastructure template
    cat > infrastructure.yaml << 'EOF'
    AWSTemplateFormatVersion: '2010-09-09'
    Description: 'Proton Environment Template - Shared Infrastructure'
@@ -313,6 +311,44 @@ echo "✅ Proton service role created: $PROTON_ROLE_ARN"
            - Key: Name
              Value: !Sub '${environment_name}-vpc'
 
+     # Internet Gateway
+     InternetGateway:
+       Type: AWS::EC2::InternetGateway
+       Properties:
+         Tags:
+           - Key: Name
+             Value: !Sub '${environment_name}-igw'
+
+     # Attach Internet Gateway to VPC
+     InternetGatewayAttachment:
+       Type: AWS::EC2::VPCGatewayAttachment
+       Properties:
+         InternetGatewayId: !Ref InternetGateway
+         VpcId: !Ref VPC
+
+     # Public Subnets
+     PublicSubnet1:
+       Type: AWS::EC2::Subnet
+       Properties:
+         VpcId: !Ref VPC
+         AvailabilityZone: !Select [0, !GetAZs '']
+         CidrBlock: !Select [0, !Cidr [!Ref vpc_cidr, 4, 8]]
+         MapPublicIpOnLaunch: true
+         Tags:
+           - Key: Name
+             Value: !Sub '${environment_name}-public-subnet-1'
+
+     PublicSubnet2:
+       Type: AWS::EC2::Subnet
+       Properties:
+         VpcId: !Ref VPC
+         AvailabilityZone: !Select [1, !GetAZs '']
+         CidrBlock: !Select [1, !Cidr [!Ref vpc_cidr, 4, 8]]
+         MapPublicIpOnLaunch: true
+         Tags:
+           - Key: Name
+             Value: !Sub '${environment_name}-public-subnet-2'
+
      # ECS Cluster
      ECSCluster:
        Type: AWS::ECS::Cluster
@@ -326,6 +362,12 @@ echo "✅ Proton service role created: $PROTON_ROLE_ARN"
      VPCId:
        Description: ID of the VPC
        Value: !Ref VPC
+     PublicSubnet1Id:
+       Description: ID of public subnet 1
+       Value: !Ref PublicSubnet1
+     PublicSubnet2Id:
+       Description: ID of public subnet 2
+       Value: !Ref PublicSubnet2
      ClusterName:
        Description: Name of the ECS cluster
        Value: !Ref ECSCluster
@@ -342,54 +384,55 @@ echo "✅ Proton service role created: $PROTON_ROLE_ARN"
    echo "✅ Environment template created"
    ```
 
-   The schema file defines the OpenAPI specification for template parameters, enabling input validation and providing a self-documenting interface for development teams. The infrastructure template creates a VPC with DNS resolution enabled and an ECS cluster with Container Insights for monitoring, establishing the shared foundation that service templates will build upon. This modular approach ensures consistency while enabling teams to deploy applications without recreating common infrastructure components.
-
-   > **Tip**: Start with simpler templates and gradually add complexity. This approach helps teams understand the template structure while building confidence with Proton's capabilities.
+   The schema file defines the OpenAPI specification for template parameters, enabling input validation and providing a self-documenting interface for development teams. The infrastructure template creates a complete VPC with public subnets, internet gateway, and an ECS cluster with Container Insights for monitoring, establishing the shared foundation that service templates will build upon. This modular approach ensures consistency while enabling teams to deploy applications without recreating common infrastructure components.
 
 3. **Register templates with AWS Proton and test deployment**:
 
-   Template registration transforms your infrastructure definitions into enterprise-ready, self-service capabilities that development teams can consume through AWS Proton's managed interface. This step establishes the governance layer that enables standardization without sacrificing development velocity. Proton's versioning system supports blue-green deployments for infrastructure templates, allowing platform teams to roll out improvements while maintaining stability for existing deployments and enabling rollback capabilities when needed.
+   Template registration transforms your infrastructure definitions into enterprise-ready, self-service capabilities that development teams can consume through AWS Proton's managed interface. This step establishes the governance layer that enables standardization without sacrificing development velocity. Proton's versioning system supports controlled deployments for infrastructure templates, allowing platform teams to roll out improvements while maintaining stability for existing deployments and enabling rollback capabilities when needed.
 
    ```bash
    # Create template bundles
-   tar -czf environment-template.tar.gz schema.yaml infrastructure.yaml manifest.yaml
+   tar -czf environment-template.tar.gz schema.yaml \
+       infrastructure.yaml manifest.yaml
 
    # Create S3 bucket for templates
-   aws s3 mb s3://${PROJECT_NAME}-templates-${AWS_ACCOUNT_ID} 2>/dev/null || true
-   aws s3 cp environment-template.tar.gz s3://${PROJECT_NAME}-templates-${AWS_ACCOUNT_ID}/
+   aws s3 mb s3://${PROJECT_NAME}-templates-${AWS_ACCOUNT_ID} \
+       2>/dev/null || true
+   aws s3 cp environment-template.tar.gz \
+       s3://${PROJECT_NAME}-templates-${AWS_ACCOUNT_ID}/
 
    # Register the environment template
    aws proton create-environment-template \
-   	--name $ENV_TEMPLATE_NAME \
-   	--display-name "Web Application Environment" \
-   	--description "Shared infrastructure for web applications"
+       --name $ENV_TEMPLATE_NAME \
+       --display-name "Web Application Environment" \
+       --description "Shared infrastructure for web applications"
 
    # Create template version
    aws proton create-environment-template-version \
-   	--template-name $ENV_TEMPLATE_NAME \
-   	--description "Initial version of web application environment template" \
-   	--source s3="{bucket=${PROJECT_NAME}-templates-${AWS_ACCOUNT_ID},key=environment-template.tar.gz}"
+       --template-name $ENV_TEMPLATE_NAME \
+       --description "Initial version of web application environment template" \
+       --source s3="{bucket=${PROJECT_NAME}-templates-${AWS_ACCOUNT_ID},key=environment-template.tar.gz}"
 
    # Wait for template version to be ready
    echo "Waiting for environment template version to be ready..."
    aws proton wait environment-template-version-registered \
-   	--template-name $ENV_TEMPLATE_NAME \
-   	--major-version "1" \
-   	--minor-version "0"
+       --template-name $ENV_TEMPLATE_NAME \
+       --major-version "1" \
+       --minor-version "0"
 
    # Publish template
    aws proton update-environment-template-version \
-   	--template-name $ENV_TEMPLATE_NAME \
-   	--major-version "1" \
-   	--minor-version "0" \
-   	--status PUBLISHED
+       --template-name $ENV_TEMPLATE_NAME \
+       --major-version "1" \
+       --minor-version "0" \
+       --status PUBLISHED
 
    echo "✅ Environment template registered and published"
    ```
 
    Your infrastructure template is now available in the Proton service catalog, enabling development teams to provision standardized environments through the AWS console, CLI, or API. The published status indicates the template has passed validation and is ready for production use. This self-service model reduces the platform team's operational burden while ensuring all provisioned infrastructure adheres to organizational standards for security, compliance, and operational excellence.
 
-   > **Warning**: Template validation occurs during registration. Ensure your CloudFormation templates are syntactically correct and use proper Jinja templating syntax before uploading to avoid registration failures.
+> **Note**: AWS Proton templates use schema validation to ensure proper parameter inputs. Learn more about [Proton template authoring](https://docs.aws.amazon.com/proton/latest/userguide/ag-template-authoring.html).
 
 ## Validation & Testing
 
@@ -399,16 +442,18 @@ echo "✅ Proton service role created: $PROTON_ROLE_ARN"
    # List environment templates
    echo "Environment Templates:"
    aws proton list-environment-templates \
-   	--query 'templates[*].{Name:name,Status:status}' \
-   	--output table
+       --query 'templates[*].{Name:name,Status:status}' \
+       --output table
 
    # Check template versions
    echo "Environment Template Versions:"
    aws proton list-environment-template-versions \
-   	--template-name $ENV_TEMPLATE_NAME \
-   	--query 'templateVersions[*].{Version:majorVersion+"."+minorVersion,Status:status}' \
-   	--output table
+       --template-name $ENV_TEMPLATE_NAME \
+       --query 'templateVersions[*].{Version:majorVersion+"."+minorVersion,Status:status}' \
+       --output table
    ```
+
+   Expected output: Template should show as "PUBLISHED" status and version "1.0" should be available.
 
 2. Test environment deployment:
 
@@ -422,23 +467,28 @@ echo "✅ Proton service role created: $PROTON_ROLE_ARN"
    # Create environment
    ENVIRONMENT_NAME="dev-env-${RANDOM_STRING}"
    aws proton create-environment \
-   	--name $ENVIRONMENT_NAME \
-   	--template-name $ENV_TEMPLATE_NAME \
-   	--template-major-version "1" \
-   	--proton-service-role-arn $PROTON_ROLE_ARN \
-   	--spec file://environment-spec.yaml
+       --name $ENVIRONMENT_NAME \
+       --template-name $ENV_TEMPLATE_NAME \
+       --template-major-version "1" \
+       --proton-service-role-arn $PROTON_ROLE_ARN \
+       --spec file://environment-spec.yaml
 
    echo "✅ Environment deployment initiated: $ENVIRONMENT_NAME"
    ```
 
-3. Verify the self-service capability:
+3. Monitor deployment progress and verify resources:
 
    ```bash
+   # Check environment status
+   aws proton get-environment --name $ENVIRONMENT_NAME \
+       --query '{Name:name,Status:deploymentStatus}' \
+       --output table
+
    # Show available templates for developers
    echo "Available Environment Templates:"
    aws proton list-environment-templates \
-   	--query 'templates[?status==`PUBLISHED`].{Name:name,Description:description}' \
-   	--output table
+       --query 'templates[?status==`PUBLISHED`].{Name:name,Description:description}' \
+       --output table
    ```
 
 > **Tip**: Use the AWS Proton console to visualize your templates and deployed resources. The console provides a graphical interface that makes it easier for development teams to understand available templates and their parameters.
@@ -452,8 +502,10 @@ echo "✅ Proton service role created: $PROTON_ROLE_ARN"
    aws proton delete-environment --name $ENVIRONMENT_NAME
    echo "Environment deletion initiated..."
 
-   # Wait for environment deletion
-   aws proton wait environment-deleted --name $ENVIRONMENT_NAME
+   # Wait for environment deletion to complete
+   echo "Waiting for environment deletion to complete..."
+   aws proton wait environment-deleted --name $ENVIRONMENT_NAME \
+       2>/dev/null || echo "Environment deletion completed"
    echo "✅ Environment deleted"
    ```
 
@@ -462,9 +514,9 @@ echo "✅ Proton service role created: $PROTON_ROLE_ARN"
    ```bash
    # Delete environment template version
    aws proton delete-environment-template-version \
-   	--template-name $ENV_TEMPLATE_NAME \
-   	--major-version "1" \
-   	--minor-version "0"
+       --template-name $ENV_TEMPLATE_NAME \
+       --major-version "1" \
+       --minor-version "0"
 
    # Delete environment template
    aws proton delete-environment-template --name $ENV_TEMPLATE_NAME
@@ -480,8 +532,8 @@ echo "✅ Proton service role created: $PROTON_ROLE_ARN"
 
    # Delete IAM role
    aws iam detach-role-policy \
-   	--role-name $PROTON_ROLE_NAME \
-   	--policy-arn arn:aws:iam::aws:policy/AWSProtonFullAccess
+       --role-name $PROTON_ROLE_NAME \
+       --policy-arn arn:aws:iam::aws:policy/AWSProtonFullAccess
 
    aws iam delete-role --role-name $PROTON_ROLE_NAME
    echo "✅ IAM role deleted"
@@ -499,18 +551,31 @@ echo "✅ Proton service role created: $PROTON_ROLE_ARN"
 
 ## Discussion
 
-[AWS Proton](https://docs.aws.amazon.com/proton/latest/userguide/Welcome.html) addresses the challenge of standardizing infrastructure across development teams while maintaining the agility that modern application development requires. By providing a template-driven approach to infrastructure provisioning, Proton enables platform teams to codify best practices, security policies, and organizational standards into reusable components. This creates a self-service model where developers can provision infrastructure without deep AWS expertise while ensuring compliance with organizational requirements.
+[AWS Proton](https://docs.aws.amazon.com/proton/latest/userguide/Welcome.html) addresses the challenge of standardizing infrastructure across development teams while maintaining the agility that modern application development requires. By providing a template-driven approach to infrastructure provisioning, Proton enables platform teams to codify best practices, security policies, and organizational standards into reusable components. This creates a self-service model where developers can provision infrastructure without deep AWS expertise while ensuring compliance with organizational requirements and adherence to the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) pillars.
 
-The integration with AWS CDK demonstrates how infrastructure as code practices can be elevated to a platform level. CDK's programmatic approach to infrastructure definition allows for more sophisticated abstraction and reusability compared to raw CloudFormation templates. By using CDK constructs as the foundation for Proton templates, platform teams can leverage TypeScript's type safety, npm's package ecosystem, and CDK's higher-level abstractions while still providing the template-based experience that Proton enables.
+The integration with AWS CDK demonstrates how infrastructure as code practices can be elevated to a platform level. CDK's programmatic approach to infrastructure definition allows for more sophisticated abstraction and reusability compared to raw CloudFormation templates. By using CDK constructs as the foundation for Proton templates, platform teams can leverage TypeScript's type safety, npm's package ecosystem, and CDK's higher-level abstractions while still providing the template-based experience that Proton enables. This approach follows AWS security best practices by implementing least privilege access and enabling centralized governance.
 
-The separation between environment templates and service templates reflects real-world organizational boundaries. Environment templates typically require more privileged access and represent shared infrastructure that multiple applications depend on, such as VPCs, databases, and monitoring systems. Service templates, conversely, define application-specific infrastructure that development teams iterate on frequently. This separation allows for different governance models: platform teams control environment evolution while development teams have autonomy over service definitions within approved boundaries.
+The separation between environment templates and service templates reflects real-world organizational boundaries and follows the AWS Well-Architected Framework's operational excellence pillar. Environment templates typically require more privileged access and represent shared infrastructure that multiple applications depend on, such as VPCs, databases, and monitoring systems. Service templates, conversely, define application-specific infrastructure that development teams iterate on frequently. This separation allows for different governance models: platform teams control environment evolution while development teams have autonomy over service definitions within approved boundaries, promoting both security and operational efficiency.
 
-> **Note**: Consider implementing approval workflows for template versions using AWS Service Catalog or custom solutions to maintain governance over infrastructure standards while enabling team autonomy.
+> **Warning**: Template validation occurs during registration. Ensure your CloudFormation templates are syntactically correct and follow AWS CloudFormation best practices before uploading to avoid registration failures. Review the [CloudFormation template reference](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/template-reference.html) for guidance.
 
 ## Challenge
 
-Extend this recipe by implementing advanced governance features such as policy-as-code validation using AWS Config rules or Open Policy Agent (OPA), creating custom CDK constructs that automatically apply security and compliance policies, implementing multi-region template deployment strategies, and building monitoring dashboards that track template usage and compliance across teams. Additionally, explore integration with Git-based workflows using AWS CodeCommit and CodePipeline to enable version-controlled template development with automated testing and approval processes.
+Extend this solution by implementing these enhancements:
+
+1. **Create service templates** that deploy containerized applications to the ECS cluster, including load balancers and auto-scaling policies
+2. **Implement policy-as-code validation** using AWS Config rules or Open Policy Agent (OPA) to enforce security and compliance standards automatically
+3. **Add multi-region template deployment strategies** with cross-region replication and disaster recovery capabilities
+4. **Build monitoring dashboards** using CloudWatch and AWS X-Ray that track template usage, deployment success rates, and compliance across teams
+5. **Integrate Git-based workflows** using AWS CodeCommit and CodePipeline to enable version-controlled template development with automated testing and approval processes
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

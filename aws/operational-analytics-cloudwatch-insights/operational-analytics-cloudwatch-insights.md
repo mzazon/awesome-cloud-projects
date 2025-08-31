@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: cloudwatch,lambda,sns,iam
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cloudwatch,lambda,sns,iam,analytics
 recipe-generator-version: 1.3
@@ -218,14 +218,15 @@ echo "✅ Set 7-day retention policy"
    # Create deployment package
    zip log-generator.zip log-generator.py
    
-   # Deploy Lambda function
+   # Deploy Lambda function with latest runtime
    aws lambda create-function \
        --function-name "$LAMBDA_FUNCTION_NAME" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/LogGeneratorRole-$RANDOM_SUFFIX" \
        --handler log-generator.lambda_handler \
        --zip-file fileb://log-generator.zip \
-       --timeout 30
+       --timeout 30 \
+       --architectures x86_64
    
    echo "✅ Created Lambda function for log generation"
    ```
@@ -247,9 +248,9 @@ echo "✅ Set 7-day retention policy"
        sleep 2
    done
    
-   # Wait for logs to be available
-   echo "⏳ Waiting for logs to be available..."
-   sleep 30
+   # Wait for logs to be indexed and available for Insights queries
+   echo "⏳ Waiting for logs to be indexed and available for Insights queries..."
+   sleep 60
    
    echo "✅ Sample log data generated"
    ```
@@ -261,21 +262,26 @@ echo "✅ Set 7-day retention policy"
    CloudWatch Logs Insights uses a powerful SQL-like query language optimized for log analysis. These pre-built queries demonstrate essential operational analytics patterns: error rate monitoring, performance trend analysis, and user behavior tracking. Learning these query structures enables you to build comprehensive monitoring solutions that transform raw log events into actionable business intelligence.
 
    ```bash
-   # Create query for error analysis
+   # Create query for error analysis with improved filtering
    cat > error-analysis-query.txt << 'EOF'
    fields @timestamp, @message, @logStream
    | filter @message like /ERROR/
+   | parse @message '"level": "*"' as log_level
+   | filter ispresent(log_level)
    | stats count() as error_count by bin(5m)
    | sort @timestamp desc
    | limit 50
    EOF
    
-   # Create query for performance monitoring
+   # Create query for performance monitoring with percentiles
    cat > performance-query.txt << 'EOF'
    fields @timestamp, @message
    | filter @message like /response_time/
    | parse @message '"response_time": *' as response_time
-   | stats avg(response_time) as avg_response_time, max(response_time) as max_response_time by bin(1m)
+   | filter ispresent(response_time) and response_time > 0
+   | stats avg(response_time) as avg_response_time, 
+           max(response_time) as max_response_time,
+           pct(response_time, 95) as p95_response_time by bin(1m)
    | sort @timestamp desc
    EOF
    
@@ -429,16 +435,13 @@ echo "✅ Set 7-day retention policy"
    Metric filters convert log patterns into CloudWatch metrics, enabling threshold-based alerting on operational events. This transformation allows log-based insights to trigger the same monitoring and alerting infrastructure used for infrastructure metrics. The alarm configuration implements operational SLIs (Service Level Indicators) based on actual application behavior captured in logs.
 
    ```bash
-   # Create custom metric filter for error rate
+   # Create custom metric filter for error rate with JSON parsing
    aws logs put-metric-filter \
        --log-group-name "$LOG_GROUP_NAME" \
        --filter-name "ErrorRateFilter" \
-       --filter-pattern "[timestamp, requestId, level=\"ERROR\", ...]" \
+       --filter-pattern '{ $.level = "ERROR" }' \
        --metric-transformations \
-           metricName="ErrorRate" \
-           metricNamespace="OperationalAnalytics" \
-           metricValue="1" \
-           defaultValue="0"
+           metricName="ErrorRate",metricNamespace="OperationalAnalytics",metricValue="1",defaultValue="0"
    
    # Create alarm for high error rate
    aws cloudwatch put-metric-alarm \
@@ -472,32 +475,13 @@ echo "✅ Set 7-day retention policy"
        --dimensions Name=LogGroupName,Value="$LOG_GROUP_NAME" \
        --stat "Average"
    
-   # Create anomaly alarm
+   # Create anomaly alarm with proper JSON escaping
    aws cloudwatch put-metric-alarm \
        --alarm-name "LogIngestionAnomaly-$RANDOM_SUFFIX" \
        --alarm-description "Detect anomalies in log ingestion patterns" \
-       --metric-name "IncomingBytes" \
-       --namespace "AWS/Logs" \
-       --statistic "Average" \
-       --period 300 \
-       --threshold 2 \
        --comparison-operator "LessThanLowerOrGreaterThanUpperThreshold" \
        --evaluation-periods 2 \
-       --metrics '[{
-           "Id": "m1",
-           "MetricStat": {
-               "Metric": {
-                   "Namespace": "AWS/Logs",
-                   "MetricName": "IncomingBytes",
-                   "Dimensions": [{"Name": "LogGroupName", "Value": "'$LOG_GROUP_NAME'"}]
-               },
-               "Period": 300,
-               "Stat": "Average"
-           }
-       }, {
-           "Id": "ad1",
-           "Expression": "ANOMALY_DETECTION_FUNCTION(m1, 2)"
-       }]' \
+       --metrics "[{\"Id\":\"m1\",\"MetricStat\":{\"Metric\":{\"Namespace\":\"AWS/Logs\",\"MetricName\":\"IncomingBytes\",\"Dimensions\":[{\"Name\":\"LogGroupName\",\"Value\":\"$LOG_GROUP_NAME\"}]},\"Period\":300,\"Stat\":\"Average\"}},{\"Id\":\"ad1\",\"Expression\":\"ANOMALY_DETECTION_FUNCTION(m1, 2)\"}]" \
        --alarm-actions "$SNS_TOPIC_ARN"
    
    echo "✅ Created anomaly detection for log ingestion patterns"
@@ -700,13 +684,13 @@ CloudWatch Logs Insights transforms raw log data into actionable operational int
 
 The key architectural decision to use CloudWatch Logs Insights as the central analytics engine provides several advantages. First, it eliminates the need for log shipping to external systems, reducing data transfer costs and security concerns. Second, the native integration with CloudWatch metrics and alarms enables real-time alerting based on log patterns. Third, the serverless nature of the service means automatic scaling without infrastructure management overhead.
 
-The implementation showcases advanced operational analytics patterns including anomaly detection, cost optimization, and automated alerting. The custom queries demonstrate how to extract business value from different log types, from error analysis to performance monitoring and user behavior tracking. The dashboard integration provides stakeholders with visual insights while the alerting system ensures proactive incident response.
+The implementation showcases advanced operational analytics patterns including machine learning-powered anomaly detection, intelligent cost optimization, and automated alerting workflows. The custom queries demonstrate how to extract business value from different log types, from error analysis with pattern recognition to performance monitoring with percentile calculations and user behavior tracking. The dashboard integration provides stakeholders with real-time visual insights while the alerting system ensures proactive incident response based on operational SLIs.
 
-Cost optimization is achieved through intelligent retention policies, query optimization techniques, and log volume monitoring. The solution includes safeguards against excessive query costs by implementing time-based filters and result limitations. Organizations can extend this approach by implementing log sampling for high-volume applications or using log groups with different retention policies based on data criticality.
+Cost optimization is achieved through intelligent retention policies, query optimization techniques using field indexing, and proactive log volume monitoring. The solution includes safeguards against excessive query costs by implementing time-based filters, result limitations, and efficient field parsing. Organizations can extend this approach by implementing log sampling for high-volume applications, using the Infrequent Access log class for long-term retention, or applying log groups with different retention policies based on data criticality and compliance requirements. The [AWS CloudWatch Logs pricing model](https://aws.amazon.com/cloudwatch/pricing/) charges for data ingestion and query scanned data, making query optimization critical for operational cost management.
 
 > **Tip**: Use the `stats` command with `bin()` function to create time-series data for trend analysis, and combine multiple queries using the `SOURCE` command for cross-service correlation.
 
-> **Note**: CloudWatch Logs Insights supports advanced functions like `ispresent()`, `strcontains()`, and `fromMillis()` for complex log analysis. Explore the complete [CloudWatch Logs Insights query syntax documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html) to unlock powerful analytical capabilities.
+> **Note**: CloudWatch Logs Insights supports advanced functions like `ispresent()`, `strcontains()`, and `fromMillis()` for complex log analysis. Use `bin()` for time-series aggregation and `pct()` for percentile calculations. Explore the complete [CloudWatch Logs Insights query syntax documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html) to unlock powerful analytical capabilities.
 
 ## Challenge
 
@@ -724,4 +708,11 @@ Extend this operational analytics solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

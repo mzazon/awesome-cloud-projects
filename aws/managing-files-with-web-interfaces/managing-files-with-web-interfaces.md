@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AWS Transfer Family, S3, IAM Identity Center, S3 Access Grants
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: file-transfer, self-service, web-apps, identity-management, s3-access-grants, secure-file-sharing
 recipe-generator-version: 1.3
@@ -144,7 +144,7 @@ echo "✅ AWS environment configured with bucket: ${BUCKET_NAME}"
 
 2. **Create IAM Identity Center Test User**:
 
-   Creating a test user demonstrates the end-user experience and validates the authentication flow. This user will represent a typical business user who needs secure file access without technical complexity.
+   Creating a test user demonstrates the end-user experience and validates the authentication flow. This user will represent a typical business user who needs secure file access without technical complexity, showcasing how IAM Identity Center simplifies user management for web applications.
 
    ```bash
    # Create a test user in IAM Identity Center
@@ -166,7 +166,7 @@ echo "✅ AWS environment configured with bucket: ${BUCKET_NAME}"
 
 3. **Create S3 Access Grants Instance**:
 
-   S3 Access Grants provides fine-grained access control capabilities that enable you to grant specific permissions to S3 resources based on user identity. This eliminates the need for complex IAM policies while maintaining security best practices.
+   S3 Access Grants provides fine-grained access control capabilities that enable you to grant specific permissions to S3 resources based on user identity. This service eliminates the need for complex IAM policies while maintaining security best practices and follows the AWS principle of least privilege access.
 
    ```bash
    # Create S3 Access Grants instance with IAM Identity Center integration
@@ -187,7 +187,7 @@ echo "✅ AWS environment configured with bucket: ${BUCKET_NAME}"
 
 4. **Register S3 Location with Access Grants**:
 
-   Registering an S3 location with Access Grants creates the foundation for fine-grained access control. This step associates your S3 bucket with the Access Grants system, enabling granular permissions management at the prefix or object level.
+   Registering an S3 location with Access Grants creates the foundation for fine-grained access control. This step associates your S3 bucket with the Access Grants system, enabling granular permissions management at the prefix or object level while maintaining enterprise security standards.
 
    ```bash
    # Create IAM role for S3 Access Grants
@@ -230,7 +230,7 @@ EOF
 
 5. **Create Access Grant for Test User**:
 
-   Access grants define specific permissions for users or groups to access S3 resources. This step demonstrates how to grant fine-grained access control, allowing users to read and write files within specific S3 prefixes while maintaining security boundaries.
+   Access grants define specific permissions for users or groups to access S3 resources. This step demonstrates how to grant fine-grained access control, allowing users to read and write files within specific S3 prefixes while maintaining security boundaries and implementing zero-trust access principles.
 
    ```bash
    # Create an access grant for the test user
@@ -250,7 +250,7 @@ EOF
 
 6. **Create Identity Bearer Role for Transfer Family**:
 
-   The Identity Bearer Role enables Transfer Family Web Apps to assume user identities and request temporary credentials from S3 Access Grants. This role bridges the authentication layer with the authorization layer, ensuring secure access to S3 resources.
+   The Identity Bearer Role enables Transfer Family Web Apps to assume user identities and request temporary credentials from S3 Access Grants. This role bridges the authentication layer with the authorization layer, ensuring secure access to S3 resources while maintaining the principle of least privilege and enabling dynamic permission evaluation.
 
    ```bash
    # Create trust policy for Identity Bearer Role
@@ -309,33 +309,16 @@ EOF
 
 7. **Create Transfer Family Web App**:
 
-   Transfer Family Web Apps provide the user-facing interface that enables secure file transfers through a web browser. This fully managed service eliminates the need for custom application development while providing enterprise-grade security, branding, and user experience.
+   Transfer Family Web Apps provide the user-facing interface that enables secure file transfers through a web browser. This fully managed service eliminates the need for custom application development while providing enterprise-grade security, branding, and user experience with automatic scaling and high availability.
 
    ```bash
-   # Get default VPC and subnet for web app endpoint
-   DEFAULT_VPC=$(aws ec2 describe-vpcs \
-       --filters Name=isDefault,Values=true \
-       --query 'Vpcs[0].VpcId' \
-       --output text)
-   
-   DEFAULT_SUBNET=$(aws ec2 describe-subnets \
-       --filters Name=default-for-az,Values=true \
-       --query 'Subnets[0].SubnetId' \
-       --output text)
-   
    # Create the Transfer Family Web App
    aws transfer create-web-app \
-       --identity-provider-type SERVICE_MANAGED \
        --identity-provider-details '{
            "IdentityCenterConfig": {
                "InstanceArn": "'${IDC_INSTANCE_ARN}'",
                "Role": "'${IDENTITY_BEARER_ROLE_ARN}'"
            }
-       }' \
-       --access-endpoint '{
-           "Type": "VPC",
-           "VpcId": "'${DEFAULT_VPC}'",
-           "SubnetIds": ["'${DEFAULT_SUBNET}'"]
        }' \
        --tags Key=Name,Value=${WEBAPP_NAME} \
            Key=Environment,Value=Demo
@@ -361,7 +344,7 @@ EOF
 
 8. **Configure Web App Branding and Settings**:
 
-   Customizing the web app appearance and behavior creates a professional, branded experience for end users. This step demonstrates how to configure the web app to match your organization's branding and user experience requirements.
+   Customizing the web app appearance and behavior creates a professional, branded experience for end users. This step demonstrates how Transfer Family Web Apps support organizational branding requirements while maintaining consistent user experience across different business units.
 
    ```bash
    # Create sample branding configuration
@@ -384,7 +367,7 @@ EOF
 
 9. **Create Test Files and Folder Structure**:
 
-   Setting up a sample folder structure demonstrates the organizational capabilities of the file management system. This step creates a realistic testing environment that showcases how users will interact with the system in production scenarios.
+   Setting up a sample folder structure demonstrates the organizational capabilities of the file management system. This step creates a realistic testing environment that showcases how users will interact with the system in production scenarios, including folder navigation and file organization patterns.
 
    ```bash
    # Create sample folder structure in S3
@@ -516,9 +499,11 @@ EOF
        --account-id ${AWS_ACCOUNT_ID} \
        --query 'AccessGrantsList[].AccessGrantId' \
        --output text); do
-       aws s3control delete-access-grant \
-           --account-id ${AWS_ACCOUNT_ID} \
-           --access-grant-id $grant_id
+       if [ "$grant_id" != "None" ]; then
+           aws s3control delete-access-grant \
+               --account-id ${AWS_ACCOUNT_ID} \
+               --access-grant-id $grant_id
+       fi
    done
    
    # Delete access grants locations
@@ -526,9 +511,11 @@ EOF
        --account-id ${AWS_ACCOUNT_ID} \
        --query 'AccessGrantsLocationsList[].AccessGrantsLocationId' \
        --output text); do
-       aws s3control delete-access-grants-location \
-           --account-id ${AWS_ACCOUNT_ID} \
-           --access-grants-location-id $location_id
+       if [ "$location_id" != "None" ]; then
+           aws s3control delete-access-grants-location \
+               --account-id ${AWS_ACCOUNT_ID} \
+               --access-grants-location-id $location_id
+       fi
    done
    
    # Delete access grants instance
@@ -566,16 +553,31 @@ EOF
    # Delete all objects in bucket
    aws s3 rm s3://${BUCKET_NAME} --recursive
    
-   # Delete all object versions (if any)
+   # Delete all object versions and delete markers (if any)
    aws s3api list-object-versions \
        --bucket ${BUCKET_NAME} \
-       --output json \
-       --query 'Versions[].{Key:Key,VersionId:VersionId}' > versions.json
+       --output json > versions.json
    
-   if [ -s versions.json ] && [ "$(cat versions.json)" != "[]" ]; then
-       aws s3api delete-objects \
-           --bucket ${BUCKET_NAME} \
-           --delete file://versions.json
+   # Extract and delete versions if they exist
+   if [ -s versions.json ] && [ "$(jq '.Versions // [] | length' versions.json)" -gt 0 ]; then
+       jq -r '.Versions[]? | "\(.Key)\t\(.VersionId)"' versions.json | \
+       while IFS=$'\t' read -r key version_id; do
+           aws s3api delete-object \
+               --bucket ${BUCKET_NAME} \
+               --key "$key" \
+               --version-id "$version_id"
+       done
+   fi
+   
+   # Extract and delete delete markers if they exist
+   if [ -s versions.json ] && [ "$(jq '.DeleteMarkers // [] | length' versions.json)" -gt 0 ]; then
+       jq -r '.DeleteMarkers[]? | "\(.Key)\t\(.VersionId)"' versions.json | \
+       while IFS=$'\t' read -r key version_id; do
+           aws s3api delete-object \
+               --bucket ${BUCKET_NAME} \
+               --key "$key" \
+               --version-id "$version_id"
+       done
    fi
    
    # Delete bucket
@@ -604,15 +606,15 @@ EOF
 
 ## Discussion
 
-AWS Transfer Family Web Apps represents a significant advancement in secure file sharing capabilities, providing organizations with a fully managed, browser-based interface for S3 file transfers. This solution eliminates the complexity of traditional file transfer protocols while maintaining enterprise-grade security through native integration with AWS IAM Identity Center and S3 Access Grants.
+AWS Transfer Family Web Apps represents a significant advancement in secure file sharing capabilities, providing organizations with a fully managed, browser-based interface for S3 file transfers. This solution eliminates the complexity of traditional file transfer protocols while maintaining enterprise-grade security through native integration with AWS IAM Identity Center and S3 Access Grants. The serverless architecture ensures automatic scaling and high availability without requiring infrastructure management.
 
-The integration between Transfer Family Web Apps and S3 Access Grants provides unprecedented flexibility in access control management. Unlike traditional approaches that require complex IAM policies or custom application development, this solution enables fine-grained permissions at the prefix or object level while supporting both IAM principals and corporate directory users. This approach follows the principle of least privilege while scaling effectively as organizations grow.
+The integration between Transfer Family Web Apps and S3 Access Grants provides unprecedented flexibility in access control management. Unlike traditional approaches that require complex IAM policies or custom application development, this solution enables fine-grained permissions at the prefix or object level while supporting both IAM principals and corporate directory users. This approach follows the AWS Well-Architected Framework's security pillar principles, implementing least privilege access while scaling effectively as organizations grow.
 
-The architecture leverages AWS's serverless and managed services to provide high availability, automatic scaling, and cost-effectiveness. The web app interface is built on AWS's global infrastructure, ensuring consistent performance and reliability across regions. The integration with IAM Identity Center enables seamless single sign-on experiences while supporting various identity providers through SAML and OIDC protocols.
+The architecture leverages AWS's serverless and managed services to provide high availability, automatic scaling, and cost-effectiveness. The web app interface is built on AWS's global infrastructure, ensuring consistent performance and reliability across regions. The integration with IAM Identity Center enables seamless single sign-on experiences while supporting various identity providers through SAML and OIDC protocols, reducing the burden on IT departments for user management.
 
-From a security perspective, the solution implements multiple layers of protection including encryption at rest and in transit, identity-based access controls, and audit logging through AWS CloudTrail. The use of temporary credentials and session-based access ensures that permissions are dynamically evaluated and can be revoked instantly when needed.
+From a security perspective, the solution implements multiple layers of protection including encryption at rest and in transit, identity-based access controls, and comprehensive audit logging through AWS CloudTrail. The use of temporary credentials and session-based access ensures that permissions are dynamically evaluated and can be revoked instantly when needed, supporting zero-trust security models and compliance requirements.
 
-> **Tip**: Consider implementing S3 lifecycle policies to automatically transition older files to cheaper storage classes, reducing long-term storage costs while maintaining accessibility through the web interface.
+> **Tip**: Consider implementing S3 lifecycle policies to automatically transition older files to cheaper storage classes like S3 Intelligent-Tiering or S3 Glacier, reducing long-term storage costs while maintaining accessibility through the web interface.
 
 For detailed implementation guidance, refer to the [AWS Transfer Family User Guide](https://docs.aws.amazon.com/transfer/latest/userguide/), [S3 Access Grants documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-grants.html), [IAM Identity Center documentation](https://docs.aws.amazon.com/singlesignon/latest/userguide/), and the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/) for architectural best practices.
 
@@ -620,16 +622,23 @@ For detailed implementation guidance, refer to the [AWS Transfer Family User Gui
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Department Access Control**: Configure separate S3 prefixes for different departments (HR, Finance, Legal) with department-specific access grants and user groups in IAM Identity Center.
+1. **Multi-Department Access Control**: Configure separate S3 prefixes for different departments (HR, Finance, Legal) with department-specific access grants and user groups in IAM Identity Center, implementing role-based access control patterns.
 
-2. **Automated File Processing**: Implement S3 Event Notifications to trigger Lambda functions for automated file processing, virus scanning, or content classification when files are uploaded through the web app.
+2. **Automated File Processing**: Implement S3 Event Notifications to trigger Lambda functions for automated file processing, virus scanning using Amazon GuardDuty Malware Protection, or content classification when files are uploaded through the web app.
 
-3. **Compliance and Audit Reporting**: Create CloudWatch dashboards and automated reports using S3 Access Logs and CloudTrail to track file access patterns, user activities, and compliance metrics.
+3. **Compliance and Audit Reporting**: Create CloudWatch dashboards and automated reports using S3 Access Logs and CloudTrail to track file access patterns, user activities, and compliance metrics with automated alerting for suspicious activities.
 
-4. **Advanced Branding and Customization**: Develop custom CSS styling and implement organization-specific workflows like approval processes for sensitive file uploads using Step Functions.
+4. **Advanced Branding and Customization**: Develop custom CSS styling hosted in S3 and CloudFront, and implement organization-specific workflows like approval processes for sensitive file uploads using AWS Step Functions.
 
-5. **Integration with External Systems**: Connect the file management system with external business applications using API Gateway and Lambda functions to enable automated workflows and data synchronization.
+5. **Integration with External Systems**: Connect the file management system with external business applications using API Gateway and Lambda functions to enable automated workflows, document management system integration, and data synchronization with enterprise systems.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

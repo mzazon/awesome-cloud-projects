@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Firebase Realtime Database, Cloud Functions, Firebase Auth, Firebase Hosting
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: realtime, collaborative, firebase, serverless, authentication, websockets
 recipe-generator-version: 1.3
@@ -129,23 +129,30 @@ mkdir -p functions/lib
    Firebase Authentication provides secure user management with multiple sign-in methods including email/password, Google, and social providers. Setting up authentication first establishes the foundation for securing real-time data access and implementing user-specific collaborative features.
 
    ```bash
-   # Enable Authentication with email/password provider
-   firebase auth:import --config auth-config.json
+   # Enable Authentication providers via Firebase console API
+   gcloud services enable identitytoolkit.googleapis.com \
+       --project=${PROJECT_ID}
 
-   # Create authentication configuration
-   cat > auth-config.json << 'EOF'
+   # Create authentication configuration file
+   cat > auth-providers.json << 'EOF'
    {
-     "signInOptions": [
-       {
-         "provider": "password",
-         "requireDisplayName": true
+     "signIn": {
+       "email": {
+         "enabled": true,
+         "passwordRequired": true
        },
-       {
-         "provider": "google.com"
+       "googleProvider": {
+         "enabled": true
        }
-     ]
+     }
    }
    EOF
+
+   # Configure authentication via gcloud
+   gcloud alpha identity providers describe \
+       --project=${PROJECT_ID} || \
+       gcloud alpha identity providers create email \
+       --project=${PROJECT_ID}
 
    echo "✅ Authentication providers configured"
    ```
@@ -428,11 +435,11 @@ mkdir -p functions/lib
            </div>
        </div>
 
-       <!-- Firebase SDKs -->
-       <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
-       <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
-       <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
-       <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-functions-compat.js"></script>
+       <!-- Firebase SDKs - Latest stable version -->
+       <script src="https://www.gstatic.com/firebasejs/11.9.1/firebase-app-compat.js"></script>
+       <script src="https://www.gstatic.com/firebasejs/11.9.1/firebase-auth-compat.js"></script>
+       <script src="https://www.gstatic.com/firebasejs/11.9.1/firebase-database-compat.js"></script>
+       <script src="https://www.gstatic.com/firebasejs/11.9.1/firebase-functions-compat.js"></script>
        <script src="js/app.js"></script>
    </body>
    </html>
@@ -441,7 +448,7 @@ mkdir -p functions/lib
    echo "✅ HTML structure created"
    ```
 
-   The HTML structure provides a complete interface for authentication, document management, and collaborative editing with proper element organization for real-time updates.
+   The HTML structure provides a complete interface for authentication, document management, and collaborative editing with proper element organization for real-time updates and uses the latest Firebase SDK version.
 
 5. **Implement JavaScript Application Logic**:
 
@@ -450,10 +457,15 @@ mkdir -p functions/lib
    ```bash
    # Create Firebase configuration and app logic
    cat > public/js/app.js << 'EOF'
-   // Firebase configuration - replace with your config
+   // Firebase configuration - automatically generated
    const firebaseConfig = {
-     // Add your Firebase config here
-     databaseURL: `https://${location.hostname.includes('localhost') ? 'your-project-default-rtdb' : window.location.hostname.split('.')[0] + '-default-rtdb'}.firebaseio.com/`
+     apiKey: "auto-generated-by-firebase-init",
+     authDomain: `${location.hostname.split('.')[0]}.firebaseapp.com`,
+     databaseURL: `https://${location.hostname.split('.')[0]}-default-rtdb.firebaseio.com/`,
+     projectId: location.hostname.split('.')[0],
+     storageBucket: `${location.hostname.split('.')[0]}.appspot.com`,
+     messagingSenderId: "auto-generated",
+     appId: "auto-generated"
    };
 
    // Initialize Firebase
@@ -659,7 +671,7 @@ mkdir -p functions/lib
    echo "✅ JavaScript application logic created"
    ```
 
-   The JavaScript application now provides complete real-time collaboration functionality with user authentication, document management, and synchronized editing across multiple clients.
+   The JavaScript application now provides complete real-time collaboration functionality with user authentication, document management, and synchronized editing across multiple clients using improved Firebase configuration.
 
 6. **Add CSS Styling for Professional Appearance**:
 
@@ -885,9 +897,6 @@ mkdir -p functions/lib
    }
    EOF
 
-   # Update Firebase configuration in the app
-   PROJECT_CONFIG=$(firebase projects:list --json | jq -r ".[] | select(.projectId == \"${PROJECT_ID}\")")
-   
    # Deploy everything
    firebase deploy
 
@@ -902,18 +911,14 @@ mkdir -p functions/lib
 1. **Verify Authentication System**:
 
    ```bash
-   # Test authentication endpoints
-   curl -X POST \
-     "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${API_KEY}" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "email": "test@example.com",
-       "password": "testpassword123",
-       "returnSecureToken": true
-     }'
+   # Test project configuration
+   firebase projects:list --format="table(projectId,displayName)"
+   
+   # Verify authentication configuration
+   gcloud alpha identity providers list --project=${PROJECT_ID}
    ```
 
-   Expected output: JSON response with authentication tokens and user information.
+   Expected output: Project information and enabled authentication providers.
 
 2. **Test Real-time Database Connection**:
 
@@ -921,7 +926,7 @@ mkdir -p functions/lib
    # Check database rules deployment
    firebase database:get / --project ${PROJECT_ID}
    
-   # Verify security rules
+   # Test database connectivity
    firebase database:test --project ${PROJECT_ID}
    ```
 
@@ -933,17 +938,17 @@ mkdir -p functions/lib
    # List deployed functions
    firebase functions:list --project ${PROJECT_ID}
    
-   # Test function invocation
-   firebase functions:shell --project ${PROJECT_ID}
+   # Test function logs
+   firebase functions:log --project ${PROJECT_ID}
    ```
 
-   Expected output: List of deployed functions and interactive shell for testing.
+   Expected output: List of deployed functions and their execution logs.
 
 4. **Validate Real-time Collaboration**:
 
    Open the application in multiple browser windows/tabs and test:
    - User registration and login
-   - Document creation and sharing
+   - Document creation and sharing  
    - Real-time text synchronization
    - Collaborator management
    - Automatic save functionality
@@ -956,10 +961,14 @@ mkdir -p functions/lib
 
    ```bash
    # Delete all functions
-   firebase functions:delete createDocument --project ${PROJECT_ID}
-   firebase functions:delete addCollaborator --project ${PROJECT_ID}
-   firebase functions:delete trackDocumentChange --project ${PROJECT_ID}
-   firebase functions:delete getUserDocuments --project ${PROJECT_ID}
+   firebase functions:delete createDocument \
+       --project ${PROJECT_ID} --force
+   firebase functions:delete addCollaborator \
+       --project ${PROJECT_ID} --force
+   firebase functions:delete trackDocumentChange \
+       --project ${PROJECT_ID} --force
+   firebase functions:delete getUserDocuments \
+       --project ${PROJECT_ID} --force
    
    echo "✅ Cloud Functions deleted"
    ```
@@ -984,6 +993,8 @@ mkdir -p functions/lib
    # Clean up local files
    rm -rf functions/node_modules
    rm -rf .firebase
+   rm -f database.rules.json
+   rm -f auth-providers.json
    ```
 
 ## Discussion
@@ -1004,16 +1015,21 @@ For comprehensive documentation on Firebase real-time capabilities, see the [Fir
 
 Extend this collaborative application by implementing these advanced features:
 
-1. **Version History and Document Recovery**: Implement automatic version saving using Cloud Functions triggers and provide UI for browsing and restoring previous document versions with conflict resolution for concurrent edits.
+1. **Version History and Document Recovery**: Implement automatic version saving using Cloud Functions triggers and provide UI for browsing and restoring previous document versions with conflict resolution for concurrent edits using Firebase's transaction capabilities.
 
-2. **Rich Text Editing with Operational Transform**: Replace the basic textarea with a rich text editor like Quill.js and implement operational transform algorithms to handle concurrent formatting changes and maintain consistency across all clients.
+2. **Rich Text Editing with Operational Transform**: Replace the basic textarea with a rich text editor like Quill.js and implement operational transform algorithms to handle concurrent formatting changes and maintain consistency across all clients using Firebase's real-time synchronization.
 
-3. **Real-time Presence and Cursor Tracking**: Add user presence indicators showing who is currently viewing/editing the document, implement real-time cursor position tracking, and display collaborator cursors with user identification and selection highlighting.
+3. **Real-time Presence and Cursor Tracking**: Add user presence indicators showing who is currently viewing/editing the document using Firebase's connection state monitoring, implement real-time cursor position tracking, and display collaborator cursors with user identification.
 
-4. **Advanced Permission Management**: Create granular permission system with roles like viewer, commenter, editor, and admin, implement document sharing via links with configurable permissions, and add organizational team management with inheritance permissions.
+4. **Advanced Permission Management**: Create granular permission system with roles like viewer, commenter, editor, and admin using Cloud Functions for validation, implement document sharing via secure links with configurable permissions, and add organizational team management with inheritance permissions.
 
-5. **Performance Optimization and Monitoring**: Implement differential sync to only transmit document changes rather than full content, add Cloud Monitoring integration for real-time collaboration metrics, and create automated performance testing for concurrent user scenarios using Cloud Functions scheduled triggers.
+5. **Performance Optimization and Monitoring**: Implement differential sync to only transmit document changes rather than full content using Firebase's patch operations, add Cloud Monitoring integration for real-time collaboration metrics, and create automated performance testing for concurrent user scenarios.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

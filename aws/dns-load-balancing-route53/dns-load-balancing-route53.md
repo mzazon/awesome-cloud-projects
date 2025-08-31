@@ -6,24 +6,24 @@ difficulty: 300
 subject: aws
 services: route53, ec2, elb
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: route53, dns, load-balancing, high-availability
 recipe-generator-version: 1.3
 ---
 
-# Creating DNS-Based Load Balancing with Route 53
+# DNS-Based Load Balancing with Route 53
 
 ## Problem
 
-A global e-commerce company experiences uneven traffic distribution across their multi-region infrastructure, leading to poor user experience in some geographic locations. Their current load balancing solution operates only at the application layer, causing users to be routed to distant servers resulting in high latency and reduced conversion rates. The company needs intelligent DNS-based load balancing that can route traffic based on geographic proximity, server health, and traffic weights while providing automated failover capabilities.
+A global e-commerce company experiences uneven traffic distribution across their multi-region infrastructure, leading to poor user experience in some geographic locations. Their current load balancing solution operates only at the application layer, causing users to be routed to distant servers resulting in high latency and reduced conversion rates during peak shopping periods. The company needs intelligent DNS-based load balancing that can route traffic based on geographic proximity, server health, and traffic weights while providing automated failover capabilities.
 
 ## Solution
 
-This solution implements comprehensive DNS-based load balancing using Amazon Route 53's advanced routing policies. It combines weighted routing for traffic distribution, latency-based routing for optimal performance, geolocation routing for regional preferences, and health checks for automatic failover. The solution provides intelligent traffic management at the DNS level, ensuring users are routed to the most appropriate and healthy endpoints.
+This solution implements comprehensive DNS-based load balancing using Amazon Route 53's advanced routing policies. It combines weighted routing for traffic distribution, latency-based routing for optimal performance, geolocation routing for regional preferences, and health checks for automatic failover. The solution provides intelligent traffic management at the DNS level, ensuring users are routed to the most appropriate and healthy endpoints while following AWS Well-Architected Framework principles.
 
 ## Architecture Diagram
 
@@ -122,10 +122,8 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
 export DOMAIN_NAME="example-${RANDOM_SUFFIX}.com"
 export SUBDOMAIN="api.${DOMAIN_NAME}"
 
-# Create VPCs and subnets in each region (simplified setup)
-# Note: In production, use proper VPC design with multiple AZs
+# VPC configuration for multi-region deployment
 export VPC_CIDR="10.0.0.0/16"
-export SUBNET_CIDR="10.0.1.0/24"
 
 echo "✅ Environment variables configured"
 echo "Domain: ${DOMAIN_NAME}"
@@ -139,7 +137,7 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
 
 1. **Create Route 53 Hosted Zone**:
 
-   A hosted zone contains DNS records for a specific domain and serves as the authoritative DNS source. This zone will manage all routing policies and health checks for our load balancing solution, providing the foundation for intelligent traffic distribution.
+   A hosted zone contains DNS records for a specific domain and serves as the authoritative DNS source. This zone will manage all routing policies and health checks for our load balancing solution, providing the foundation for intelligent traffic distribution across multiple AWS regions.
 
    ```bash
    # Create hosted zone for the domain
@@ -156,31 +154,39 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
 
 2. **Create VPC and Load Balancer Infrastructure in Primary Region**:
 
-   We establish the network foundation in our primary region by creating VPC infrastructure that will host our application load balancers and EC2 instances. This infrastructure provides the endpoints that Route 53 will direct traffic to based on our routing policies.
+   We establish the network foundation in our primary region by creating VPC infrastructure that will host our application load balancers. This infrastructure provides the endpoints that Route 53 will direct traffic to based on our routing policies, ensuring high availability and proper network isolation.
 
    ```bash
    # Switch to primary region
    aws configure set region $PRIMARY_REGION
    
-   # Create VPC
+   # Create VPC with DNS resolution enabled
    VPC_ID_PRIMARY=$(aws ec2 create-vpc \
        --cidr-block $VPC_CIDR \
+       --tag-specifications \
+       'ResourceType=vpc,Tags=[{Key=Name,Value=route53-lb-primary}]' \
        --query 'Vpc.VpcId' --output text)
    
-   # Enable DNS resolution
+   # Enable DNS resolution and hostnames
    aws ec2 modify-vpc-attribute \
        --vpc-id $VPC_ID_PRIMARY \
        --enable-dns-hostnames
    
+   aws ec2 modify-vpc-attribute \
+       --vpc-id $VPC_ID_PRIMARY \
+       --enable-dns-support
+   
    # Create internet gateway
    IGW_ID_PRIMARY=$(aws ec2 create-internet-gateway \
+       --tag-specifications \
+       'ResourceType=internet-gateway,Tags=[{Key=Name,Value=route53-lb-igw-primary}]' \
        --query 'InternetGateway.InternetGatewayId' --output text)
    
    aws ec2 attach-internet-gateway \
        --internet-gateway-id $IGW_ID_PRIMARY \
        --vpc-id $VPC_ID_PRIMARY
    
-   # Create subnet in first AZ
+   # Create subnets in multiple AZs for high availability
    AZ1_PRIMARY=$(aws ec2 describe-availability-zones \
        --query 'AvailabilityZones[0].ZoneName' --output text)
    
@@ -188,9 +194,10 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --vpc-id $VPC_ID_PRIMARY \
        --cidr-block "10.0.1.0/24" \
        --availability-zone $AZ1_PRIMARY \
+       --tag-specifications \
+       'ResourceType=subnet,Tags=[{Key=Name,Value=route53-lb-subnet-1-primary}]' \
        --query 'Subnet.SubnetId' --output text)
    
-   # Create subnet in second AZ
    AZ2_PRIMARY=$(aws ec2 describe-availability-zones \
        --query 'AvailabilityZones[1].ZoneName' --output text)
    
@@ -198,6 +205,8 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --vpc-id $VPC_ID_PRIMARY \
        --cidr-block "10.0.2.0/24" \
        --availability-zone $AZ2_PRIMARY \
+       --tag-specifications \
+       'ResourceType=subnet,Tags=[{Key=Name,Value=route53-lb-subnet-2-primary}]' \
        --query 'Subnet.SubnetId' --output text)
    
    # Configure subnets for public access
@@ -209,9 +218,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --subnet-id $SUBNET_ID_PRIMARY_2 \
        --map-public-ip-on-launch
    
-   # Create route table and associate with subnets
+   # Create and configure route table
    RT_ID_PRIMARY=$(aws ec2 create-route-table \
        --vpc-id $VPC_ID_PRIMARY \
+       --tag-specifications \
+       'ResourceType=route-table,Tags=[{Key=Name,Value=route53-lb-rt-primary}]' \
        --query 'RouteTable.RouteTableId' --output text)
    
    aws ec2 create-route \
@@ -232,17 +243,19 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
 
 3. **Create Application Load Balancer in Primary Region**:
 
-   The Application Load Balancer serves as the primary entry point for traffic in this region, distributing requests across multiple EC2 instances. Route 53 will use the ALB's DNS name as a target for our routing policies, enabling seamless failover and traffic distribution.
+   The Application Load Balancer serves as the primary entry point for traffic in this region, distributing requests across multiple availability zones. Route 53 will use the ALB's DNS name as a target for our routing policies through ALIAS records, enabling seamless failover and efficient traffic distribution.
 
    ```bash
-   # Create security group for ALB
+   # Create security group for ALB with proper ingress rules
    ALB_SG_ID_PRIMARY=$(aws ec2 create-security-group \
-       --group-name "alb-sg-${RANDOM_SUFFIX}" \
-       --description "Security group for ALB" \
+       --group-name "alb-sg-${RANDOM_SUFFIX}-primary" \
+       --description "Security group for ALB in primary region" \
        --vpc-id $VPC_ID_PRIMARY \
+       --tag-specifications \
+       'ResourceType=security-group,Tags=[{Key=Name,Value=route53-lb-alb-sg-primary}]' \
        --query 'GroupId' --output text)
    
-   # Allow HTTP and HTTPS traffic
+   # Allow HTTP and HTTPS traffic from internet
    aws ec2 authorize-security-group-ingress \
        --group-id $ALB_SG_ID_PRIMARY \
        --protocol tcp \
@@ -260,14 +273,23 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --name "alb-primary-${RANDOM_SUFFIX}" \
        --subnets $SUBNET_ID_PRIMARY_1 $SUBNET_ID_PRIMARY_2 \
        --security-groups $ALB_SG_ID_PRIMARY \
+       --scheme internet-facing \
+       --type application \
+       --ip-address-type ipv4 \
+       --tags Key=Name,Value=route53-lb-alb-primary \
        --query 'LoadBalancers[0].LoadBalancerArn' --output text)
    
-   # Get ALB DNS name
+   # Get ALB DNS name for Route 53 configuration
    ALB_DNS_PRIMARY=$(aws elbv2 describe-load-balancers \
        --load-balancer-arns $ALB_ARN_PRIMARY \
        --query 'LoadBalancers[0].DNSName' --output text)
    
-   # Create target group
+   # Get ALB Hosted Zone ID for ALIAS records
+   ALB_ZONE_ID_PRIMARY=$(aws elbv2 describe-load-balancers \
+       --load-balancer-arns $ALB_ARN_PRIMARY \
+       --query 'LoadBalancers[0].CanonicalHostedZoneId' --output text)
+   
+   # Create target group with health check configuration
    TG_ARN_PRIMARY=$(aws elbv2 create-target-group \
        --name "tg-primary-${RANDOM_SUFFIX}" \
        --protocol HTTP \
@@ -278,9 +300,10 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --health-check-timeout-seconds 5 \
        --healthy-threshold-count 2 \
        --unhealthy-threshold-count 3 \
+       --tags Key=Name,Value=route53-lb-tg-primary \
        --query 'TargetGroups[0].TargetGroupArn' --output text)
    
-   # Create listener
+   # Create listener for ALB
    aws elbv2 create-listener \
        --load-balancer-arn $ALB_ARN_PRIMARY \
        --protocol HTTP \
@@ -292,30 +315,38 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
 
 4. **Create Infrastructure in Secondary Region**:
 
-   We replicate our infrastructure in a secondary region to provide geographic diversity and failover capabilities. This region serves as both a performance optimization for users closer to this location and a backup in case the primary region becomes unavailable.
+   We replicate our infrastructure in a secondary region to provide geographic diversity and failover capabilities. This region serves as both a performance optimization for users closer to this location and a backup in case the primary region experiences issues, following AWS Well-Architected reliability principles.
 
    ```bash
    # Switch to secondary region
    aws configure set region $SECONDARY_REGION
    
-   # Create VPC (similar to primary)
+   # Create VPC infrastructure (similar to primary)
    VPC_ID_SECONDARY=$(aws ec2 create-vpc \
        --cidr-block $VPC_CIDR \
+       --tag-specifications \
+       'ResourceType=vpc,Tags=[{Key=Name,Value=route53-lb-secondary}]' \
        --query 'Vpc.VpcId' --output text)
    
    aws ec2 modify-vpc-attribute \
        --vpc-id $VPC_ID_SECONDARY \
        --enable-dns-hostnames
    
+   aws ec2 modify-vpc-attribute \
+       --vpc-id $VPC_ID_SECONDARY \
+       --enable-dns-support
+   
    # Create internet gateway
    IGW_ID_SECONDARY=$(aws ec2 create-internet-gateway \
+       --tag-specifications \
+       'ResourceType=internet-gateway,Tags=[{Key=Name,Value=route53-lb-igw-secondary}]' \
        --query 'InternetGateway.InternetGatewayId' --output text)
    
    aws ec2 attach-internet-gateway \
        --internet-gateway-id $IGW_ID_SECONDARY \
        --vpc-id $VPC_ID_SECONDARY
    
-   # Create subnets
+   # Create subnets in multiple AZs
    AZ1_SECONDARY=$(aws ec2 describe-availability-zones \
        --query 'AvailabilityZones[0].ZoneName' --output text)
    
@@ -323,6 +354,8 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --vpc-id $VPC_ID_SECONDARY \
        --cidr-block "10.0.1.0/24" \
        --availability-zone $AZ1_SECONDARY \
+       --tag-specifications \
+       'ResourceType=subnet,Tags=[{Key=Name,Value=route53-lb-subnet-1-secondary}]' \
        --query 'Subnet.SubnetId' --output text)
    
    AZ2_SECONDARY=$(aws ec2 describe-availability-zones \
@@ -332,9 +365,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --vpc-id $VPC_ID_SECONDARY \
        --cidr-block "10.0.2.0/24" \
        --availability-zone $AZ2_SECONDARY \
+       --tag-specifications \
+       'ResourceType=subnet,Tags=[{Key=Name,Value=route53-lb-subnet-2-secondary}]' \
        --query 'Subnet.SubnetId' --output text)
    
-   # Configure public subnets
+   # Configure public access
    aws ec2 modify-subnet-attribute \
        --subnet-id $SUBNET_ID_SECONDARY_1 \
        --map-public-ip-on-launch
@@ -346,6 +381,8 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
    # Create and configure route table
    RT_ID_SECONDARY=$(aws ec2 create-route-table \
        --vpc-id $VPC_ID_SECONDARY \
+       --tag-specifications \
+       'ResourceType=route-table,Tags=[{Key=Name,Value=route53-lb-rt-secondary}]' \
        --query 'RouteTable.RouteTableId' --output text)
    
    aws ec2 create-route \
@@ -361,11 +398,13 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --route-table-id $RT_ID_SECONDARY \
        --subnet-id $SUBNET_ID_SECONDARY_2
    
-   # Create ALB
+   # Create ALB infrastructure
    ALB_SG_ID_SECONDARY=$(aws ec2 create-security-group \
-       --group-name "alb-sg-${RANDOM_SUFFIX}" \
-       --description "Security group for ALB" \
+       --group-name "alb-sg-${RANDOM_SUFFIX}-secondary" \
+       --description "Security group for ALB in secondary region" \
        --vpc-id $VPC_ID_SECONDARY \
+       --tag-specifications \
+       'ResourceType=security-group,Tags=[{Key=Name,Value=route53-lb-alb-sg-secondary}]' \
        --query 'GroupId' --output text)
    
    aws ec2 authorize-security-group-ingress \
@@ -374,22 +413,36 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --port 80 \
        --cidr "0.0.0.0/0"
    
+   aws ec2 authorize-security-group-ingress \
+       --group-id $ALB_SG_ID_SECONDARY \
+       --protocol tcp \
+       --port 443 \
+       --cidr "0.0.0.0/0"
+   
    ALB_ARN_SECONDARY=$(aws elbv2 create-load-balancer \
        --name "alb-secondary-${RANDOM_SUFFIX}" \
        --subnets $SUBNET_ID_SECONDARY_1 $SUBNET_ID_SECONDARY_2 \
        --security-groups $ALB_SG_ID_SECONDARY \
+       --scheme internet-facing \
+       --type application \
+       --ip-address-type ipv4 \
+       --tags Key=Name,Value=route53-lb-alb-secondary \
        --query 'LoadBalancers[0].LoadBalancerArn' --output text)
    
    ALB_DNS_SECONDARY=$(aws elbv2 describe-load-balancers \
        --load-balancer-arns $ALB_ARN_SECONDARY \
        --query 'LoadBalancers[0].DNSName' --output text)
    
+   ALB_ZONE_ID_SECONDARY=$(aws elbv2 describe-load-balancers \
+       --load-balancer-arns $ALB_ARN_SECONDARY \
+       --query 'LoadBalancers[0].CanonicalHostedZoneId' --output text)
+   
    echo "✅ Created ALB in ${SECONDARY_REGION}: ${ALB_DNS_SECONDARY}"
    ```
 
 5. **Create Infrastructure in Tertiary Region**:
 
-   The tertiary region completes our global infrastructure setup, providing additional geographic coverage and redundancy. With three regions, we can implement sophisticated routing policies that optimize for latency, implement complex failover scenarios, and ensure global availability.
+   The tertiary region completes our global infrastructure setup, providing additional geographic coverage and redundancy. With three regions, we can implement sophisticated routing policies that optimize for latency, implement complex failover scenarios, and ensure global availability while maintaining cost efficiency.
 
    ```bash
    # Switch to tertiary region
@@ -398,13 +451,21 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
    # Create VPC infrastructure (similar pattern)
    VPC_ID_TERTIARY=$(aws ec2 create-vpc \
        --cidr-block $VPC_CIDR \
+       --tag-specifications \
+       'ResourceType=vpc,Tags=[{Key=Name,Value=route53-lb-tertiary}]' \
        --query 'Vpc.VpcId' --output text)
    
    aws ec2 modify-vpc-attribute \
        --vpc-id $VPC_ID_TERTIARY \
        --enable-dns-hostnames
    
+   aws ec2 modify-vpc-attribute \
+       --vpc-id $VPC_ID_TERTIARY \
+       --enable-dns-support
+   
    IGW_ID_TERTIARY=$(aws ec2 create-internet-gateway \
+       --tag-specifications \
+       'ResourceType=internet-gateway,Tags=[{Key=Name,Value=route53-lb-igw-tertiary}]' \
        --query 'InternetGateway.InternetGatewayId' --output text)
    
    aws ec2 attach-internet-gateway \
@@ -419,6 +480,8 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --vpc-id $VPC_ID_TERTIARY \
        --cidr-block "10.0.1.0/24" \
        --availability-zone $AZ1_TERTIARY \
+       --tag-specifications \
+       'ResourceType=subnet,Tags=[{Key=Name,Value=route53-lb-subnet-1-tertiary}]' \
        --query 'Subnet.SubnetId' --output text)
    
    AZ2_TERTIARY=$(aws ec2 describe-availability-zones \
@@ -428,6 +491,8 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --vpc-id $VPC_ID_TERTIARY \
        --cidr-block "10.0.2.0/24" \
        --availability-zone $AZ2_TERTIARY \
+       --tag-specifications \
+       'ResourceType=subnet,Tags=[{Key=Name,Value=route53-lb-subnet-2-tertiary}]' \
        --query 'Subnet.SubnetId' --output text)
    
    # Configure public access
@@ -442,6 +507,8 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
    # Create route table
    RT_ID_TERTIARY=$(aws ec2 create-route-table \
        --vpc-id $VPC_ID_TERTIARY \
+       --tag-specifications \
+       'ResourceType=route-table,Tags=[{Key=Name,Value=route53-lb-rt-tertiary}]' \
        --query 'RouteTable.RouteTableId' --output text)
    
    aws ec2 create-route \
@@ -459,9 +526,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
    
    # Create ALB
    ALB_SG_ID_TERTIARY=$(aws ec2 create-security-group \
-       --group-name "alb-sg-${RANDOM_SUFFIX}" \
-       --description "Security group for ALB" \
+       --group-name "alb-sg-${RANDOM_SUFFIX}-tertiary" \
+       --description "Security group for ALB in tertiary region" \
        --vpc-id $VPC_ID_TERTIARY \
+       --tag-specifications \
+       'ResourceType=security-group,Tags=[{Key=Name,Value=route53-lb-alb-sg-tertiary}]' \
        --query 'GroupId' --output text)
    
    aws ec2 authorize-security-group-ingress \
@@ -470,28 +539,42 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        --port 80 \
        --cidr "0.0.0.0/0"
    
+   aws ec2 authorize-security-group-ingress \
+       --group-id $ALB_SG_ID_TERTIARY \
+       --protocol tcp \
+       --port 443 \
+       --cidr "0.0.0.0/0"
+   
    ALB_ARN_TERTIARY=$(aws elbv2 create-load-balancer \
        --name "alb-tertiary-${RANDOM_SUFFIX}" \
        --subnets $SUBNET_ID_TERTIARY_1 $SUBNET_ID_TERTIARY_2 \
        --security-groups $ALB_SG_ID_TERTIARY \
+       --scheme internet-facing \
+       --type application \
+       --ip-address-type ipv4 \
+       --tags Key=Name,Value=route53-lb-alb-tertiary \
        --query 'LoadBalancers[0].LoadBalancerArn' --output text)
    
    ALB_DNS_TERTIARY=$(aws elbv2 describe-load-balancers \
        --load-balancer-arns $ALB_ARN_TERTIARY \
        --query 'LoadBalancers[0].DNSName' --output text)
    
+   ALB_ZONE_ID_TERTIARY=$(aws elbv2 describe-load-balancers \
+       --load-balancer-arns $ALB_ARN_TERTIARY \
+       --query 'LoadBalancers[0].CanonicalHostedZoneId' --output text)
+   
    echo "✅ Created ALB in ${TERTIARY_REGION}: ${ALB_DNS_TERTIARY}"
    ```
 
 6. **Create Route 53 Health Checks**:
 
-   Health checks are the foundation of intelligent routing, continuously monitoring endpoint availability and automatically removing failed endpoints from DNS responses. This automated health monitoring ensures traffic is only routed to healthy infrastructure.
+   Health checks are the foundation of intelligent routing, continuously monitoring endpoint availability and automatically removing failed endpoints from DNS responses. Route 53 performs health checks from multiple global locations, providing comprehensive monitoring coverage and enabling automated failover capabilities.
 
    ```bash
    # Switch back to primary region for Route 53 operations
    aws configure set region $PRIMARY_REGION
    
-   # Create health check for primary region
+   # Create health check for primary region ALB
    HC_ID_PRIMARY=$(aws route53 create-health-check \
        --caller-reference "hc-primary-$(date +%s)" \
        --health-check-config '{
@@ -503,10 +586,8 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
          "FailureThreshold": 3
        }' \
        --query 'HealthCheck.Id' --output text)
-
-   > **Note**: Health checks are performed from multiple AWS edge locations globally, providing comprehensive monitoring coverage. The 30-second interval with 3-failure threshold balances rapid failure detection with stability. For production systems, consider using HTTPS health checks and custom health check endpoints. For detailed health check configuration, see the [Route 53 DNS Failover Configuration Guide](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-failover-configuring.html).
    
-   # Create health check for secondary region
+   # Create health check for secondary region ALB
    HC_ID_SECONDARY=$(aws route53 create-health-check \
        --caller-reference "hc-secondary-$(date +%s)" \
        --health-check-config '{
@@ -519,7 +600,7 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
        }' \
        --query 'HealthCheck.Id' --output text)
    
-   # Create health check for tertiary region
+   # Create health check for tertiary region ALB
    HC_ID_TERTIARY=$(aws route53 create-health-check \
        --caller-reference "hc-tertiary-$(date +%s)" \
        --health-check-config '{
@@ -538,12 +619,14 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
    echo "Tertiary: ${HC_ID_TERTIARY}"
    ```
 
-7. **Create Weighted Routing Records**:
+   > **Note**: Health checks are performed from multiple AWS edge locations globally, providing comprehensive monitoring coverage. The 30-second interval with 3-failure threshold balances rapid failure detection with stability. For production systems, consider using HTTPS health checks and custom health check endpoints. For detailed health check configuration, see the [Route 53 DNS Failover Configuration Guide](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-failover-configuring.html).
 
-   Weighted routing allows precise traffic distribution across regions, enabling gradual traffic shifting for blue-green deployments, capacity-based routing, and cost optimization. The weight values determine the relative proportion of traffic each endpoint receives.
+7. **Create Weighted Routing Records with ALIAS**:
+
+   Weighted routing allows precise traffic distribution across regions, enabling gradual traffic shifting for blue-green deployments, capacity-based routing, and cost optimization. Using ALIAS records provides better performance and automatic IP resolution compared to A records, as recommended by AWS best practices.
 
    ```bash
-   # Create weighted routing records with health checks
+   # Create weighted routing records using ALIAS records for better performance
    # Primary region - 50% weight
    aws route53 change-resource-record-sets \
        --hosted-zone-id $HOSTED_ZONE_ID \
@@ -556,21 +639,18 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                "Type": "A",
                "SetIdentifier": "Primary-Weighted",
                "Weight": 50,
-               "TTL": 60,
-               "ResourceRecords": [
-                 {
-                   "Value": "1.2.3.4"
-                 }
-               ],
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_PRIMARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_PRIMARY'"
+               },
                "HealthCheckId": "'$HC_ID_PRIMARY'"
              }
            }
          ]
        }'
-
-   > **Warning**: DNS records use actual IP addresses in production. The placeholder IPs (1.2.3.4, etc.) used in this recipe should be replaced with your actual ALB DNS names or IP addresses. Consider using ALIAS records for ALBs instead of A records for better performance and automatic IP resolution. For guidance on routing to load balancers, see the [Route 53 ELB Load Balancer Routing Guide](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-to-elb-load-balancer.html).
    
-   # Secondary region - 30% weight
+   # Secondary region - 30% weight  
    aws route53 change-resource-record-sets \
        --hosted-zone-id $HOSTED_ZONE_ID \
        --change-batch '{
@@ -582,12 +662,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                "Type": "A",
                "SetIdentifier": "Secondary-Weighted",
                "Weight": 30,
-               "TTL": 60,
-               "ResourceRecords": [
-                 {
-                   "Value": "5.6.7.8"
-                 }
-               ],
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_SECONDARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_SECONDARY'"
+               },
                "HealthCheckId": "'$HC_ID_SECONDARY'"
              }
            }
@@ -606,27 +685,28 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                "Type": "A",
                "SetIdentifier": "Tertiary-Weighted",
                "Weight": 20,
-               "TTL": 60,
-               "ResourceRecords": [
-                 {
-                   "Value": "9.10.11.12"
-                 }
-               ],
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_TERTIARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_TERTIARY'"
+               },
                "HealthCheckId": "'$HC_ID_TERTIARY'"
              }
            }
          ]
        }'
    
-   echo "✅ Created weighted routing records"
+   echo "✅ Created weighted routing records with ALIAS targets"
    ```
+
+   > **Warning**: This implementation uses ALIAS records pointing to Application Load Balancers, which is the AWS recommended approach for better performance and automatic IP resolution. ALIAS records eliminate the need for manual IP address management and provide better failover capabilities compared to A records. For guidance on routing to load balancers, see the [Route 53 ELB Load Balancer Routing Guide](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-to-elb-load-balancer.html).
 
 8. **Create Latency-Based Routing Records**:
 
-   Latency-based routing automatically directs users to the AWS region that provides the lowest network latency from their location. Route 53 continuously measures latency from users to AWS regions using actual network measurements, not geographic distance. This intelligent routing significantly improves user experience by ensuring users are always connected to the fastest available endpoint, reducing page load times and improving application responsiveness. For detailed configuration options, see the [Route 53 Latency-Based Routing Documentation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy-latency.html).
+   Latency-based routing automatically directs users to the AWS region that provides the lowest network latency from their location. Route 53 continuously measures latency from users to AWS regions using actual network measurements, not geographic distance, significantly improving user experience and application performance.
 
    ```bash
-   # Create latency-based routing for better performance
+   # Create latency-based routing for optimal performance
    # Primary region record
    aws route53 change-resource-record-sets \
        --hosted-zone-id $HOSTED_ZONE_ID \
@@ -639,12 +719,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                "Type": "A",
                "SetIdentifier": "Primary-Latency",
                "Region": "'$PRIMARY_REGION'",
-               "TTL": 60,
-               "ResourceRecords": [
-                 {
-                   "Value": "1.2.3.4"
-                 }
-               ],
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_PRIMARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_PRIMARY'"
+               },
                "HealthCheckId": "'$HC_ID_PRIMARY'"
              }
            }
@@ -663,12 +742,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                "Type": "A",
                "SetIdentifier": "Secondary-Latency",
                "Region": "'$SECONDARY_REGION'",
-               "TTL": 60,
-               "ResourceRecords": [
-                 {
-                   "Value": "5.6.7.8"
-                 }
-               ],
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_SECONDARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_SECONDARY'"
+               },
                "HealthCheckId": "'$HC_ID_SECONDARY'"
              }
            }
@@ -687,12 +765,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                "Type": "A",
                "SetIdentifier": "Tertiary-Latency",
                "Region": "'$TERTIARY_REGION'",
-               "TTL": 60,
-               "ResourceRecords": [
-                 {
-                   "Value": "9.10.11.12"
-                 }
-               ],
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_TERTIARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_TERTIARY'"
+               },
                "HealthCheckId": "'$HC_ID_TERTIARY'"
              }
            }
@@ -702,9 +779,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
    echo "✅ Created latency-based routing records"
    ```
 
+   For detailed configuration options, see the [Route 53 Latency-Based Routing Documentation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy-latency.html).
+
 9. **Create Geolocation Routing Records**:
 
-   Geolocation routing enables compliance with data residency requirements and provides localized content delivery. This policy routes users based on their geographic location, ensuring data sovereignty and optimizing for regional preferences.
+   Geolocation routing enables compliance with data residency requirements and provides localized content delivery. This policy routes users based on their geographic location, ensuring data sovereignty and optimizing for regional preferences while maintaining high availability through health checks.
 
    ```bash
    # Create geolocation-based routing
@@ -722,19 +801,16 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                "GeoLocation": {
                  "ContinentCode": "NA"
                },
-               "TTL": 60,
-               "ResourceRecords": [
-                 {
-                   "Value": "1.2.3.4"
-                 }
-               ],
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_PRIMARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_PRIMARY'"
+               },
                "HealthCheckId": "'$HC_ID_PRIMARY'"
              }
            }
          ]
        }'
-
-   > **Tip**: Geolocation routing can be configured at continent, country, or subdivision (state/province) levels for granular control. Always include a default location record (CountryCode: "*") as a fallback for unrecognized locations. For comprehensive geolocation configuration, see the [Route 53 Geolocation Routing Guide](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy-geo.html).
    
    # Europe -> Secondary region
    aws route53 change-resource-record-sets \
@@ -750,12 +826,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                "GeoLocation": {
                  "ContinentCode": "EU"
                },
-               "TTL": 60,
-               "ResourceRecords": [
-                 {
-                   "Value": "5.6.7.8"
-                 }
-               ],
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_SECONDARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_SECONDARY'"
+               },
                "HealthCheckId": "'$HC_ID_SECONDARY'"
              }
            }
@@ -776,19 +851,18 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                "GeoLocation": {
                  "ContinentCode": "AS"
                },
-               "TTL": 60,
-               "ResourceRecords": [
-                 {
-                   "Value": "9.10.11.12"
-                 }
-               ],
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_TERTIARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_TERTIARY'"
+               },
                "HealthCheckId": "'$HC_ID_TERTIARY'"
              }
            }
          ]
        }'
    
-   # Default location (fallback)
+   # Default location (fallback for unrecognized locations)
    aws route53 change-resource-record-sets \
        --hosted-zone-id $HOSTED_ZONE_ID \
        --change-batch '{
@@ -802,12 +876,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                "GeoLocation": {
                  "CountryCode": "*"
                },
-               "TTL": 60,
-               "ResourceRecords": [
-                 {
-                   "Value": "1.2.3.4"
-                 }
-               ],
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_PRIMARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_PRIMARY'"
+               },
                "HealthCheckId": "'$HC_ID_PRIMARY'"
              }
            }
@@ -817,9 +890,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
    echo "✅ Created geolocation routing records"
    ```
 
+   > **Tip**: Geolocation routing can be configured at continent, country, or subdivision (state/province) levels for granular control. Always include a default location record (CountryCode: "*") as a fallback for unrecognized locations. For comprehensive geolocation configuration, see the [Route 53 Geolocation Routing Guide](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy-geo.html).
+
 10. **Create Failover Routing Records**:
 
-    Failover routing provides active-passive disaster recovery capabilities by automatically switching traffic from a failed primary resource to a healthy secondary resource. This routing policy is essential for business continuity, ensuring minimal downtime during outages. Route 53 continuously monitors the health of your primary endpoint and automatically redirects traffic to the secondary endpoint when the primary fails. This configuration is ideal for critical applications requiring high availability with automatic failover capabilities. For comprehensive failover configuration, see the [Route 53 DNS Failover Documentation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-failover-configuring.html).
+    Failover routing provides active-passive disaster recovery capabilities by automatically switching traffic from a failed primary resource to a healthy secondary resource. This routing policy is essential for business continuity, ensuring minimal downtime during outages while maintaining optimal performance through ALIAS record integration.
 
     ```bash
     # Create failover routing (primary/secondary)
@@ -835,12 +910,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                 "Type": "A",
                 "SetIdentifier": "Primary-Failover",
                 "Failover": "PRIMARY",
-                "TTL": 60,
-                "ResourceRecords": [
-                  {
-                    "Value": "1.2.3.4"
-                  }
-                ],
+                "AliasTarget": {
+                  "DNSName": "'$ALB_DNS_PRIMARY'",
+                  "EvaluateTargetHealth": true,
+                  "HostedZoneId": "'$ALB_ZONE_ID_PRIMARY'"
+                },
                 "HealthCheckId": "'$HC_ID_PRIMARY'"
               }
             }
@@ -859,12 +933,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                 "Type": "A",
                 "SetIdentifier": "Secondary-Failover",
                 "Failover": "SECONDARY",
-                "TTL": 60,
-                "ResourceRecords": [
-                  {
-                    "Value": "5.6.7.8"
-                  }
-                ],
+                "AliasTarget": {
+                  "DNSName": "'$ALB_DNS_SECONDARY'",
+                  "EvaluateTargetHealth": true,
+                  "HostedZoneId": "'$ALB_ZONE_ID_SECONDARY'"
+                },
                 "HealthCheckId": "'$HC_ID_SECONDARY'"
               }
             }
@@ -874,9 +947,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
     echo "✅ Created failover routing records"
     ```
 
+    For comprehensive failover configuration, see the [Route 53 DNS Failover Documentation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-failover-configuring.html).
+
 11. **Create Multivalue Answer Routing Records**:
 
-    Multivalue answer routing enables Route 53 to return multiple healthy IP addresses in response to DNS queries, providing DNS-level load balancing and improved availability. Unlike simple round-robin DNS, multivalue routing integrates with health checks to ensure only healthy endpoints are returned. This approach provides client-side load balancing capability and enhances application resilience by giving clients multiple options to connect to. While not a replacement for application load balancers, it offers an additional layer of fault tolerance and can improve performance for applications with multiple endpoints. For detailed implementation guidance, see the [Route 53 Multivalue Answer Routing Documentation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy-multivalue.html).
+    Multivalue answer routing enables Route 53 to return multiple healthy IP addresses in response to DNS queries, providing DNS-level load balancing and improved availability. This approach provides client-side load balancing capability and enhances application resilience while integrating with health checks to ensure only healthy endpoints are returned.
 
     ```bash
     # Create multivalue answer routing for load distribution
@@ -891,12 +966,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                 "Name": "multivalue.'$SUBDOMAIN'",
                 "Type": "A",
                 "SetIdentifier": "Primary-Multivalue",
-                "TTL": 60,
-                "ResourceRecords": [
-                  {
-                    "Value": "1.2.3.4"
-                  }
-                ],
+                "AliasTarget": {
+                  "DNSName": "'$ALB_DNS_PRIMARY'",
+                  "EvaluateTargetHealth": true,
+                  "HostedZoneId": "'$ALB_ZONE_ID_PRIMARY'"
+                },
                 "HealthCheckId": "'$HC_ID_PRIMARY'"
               }
             }
@@ -914,12 +988,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                 "Name": "multivalue.'$SUBDOMAIN'",
                 "Type": "A",
                 "SetIdentifier": "Secondary-Multivalue",
-                "TTL": 60,
-                "ResourceRecords": [
-                  {
-                    "Value": "5.6.7.8"
-                  }
-                ],
+                "AliasTarget": {
+                  "DNSName": "'$ALB_DNS_SECONDARY'",
+                  "EvaluateTargetHealth": true,
+                  "HostedZoneId": "'$ALB_ZONE_ID_SECONDARY'"
+                },
                 "HealthCheckId": "'$HC_ID_SECONDARY'"
               }
             }
@@ -937,12 +1010,11 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                 "Name": "multivalue.'$SUBDOMAIN'",
                 "Type": "A",
                 "SetIdentifier": "Tertiary-Multivalue",
-                "TTL": 60,
-                "ResourceRecords": [
-                  {
-                    "Value": "9.10.11.12"
-                  }
-                ],
+                "AliasTarget": {
+                  "DNSName": "'$ALB_DNS_TERTIARY'",
+                  "EvaluateTargetHealth": true,
+                  "HostedZoneId": "'$ALB_ZONE_ID_TERTIARY'"
+                },
                 "HealthCheckId": "'$HC_ID_TERTIARY'"
               }
             }
@@ -952,65 +1024,75 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
     echo "✅ Created multivalue answer routing records"
     ```
 
+    For detailed implementation guidance, see the [Route 53 Multivalue Answer Routing Documentation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy-multivalue.html).
+
 12. **Configure Health Check Notifications**:
 
-    Health check notifications provide proactive monitoring and alerting for your DNS-based load balancing infrastructure. By integrating Route 53 health checks with SNS topics, you can receive real-time notifications when endpoints fail or recover, enabling rapid response to infrastructure issues. This monitoring setup is crucial for maintaining high availability and meeting SLA requirements. Proper tagging of health checks enables better organization and automated operations workflows. For comprehensive health check monitoring options, see the [Route 53 Health Check Monitoring Documentation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/monitoring-health-checks.html).
+    Health check notifications provide proactive monitoring and alerting for your DNS-based load balancing infrastructure. By integrating Route 53 health checks with SNS topics and proper tagging, you can receive real-time notifications when endpoints fail or recover, enabling rapid response to infrastructure issues and maintaining SLA compliance.
 
     ```bash
     # Create SNS topic for health check notifications
     SNS_TOPIC_ARN=$(aws sns create-topic \
         --name "route53-health-alerts-${RANDOM_SUFFIX}" \
+        --tags Key=Application,Value=Route53LoadBalancing \
+               Key=Environment,Value=Production \
         --query 'TopicArn' --output text)
     
-    # Add tags to health checks for better organization
+    # Add comprehensive tags to health checks for better organization
     aws route53 change-tags-for-resource \
         --resource-type healthcheck \
         --resource-id $HC_ID_PRIMARY \
         --add-tags Key=Environment,Value=Production \
                    Key=Region,Value=$PRIMARY_REGION \
-                   Key=Application,Value=API
+                   Key=Application,Value=API \
+                   Key=HealthCheckType,Value=ALB
     
     aws route53 change-tags-for-resource \
         --resource-type healthcheck \
         --resource-id $HC_ID_SECONDARY \
         --add-tags Key=Environment,Value=Production \
                    Key=Region,Value=$SECONDARY_REGION \
-                   Key=Application,Value=API
+                   Key=Application,Value=API \
+                   Key=HealthCheckType,Value=ALB
     
     aws route53 change-tags-for-resource \
         --resource-type healthcheck \
         --resource-id $HC_ID_TERTIARY \
         --add-tags Key=Environment,Value=Production \
                    Key=Region,Value=$TERTIARY_REGION \
-                   Key=Application,Value=API
+                   Key=Application,Value=API \
+                   Key=HealthCheckType,Value=ALB
     
-    echo "✅ Configured health check notifications"
+    echo "✅ Configured health check notifications and tags"
     echo "SNS Topic: ${SNS_TOPIC_ARN}"
     ```
+
+    For comprehensive health check monitoring options, see the [Route 53 Health Check Monitoring Documentation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/monitoring-health-checks.html).
 
 ## Validation & Testing
 
 1. **Verify Route 53 records and health checks**:
 
    ```bash
-   # List all resource record sets
+   # List all resource record sets with routing policies
    aws route53 list-resource-record-sets \
        --hosted-zone-id $HOSTED_ZONE_ID \
-       --query 'ResourceRecordSets[?Type==`A`].[Name,Type,SetIdentifier,Weight,Region]' \
+       --query 'ResourceRecordSets[?Type==`A`].[Name,Type,SetIdentifier,Weight,Region,Failover]' \
        --output table
    
-   # Check health check status
+   # Check health check status and configuration
    aws route53 list-health-checks \
-       --query 'HealthChecks[].[Id,HealthCheckConfig.FullyQualifiedDomainName]' \
+       --query 'HealthChecks[].[Id,HealthCheckConfig.FullyQualifiedDomainName,HealthCheckConfig.Type]' \
        --output table
    ```
 
-   Expected output: Table showing all created DNS records with their routing policies
+   Expected output: Table showing all created DNS records with their routing policies and health check associations
 
 2. **Test DNS resolution from different locations**:
 
    ```bash
    # Test weighted routing
+   echo "Testing weighted routing:"
    for i in {1..5}; do
        echo "Query $i:"
        dig +short $SUBDOMAIN @8.8.8.8
@@ -1018,30 +1100,37 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
    done
    
    # Test geolocation routing
+   echo "Testing geolocation routing:"
    dig +short geo.$SUBDOMAIN @8.8.8.8
    
    # Test latency-based routing
+   echo "Testing latency-based routing:"
    dig +short latency.$SUBDOMAIN @8.8.8.8
    
    # Test failover routing
+   echo "Testing failover routing:"
    dig +short failover.$SUBDOMAIN @8.8.8.8
    
-   # Test multivalue routing
+   # Test multivalue routing (may return multiple IPs)
+   echo "Testing multivalue routing:"
    dig +short multivalue.$SUBDOMAIN @8.8.8.8
    ```
 
 3. **Verify health check functionality**:
 
    ```bash
-   # Get health check status
+   # Get detailed health check status for all regions
+   echo "Primary region health check status:"
    aws route53 get-health-check-status \
        --health-check-id $HC_ID_PRIMARY \
        --query 'StatusList[0]' --output json
    
+   echo "Secondary region health check status:"
    aws route53 get-health-check-status \
        --health-check-id $HC_ID_SECONDARY \
        --query 'StatusList[0]' --output json
    
+   echo "Tertiary region health check status:"
    aws route53 get-health-check-status \
        --health-check-id $HC_ID_TERTIARY \
        --query 'StatusList[0]' --output json
@@ -1049,42 +1138,37 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
 
    Expected output: JSON showing health check status as "Success" when endpoints are healthy
 
-4. **Test automatic failover**:
+4. **Test automatic failover behavior**:
 
    ```bash
-   # Monitor DNS resolution while simulating failure
-   echo "Testing failover behavior..."
+   # Monitor DNS resolution while observing normal operation
+   echo "Testing failover behavior - monitoring for 60 seconds..."
    
-   # Continuous monitoring (run in background)
-   while true; do
-       echo "$(date): $(dig +short failover.$SUBDOMAIN @8.8.8.8)"
+   # Create monitoring script in background
+   (
+     for i in {1..12}; do
+       TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+       RESULT=$(dig +short failover.$SUBDOMAIN @8.8.8.8 | head -1)
+       echo "${TIMESTAMP}: ${RESULT}"
        sleep 5
-   done &
+     done
+   ) &
    
    MONITOR_PID=$!
    
-   # Let it run for 30 seconds, then stop
-   sleep 30
-   kill $MONITOR_PID
+   # Wait for monitoring to complete
+   wait $MONITOR_PID
    
-   echo "✅ Failover test completed"
+   echo "✅ Failover monitoring completed"
    ```
 
 ## Cleanup
 
-1. **Delete Route 53 records**:
+1. **Delete Route 53 records systematically**:
 
    ```bash
-   # Delete all A records (this will remove all routing policy records)
-   aws route53 list-resource-record-sets \
-       --hosted-zone-id $HOSTED_ZONE_ID \
-       --query 'ResourceRecordSets[?Type==`A` && SetIdentifier!=null]' \
-       --output json > /tmp/records_to_delete.json
-   
-   # Delete each record (simplified - in production, use proper JSON parsing)
-   # Note: This is a simplified approach - production should handle this more carefully
-   
-   # Delete weighted records
+   # Delete all routing policy records
+   # Start with weighted records
    aws route53 change-resource-record-sets \
        --hosted-zone-id $HOSTED_ZONE_ID \
        --change-batch '{
@@ -1096,13 +1180,61 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
                "Type": "A",
                "SetIdentifier": "Primary-Weighted",
                "Weight": 50,
-               "TTL": 60,
-               "ResourceRecords": [{"Value": "1.2.3.4"}],
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_PRIMARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_PRIMARY'"
+               },
                "HealthCheckId": "'$HC_ID_PRIMARY'"
              }
            }
          ]
-       }'
+       }' || true
+   
+   # Delete remaining weighted records
+   aws route53 change-resource-record-sets \
+       --hosted-zone-id $HOSTED_ZONE_ID \
+       --change-batch '{
+         "Changes": [
+           {
+             "Action": "DELETE",
+             "ResourceRecordSet": {
+               "Name": "'$SUBDOMAIN'",
+               "Type": "A",
+               "SetIdentifier": "Secondary-Weighted",
+               "Weight": 30,
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_SECONDARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_SECONDARY'"
+               },
+               "HealthCheckId": "'$HC_ID_SECONDARY'"
+             }
+           }
+         ]
+       }' || true
+   
+   aws route53 change-resource-record-sets \
+       --hosted-zone-id $HOSTED_ZONE_ID \
+       --change-batch '{
+         "Changes": [
+           {
+             "Action": "DELETE",
+             "ResourceRecordSet": {
+               "Name": "'$SUBDOMAIN'",
+               "Type": "A",
+               "SetIdentifier": "Tertiary-Weighted",
+               "Weight": 20,
+               "AliasTarget": {
+                 "DNSName": "'$ALB_DNS_TERTIARY'",
+                 "EvaluateTargetHealth": true,
+                 "HostedZoneId": "'$ALB_ZONE_ID_TERTIARY'"
+               },
+               "HealthCheckId": "'$HC_ID_TERTIARY'"
+             }
+           }
+         ]
+       }' || true
    
    echo "✅ Deleted Route 53 records"
    ```
@@ -1111,9 +1243,12 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
 
    ```bash
    # Delete all health checks
-   aws route53 delete-health-check --health-check-id $HC_ID_PRIMARY
-   aws route53 delete-health-check --health-check-id $HC_ID_SECONDARY
-   aws route53 delete-health-check --health-check-id $HC_ID_TERTIARY
+   aws route53 delete-health-check \
+       --health-check-id $HC_ID_PRIMARY || true
+   aws route53 delete-health-check \
+       --health-check-id $HC_ID_SECONDARY || true
+   aws route53 delete-health-check \
+       --health-check-id $HC_ID_TERTIARY || true
    
    echo "✅ Deleted health checks"
    ```
@@ -1121,8 +1256,8 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
 3. **Delete SNS topic**:
 
    ```bash
-   # Delete SNS topic
-   aws sns delete-topic --topic-arn $SNS_TOPIC_ARN
+   # Delete SNS topic and subscriptions
+   aws sns delete-topic --topic-arn $SNS_TOPIC_ARN || true
    
    echo "✅ Deleted SNS topic"
    ```
@@ -1130,15 +1265,18 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
 4. **Delete Application Load Balancers**:
 
    ```bash
-   # Delete ALBs in each region
+   # Delete ALBs in each region with proper wait
    aws configure set region $PRIMARY_REGION
-   aws elbv2 delete-load-balancer --load-balancer-arn $ALB_ARN_PRIMARY
+   aws elbv2 delete-load-balancer \
+       --load-balancer-arn $ALB_ARN_PRIMARY || true
    
    aws configure set region $SECONDARY_REGION
-   aws elbv2 delete-load-balancer --load-balancer-arn $ALB_ARN_SECONDARY
+   aws elbv2 delete-load-balancer \
+       --load-balancer-arn $ALB_ARN_SECONDARY || true
    
    aws configure set region $TERTIARY_REGION
-   aws elbv2 delete-load-balancer --load-balancer-arn $ALB_ARN_TERTIARY
+   aws elbv2 delete-load-balancer \
+       --load-balancer-arn $ALB_ARN_TERTIARY || true
    
    echo "✅ Deleted Application Load Balancers"
    ```
@@ -1146,20 +1284,33 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
 5. **Delete VPC infrastructure**:
 
    ```bash
-   # Delete VPCs and associated resources in each region
-   # (Simplified - in production, delete in proper order)
-   
+   # Delete VPCs and associated resources in proper order
    # Primary region
    aws configure set region $PRIMARY_REGION
-   aws ec2 delete-vpc --vpc-id $VPC_ID_PRIMARY
+   aws ec2 detach-internet-gateway \
+       --internet-gateway-id $IGW_ID_PRIMARY \
+       --vpc-id $VPC_ID_PRIMARY || true
+   aws ec2 delete-internet-gateway \
+       --internet-gateway-id $IGW_ID_PRIMARY || true
+   aws ec2 delete-vpc --vpc-id $VPC_ID_PRIMARY || true
    
    # Secondary region
    aws configure set region $SECONDARY_REGION
-   aws ec2 delete-vpc --vpc-id $VPC_ID_SECONDARY
+   aws ec2 detach-internet-gateway \
+       --internet-gateway-id $IGW_ID_SECONDARY \
+       --vpc-id $VPC_ID_SECONDARY || true
+   aws ec2 delete-internet-gateway \
+       --internet-gateway-id $IGW_ID_SECONDARY || true
+   aws ec2 delete-vpc --vpc-id $VPC_ID_SECONDARY || true
    
    # Tertiary region
    aws configure set region $TERTIARY_REGION
-   aws ec2 delete-vpc --vpc-id $VPC_ID_TERTIARY
+   aws ec2 detach-internet-gateway \
+       --internet-gateway-id $IGW_ID_TERTIARY \
+       --vpc-id $VPC_ID_TERTIARY || true
+   aws ec2 delete-internet-gateway \
+       --internet-gateway-id $IGW_ID_TERTIARY || true
+   aws ec2 delete-vpc --vpc-id $VPC_ID_TERTIARY || true
    
    echo "✅ Deleted VPC infrastructure"
    ```
@@ -1170,46 +1321,55 @@ echo "Tertiary Region: ${TERTIARY_REGION}"
    # Switch back to primary region
    aws configure set region $PRIMARY_REGION
    
-   # Delete hosted zone
-   aws route53 delete-hosted-zone --id $HOSTED_ZONE_ID
+   # Delete hosted zone (only if no other records exist)
+   aws route53 delete-hosted-zone --id $HOSTED_ZONE_ID || true
    
    echo "✅ Deleted hosted zone"
    ```
 
 ## Discussion
 
-This comprehensive DNS-based load balancing solution leverages Amazon Route 53's sophisticated routing capabilities to provide intelligent traffic distribution across multiple regions. The implementation combines several routing policies to address different use cases and requirements.
+This comprehensive DNS-based load balancing solution leverages Amazon Route 53's sophisticated routing capabilities to provide intelligent traffic distribution across multiple regions while following AWS Well-Architected Framework principles. The implementation combines several routing policies to address different use cases and operational requirements.
 
-**Weighted routing** provides granular control over traffic distribution, allowing you to gradually shift traffic between regions for blue-green deployments or A/B testing. The 50-30-20 weight distribution in this recipe can be adjusted based on regional capacity or business requirements. This approach is particularly useful for testing new infrastructure or managing traffic during peak periods.
+**ALIAS Records and Performance Optimization**: The solution uses Route 53 ALIAS records instead of traditional A records, providing several key advantages. ALIAS records automatically resolve to the current IP addresses of AWS resources like Application Load Balancers, eliminating the need for manual IP address management. They also provide better performance as Route 53 can respond to queries without additional DNS lookups, and they integrate seamlessly with health checks through the `EvaluateTargetHealth` parameter. This approach follows AWS best practices and provides better resilience compared to static IP addresses.
 
-**Latency-based routing** automatically directs users to the region that provides the lowest latency, significantly improving user experience. Route 53 measures latency from users to AWS regions and makes routing decisions based on these measurements. This policy is ideal for global applications where performance is critical, as it ensures users are always routed to the fastest available endpoint.
+**Weighted routing** provides granular control over traffic distribution, allowing gradual traffic shifting for blue-green deployments, canary releases, or capacity-based routing. The 50-30-20 weight distribution demonstrated can be adjusted dynamically based on regional capacity, performance metrics, or business requirements. This routing policy is particularly valuable during infrastructure changes or when testing new deployments across regions.
 
-**Geolocation routing** enables compliance with data residency requirements and provides localized content delivery. By routing users based on their geographic location, you can ensure data stays within specific regions and provide region-specific content or services. The continent-level routing in this recipe can be refined to country or subdivision levels for more granular control.
+**Latency-based routing** automatically directs users to the AWS region that provides the lowest network latency from their location. Route 53 measures actual network latency from users to AWS regions using real-world measurements rather than geographic distance calculations. This intelligent routing significantly improves user experience by ensuring consistent performance regardless of user location, making it ideal for latency-sensitive applications.
 
-**Health checks** form the backbone of the failover mechanism, continuously monitoring endpoint health and automatically removing unhealthy endpoints from DNS responses. The 30-second check interval with a 3-failure threshold provides rapid detection of issues while avoiding false positives. Integration with SNS enables real-time alerting when health checks fail.
+**Geolocation routing** enables compliance with data residency requirements and provides localized content delivery capabilities. This policy routes users based on their geographic location, ensuring data remains within specific regions and enabling region-specific content or services. The implementation demonstrates continent-level routing with a default fallback, but can be refined to country or subdivision levels for more granular control over data sovereignty.
 
-**Multivalue answer routing** provides a DNS-level load balancing capability by returning multiple IP addresses in response to queries. While not a replacement for application-level load balancing, it provides additional resilience and can help distribute load across multiple endpoints.
+**Health checks** form the backbone of the intelligent failover mechanism, continuously monitoring endpoint availability from multiple AWS edge locations globally. The 30-second check interval with a 3-failure threshold provides rapid detection of issues while avoiding false positives. The integration with SNS enables real-time alerting when health checks fail, supporting proactive incident response and SLA compliance.
 
-The solution's architecture supports both active-active and active-passive configurations. The weighted and latency-based routing policies enable active-active deployments where traffic is distributed across all healthy regions. The failover routing policy provides active-passive capabilities with automatic failover to secondary regions when the primary becomes unavailable.
+The solution's architecture supports both active-active and active-passive configurations seamlessly. The weighted and latency-based routing policies enable active-active deployments where traffic is distributed across all healthy regions based on performance and capacity. The failover routing policy provides active-passive capabilities with automatic failover to secondary regions when the primary becomes unavailable, ensuring business continuity during outages.
 
-Cost optimization considerations include the health check frequency, number of health checks, and DNS query volume. Each health check costs approximately $0.50 per month, and DNS queries are charged at $0.40 per million queries. The solution's multi-region approach provides excellent availability but requires careful cost monitoring, especially for high-traffic applications.
+Cost optimization considerations include health check frequency, number of health checks, and DNS query volume. Each health check costs approximately $0.50 per month, and DNS queries are charged at $0.40 per million queries. The solution's multi-region approach provides excellent availability but requires careful cost monitoring, especially for high-traffic applications. Using ALIAS records reduces costs compared to A records as they don't incur additional query charges for AWS resource resolution.
 
-> **Tip**: Use Route 53 Application Recovery Controller for more advanced failover scenarios that require cross-region coordination and automated runbook execution.
+For additional insights on DNS load balancing patterns and advanced configurations, see the [AWS Well-Architected Framework Reliability Pillar](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) and the comprehensive [Route 53 Developer Guide](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/).
+
+> **Tip**: Use Route 53 Application Recovery Controller for more advanced failover scenarios that require cross-region coordination, automated runbook execution, and readiness checks across multiple AWS services.
 
 ## Challenge
 
 Extend this solution by implementing these advanced DNS load balancing scenarios:
 
-1. **Implement geoproximity routing with bias adjustment** to fine-tune traffic distribution based on geographic proximity while accounting for regional capacity differences and business priorities.
+1. **Implement geoproximity routing with bias adjustment** to fine-tune traffic distribution based on geographic proximity while accounting for regional capacity differences and business priorities, enabling more sophisticated traffic management than standard geolocation routing.
 
-2. **Create a traffic flow policy** using Route 53's visual editor to build complex routing decision trees that combine multiple routing policies with conditional logic for sophisticated traffic management.
+2. **Create a traffic flow policy** using Route 53's visual editor to build complex routing decision trees that combine multiple routing policies with conditional logic, enabling sophisticated traffic management scenarios like staged rollouts and complex failover chains.
 
-3. **Add Route 53 Resolver for private DNS** to enable cross-VPC and hybrid cloud DNS resolution, allowing private resources to participate in the load balancing scheme without exposing them to the public internet.
+3. **Add Route 53 Resolver for private DNS** to enable cross-VPC and hybrid cloud DNS resolution, allowing private resources to participate in the load balancing scheme without exposing them to the public internet while maintaining intelligent routing capabilities.
 
-4. **Integrate with AWS Global Accelerator** to provide additional performance optimization and DDoS protection at the network layer while maintaining DNS-based routing flexibility.
+4. **Integrate with AWS Global Accelerator** to provide additional performance optimization and DDoS protection at the network layer while maintaining DNS-based routing flexibility, creating a comprehensive global traffic management solution.
 
-5. **Implement automated DNS record management** using Lambda functions and CloudWatch Events to dynamically adjust routing policies based on application metrics, enabling auto-scaling at the DNS level.
+5. **Implement automated DNS record management** using Lambda functions triggered by CloudWatch Events to dynamically adjust routing policies based on application metrics, auto-scaling events, and performance thresholds, enabling truly autonomous traffic management at the DNS level.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -4,12 +4,12 @@ id: a4f5b2c8
 category: machine-learning
 difficulty: 200
 subject: gcp
-services: Google Agentspace, Vertex AI Search, Cloud Storage, BigQuery
-estimated-time: 105 minutes
-recipe-version: 1.0
+services: Vertex AI Search, Cloud Storage, BigQuery, Agentspace Enterprise
+estimated-time: 120 minutes
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: ai, search, enterprise, knowledge-discovery, agentspace, vertex-ai
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Organizations struggle with information silos across departments, making it diff
 
 ## Solution
 
-This recipe demonstrates how to build an intelligent enterprise knowledge discovery system using Google Agentspace and Vertex AI Search. We'll create a unified search interface that combines semantic document retrieval with AI-powered insights, allowing employees to query organizational data using natural language while receiving contextual answers grounded in enterprise content.
+This recipe demonstrates how to build an intelligent enterprise knowledge discovery system using Google Agentspace Enterprise and Vertex AI Search. We'll create a unified search interface that combines semantic document retrieval with AI-powered insights, allowing employees to query organizational data using natural language while receiving contextual answers grounded in enterprise content.
 
 ## Architecture Diagram
 
@@ -51,7 +51,7 @@ graph TB
         INSIGHTS[Query Insights]
     end
     
-    subgraph "Google Agentspace"
+    subgraph "Google Agentspace Enterprise"
         AGENT[Knowledge Agent]
         INTERFACE[Search Interface]
         WORKFLOW[Agent Workflows]
@@ -94,7 +94,7 @@ graph TB
 5. Sample enterprise documents and data sources for testing
 6. Estimated cost: $50-100 USD for initial setup and testing (varies by data volume)
 
-> **Note**: Google Agentspace is currently in preview. Some features may require allowlisting or have limited availability.
+> **Note**: Google Agentspace Enterprise is generally available but may require enterprise licensing. Some features may have regional availability limitations.
 
 ## Preparation
 
@@ -120,7 +120,6 @@ gcloud services enable discoveryengine.googleapis.com
 gcloud services enable storage.googleapis.com
 gcloud services enable bigquery.googleapis.com
 gcloud services enable aiplatform.googleapis.com
-gcloud services enable agentspace.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Required APIs enabled"
@@ -275,7 +274,7 @@ echo "✅ Required APIs enabled"
    Vertex AI Search leverages Google's semantic search technologies to provide enterprise-grade search capabilities with automatic content understanding, relevance ranking, and personalization. The search application serves as the core retrieval engine that powers intelligent knowledge discovery.
 
    ```bash
-   # Create Vertex AI Search application
+   # Create Vertex AI Search data store
    gcloud alpha discovery-engine data-stores create \
        --data-store-id=${SEARCH_APP_ID} \
        --display-name="Enterprise Knowledge Search" \
@@ -343,75 +342,52 @@ echo "✅ Required APIs enabled"
 
    The search index is now optimized for enterprise knowledge discovery with advanced features including language detection, personalization, and LLM-powered result enhancement. These capabilities enable more accurate and contextually relevant search results.
 
-6. **Set up Google Agentspace Integration**:
+6. **Set up Google Agentspace Enterprise Integration**:
 
-   Google Agentspace provides the intelligent agent layer that orchestrates search capabilities, synthesizes results, and delivers personalized knowledge discovery experiences. The integration connects Vertex AI Search with conversational interfaces and workflow automation.
+   Google Agentspace Enterprise provides the intelligent agent layer that orchestrates search capabilities, synthesizes results, and delivers personalized knowledge discovery experiences. This integration works through the Google Cloud Console and Agentspace Enterprise web interface.
 
    ```bash
-   # Create Agentspace configuration
-   cat > agentspace_config.yaml << 'EOF'
-   apiVersion: agentspace.googleapis.com/v1
-   kind: KnowledgeAgent
-   metadata:
-     name: enterprise-knowledge-agent
-   spec:
-     displayName: "Enterprise Knowledge Discovery Agent"
-     description: "AI agent for enterprise knowledge search and synthesis"
-     searchEngineId: "${SEARCH_APP_ID}-engine"
-     capabilities:
-       - semantic_search
-       - content_summarization
-       - question_answering
-       - document_analysis
-     personalizations:
-       - user_role_based_filtering
-       - department_specific_results
-       - usage_pattern_optimization
+   # Note: Agentspace Enterprise is primarily configured through 
+   # the Google Cloud Console web interface
+   echo "Setting up Agentspace Enterprise configuration..."
+   
+   # Create configuration template for Agentspace
+   cat > agentspace_setup.md << 'EOF'
+   # Agentspace Enterprise Setup Instructions
+   
+   ## Steps to configure in Google Cloud Console:
+   1. Navigate to Agentspace Enterprise in Google Cloud Console
+   2. Create a new Agentspace Enterprise app
+   3. Connect the Vertex AI Search engine created in previous steps
+   4. Configure search settings and personalization
+   5. Set up user access and permissions
+   
+   ## Key Configuration Values:
+   - Search Engine ID: ${SEARCH_APP_ID}-engine
+   - Data Store ID: ${SEARCH_APP_ID}
+   - Project ID: ${PROJECT_ID}
+   - Region: global
+   
+   ## Required URLs for setup:
+   - Agentspace Console: https://console.cloud.google.com/agentspace
+   - Search Engine: projects/${PROJECT_ID}/locations/global/engines/${SEARCH_APP_ID}-engine
    EOF
    
-   # Deploy Agentspace knowledge agent
-   gcloud alpha agentspace agents create \
-       --agent-config=agentspace_config.yaml \
-       --location=global \
-       --project=${PROJECT_ID}
+   # Create IAM service account for Agentspace integration
+   gcloud iam service-accounts create agentspace-service \
+       --description="Service account for Agentspace Enterprise" \
+       --display-name="Agentspace Service Account"
    
-   # Create agent workflow for knowledge discovery
-   cat > knowledge_workflow.yaml << 'EOF'
-   apiVersion: agentspace.googleapis.com/v1
-   kind: Workflow
-   metadata:
-     name: knowledge-discovery-workflow
-   spec:
-     triggers:
-       - type: "natural_language_query"
-     steps:
-       - name: "semantic_search"
-         type: "vertex_ai_search"
-         config:
-           engine_id: "${SEARCH_APP_ID}-engine"
-           max_results: 10
-       - name: "content_analysis"
-         type: "llm_processing"
-         config:
-           model: "gemini-pro"
-           prompt: "Analyze and synthesize the following search results"
-       - name: "answer_generation"
-         type: "response_synthesis"
-         config:
-           format: "conversational"
-           include_citations: true
-   EOF
+   # Grant necessary permissions
+   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:agentspace-service@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/discoveryengine.editor"
    
-   # Deploy knowledge discovery workflow
-   gcloud alpha agentspace workflows create \
-       --workflow-config=knowledge_workflow.yaml \
-       --location=global \
-       --project=${PROJECT_ID}
-   
-   echo "✅ Agentspace integration configured"
+   echo "✅ Agentspace Enterprise setup template created"
+   echo "Please follow instructions in agentspace_setup.md to complete setup"
    ```
 
-   The Agentspace integration is now active, providing intelligent orchestration of search, analysis, and response generation. The system can handle complex knowledge discovery queries and provide contextual, synthesized answers with proper citations.
+   The Agentspace integration setup is now prepared with the necessary service account and permissions. The actual Agentspace Enterprise configuration must be completed through the Google Cloud Console web interface for security and compliance reasons.
 
 7. **Configure IAM and Access Controls**:
 
@@ -441,7 +417,6 @@ echo "✅ Required APIs enabled"
      - storage.objects.*
      - bigquery.datasets.*
      - bigquery.tables.*
-     - agentspace.*
    EOF
    
    # Create IAM roles
@@ -587,37 +562,23 @@ echo "✅ Required APIs enabled"
     ORDER BY view_count DESC"
    ```
 
-4. **Validate Agentspace Integration**:
+4. **Validate Agentspace Enterprise Integration**:
 
    ```bash
-   # Test agent workflow
-   gcloud alpha agentspace agents query \
-       --agent-id="enterprise-knowledge-agent" \
-       --location=global \
-       --query="What is the remote work policy for our company?"
+   # Test service account access
+   gcloud auth activate-service-account \
+       agentspace-service@${PROJECT_ID}.iam.gserviceaccount.com \
+       --key-file=agentspace-service-key.json
+   
+   # Verify search engine access
+   gcloud alpha discovery-engine engines describe \
+       ${SEARCH_APP_ID}-engine \
+       --location=global
    ```
 
 ## Cleanup
 
-1. **Remove Agentspace Configuration**:
-
-   ```bash
-   # Delete Agentspace workflows
-   gcloud alpha agentspace workflows delete \
-       knowledge-discovery-workflow \
-       --location=global \
-       --quiet
-   
-   # Delete Agentspace agents
-   gcloud alpha agentspace agents delete \
-       enterprise-knowledge-agent \
-       --location=global \
-       --quiet
-   
-   echo "✅ Agentspace resources deleted"
-   ```
-
-2. **Remove Vertex AI Search Resources**:
+1. **Remove Vertex AI Search Resources**:
 
    ```bash
    # Delete search engine
@@ -635,7 +596,7 @@ echo "✅ Required APIs enabled"
    echo "✅ Vertex AI Search resources deleted"
    ```
 
-3. **Remove BigQuery Resources**:
+2. **Remove BigQuery Resources**:
 
    ```bash
    # Delete BigQuery dataset
@@ -644,7 +605,7 @@ echo "✅ Required APIs enabled"
    echo "✅ BigQuery dataset deleted"
    ```
 
-4. **Remove Cloud Storage Resources**:
+3. **Remove Cloud Storage Resources**:
 
    ```bash
    # Delete storage bucket and contents
@@ -653,12 +614,16 @@ echo "✅ Required APIs enabled"
    echo "✅ Storage bucket deleted"
    ```
 
-5. **Remove IAM Resources**:
+4. **Remove IAM Resources**:
 
    ```bash
-   # Delete service account
+   # Delete service accounts
    gcloud iam service-accounts delete \
        knowledge-discovery-sa@${PROJECT_ID}.iam.gserviceaccount.com \
+       --quiet
+   
+   gcloud iam service-accounts delete \
+       agentspace-service@${PROJECT_ID}.iam.gserviceaccount.com \
        --quiet
    
    # Delete custom IAM roles
@@ -673,11 +638,23 @@ echo "✅ Required APIs enabled"
    echo "✅ IAM resources cleaned up"
    ```
 
+5. **Clean up local files**:
+
+   ```bash
+   # Remove temporary files
+   rm -f lifecycle.json search_config.json monitoring_config.json
+   rm -f knowledge_reader_role.yaml knowledge_admin_role.yaml
+   rm -f agentspace_setup.md
+   rm -rf sample_docs/
+   
+   echo "✅ Local files cleaned up"
+   ```
+
 ## Discussion
 
-This recipe demonstrates the power of combining Google Agentspace with Vertex AI Search to create an intelligent enterprise knowledge discovery system. The solution leverages Google's advanced semantic search capabilities, built on decades of search expertise, to provide contextually relevant results from enterprise content repositories.
+This recipe demonstrates the power of combining Google Agentspace Enterprise with Vertex AI Search to create an intelligent enterprise knowledge discovery system. The solution leverages Google's advanced semantic search capabilities, built on decades of search expertise, to provide contextually relevant results from enterprise content repositories.
 
-The integration of Agentspace adds conversational AI capabilities that transform traditional search into an interactive knowledge discovery experience. Users can ask complex questions in natural language and receive synthesized answers that draw from multiple sources, complete with proper citations and confidence scores. This approach significantly reduces the time employees spend searching for information and increases the likelihood of discovering relevant insights.
+The integration of Agentspace Enterprise adds conversational AI capabilities that transform traditional search into an interactive knowledge discovery experience. Users can ask complex questions in natural language and receive synthesized answers that draw from multiple sources, complete with proper citations and confidence scores. This approach significantly reduces the time employees spend searching for information and increases the likelihood of discovering relevant insights.
 
 The architecture provides several key advantages for enterprise deployments. First, the serverless nature of Vertex AI Search eliminates the need for complex infrastructure management while automatically scaling to handle varying query loads. Second, the integration with BigQuery enables sophisticated analytics and reporting capabilities that help organizations understand how knowledge is being accessed and utilized. Third, the robust IAM integration ensures that sensitive information remains protected while providing seamless access to authorized users.
 
@@ -687,7 +664,7 @@ From a cost optimization perspective, the solution uses Google Cloud's pay-as-yo
 
 The system's effectiveness depends heavily on the quality and organization of the source content. Organizations should establish clear content governance policies, implement consistent metadata standards, and regularly audit the knowledge base to ensure accuracy and relevance. Additionally, monitoring user search patterns and feedback helps identify gaps in the knowledge base and opportunities for improvement.
 
-For more information on implementing enterprise search solutions, see the [Google Cloud Search Documentation](https://cloud.google.com/enterprise-search/docs), [Vertex AI Search Best Practices](https://cloud.google.com/generative-ai-app-builder/docs/best-practices), [Google Agentspace Enterprise Guide](https://cloud.google.com/agentspace/docs), [BigQuery Analytics Patterns](https://cloud.google.com/bigquery/docs/best-practices-performance-overview), and [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
+For more information on implementing enterprise search solutions, see the [Vertex AI Search Documentation](https://cloud.google.com/generative-ai-app-builder/docs), [Agentspace Enterprise Guide](https://cloud.google.com/agentspace/docs), [BigQuery Analytics Patterns](https://cloud.google.com/bigquery/docs/best-practices-performance-overview), and [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
 
 ## Challenge
 
@@ -705,4 +682,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

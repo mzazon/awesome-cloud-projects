@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Static Web Apps, Azure Front Door, Azure Web Application Firewall
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, web-application-firewall, cdn, global-delivery, ddos-protection
 recipe-generator-version: 1.3
@@ -180,32 +180,50 @@ echo "✅ Front Door name: ${AFD_NAME}"
    Custom WAF rules provide granular control over traffic patterns specific to your application. Rate limiting prevents abuse and DDoS attacks at the application layer by restricting requests per IP address. Geo-filtering enables compliance with data sovereignty requirements by controlling access based on geographic location.
 
    ```bash
-   # Add rate limiting rule (100 requests per minute per IP)
-   az network front-door waf-policy custom-rule create \
+   # Create rate limiting rule (100 requests per minute per IP)
+   az network front-door waf-policy rule create \
        --name RateLimitRule \
        --policy-name ${WAF_POLICY_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --rule-type RateLimiting \
+       --rule-type RateLimitRule \
+       --rate-limit-duration 1 \
        --rate-limit-threshold 100 \
-       --rate-limit-duration-in-minutes 1 \
        --priority 1 \
-       --action Block
+       --action Block \
+       --defer
 
-   # Add geo-filtering rule (example: allow only specific regions)
-   az network front-door waf-policy custom-rule create \
+   # Add match condition for rate limiting rule
+   az network front-door waf-policy rule match-condition add \
+       --match-variable RequestUri \
+       --operator Contains \
+       --values "/" \
+       --name RateLimitRule \
+       --policy-name ${WAF_POLICY_NAME} \
+       --resource-group ${RESOURCE_GROUP}
+
+   # Create geo-filtering rule (allow only specific regions)
+   az network front-door waf-policy rule create \
        --name GeoFilterRule \
        --policy-name ${WAF_POLICY_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --rule-type MatchRule \
        --priority 2 \
        --action Allow \
-       --match-condition RemoteAddr GeoMatch "US" "CA" "GB" "DE" \
-       --negate-condition false
+       --defer
+
+   # Add geo-filtering match condition
+   az network front-door waf-policy rule match-condition add \
+       --match-variable RemoteAddr \
+       --operator GeoMatch \
+       --values "US" "CA" "GB" "DE" "ZZ" \
+       --name GeoFilterRule \
+       --policy-name ${WAF_POLICY_NAME} \
+       --resource-group ${RESOURCE_GROUP}
 
    echo "✅ Custom security rules configured for rate limiting and geo-filtering"
    ```
 
-   These custom rules work alongside managed rules to provide comprehensive protection. Rate limiting prevents resource exhaustion while geo-filtering ensures compliance with regional access requirements.
+   These custom rules work alongside managed rules to provide comprehensive protection. Rate limiting prevents resource exhaustion while geo-filtering ensures compliance with regional access requirements. The "ZZ" country code handles IP addresses not yet mapped to avoid false positives.
 
 4. **Create Azure Front Door with WAF Integration**:
 
@@ -357,18 +375,23 @@ echo "✅ Front Door name: ${AFD_NAME}"
 
    This configuration locks down your Static Web App to only accept traffic from your specific Front Door instance, preventing attackers from bypassing your WAF protection by accessing the origin directly.
 
-8. **Enable Caching and Compression**:
+8. **Enable Caching and Compression with Rule Sets**:
 
-   Front Door's caching capabilities reduce origin load and improve performance by serving content from edge locations. Compression further optimizes bandwidth usage by reducing payload sizes for text-based content. These features work together to provide faster page loads while reducing infrastructure costs through decreased origin traffic.
+   Front Door's caching capabilities reduce origin load and improve performance by serving content from edge locations. Rule sets govern how content should be cached and compressed. These features work together to provide faster page loads while reducing infrastructure costs through decreased origin traffic.
 
    ```bash
+   # Create rule set for caching and compression
+   az afd rule-set create \
+       --rule-set-name "ruleset-optimizations" \
+       --profile-name ${AFD_NAME} \
+       --resource-group ${RESOURCE_GROUP}
+
    # Create cache rule for static assets
    az afd rule create \
        --rule-name "rule-cache-static" \
        --profile-name ${AFD_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --endpoint-name ${ENDPOINT_NAME} \
-       --rule-set-name "ruleset-caching" \
+       --rule-set-name "ruleset-optimizations" \
        --order 1 \
        --match-variable RequestUri \
        --operator Contains \
@@ -377,14 +400,13 @@ echo "✅ Front Door name: ${AFD_NAME}"
        --cache-behavior Override \
        --cache-duration "7.00:00:00"
 
-   # Enable compression for text content
+   # Create compression rule for text content
    az afd rule create \
        --rule-name "rule-compression" \
        --profile-name ${AFD_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --endpoint-name ${ENDPOINT_NAME} \
-       --rule-set-name "ruleset-compression" \
-       --order 1 \
+       --rule-set-name "ruleset-optimizations" \
+       --order 2 \
        --match-variable RequestHeader \
        --selector "Accept-Encoding" \
        --operator Contains \
@@ -392,10 +414,18 @@ echo "✅ Front Door name: ${AFD_NAME}"
        --action-name Compression \
        --enable-compression true
 
+   # Associate rule set with the route
+   az afd route update \
+       --route-name "route-secure" \
+       --endpoint-name ${ENDPOINT_NAME} \
+       --profile-name ${AFD_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --rule-sets "ruleset-optimizations"
+
    echo "✅ Caching and compression optimizations configured"
    ```
 
-   Static assets are now cached at edge locations for 7 days while dynamic content remains fresh. Compression automatically applies to supported content types when clients indicate support.
+   Static assets are now cached at edge locations for 7 days while dynamic content remains fresh. Compression automatically applies to supported content types when clients indicate support, reducing bandwidth usage and improving page load times.
 
 ## Validation & Testing
 
@@ -404,8 +434,6 @@ echo "✅ Front Door name: ${AFD_NAME}"
    ```bash
    # Test Front Door endpoint
    curl -I https://${AFD_HOSTNAME}
-
-   # Expected output: HTTP/2 200 status with security headers
    ```
 
    Expected output: You should see HTTP headers including `X-Azure-Ref` indicating Front Door processing.
@@ -418,8 +446,6 @@ echo "✅ Front Door name: ${AFD_NAME}"
 
    # Test XSS protection (should be blocked)
    curl -X GET "https://${AFD_HOSTNAME}/?search=<script>alert('xss')</script>"
-
-   # Expected output: 403 Forbidden for both requests
    ```
 
    Expected output: Both requests should return 403 Forbidden, confirming WAF is blocking malicious patterns.
@@ -431,8 +457,6 @@ echo "✅ Front Door name: ${AFD_NAME}"
    for i in {1..150}; do
      curl -s -o /dev/null -w "%{http_code}\n" https://${AFD_HOSTNAME}
    done | sort | uniq -c
-
-   # Expected output: Most return 200, some return 429 after threshold
    ```
 
    Expected output: After 100 requests, subsequent requests should return 429 Too Many Requests.
@@ -440,7 +464,8 @@ echo "✅ Front Door name: ${AFD_NAME}"
 4. Check WAF logs for blocked requests:
 
    ```bash
-   # Query WAF logs (after a few minutes for log aggregation)
+   # Query WAF logs (requires Log Analytics workspace setup)
+   # Note: Replace ${LOG_ANALYTICS_WORKSPACE} with your workspace ID
    az monitor log-analytics query \
        --workspace ${LOG_ANALYTICS_WORKSPACE} \
        --analytics-query "AzureDiagnostics | where Category == 'FrontDoorWebApplicationFirewallLog' | where action_s == 'Block' | project TimeGenerated, clientIP_s, requestUri_s, ruleName_s | take 10" \
@@ -449,10 +474,10 @@ echo "✅ Front Door name: ${AFD_NAME}"
 
 ## Cleanup
 
-1. Delete Front Door and WAF policy:
+1. Delete Front Door profile (includes endpoints and routes):
 
    ```bash
-   # Delete Front Door profile (includes endpoints and routes)
+   # Delete Front Door profile
    az afd profile delete \
        --profile-name ${AFD_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -519,4 +544,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

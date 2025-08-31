@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Container Apps, Azure Service Bus, Azure Container Registry
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: serverless, event-driven, containers, messaging, workflows, microservices
 recipe-generator-version: 1.3
@@ -89,25 +89,23 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-container-jobs-demo"
+export RESOURCE_GROUP="rg-container-jobs-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export ENVIRONMENT_NAME="env-container-jobs"
-export SERVICE_BUS_NAMESPACE="sb-container-jobs-$(date +%s)"
 export QUEUE_NAME="message-processing-queue"
-export CONTAINER_REGISTRY_NAME="acrcontainerjobs$(date +%s)"
 export JOB_NAME="message-processor-job"
 export CONTAINER_IMAGE_NAME="message-processor:1.0"
 
 # Generate unique suffix for global resources
 RANDOM_SUFFIX=$(openssl rand -hex 3)
-SERVICE_BUS_NAMESPACE="sb-container-jobs-${RANDOM_SUFFIX}"
-CONTAINER_REGISTRY_NAME="acrjobs${RANDOM_SUFFIX}"
+export SERVICE_BUS_NAMESPACE="sb-container-jobs-${RANDOM_SUFFIX}"
+export CONTAINER_REGISTRY_NAME="acrjobs${RANDOM_SUFFIX}"
 
 # Create resource group
 az group create \
     --name ${RESOURCE_GROUP} \
     --location ${LOCATION} \
-    --tags purpose=demo environment=learning
+    --tags purpose=recipe environment=demo
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
@@ -213,18 +211,24 @@ echo "✅ Resource providers registered successfully"
    
    # Create Dockerfile for message processor
    cat > Dockerfile << 'EOF'
-   FROM mcr.microsoft.com/dotnet/runtime:8.0-alpine
+   FROM mcr.microsoft.com/dotnet/sdk:8.0-alpine AS build
    WORKDIR /app
    
-   # Copy application files
-   COPY . .
-   
-   # Install dependencies
+   # Copy project files
+   COPY *.csproj .
    RUN dotnet restore
-   RUN dotnet publish -c Release -o out
+   
+   # Copy source code and build
+   COPY . .
+   RUN dotnet publish -c Release -o out --no-restore
+   
+   # Runtime image
+   FROM mcr.microsoft.com/dotnet/runtime:8.0-alpine
+   WORKDIR /app
+   COPY --from=build /app/out .
    
    # Set entry point
-   ENTRYPOINT ["dotnet", "out/MessageProcessor.dll"]
+   ENTRYPOINT ["dotnet", "MessageProcessor.dll"]
    EOF
    
    # Create a sample .NET application
@@ -237,7 +241,7 @@ echo "✅ Resource providers registered successfully"
        <Nullable>enable</Nullable>
      </PropertyGroup>
      <ItemGroup>
-       <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.15.0" />
+       <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.18.1" />
        <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
        <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />
      </ItemGroup>
@@ -249,7 +253,8 @@ echo "✅ Resource providers registered successfully"
    using Azure.Messaging.ServiceBus;
    using Microsoft.Extensions.Logging;
    
-   var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole());
+   var loggerFactory = LoggerFactory.Create(builder => 
+       builder.AddConsole().SetMinimumLevel(LogLevel.Information));
    var logger = loggerFactory.CreateLogger<Program>();
    
    var connectionString = Environment.GetEnvironmentVariable("SERVICE_BUS_CONNECTION_STRING");
@@ -261,37 +266,55 @@ echo "✅ Resource providers registered successfully"
        Environment.Exit(1);
    }
    
+   logger.LogInformation("Starting message processor for queue: {QueueName}", queueName);
+   
    var client = new ServiceBusClient(connectionString);
    var processor = client.CreateProcessor(queueName);
+   
+   var messagesProcessed = 0;
    
    processor.ProcessMessageAsync += async args =>
    {
        var message = args.Message;
-       logger.LogInformation($"Processing message: {message.Body}");
+       logger.LogInformation("Processing message: {MessageId}, Body: {Body}", 
+           message.MessageId, message.Body);
        
-       // Simulate processing work
-       await Task.Delay(1000);
-       
-       logger.LogInformation($"Message processed successfully: {message.MessageId}");
-       await args.CompleteMessageAsync(message);
+       try
+       {
+           // Simulate processing work
+           await Task.Delay(1000);
+           
+           messagesProcessed++;
+           logger.LogInformation("Message processed successfully: {MessageId} (Total: {Count})", 
+               message.MessageId, messagesProcessed);
+           
+           await args.CompleteMessageAsync(message);
+       }
+       catch (Exception ex)
+       {
+           logger.LogError(ex, "Error processing message: {MessageId}", message.MessageId);
+           await args.AbandonMessageAsync(message);
+       }
    };
    
    processor.ProcessErrorAsync += args =>
    {
-       logger.LogError($"Error processing message: {args.Exception}");
+       logger.LogError(args.Exception, "Error processing message from source: {Source}", 
+           args.ErrorSource);
        return Task.CompletedTask;
    };
    
    await processor.StartProcessingAsync();
    
-   // Keep the job alive until a message is processed
-   await Task.Delay(30000);
+   // Keep the job alive for processing messages
+   await Task.Delay(TimeSpan.FromSeconds(30));
    
    await processor.StopProcessingAsync();
    await processor.DisposeAsync();
    await client.DisposeAsync();
    
-   logger.LogInformation("Message processor completed");
+   logger.LogInformation("Message processor completed. Total messages processed: {Count}", 
+       messagesProcessed);
    EOF
    
    # Build and push image using ACR Build
@@ -361,35 +384,70 @@ echo "✅ Resource providers registered successfully"
        --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId \
        --output tsv)
    
-   # Create alert rule for job failures
-   az monitor metrics alert create \
-       --name "container-job-failure-alert" \
-       --resource-group ${RESOURCE_GROUP} \
-       --scopes "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/jobs/${JOB_NAME}" \
-       --condition "count static.Microsoft.App/jobs.JobExecutionCount > 0" \
-       --description "Alert when container job executions fail" \
-       --evaluation-frequency 5m \
-       --window-size 5m \
-       --severity 2
-   
-   echo "✅ Monitoring and alerting configured for Container Apps job"
+   echo "✅ Monitoring and logging configured for Container Apps job"
+   echo "Log Analytics Workspace ID: ${LOG_ANALYTICS_WORKSPACE}"
    ```
 
-   The job now has comprehensive monitoring with Log Analytics integration and automated alerting for failures, enabling proactive management and performance optimization of your event-driven workflows.
+   The job now has comprehensive monitoring with Log Analytics integration, enabling proactive management and performance optimization of your event-driven workflows.
 
 ## Validation & Testing
 
-1. **Send test messages to Service Bus queue**:
+1. **Create a simple test message sender**:
+
+   Since Azure CLI doesn't provide direct message sending capabilities, we'll create a simple .NET application to send test messages to the Service Bus queue.
 
    ```bash
-   # Send test messages to trigger job executions
-   for i in {1..5}; do
-       az servicebus queue message send \
-           --namespace-name ${SERVICE_BUS_NAMESPACE} \
-           --queue-name ${QUEUE_NAME} \
-           --resource-group ${RESOURCE_GROUP} \
-           --body "Test message $i - $(date)"
-   done
+   # Create a test message sender application
+   mkdir -p message-sender
+   cd message-sender
+   
+   # Create project file for sender
+   cat > MessageSender.csproj << 'EOF'
+   <Project Sdk="Microsoft.NET.Sdk">
+     <PropertyGroup>
+       <OutputType>Exe</OutputType>
+       <TargetFramework>net8.0</TargetFramework>
+       <ImplicitUsings>enable</ImplicitUsings>
+       <Nullable>enable</Nullable>
+     </PropertyGroup>
+     <ItemGroup>
+       <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.18.1" />
+     </ItemGroup>
+   </Project>
+   EOF
+   
+   # Create message sender code
+   cat > Program.cs << 'EOF'
+   using Azure.Messaging.ServiceBus;
+   
+   var connectionString = Environment.GetEnvironmentVariable("SERVICE_BUS_CONNECTION_STRING");
+   var queueName = Environment.GetEnvironmentVariable("QUEUE_NAME");
+   
+   if (string.IsNullOrEmpty(connectionString) || string.IsNullOrEmpty(queueName))
+   {
+       Console.WriteLine("Missing required environment variables");
+       Environment.Exit(1);
+   }
+   
+   await using var client = new ServiceBusClient(connectionString);
+   ServiceBusSender sender = client.CreateSender(queueName);
+   
+   // Send test messages
+   for (int i = 1; i <= 5; i++)
+   {
+       var message = new ServiceBusMessage($"Test message {i} - {DateTime.Now}");
+       await sender.SendMessageAsync(message);
+       Console.WriteLine($"Sent message {i}");
+   }
+   
+   Console.WriteLine("✅ All test messages sent successfully");
+   EOF
+   
+   # Build and run the sender
+   dotnet build
+   dotnet run
+   
+   cd ..
    
    echo "✅ Test messages sent to Service Bus queue"
    ```
@@ -403,17 +461,19 @@ echo "✅ Resource providers registered successfully"
        --resource-group ${RESOURCE_GROUP} \
        --output table
    
-   # Get job execution details
+   # Get the most recent job execution details
    JOB_EXECUTION_NAME=$(az containerapp job execution list \
        --name ${JOB_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query '[0].name' \
        --output tsv)
    
-   az containerapp job execution show \
-       --name ${JOB_EXECUTION_NAME} \
-       --job-name ${JOB_NAME} \
-       --resource-group ${RESOURCE_GROUP}
+   if [ ! -z "$JOB_EXECUTION_NAME" ]; then
+       az containerapp job execution show \
+           --name ${JOB_EXECUTION_NAME} \
+           --job-name ${JOB_NAME} \
+           --resource-group ${RESOURCE_GROUP}
+   fi
    ```
 
 3. **Check job execution logs**:
@@ -530,4 +590,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

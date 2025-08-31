@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Arc-enabled Data Services, Azure Database for PostgreSQL, Azure Event Grid, Azure Data Factory
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: hybrid-cloud, database-replication, postgresql, azure-arc, data-synchronization
 recipe-generator-version: 1.3
@@ -113,6 +113,9 @@ echo "✅ Environment prepared successfully"
    Azure Arc Data Controller serves as the management layer for Arc-enabled data services, providing the foundation for deploying and managing PostgreSQL instances on your Kubernetes cluster. This controller enables hybrid cloud management capabilities, allowing you to manage on-premises databases through Azure's control plane while maintaining data sovereignty and local performance.
 
    ```bash
+   # Generate random suffix for unique naming
+   RANDOM_SUFFIX=$(openssl rand -hex 3)
+   
    # Create service principal for Arc data controller
    ARC_SP_NAME="sp-arc-dc-${RANDOM_SUFFIX}"
    ARC_SP=$(az ad sp create-for-rbac \
@@ -287,7 +290,7 @@ echo "✅ Environment prepared successfully"
      "properties": {
        "type": "PostgreSql",
        "typeProperties": {
-         "connectionString": "Host=${POSTGRES_ENDPOINT};Database=postgres;Username=postgres;Password=P@ssw0rd123!"
+         "connectionString": "Server=${POSTGRES_ENDPOINT};Database=postgres;Port=5432;UID=postgres;Password=P@ssw0rd123!"
        }
      }
    }
@@ -298,8 +301,9 @@ echo "✅ Environment prepared successfully"
      "name": "AzurePostgreSQLLinkedService",
      "properties": {
        "type": "AzurePostgreSql",
+       "version": "1.0",
        "typeProperties": {
-         "connectionString": "Server=${AZURE_PG_NAME}.postgres.database.azure.com;Database=postgres;Port=5432;UID=pgadmin;Password=P@ssw0rd123!;SSL Mode=Require;"
+         "connectionString": "host=${AZURE_PG_NAME}.postgres.database.azure.com;database=postgres;port=5432;uid=pgadmin;password=P@ssw0rd123!"
        }
      }
    }
@@ -372,12 +376,12 @@ echo "✅ Environment prepared successfully"
        --name HybridPostgreSQLSync \
        --pipeline @adf-pipeline.json
    
-   # Create Event Grid trigger
+   # Create Event Grid trigger for custom events
    cat <<EOF > adf-trigger.json
    {
      "name": "EventGridSyncTrigger",
      "properties": {
-       "type": "BlobEventsTrigger",
+       "type": "CustomEventsTrigger",
        "pipelines": [
          {
            "pipelineReference": {
@@ -387,7 +391,7 @@ echo "✅ Environment prepared successfully"
          }
        ],
        "typeProperties": {
-         "blobPathBeginsWith": "/sync/",
+         "events": ["database_change"],
          "scope": "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventGrid/topics/${EVENTGRID_TOPIC}"
        }
      }
@@ -437,8 +441,8 @@ echo "✅ Environment prepared successfully"
        --name alert-replication-lag \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DBforPostgreSQL/flexibleServers/${AZURE_PG_NAME}" \
-       --condition "avg replication_lag_in_seconds > 300" \
-       --description "Alert when replication lag exceeds 5 minutes"
+       --condition "avg replica_lag_in_bytes > 1048576" \
+       --description "Alert when replication lag exceeds 1MB"
    
    echo "✅ Monitoring and alerting configured"
    ```
@@ -475,20 +479,17 @@ echo "✅ Environment prepared successfully"
 
    ```bash
    # Trigger a test pipeline run
-   az datafactory pipeline create-run \
+   RUN_ID=$(az datafactory pipeline create-run \
        --factory-name ${ADF_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --name HybridPostgreSQLSync
+       --name HybridPostgreSQLSync \
+       --query runId -o tsv)
    
    # Check pipeline run status
    az datafactory pipeline-run show \
        --factory-name ${ADF_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --run-id $(az datafactory pipeline-run query-by-factory \
-           --factory-name ${ADF_NAME} \
-           --resource-group ${RESOURCE_GROUP} \
-           --last-updated-after "2024-01-01T00:00:00Z" \
-           --query "[0].runId" -o tsv)
+       --run-id ${RUN_ID}
    ```
 
 4. Test end-to-end replication:
@@ -606,4 +607,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

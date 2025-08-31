@@ -4,12 +4,12 @@ id: 9d302df8
 category: serverless
 difficulty: 400
 subject: aws
-services: eventbridge, lambda, cloudwatch
+services: eventbridge, lambda, cloudwatch, route53
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: eventbridge, multi-region, disaster-recovery, event-replication, global-endpoints, serverless, advanced
 recipe-generator-version: 1.3
@@ -87,23 +87,24 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for EventBridge, Lambda, CloudWatch, and Route 53
+1. AWS account with appropriate permissions for EventBridge, Lambda, CloudWatch, Route 53, and IAM
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic knowledge of event-driven architectures and AWS cross-region networking
 4. Understanding of JSON event patterns and Lambda function development
 5. Estimated cost: $50-100/month for production workloads (depends on event volume and Lambda executions)
 
-> **Note**: Global endpoints are available in specific regions. Verify your target regions support this feature before implementation.
+> **Note**: EventBridge global endpoints are available in specific regions. Verify your target regions support this feature before implementation. See the [AWS EventBridge documentation](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-global-endpoints.html) for region availability.
 
 ## Preparation
 
 ```bash
 # Set environment variables for multi-region setup
+export AWS_REGION=$(aws configure get region)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+    --query Account --output text)
 export PRIMARY_REGION="us-east-1"
 export SECONDARY_REGION="us-west-2"
 export TERTIARY_REGION="eu-west-1"
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-    --query Account --output text)
 
 # Generate unique identifiers for resources
 RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
@@ -132,7 +133,85 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
 
 ## Steps
 
-1. **Create Custom Event Buses in All Regions**:
+1. **Create IAM Roles for Cross-Region Access**:
+
+   IAM roles provide secure, temporary credentials for AWS services to interact with resources across regions and accounts. The EventBridge cross-region role enables the service to deliver events from one region's event bus to another region's event bus. Lambda execution roles provide the necessary permissions for functions to write logs and interact with other AWS services during event processing.
+
+   ```bash
+   # Create cross-region EventBridge role
+   cat > eventbridge-cross-region-trust-policy.json << 'EOF'
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Principal": {
+                   "Service": "events.amazonaws.com"
+               },
+               "Action": "sts:AssumeRole"
+           }
+       ]
+   }
+   EOF
+   
+   # Create cross-region EventBridge permissions policy
+   cat > eventbridge-cross-region-permissions.json << 'EOF'
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "events:PutEvents"
+               ],
+               "Resource": [
+                   "arn:aws:events:*:*:event-bus/*"
+               ]
+           }
+       ]
+   }
+   EOF
+   
+   # Create the cross-region role
+   aws iam create-role \
+       --role-name eventbridge-cross-region-role \
+       --assume-role-policy-document file://eventbridge-cross-region-trust-policy.json
+   
+   aws iam put-role-policy \
+       --role-name eventbridge-cross-region-role \
+       --policy-name EventBridgeCrossRegionPolicy \
+       --policy-document file://eventbridge-cross-region-permissions.json
+   
+   # Create Lambda execution role
+   aws iam create-role \
+       --role-name lambda-execution-role \
+       --assume-role-policy-document '{
+           "Version": "2012-10-17",
+           "Statement": [
+               {
+                   "Effect": "Allow",
+                   "Principal": {
+                       "Service": "lambda.amazonaws.com"
+                   },
+                   "Action": "sts:AssumeRole"
+               }
+           ]
+       }'
+   
+   aws iam attach-role-policy \
+       --role-name lambda-execution-role \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   # Wait for role propagation
+   echo "Waiting 10 seconds for IAM role propagation..."
+   sleep 10
+   
+   echo "✅ IAM roles created for cross-region access"
+   ```
+
+   The IAM roles are now established with least-privilege access policies, enabling secure cross-region event delivery and Lambda function execution. These roles use AWS-managed policies where possible and custom policies for specific cross-region requirements. The security model ensures that services can only access the resources they need for proper operation.
+
+2. **Create Custom Event Buses in All Regions**:
 
    Custom event buses provide isolated namespaces for events within each region, enabling you to segregate different application events and apply region-specific routing rules. EventBridge custom buses support up to 300 rules per bus and provide enhanced security through resource-based policies and KMS encryption. Creating buses in multiple regions establishes the foundation for cross-region event replication and ensures events can be processed locally within each region for optimal performance.
 
@@ -166,18 +245,72 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
 
    The custom event buses are now operational across all three regions with KMS encryption enabled for data protection. Each bus can independently process events while maintaining the ability to receive replicated events from other regions. This multi-region foundation enables both local processing and cross-region disaster recovery capabilities.
 
-2. **Create Lambda Functions for Event Processing**:
+3. **Configure Event Bus Permissions**:
+
+   Resource-based policies on event buses control which principals can publish events to each bus, providing an additional layer of security beyond IAM roles. These policies explicitly allow cross-region access from the same AWS account while maintaining security boundaries. The permissions enable EventBridge rules in one region to successfully deliver events to event buses in other regions.
+
+   ```bash
+   # Apply cross-region permissions to all event buses
+   aws events put-permission \
+       --principal ${AWS_ACCOUNT_ID} \
+       --action events:PutEvents \
+       --statement-id "AllowCrossRegionAccess" \
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${PRIMARY_REGION}
+   
+   aws events put-permission \
+       --principal ${AWS_ACCOUNT_ID} \
+       --action events:PutEvents \
+       --statement-id "AllowCrossRegionAccess" \
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${SECONDARY_REGION}
+   
+   aws events put-permission \
+       --principal ${AWS_ACCOUNT_ID} \
+       --action events:PutEvents \
+       --statement-id "AllowCrossRegionAccess" \
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${TERTIARY_REGION}
+   
+   # Allow EventBridge service access across regions
+   aws events put-permission \
+       --principal events.amazonaws.com \
+       --action events:PutEvents \
+       --statement-id "AllowEventBridgeService" \
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${PRIMARY_REGION}
+   
+   aws events put-permission \
+       --principal events.amazonaws.com \
+       --action events:PutEvents \
+       --statement-id "AllowEventBridgeService" \
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${SECONDARY_REGION}
+   
+   aws events put-permission \
+       --principal events.amazonaws.com \
+       --action events:PutEvents \
+       --statement-id "AllowEventBridgeService" \
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${TERTIARY_REGION}
+   
+   echo "✅ Event bus permissions configured for cross-region access"
+   ```
+
+   Event bus permissions are now configured to allow secure cross-region event delivery while maintaining proper access controls. The resource-based policies work in conjunction with IAM roles to provide defense-in-depth security for event routing. This configuration enables the multi-region replication while ensuring that only authorized services can publish events to each bus.
+
+4. **Create Lambda Functions for Event Processing**:
 
    AWS Lambda provides serverless compute for event processing, automatically scaling from zero to thousands of concurrent executions based on incoming event volume. Deploying identical Lambda functions across multiple regions ensures that events can be processed regardless of which region receives them. The functions include region-aware logic to handle events appropriately based on their geographic location and business requirements.
 
    ```bash
-   # Create Lambda function code
+   # Create Lambda function code with updated Python runtime
    cat > lambda_function.py << 'EOF'
    import json
    import boto3
    import os
    from datetime import datetime
-
+   
    def lambda_handler(event, context):
        region = os.environ.get('AWS_REGION', 'unknown')
        
@@ -185,8 +318,8 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
        print(f"Processing event in region {region}")
        print(f"Event: {json.dumps(event, indent=2)}")
        
-       # Extract event details
-       for record in event.get('Records', []):
+       # Extract event details for EventBridge events
+       for record in event.get('Records', [event]):
            event_source = record.get('source', 'unknown')
            event_detail_type = record.get('detail-type', 'unknown')
            event_detail = record.get('detail', {})
@@ -202,7 +335,7 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
                'region': region
            })
        }
-
+   
    def process_business_event(source, detail_type, detail, region):
        """Process business events with region-specific logic"""
        
@@ -232,7 +365,7 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
    # Deploy Lambda function to primary region
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -243,7 +376,7 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
    # Deploy Lambda function to secondary region
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -254,7 +387,7 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
    # Deploy Lambda function to tertiary region
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -265,11 +398,9 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
    echo "✅ Lambda functions deployed to all regions"
    ```
 
-   The Lambda functions are now deployed across all regions with identical business logic but region-specific processing capabilities. Each function can handle events locally while maintaining visibility into which region processed each event. This distributed processing model ensures low latency and high availability for event-driven workloads.
+   The Lambda functions are now deployed across all regions with identical business logic but region-specific processing capabilities using the updated Python 3.12 runtime. Each function can handle events locally while maintaining visibility into which region processed each event. This distributed processing model ensures low latency and high availability for event-driven workloads.
 
-> **Warning**: Ensure IAM roles are created before deploying Lambda functions, as the functions will fail to deploy without proper execution roles.
-
-3. **Create Cross-Region Event Rules**:
+5. **Create Cross-Region Event Rules**:
 
    EventBridge rules define which events should be processed and where they should be routed based on event patterns. The primary region rule includes cross-region replication logic to ensure critical events are distributed to all regions for processing and backup. Secondary and tertiary region rules focus on local processing, creating an efficient hybrid approach that balances replication needs with processing efficiency.
 
@@ -315,7 +446,7 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
 
    The event rules are now configured to filter events based on business priority and route them appropriately across regions. High and critical priority events are replicated cross-region, while standard events may be processed only locally. This intelligent routing strategy optimizes costs while ensuring business-critical events have the highest availability.
 
-4. **Configure Cross-Region Targets**:
+6. **Configure Cross-Region Targets**:
 
    EventBridge targets define the destination services that process events when rules are triggered. Cross-region targets enable events to be sent from one region's event bus to another region's event bus, creating the replication mechanism essential for disaster recovery. This configuration requires proper IAM roles to authorize cross-region event delivery and ensure secure, reliable event routing.
 
@@ -337,8 +468,7 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
            },
            {
                "Id": "3",
-               "Arn": "arn:aws:lambda:'${PRIMARY_REGION}':'${AWS_ACCOUNT_ID}':function:'${LAMBDA_FUNCTION_NAME}'",
-               "RoleArn": "arn:aws:iam::'${AWS_ACCOUNT_ID}':role/eventbridge-lambda-role"
+               "Arn": "arn:aws:lambda:'${PRIMARY_REGION}':'${AWS_ACCOUNT_ID}':function:'${LAMBDA_FUNCTION_NAME}'"
            }
        ]' \
        --region ${PRIMARY_REGION}
@@ -355,6 +485,15 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
        ]' \
        --region ${SECONDARY_REGION}
    
+   # Add Lambda permission for EventBridge in secondary region
+   aws lambda add-permission \
+       --function-name ${LAMBDA_FUNCTION_NAME} \
+       --statement-id "AllowEventBridge" \
+       --action "lambda:InvokeFunction" \
+       --principal "events.amazonaws.com" \
+       --source-arn "arn:aws:events:${SECONDARY_REGION}:${AWS_ACCOUNT_ID}:rule/${EVENT_BUS_NAME}/local-processing-rule" \
+       --region ${SECONDARY_REGION}
+   
    # Add Lambda targets to tertiary region rule
    aws events put-targets \
        --rule local-processing-rule \
@@ -367,12 +506,21 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
        ]' \
        --region ${TERTIARY_REGION}
    
+   # Add Lambda permission for EventBridge in tertiary region
+   aws lambda add-permission \
+       --function-name ${LAMBDA_FUNCTION_NAME} \
+       --statement-id "AllowEventBridge" \
+       --action "lambda:InvokeFunction" \
+       --principal "events.amazonaws.com" \
+       --source-arn "arn:aws:events:${TERTIARY_REGION}:${AWS_ACCOUNT_ID}:rule/${EVENT_BUS_NAME}/local-processing-rule" \
+       --region ${TERTIARY_REGION}
+   
    echo "✅ Cross-region targets configured for event replication"
    ```
 
    The cross-region targets are now established, enabling automatic event replication from the primary region to secondary and tertiary regions. Each target includes IAM role specifications to ensure secure cross-region access. This configuration creates a robust event distribution network that can maintain operations even if individual regions become unavailable.
 
-5. **Create Global Endpoint with Route 53 Health Check**:
+7. **Create Global Endpoint with Route 53 Health Check**:
 
    EventBridge global endpoints provide automatic failover capabilities by monitoring region health and routing events to available regions. Route 53 health checks continuously monitor the EventBridge service endpoint in each region, detecting failures within minutes. When a primary region fails, the global endpoint automatically redirects traffic to the secondary region, ensuring minimal service disruption.
 
@@ -424,9 +572,9 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
    echo "✅ Global endpoint created with health check: ${GLOBAL_ENDPOINT_ARN}"
    ```
 
-   The global endpoint is now active with automated health monitoring, providing intelligent traffic routing based on real-time region availability. Applications can publish events to a single global endpoint URL without needing to handle region failover logic. This abstraction layer simplifies application architecture while providing enterprise-grade disaster recovery capabilities.
+   The global endpoint is now active with automated health monitoring, providing intelligent traffic routing based on real-time region availability. Applications can publish events to a single global endpoint URL without needing to handle region failover logic. This abstraction layer simplifies application architecture while providing enterprise-grade disaster recovery capabilities with RTO and RPO of approximately 6-7 minutes.
 
-6. **Set Up CloudWatch Monitoring and Alarms**:
+8. **Set Up CloudWatch Monitoring and Alarms**:
 
    CloudWatch monitoring provides comprehensive visibility into EventBridge and Lambda performance metrics, enabling proactive identification of issues before they impact business operations. Alarms trigger automated notifications when failure thresholds are exceeded, allowing operations teams to respond quickly to service degradation. The dashboard consolidates metrics from multiple regions, providing a unified view of global event processing health.
 
@@ -502,242 +650,113 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
 
    Comprehensive monitoring is now in place with automated alerting for both EventBridge rule failures and Lambda function errors. The dashboard provides real-time visibility into system performance across all regions. This monitoring foundation enables proactive maintenance and rapid response to any service issues that might affect event processing reliability.
 
-7. **Create IAM Roles for Cross-Region Access**:
+9. **Create Event Pattern Templates for Different Event Types**:
 
-   IAM roles provide secure, temporary credentials for AWS services to interact with resources across regions and accounts. The EventBridge cross-region role enables the service to deliver events from one region's event bus to another region's event bus. Lambda execution roles provide the necessary permissions for functions to write logs and interact with other AWS services during event processing.
-
-   ```bash
-   # Create cross-region EventBridge role
-   cat > eventbridge-cross-region-trust-policy.json << 'EOF'
-   {
-       "Version": "2012-10-17",
-       "Statement": [
-           {
-               "Effect": "Allow",
-               "Principal": {
-                   "Service": "events.amazonaws.com"
-               },
-               "Action": "sts:AssumeRole"
-           }
-       ]
-   }
-   EOF
-   
-   # Create cross-region EventBridge permissions policy
-   cat > eventbridge-cross-region-permissions.json << 'EOF'
-   {
-       "Version": "2012-10-17",
-       "Statement": [
-           {
-               "Effect": "Allow",
-               "Action": [
-                   "events:PutEvents"
-               ],
-               "Resource": [
-                   "arn:aws:events:*:*:event-bus/*"
-               ]
-           }
-       ]
-   }
-   EOF
-   
-   # Create the cross-region role
-   aws iam create-role \
-       --role-name eventbridge-cross-region-role \
-       --assume-role-policy-document file://eventbridge-cross-region-trust-policy.json
-   
-   aws iam put-role-policy \
-       --role-name eventbridge-cross-region-role \
-       --policy-name EventBridgeCrossRegionPolicy \
-       --policy-document file://eventbridge-cross-region-permissions.json
-   
-   # Create Lambda execution role
-   aws iam create-role \
-       --role-name lambda-execution-role \
-       --assume-role-policy-document '{
-           "Version": "2012-10-17",
-           "Statement": [
-               {
-                   "Effect": "Allow",
-                   "Principal": {
-                       "Service": "lambda.amazonaws.com"
-                   },
-                   "Action": "sts:AssumeRole"
-               }
-           ]
-       }'
-   
-   aws iam attach-role-policy \
-       --role-name lambda-execution-role \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-   
-   echo "✅ IAM roles created for cross-region access"
-   ```
-
-   The IAM roles are now established with least-privilege access policies, enabling secure cross-region event delivery and Lambda function execution. These roles use AWS-managed policies where possible and custom policies for specific cross-region requirements. The security model ensures that services can only access the resources they need for proper operation.
-
-8. **Configure Event Bus Permissions**:
-
-   Resource-based policies on event buses control which principals can publish events to each bus, providing an additional layer of security beyond IAM roles. These policies explicitly allow cross-region access from the same AWS account while maintaining security boundaries. The permissions enable EventBridge rules in one region to successfully deliver events to event buses in other regions.
+   Event pattern templates provide reusable filtering logic for different categories of business events, enabling sophisticated routing based on event content, source, and metadata. These templates support complex filtering scenarios such as routing financial events above certain thresholds, user events with specific risk levels, or system events with particular severity levels. This pattern-based approach enables fine-grained control over which events are replicated across regions.
 
    ```bash
-   # Create resource-based policy for cross-region access
-   cat > event-bus-policy.json << EOF
+   # Create event pattern templates
+   cat > financial-events-pattern.json << 'EOF'
    {
-       "Version": "2012-10-17",
-       "Statement": [
-           {
-               "Sid": "AllowCrossRegionAccess",
-               "Effect": "Allow",
-               "Principal": {
-                   "AWS": "arn:aws:iam::${AWS_ACCOUNT_ID}:root"
-               },
-               "Action": "events:PutEvents",
-               "Resource": "arn:aws:events:*:${AWS_ACCOUNT_ID}:event-bus/${EVENT_BUS_NAME}"
-           },
-           {
-               "Sid": "AllowEventBridgeService",
-               "Effect": "Allow",
-               "Principal": {
-                   "Service": "events.amazonaws.com"
-               },
-               "Action": "events:PutEvents",
-               "Resource": "arn:aws:events:*:${AWS_ACCOUNT_ID}:event-bus/${EVENT_BUS_NAME}"
-           }
-       ]
-   }
-   EOF
-   
-   # Apply policy to event buses in all regions
-   aws events put-permission \
-       --principal ${AWS_ACCOUNT_ID} \
-       --action events:PutEvents \
-       --statement-id "AllowCrossRegionAccess" \
-       --event-bus-name ${EVENT_BUS_NAME} \
-       --region ${PRIMARY_REGION}
-   
-   aws events put-permission \
-       --principal ${AWS_ACCOUNT_ID} \
-       --action events:PutEvents \
-       --statement-id "AllowCrossRegionAccess" \
-       --event-bus-name ${EVENT_BUS_NAME} \
-       --region ${SECONDARY_REGION}
-   
-   aws events put-permission \
-       --principal ${AWS_ACCOUNT_ID} \
-       --action events:PutEvents \
-       --statement-id "AllowCrossRegionAccess" \
-       --event-bus-name ${EVENT_BUS_NAME} \
-       --region ${TERTIARY_REGION}
-   
-   echo "✅ Event bus permissions configured for cross-region access"
-   ```
-
-   Event bus permissions are now configured to allow secure cross-region event delivery while maintaining proper access controls. The resource-based policies work in conjunction with IAM roles to provide defense-in-depth security for event routing. This configuration enables the multi-region replication while ensuring that only authorized services can publish events to each bus.
-
-9. **Enable Event Replication and Test Configuration**:
-
-   Testing validates that the multi-region event replication system functions correctly by sending sample events through the global endpoint and verifying they are processed in all target regions. This validation step confirms that the entire event flow works as designed, from event publication through cross-region replication to final processing. Successful testing indicates the system is ready for production workloads.
-
-   ```bash
-   # Create test event
-   cat > test-event.json << 'EOF'
-   [
-       {
-           "Source": "finance.transactions",
-           "DetailType": "Transaction Created",
-           "Detail": "{\"transactionId\":\"tx-12345\",\"amount\":\"1000.00\",\"currency\":\"USD\",\"priority\":\"high\"}",
-           "EventBusName": "'${EVENT_BUS_NAME}'"
+       "source": ["finance.transactions", "finance.payments"],
+       "detail-type": ["Transaction Created", "Payment Processed", "Fraud Detected"],
+       "detail": {
+           "priority": ["high", "critical"],
+           "amount": [{"numeric": [">=", 1000]}]
        }
-   ]
+   }
    EOF
    
-   # Send test event using global endpoint
-   aws events put-events \
-       --entries file://test-event.json \
-       --endpoint-id ${GLOBAL_ENDPOINT_NAME} \
+   cat > user-events-pattern.json << 'EOF'
+   {
+       "source": ["user.management", "user.authentication"],
+       "detail-type": ["User Login", "User Logout", "Password Reset"],
+       "detail": {
+           "risk_level": ["medium", "high"],
+           "region": ["us-east-1", "us-west-2", "eu-west-1"]
+       }
+   }
+   EOF
+   
+   cat > system-events-pattern.json << 'EOF'
+   {
+       "source": ["system.monitoring", "system.alerts"],
+       "detail-type": ["System Error", "Performance Alert", "Security Incident"],
+       "detail": {
+           "severity": ["warning", "error", "critical"]
+       }
+   }
+   EOF
+   
+   # Create specialized rules for different event types
+   aws events put-rule \
+       --name "financial-events-rule" \
+       --event-pattern file://financial-events-pattern.json \
+       --state ENABLED \
+       --event-bus-name ${EVENT_BUS_NAME} \
        --region ${PRIMARY_REGION}
    
-   # Wait for processing
-   sleep 30
+   aws events put-rule \
+       --name "user-events-rule" \
+       --event-pattern file://user-events-pattern.json \
+       --state ENABLED \
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${PRIMARY_REGION}
    
-   # Check Lambda function logs in all regions
-   aws logs describe-log-groups \
-       --log-group-name-prefix "/aws/lambda/${LAMBDA_FUNCTION_NAME}" \
-       --region ${PRIMARY_REGION} \
-       --query 'logGroups[0].logGroupName' --output text
+   aws events put-rule \
+       --name "system-events-rule" \
+       --event-pattern file://system-events-pattern.json \
+       --state ENABLED \
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${PRIMARY_REGION}
    
-   echo "✅ Test event sent and multi-region replication configured"
+   echo "✅ Event pattern templates created for different event types"
    ```
 
-   The test event has been successfully processed across all regions, confirming that the cross-region replication mechanism is working correctly. Lambda function logs in each region will show the event processing, demonstrating that events published to the global endpoint are properly distributed and processed. This validates the complete end-to-end event flow from publication to processing.
+   The event pattern templates are now active and ready to filter events based on business-specific criteria. These patterns enable intelligent event routing where different types of events can be processed differently across regions. This granular control helps optimize costs by replicating only the most critical events while ensuring all regions can handle local event processing requirements.
 
-10. **Create Event Pattern Templates for Different Event Types**:
+10. **Enable Event Replication and Test Configuration**:
 
-    Event pattern templates provide reusable filtering logic for different categories of business events, enabling sophisticated routing based on event content, source, and metadata. These templates support complex filtering scenarios such as routing financial events above certain thresholds, user events with specific risk levels, or system events with particular severity levels. This pattern-based approach enables fine-grained control over which events are replicated across regions.
+    Testing validates that the multi-region event replication system functions correctly by sending sample events through the global endpoint and verifying they are processed in all target regions. This validation step confirms that the entire event flow works as designed, from event publication through cross-region replication to final processing. Successful testing indicates the system is ready for production workloads.
 
     ```bash
-    # Create event pattern templates
-    cat > financial-events-pattern.json << 'EOF'
-    {
-        "source": ["finance.transactions", "finance.payments"],
-        "detail-type": ["Transaction Created", "Payment Processed", "Fraud Detected"],
-        "detail": {
-            "priority": ["high", "critical"],
-            "amount": [{"numeric": [">=", 1000]}]
+    # Create test event
+    cat > test-event.json << 'EOF'
+    [
+        {
+            "Source": "finance.transactions",
+            "DetailType": "Transaction Created",
+            "Detail": "{\"transactionId\":\"tx-12345\",\"amount\":\"1000.00\",\"currency\":\"USD\",\"priority\":\"high\"}",
+            "EventBusName": "'${EVENT_BUS_NAME}'"
         }
-    }
+    ]
     EOF
     
-    cat > user-events-pattern.json << 'EOF'
-    {
-        "source": ["user.management", "user.authentication"],
-        "detail-type": ["User Login", "User Logout", "Password Reset"],
-        "detail": {
-            "risk_level": ["medium", "high"],
-            "region": ["us-east-1", "us-west-2", "eu-west-1"]
-        }
-    }
-    EOF
-    
-    cat > system-events-pattern.json << 'EOF'
-    {
-        "source": ["system.monitoring", "system.alerts"],
-        "detail-type": ["System Error", "Performance Alert", "Security Incident"],
-        "detail": {
-            "severity": ["warning", "error", "critical"]
-        }
-    }
-    EOF
-    
-    # Create specialized rules for different event types
-    aws events put-rule \
-        --name "financial-events-rule" \
-        --event-pattern file://financial-events-pattern.json \
-        --state ENABLED \
-        --event-bus-name ${EVENT_BUS_NAME} \
+    # Send test event using the event bus directly first
+    aws events put-events \
+        --entries file://test-event.json \
         --region ${PRIMARY_REGION}
     
-    aws events put-rule \
-        --name "user-events-rule" \
-        --event-pattern file://user-events-pattern.json \
-        --state ENABLED \
-        --event-bus-name ${EVENT_BUS_NAME} \
-        --region ${PRIMARY_REGION}
+    # Wait for processing
+    sleep 30
     
-    aws events put-rule \
-        --name "system-events-rule" \
-        --event-pattern file://system-events-pattern.json \
-        --state ENABLED \
-        --event-bus-name ${EVENT_BUS_NAME} \
-        --region ${PRIMARY_REGION}
+    # Check Lambda function logs in all regions
+    echo "Checking Lambda logs in all regions..."
+    for region in ${PRIMARY_REGION} ${SECONDARY_REGION} ${TERTIARY_REGION}; do
+        echo "=== Checking ${region} ==="
+        LOG_GROUP=$(aws logs describe-log-groups \
+            --log-group-name-prefix "/aws/lambda/${LAMBDA_FUNCTION_NAME}" \
+            --region ${region} \
+            --query 'logGroups[0].logGroupName' --output text)
+        echo "Log group: ${LOG_GROUP}"
+    done
     
-    echo "✅ Event pattern templates created for different event types"
+    echo "✅ Test event sent and multi-region replication configured"
     ```
 
-    The event pattern templates are now active and ready to filter events based on business-specific criteria. These patterns enable intelligent event routing where different types of events can be processed differently across regions. This granular control helps optimize costs by replicating only the most critical events while ensuring all regions can handle local event processing requirements.
+    The test event has been successfully processed across all regions, confirming that the cross-region replication mechanism is working correctly. Lambda function logs in each region will show the event processing, demonstrating that events published to the primary region are properly distributed and processed. This validates the complete end-to-end event flow from publication to processing.
 
-> **Tip**: Use numeric comparison operators in event patterns to filter events based on transaction amounts, user counts, or other business metrics. See [EventBridge Event Patterns](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-event-patterns.html) for advanced filtering options.
+> **Tip**: Use event replication judiciously as it increases your event processing costs. Consider implementing intelligent filtering based on event priority or type to optimize costs while maintaining business continuity. See the [AWS EventBridge Event Patterns documentation](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-event-patterns.html) for advanced filtering options.
 
 ## Validation & Testing
 
@@ -861,9 +880,24 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
        --event-bus-name ${EVENT_BUS_NAME} \
        --region ${TERTIARY_REGION}
    
-   # Delete rules in all regions
+   # Delete all rules in all regions
    aws events delete-rule \
        --name cross-region-replication-rule \
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${PRIMARY_REGION}
+   
+   aws events delete-rule \
+       --name financial-events-rule \
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${PRIMARY_REGION}
+   
+   aws events delete-rule \
+       --name user-events-rule \
+       --event-bus-name ${EVENT_BUS_NAME} \
+       --region ${PRIMARY_REGION}
+   
+   aws events delete-rule \
+       --name system-events-rule \
        --event-bus-name ${EVENT_BUS_NAME} \
        --region ${PRIMARY_REGION}
    
@@ -962,7 +996,7 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
    rm -f lambda_function.py lambda_function.zip
    rm -f eventbridge-cross-region-trust-policy.json 
    rm -f eventbridge-cross-region-permissions.json
-   rm -f event-bus-policy.json test-event.json
+   rm -f test-event.json
    rm -f financial-events-pattern.json user-events-pattern.json system-events-pattern.json
    
    echo "✅ IAM roles and local files cleaned up"
@@ -970,30 +1004,37 @@ echo "✅ Environment prepared with random suffix: ${RANDOM_SUFFIX}"
 
 ## Discussion
 
-This multi-region event replication architecture provides robust disaster recovery capabilities for event-driven applications. EventBridge's global endpoints automatically handle failover between regions, typically achieving RTO (Recovery Time Objective) of 6-7 minutes and RPO (Recovery Point Objective) of 6-7 minutes when properly configured. The architecture supports business continuity requirements by ensuring events are processed even during regional outages.
+This multi-region event replication architecture provides robust disaster recovery capabilities for event-driven applications. EventBridge's global endpoints automatically handle failover between regions, typically achieving RTO (Recovery Time Objective) and RPO (Recovery Point Objective) of 360 seconds with a maximum of 420 seconds when properly configured with prescriptive alarm configuration. The architecture supports business continuity requirements by ensuring events are processed even during regional outages.
 
-The event replication mechanism works by sending all events to both primary and secondary regions simultaneously. When the primary region fails, Route 53 health checks detect the failure and redirect traffic to the secondary region. The global endpoint ensures that applications can continue publishing events without code changes, while the replicated event buses maintain processing capabilities across regions.
+The event replication mechanism works by enabling event replication on the global endpoint, which sends all custom events to both primary and secondary regions simultaneously using managed rules. When the primary region fails, Route 53 health checks detect the failure and redirect traffic to the secondary region. The global endpoint ensures that applications can continue publishing events without code changes, while the replicated event buses maintain processing capabilities across regions.
 
-Cross-region event filtering allows for sophisticated routing strategies where different event types can be processed by different regions based on compliance requirements, data residency laws, or performance optimization. The pattern-based filtering ensures that only relevant events are replicated, reducing costs and improving performance.
+Cross-region event filtering allows for sophisticated routing strategies where different event types can be processed by different regions based on compliance requirements, data residency laws, or performance optimization. The pattern-based filtering ensures that only relevant events are replicated, reducing costs and improving performance. Advanced numeric comparison operators in event patterns enable filtering based on transaction amounts, user counts, or other business metrics.
 
-Security considerations include proper IAM role configuration for cross-region access, KMS encryption for event data at rest, and VPC endpoints for private network access. The architecture supports audit trails through CloudTrail integration and provides comprehensive monitoring through CloudWatch metrics and alarms.
+Security considerations include proper IAM role configuration for cross-region access following the principle of least privilege, KMS encryption for event data at rest, and resource-based policies for event buses. The architecture supports comprehensive audit trails through CloudTrail integration and provides comprehensive monitoring through CloudWatch metrics and alarms. The updated Lambda runtime (Python 3.12) provides improved performance and security features for event processing.
 
-> **Tip**: Use event replication judiciously as it doubles your event processing costs. Consider implementing intelligent filtering based on event priority or type to optimize costs while maintaining business continuity.
+> **Warning**: Event replication increases your monthly costs as events are processed in multiple regions. Monitor your usage and costs regularly using AWS Cost Explorer to ensure the disaster recovery benefits justify the additional expenses.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Implement Event Archive and Replay**: Create automated event archiving across regions with replay capabilities for disaster recovery testing and compliance auditing.
+1. **Implement Event Archive and Replay**: Create automated event archiving across regions with replay capabilities for disaster recovery testing and compliance auditing using EventBridge Archive and Replay features.
 
-2. **Build Advanced Event Filtering**: Develop content-based routing with machine learning-powered event classification to automatically route events to appropriate regions based on data sensitivity or regulatory requirements.
+2. **Build Advanced Event Filtering**: Develop content-based routing with machine learning-powered event classification using Amazon Comprehend to automatically route events to appropriate regions based on data sensitivity or regulatory requirements.
 
-3. **Create Event Lineage Tracking**: Implement distributed tracing across regions to track event flow and processing status for compliance and debugging purposes.
+3. **Create Event Lineage Tracking**: Implement distributed tracing across regions to track event flow and processing status using AWS X-Ray for compliance and debugging purposes.
 
-4. **Develop Automated Failover Testing**: Build chaos engineering workflows that automatically test failover scenarios and validate recovery procedures across regions.
+4. **Develop Automated Failover Testing**: Build chaos engineering workflows using AWS Fault Injection Simulator that automatically test failover scenarios and validate recovery procedures across regions.
 
-5. **Implement Event Deduplication**: Create intelligent event deduplication mechanisms to handle duplicate events that may occur during failover scenarios while maintaining exactly-once processing guarantees.
+5. **Implement Event Deduplication**: Create intelligent event deduplication mechanisms using DynamoDB Global Tables to handle duplicate events that may occur during failover scenarios while maintaining exactly-once processing guarantees.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Vertex AI, BigQuery, Cloud Functions, Cloud Scheduler
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: machine learning, time series, forecasting, analytics, automation
 recipe-generator-version: 1.3
@@ -90,7 +90,6 @@ graph TB
 export PROJECT_ID="timesfm-forecasting-$(date +%s)"
 export REGION="us-central1"
 export DATASET_NAME="financial_forecasting"
-export BUCKET_NAME="timesfm-data-${PROJECT_ID}"
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -102,12 +101,12 @@ gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
 
 # Enable required Google Cloud APIs
-gcloud services enable bigquery.googleapis.com
-gcloud services enable aiplatform.googleapis.com
-gcloud services enable cloudfunctions.googleapis.com
-gcloud services enable cloudscheduler.googleapis.com
-gcloud services enable pubsub.googleapis.com
-gcloud services enable storage.googleapis.com
+gcloud services enable bigquery.googleapis.com \
+    aiplatform.googleapis.com \
+    cloudfunctions.googleapis.com \
+    cloudscheduler.googleapis.com \
+    pubsub.googleapis.com \
+    storage.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Region set to: ${REGION}"
@@ -218,7 +217,8 @@ def process_financial_data(request):
             return {'error': 'Missing required fields'}, 400
         
         # Insert data into BigQuery
-        table_id = f"{client.project}.financial_forecasting.stock_prices"
+        project_id = client.project
+        table_id = f"{project_id}.financial_forecasting.stock_prices"
         
         rows_to_insert = [{
             'date': request_json['date'],
@@ -280,22 +280,24 @@ EOF
    Deploying the Cloud Function with appropriate IAM permissions and resource allocation ensures secure and performant data processing. The serverless architecture automatically scales based on incoming data volume while maintaining low latency for real-time financial data processing workflows.
 
    ```bash
-   # Deploy the Cloud Function
+   # Deploy the Cloud Function (2nd generation)
    gcloud functions deploy ${FUNCTION_NAME} \
+       --gen2 \
        --runtime=python311 \
+       --source=/tmp/forecast-function \
+       --entry-point=process_financial_data \
        --trigger=http \
        --allow-unauthenticated \
        --memory=512MB \
        --timeout=300s \
        --set-env-vars=PROJECT_ID=${PROJECT_ID} \
-       --region=${REGION} \
-       --source=/tmp/forecast-function \
-       --entry-point=process_financial_data
+       --region=${REGION}
    
    # Get the function URL
    FUNCTION_URL=$(gcloud functions describe ${FUNCTION_NAME} \
        --region=${REGION} \
-       --format="value(httpsTrigger.url)")
+       --gen2 \
+       --format="value(serviceConfig.uri)")
    
    echo "✅ Cloud Function deployed successfully"
    echo "Function URL: ${FUNCTION_URL}"
@@ -338,53 +340,24 @@ EOF
    TimesFM represents Google Research's breakthrough in foundation models for time series forecasting, pre-trained on billions of time points from diverse real-world datasets. Using BigQuery's AI.FORECAST function with TimesFM eliminates the complexity of model training and deployment while delivering state-of-the-art forecasting accuracy comparable to traditional statistical methods.
 
    ```bash
-   # Create forecasting query using TimesFM
+   # Create forecasting query using TimesFM with AI.FORECAST
    bq query --use_legacy_sql=false "
-   CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET_NAME}.stock_forecasts\` AS
+   CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET_NAME}.timesfm_forecasts\` AS
    SELECT 
      symbol,
      forecast_timestamp,
      forecast_value,
      prediction_interval_lower_bound,
      prediction_interval_upper_bound,
-     CURRENT_TIMESTAMP() as forecast_created_at
-   FROM 
-     ML.FORECAST(
-       MODEL \`${PROJECT_ID}.${DATASET_NAME}.timesfm_model\`,
-       STRUCT(
-         7 as horizon,  -- Forecast 7 days ahead
-         0.95 as confidence_level
-       )
-     )"
-   
-   # Alternative: Use AI.FORECAST directly with TimesFM (recommended approach)
-   bq query --use_legacy_sql=false "
-   CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET_NAME}.timesfm_forecasts\` AS
-   WITH forecast_input AS (
-     SELECT 
-       symbol,
-       date as time_series_timestamp,
-       close_price as time_series_data
-     FROM \`${PROJECT_ID}.${DATASET_NAME}.stock_prices\`
-     WHERE symbol IN ('AAPL', 'GOOGL')
-     AND date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
-   )
-   SELECT 
-     symbol,
-     forecast_timestamp,
-     forecast_value,
-     prediction_interval_lower_bound,
-     prediction_interval_upper_bound
-   FROM ML.AI_FORECAST(
-     (SELECT * FROM forecast_input),
-     STRUCT(
-       'time_series_timestamp' as time_column,
-       'time_series_data' as data_column,
-       ['symbol'] as group_columns,
-       7 as horizon,
-       0.95 as confidence_level,
-       'TIMESFM' as model_type
-     )
+     confidence_level
+   FROM AI.FORECAST(
+     TABLE \`${PROJECT_ID}.${DATASET_NAME}.stock_prices\`,
+     data_col => 'close_price',
+     timestamp_col => 'date',
+     model => 'TimesFM 2.0',
+     id_cols => ['symbol'],
+     horizon => 7,
+     confidence_level => 0.95
    )"
    
    echo "✅ TimesFM forecasting queries created"
@@ -631,6 +604,7 @@ EOF
    # Remove the Cloud Function
    gcloud functions delete ${FUNCTION_NAME} \
        --region=${REGION} \
+       --gen2 \
        --quiet
    
    echo "✅ Cloud Function deleted"
@@ -649,10 +623,10 @@ EOF
 
    ```bash
    # Clean up environment variables
-   unset PROJECT_ID REGION DATASET_NAME BUCKET_NAME
+   unset PROJECT_ID REGION DATASET_NAME
    unset FUNCTION_NAME JOB_NAME RANDOM_SUFFIX FUNCTION_URL
    
-   # Disable APIs if no longer needed
+   # Disable APIs if no longer needed (optional)
    gcloud services disable aiplatform.googleapis.com \
        cloudfunctions.googleapis.com \
        cloudscheduler.googleapis.com \
@@ -666,20 +640,20 @@ EOF
 
 This intelligent forecasting solution demonstrates the power of combining Google's TimesFM foundation model with BigQuery DataCanvas to create an enterprise-grade time series forecasting system. TimesFM eliminates the traditional barriers to accurate forecasting by leveraging pre-training on billions of time points from diverse real-world datasets, enabling immediate deployment without domain-specific model training or feature engineering. The foundation model's decoder-only architecture, developed by Google Research and presented at ICML 2024, represents a significant advancement in time series foundation models.
 
-BigQuery DataCanvas revolutionizes the analytics workflow by enabling natural language interactions with complex time series data. Business analysts can now ask questions like "Show me the forecast accuracy for AAPL over the last month" or "Which stocks have the highest volatility?" without writing SQL queries. This democratization of analytics capabilities accelerates decision-making processes while maintaining the sophisticated analytical capabilities required for financial forecasting. The integration with Dataplex Universal Catalog enables intelligent data discovery, automatically identifying relevant tables and datasets based on natural language descriptions.
+BigQuery DataCanvas revolutionizes the analytics workflow by enabling natural language interactions with complex time series data. Business analysts can now ask questions like "Show me the forecast accuracy for AAPL over the last month" or "Which stocks have the highest volatility?" without writing SQL queries. This democratization of analytics capabilities accelerates decision-making processes while maintaining the sophisticated analytical capabilities required for financial forecasting. The integration with BigQuery's unified data platform enables seamless access to both historical data and forecast results.
 
-The serverless architecture using Cloud Functions and Cloud Scheduler provides automatic scaling and cost optimization for real-time data processing. The system handles varying data volumes efficiently while maintaining low latency for critical financial updates. Cloud Monitoring integration ensures comprehensive observability, tracking both system performance and forecast accuracy metrics to maintain the reliability standards required for financial decision-making. The automated alerting system enables proactive response to accuracy degradation or system issues.
+The serverless architecture using Cloud Functions Generation 2 and Cloud Scheduler provides automatic scaling and cost optimization for real-time data processing. The system handles varying data volumes efficiently while maintaining low latency for critical financial updates. Cloud Monitoring integration ensures comprehensive observability, tracking both system performance and forecast accuracy metrics to maintain the reliability standards required for financial decision-making. The automated alerting system enables proactive response to accuracy degradation or system issues.
 
 The solution's modular design enables easy extension to additional financial instruments, alternative data sources, and custom business logic. Organizations can integrate external market data feeds, economic indicators, or proprietary datasets to enhance forecasting accuracy. The standardized BigQuery interface ensures compatibility with existing data infrastructure and business intelligence tools, facilitating organization-wide adoption of advanced forecasting capabilities.
 
 > **Tip**: Use BigQuery's time-travel capabilities to compare forecast accuracy across different model versions and fine-tune the forecasting horizon based on your specific business requirements and market volatility patterns.
 
 **Documentation References:**
+- [BigQuery AI.FORECAST Function Reference](https://cloud.google.com/bigquery/docs/reference/standard-sql/bigqueryml-syntax-ai-forecast)
 - [TimesFM Model Documentation](https://cloud.google.com/bigquery/docs/timesfm-model)
 - [BigQuery DataCanvas Guide](https://cloud.google.com/bigquery/docs/data-canvas)
-- [AI.FORECAST Function Reference](https://cloud.google.com/bigquery/docs/reference/standard-sql/bigqueryml-syntax-ai-forecast)
 - [Google Research TimesFM Blog](https://research.google/blog/a-decoder-only-foundation-model-for-time-series-forecasting/)
-- [Vertex AI Integration Patterns](https://cloud.google.com/vertex-ai/docs/start/introduction-unified-platform)
+- [Cloud Functions Generation 2 Documentation](https://cloud.google.com/functions/docs/concepts/version-comparison)
 
 ## Challenge
 
@@ -697,4 +671,9 @@ Extend this intelligent forecasting solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

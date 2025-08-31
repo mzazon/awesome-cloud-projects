@@ -1,21 +1,21 @@
 ---
-title: Document Processing Pipelines with Textract
+title: Document Processing Pipelines with Textract and Step Functions
 id: a7b4c8d9
 category: analytics
 difficulty: 200
 subject: aws
 services: Textract, Step Functions, S3, Lambda
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: document-processing, automation, ocr, serverless, workflow-orchestration
 recipe-generator-version: 1.3
 ---
 
-# Document Processing Pipelines with Textract
+# Document Processing Pipelines with Textract and Step Functions
 
 ## Problem
 
@@ -39,6 +39,7 @@ graph TB
         LAMBDA_TRIGGER[Document Processor Lambda]
         TEXTRACT[Amazon Textract]
         LAMBDA_PROCESS[Result Processor Lambda]
+        S3_TRIGGER[S3 Event Trigger Lambda]
     end
     
     subgraph "Results Storage"
@@ -48,18 +49,19 @@ graph TB
     
     subgraph "Monitoring"
         CW[CloudWatch Logs]
-        SNS[SNS Notifications]
+        DASHBOARD[CloudWatch Dashboard]
     end
     
     USER --> S3_INPUT
-    S3_INPUT --> SF
+    S3_INPUT --> S3_TRIGGER
+    S3_TRIGGER --> SF
     SF --> LAMBDA_TRIGGER
     LAMBDA_TRIGGER --> TEXTRACT
     TEXTRACT --> LAMBDA_PROCESS
     LAMBDA_PROCESS --> S3_OUTPUT
     LAMBDA_PROCESS --> S3_ARCHIVE
-    SF --> SNS
     SF --> CW
+    SF --> DASHBOARD
     
     style TEXTRACT fill:#FF9900
     style SF fill:#8C4FFF
@@ -73,7 +75,8 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of serverless architectures and document processing workflows
 4. Familiarity with JSON and AWS IAM policies
-5. Estimated cost: $5-15 for testing with sample documents (varies based on document size and processing volume)
+5. jq command-line JSON processor for validation testing
+6. Estimated cost: $5-15 for testing with sample documents (varies based on document size and processing volume)
 
 > **Note**: Amazon Textract pricing is based on the number of pages processed. Review the [Textract pricing page](https://aws.amazon.com/textract/pricing/) for current rates and consider implementing page limits for cost control during testing.
 
@@ -96,19 +99,29 @@ export INPUT_BUCKET="${PROJECT_NAME}-input"
 export OUTPUT_BUCKET="${PROJECT_NAME}-output"
 export ARCHIVE_BUCKET="${PROJECT_NAME}-archive"
 
-# Create S3 buckets for document processing pipeline
+# Create S3 buckets with server-side encryption
 aws s3 mb s3://${INPUT_BUCKET} --region ${AWS_REGION}
 aws s3 mb s3://${OUTPUT_BUCKET} --region ${AWS_REGION}
 aws s3 mb s3://${ARCHIVE_BUCKET} --region ${AWS_REGION}
 
-echo "✅ S3 buckets created for document processing pipeline"
+# Enable versioning and encryption for security
+aws s3api put-bucket-versioning \
+    --bucket ${INPUT_BUCKET} \
+    --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+    --bucket ${INPUT_BUCKET} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
+echo "✅ S3 buckets created with security features enabled"
 ```
 
 ## Steps
 
 1. **Create IAM Role for Step Functions Execution**:
 
-   AWS Step Functions requires specific IAM permissions to orchestrate the document processing workflow, including the ability to invoke Lambda functions, access S3 buckets, and interact with Amazon Textract. This role enables secure, automated workflow execution while following the principle of least privilege for enterprise security requirements. IAM roles provide temporary, rotatable credentials that are more secure than long-term access keys.
+   AWS Step Functions requires specific IAM permissions to orchestrate the document processing workflow, including the ability to invoke Lambda functions, access S3 buckets, and interact with Amazon Textract. This role enables secure, automated workflow execution while following the principle of least privilege for enterprise security requirements. IAM roles provide temporary, rotatable credentials that are more secure than long-term access keys, aligning with [AWS security best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
 
    ```bash
    # Create trust policy for Step Functions
@@ -196,7 +209,7 @@ echo "✅ S3 buckets created for document processing pipeline"
 
 2. **Create Lambda Function for Document Processing Initiation**:
 
-   Lambda functions provide the serverless compute layer that bridges Step Functions orchestration with Amazon Textract's document analysis capabilities. This function handles document type detection, initiates appropriate Textract operations, and manages asynchronous processing workflows essential for scalable document processing architectures. Lambda's automatic scaling ensures the system can handle varying document volumes without infrastructure management.
+   Lambda functions provide the serverless compute layer that bridges Step Functions orchestration with Amazon Textract's document analysis capabilities. This function handles document type detection, initiates appropriate Textract operations, and manages asynchronous processing workflows essential for scalable document processing architectures. Lambda's automatic scaling ensures the system can handle varying document volumes without infrastructure management, following [AWS serverless best practices](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html).
 
    ```bash
    # Create Lambda execution role
@@ -222,22 +235,58 @@ echo "✅ S3 buckets created for document processing pipeline"
    # Wait for IAM role propagation
    sleep 10
    
-   # Attach managed policies for Lambda execution
-   aws iam attach-role-policy \
-       --role-name ${PROJECT_NAME}-lambda-role \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   # Create custom policy for Lambda with least privilege access
+   cat > lambda-policy.json << EOF
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": [
+           "logs:CreateLogGroup",
+           "logs:CreateLogStream",
+           "logs:PutLogEvents"
+         ],
+         "Resource": "arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "textract:StartDocumentAnalysis",
+           "textract:StartDocumentTextDetection",
+           "textract:GetDocumentAnalysis",
+           "textract:GetDocumentTextDetection"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "s3:GetObject",
+           "s3:PutObject"
+         ],
+         "Resource": [
+           "arn:aws:s3:::${INPUT_BUCKET}/*",
+           "arn:aws:s3:::${OUTPUT_BUCKET}/*",
+           "arn:aws:s3:::${ARCHIVE_BUCKET}/*"
+         ]
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "states:StartExecution"
+         ],
+         "Resource": "arn:aws:states:${AWS_REGION}:${AWS_ACCOUNT_ID}:stateMachine:${PROJECT_NAME}-*"
+       }
+     ]
+   }
+   EOF
    
-   aws iam attach-role-policy \
+   # Attach custom policy to role
+   aws iam put-role-policy \
        --role-name ${PROJECT_NAME}-lambda-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonTextractFullAccess
-   
-   aws iam attach-role-policy \
-       --role-name ${PROJECT_NAME}-lambda-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-   
-   aws iam attach-role-policy \
-       --role-name ${PROJECT_NAME}-lambda-role \
-       --policy-arn arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess
+       --policy-name LambdaExecutionPolicy \
+       --policy-document file://lambda-policy.json
    
    export LAMBDA_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-lambda-role"
    
@@ -267,7 +316,7 @@ echo "✅ S3 buckets created for document processing pipeline"
            
            # Configure Textract parameters based on document type
            if file_extension in ['pdf', 'png', 'jpg', 'jpeg', 'tiff']:
-               # Start document analysis for complex documents
+               # Start document analysis for complex documents with updated feature types
                response = textract.start_document_analysis(
                    DocumentLocation={
                        'S3Object': {
@@ -275,7 +324,7 @@ echo "✅ S3 buckets created for document processing pipeline"
                            'Name': key
                        }
                    },
-                   FeatureTypes=['TABLES', 'FORMS', 'SIGNATURES']
+                   FeatureTypes=['TABLES', 'FORMS', 'LAYOUT']
                )
                
                job_id = response['JobId']
@@ -299,12 +348,12 @@ echo "✅ S3 buckets created for document processing pipeline"
            }
    EOF
    
-   # Package and deploy Lambda function
+   # Package and deploy Lambda function with latest Python runtime
    zip -j document-processor.zip document-processor.py
    
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-document-processor \
-       --runtime python3.11 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler document-processor.lambda_handler \
        --zip-file fileb://document-processor.zip \
@@ -312,14 +361,14 @@ echo "✅ S3 buckets created for document processing pipeline"
        --memory-size 256 \
        --description "Initiates Textract document processing"
    
-   echo "✅ Document processor Lambda function deployed"
+   echo "✅ Document processor Lambda function deployed with latest runtime"
    ```
 
-   The Lambda function now intelligently handles different document types and initiates appropriate Textract analysis operations, providing the foundation for automated document processing with built-in error handling and logging capabilities. The function uses the latest Python runtime for optimal performance and security.
+   The Lambda function now intelligently handles different document types and initiates appropriate Textract analysis operations using the latest supported feature types including LAYOUT analysis. The function uses Python 3.12 runtime for optimal performance and security with granular IAM permissions following the principle of least privilege.
 
 3. **Create Lambda Function for Results Processing**:
 
-   Processing Textract results requires sophisticated parsing and transformation logic to convert raw extraction data into structured, business-ready formats. This Lambda function handles asynchronous result retrieval, data validation, and output formatting, ensuring reliable processing of complex documents with tables, forms, and multi-page content. The function implements robust error handling and provides detailed metadata for downstream analytics systems.
+   Processing Textract results requires sophisticated parsing and transformation logic to convert raw extraction data into structured, business-ready formats. This Lambda function handles asynchronous result retrieval, data validation, and output formatting, ensuring reliable processing of complex documents with tables, forms, and multi-page content. The function implements robust error handling and provides detailed metadata for downstream analytics systems, following [Textract best practices](https://docs.aws.amazon.com/textract/latest/dg/textract-best-practices.html).
 
    ```bash
    # Create results processor Lambda function
@@ -364,7 +413,8 @@ echo "✅ S3 buckets created for document processing pipeline"
                    'extractedData': {
                        'text': [],
                        'tables': [],
-                       'forms': []
+                       'forms': [],
+                       'layout': []
                    }
                }
                
@@ -398,6 +448,16 @@ echo "✅ S3 buckets created for document processing pipeline"
                                'text': block.get('Text', '')
                            }
                            processed_data['extractedData']['forms'].append(form_data)
+                   elif block['BlockType'] == 'LAYOUT':
+                       # Process layout data for document structure
+                       layout_data = {
+                           'id': block.get('Id', ''),
+                           'confidence': block.get('Confidence', 0),
+                           'geometry': block.get('Geometry', {}),
+                           'layoutType': block.get('LayoutType', ''),
+                           'text': block.get('Text', '')
+                       }
+                       processed_data['extractedData']['layout'].append(layout_data)
                
                # Save processed results to S3 output bucket
                output_key = f"processed/{key.replace('.', '_')}_results.json"
@@ -430,7 +490,8 @@ echo "✅ S3 buckets created for document processing pipeline"
                    'extractedItems': {
                        'textLines': len(processed_data['extractedData']['text']),
                        'tables': len(processed_data['extractedData']['tables']),
-                       'forms': len(processed_data['extractedData']['forms'])
+                       'forms': len(processed_data['extractedData']['forms']),
+                       'layoutElements': len(processed_data['extractedData']['layout'])
                    }
                }
                
@@ -458,12 +519,12 @@ echo "✅ S3 buckets created for document processing pipeline"
            }
    EOF
    
-   # Package and deploy results processor
+   # Package and deploy results processor with enhanced timeout
    zip -j results-processor.zip results-processor.py
    
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-results-processor \
-       --runtime python3.11 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler results-processor.lambda_handler \
        --zip-file fileb://results-processor.zip \
@@ -471,20 +532,20 @@ echo "✅ S3 buckets created for document processing pipeline"
        --memory-size 512 \
        --description "Processes and formats Textract extraction results"
    
-   echo "✅ Results processor Lambda function deployed"
+   echo "✅ Results processor Lambda function deployed with layout analysis support"
    ```
 
-   The results processor now handles complex data transformation and provides structured output for downstream analytics systems, ensuring reliable processing of multi-page documents with comprehensive error handling and progress tracking. The enhanced metadata collection supports advanced analytics and audit requirements.
+   The results processor now handles complex data transformation including layout analysis for better document structure understanding. It provides structured output for downstream analytics systems with comprehensive error handling and enhanced metadata collection that supports advanced analytics and audit requirements.
 
 4. **Create Step Functions State Machine for Workflow Orchestration**:
 
-   AWS Step Functions provides visual workflow orchestration that coordinates complex document processing operations with built-in error handling, retry logic, and state management. This state machine defines the complete document processing pipeline, ensuring reliable execution across multiple AWS services while providing visibility into processing status and error conditions. The declarative workflow definition enables easy maintenance and modification of business logic.
+   AWS Step Functions provides visual workflow orchestration that coordinates complex document processing operations with built-in error handling, retry logic, and state management. This state machine defines the complete document processing pipeline, ensuring reliable execution across multiple AWS services while providing visibility into processing status and error conditions. The declarative workflow definition enables easy maintenance and modification of business logic, following [Step Functions best practices](https://docs.aws.amazon.com/step-functions/latest/dg/bp-express.html).
 
    ```bash
-   # Create Step Functions state machine definition
+   # Create Step Functions state machine definition with enhanced error handling
    cat > state-machine-definition.json << EOF
    {
-     "Comment": "Document Processing Pipeline with Amazon Textract",
+     "Comment": "Document Processing Pipeline with Amazon Textract and Enhanced Error Handling",
      "StartAt": "ProcessDocument",
      "States": {
        "ProcessDocument": {
@@ -496,7 +557,7 @@ echo "✅ S3 buckets created for document processing pipeline"
          },
          "Retry": [
            {
-             "ErrorEquals": ["States.TaskFailed"],
+             "ErrorEquals": ["States.TaskFailed", "States.ALL"],
              "IntervalSeconds": 5,
              "MaxAttempts": 3,
              "BackoffRate": 2.0
@@ -505,7 +566,8 @@ echo "✅ S3 buckets created for document processing pipeline"
          "Catch": [
            {
              "ErrorEquals": ["States.ALL"],
-             "Next": "ProcessingFailed"
+             "Next": "ProcessingFailed",
+             "ResultPath": "$.error"
            }
          ],
          "Next": "WaitForTextractCompletion"
@@ -532,6 +594,13 @@ echo "✅ S3 buckets created for document processing pipeline"
              "IntervalSeconds": 10,
              "MaxAttempts": 3,
              "BackoffRate": 2.0
+           }
+         ],
+         "Catch": [
+           {
+             "ErrorEquals": ["States.ALL"],
+             "Next": "ProcessingFailed",
+             "ResultPath": "$.error"
            }
          ],
          "Next": "EvaluateStatus"
@@ -574,25 +643,26 @@ echo "✅ S3 buckets created for document processing pipeline"
    # Wait for IAM role propagation
    sleep 15
    
-   # Create Step Functions state machine
+   # Create Step Functions state machine with logging enabled
    aws stepfunctions create-state-machine \
        --name ${PROJECT_NAME}-document-pipeline \
        --definition file://state-machine-definition.json \
        --role-arn ${STEPFUNCTIONS_ROLE_ARN} \
-       --type STANDARD
+       --type STANDARD \
+       --logging-configuration level=ALL,includeExecutionData=true,destinations="[{cloudWatchLogsLogGroup:{logGroupArn:arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:/aws/stepfunctions/${PROJECT_NAME}-document-pipeline}}]"
    
    export STATE_MACHINE_ARN=$(aws stepfunctions list-state-machines \
        --query "stateMachines[?name=='${PROJECT_NAME}-document-pipeline'].stateMachineArn" \
        --output text)
    
-   echo "✅ Step Functions state machine created for document processing orchestration"
+   echo "✅ Step Functions state machine created with comprehensive logging enabled"
    ```
 
-   The state machine now provides enterprise-grade workflow orchestration with automatic retry logic, error handling, and progress tracking, ensuring reliable document processing at scale with full visibility into execution status. The visual workflow representation simplifies troubleshooting and process optimization.
+   The state machine now provides enterprise-grade workflow orchestration with enhanced error handling, automatic retry logic, and comprehensive logging for full visibility into execution status. The visual workflow representation simplifies troubleshooting and process optimization while ensuring reliable document processing at scale.
 
 5. **Create S3 Event Trigger for Automatic Processing**:
 
-   S3 event notifications enable automatic pipeline initiation when documents are uploaded, creating a fully automated document processing workflow. This event-driven architecture ensures immediate processing of new documents while maintaining scalability and cost-effectiveness through serverless execution patterns. The trigger configuration filters for specific file types to optimize processing costs.
+   S3 event notifications enable automatic pipeline initiation when documents are uploaded, creating a fully automated document processing workflow. This event-driven architecture ensures immediate processing of new documents while maintaining scalability and cost-effectiveness through serverless execution patterns. The trigger configuration filters for specific file types to optimize processing costs and follows [S3 event notification best practices](https://docs.aws.amazon.com/AmazonS3/latest/userguide/notification-how-to-filtering.html).
 
    ```bash
    # Create Lambda function for S3 event handling
@@ -619,11 +689,19 @@ echo "✅ S3 buckets created for document processing pipeline"
                
                logger.info(f"New document uploaded: s3://{bucket}/{key}")
                
-               # Start Step Functions execution
+               # Validate file extension
+               file_extension = key.lower().split('.')[-1]
+               if file_extension not in ['pdf', 'png', 'jpg', 'jpeg', 'tiff']:
+                   logger.warning(f"Unsupported file type: {file_extension}")
+                   continue
+               
+               # Start Step Functions execution with enhanced metadata
                execution_input = {
                    'bucket': bucket,
                    'key': key,
-                   'eventTime': record['eventTime']
+                   'eventTime': record['eventTime'],
+                   'fileSize': record['s3']['object']['size'],
+                   'sourceIp': record.get('requestParameters', {}).get('sourceIPAddress', 'unknown')
                }
                
                execution_name = f"doc-processing-{key.replace('/', '-').replace('.', '-')}-{context.aws_request_id[:8]}"
@@ -654,7 +732,7 @@ echo "✅ S3 buckets created for document processing pipeline"
    
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-s3-trigger \
-       --runtime python3.11 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler s3-trigger.lambda_handler \
        --zip-file fileb://s3-trigger.zip \
@@ -671,7 +749,7 @@ echo "✅ S3 buckets created for document processing pipeline"
        --statement-id s3-trigger-permission \
        --source-arn arn:aws:s3:::${INPUT_BUCKET}
    
-   # Configure S3 bucket notification for multiple file types
+   # Configure S3 bucket notification for multiple supported file types
    cat > notification-config.json << EOF
    {
      "LambdaConfigurations": [
@@ -689,6 +767,21 @@ echo "✅ S3 buckets created for document processing pipeline"
              ]
            }
          }
+       },
+       {
+         "Id": "ImageUploadTrigger",
+         "LambdaFunctionArn": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PROJECT_NAME}-s3-trigger",
+         "Events": ["s3:ObjectCreated:*"],
+         "Filter": {
+           "Key": {
+             "FilterRules": [
+               {
+                 "Name": "suffix",
+                 "Value": ".png"
+               }
+             ]
+           }
+         }
        }
      ]
    }
@@ -701,14 +794,14 @@ echo "✅ S3 buckets created for document processing pipeline"
    echo "✅ S3 event trigger configured for automatic document processing"
    ```
 
-   The S3 event trigger now automatically initiates document processing when files are uploaded, creating a seamless end-to-end automation pipeline that scales based on document volume while maintaining cost efficiency. The robust error handling ensures reliable processing even with varying document types and sizes.
+   The S3 event trigger now automatically initiates document processing when supported files are uploaded, with enhanced validation and metadata collection. The configuration supports multiple file types and provides robust error handling to ensure reliable processing across varying document types and sizes.
 
 6. **Configure CloudWatch Monitoring and Logging**:
 
-   CloudWatch provides comprehensive monitoring and observability for the document processing pipeline, enabling proactive issue detection, performance optimization, and compliance reporting. This monitoring setup ensures operational visibility across all pipeline components with automated alerting for critical failures. The dashboard configuration provides real-time insights into processing metrics and system health.
+   CloudWatch provides comprehensive monitoring and observability for the document processing pipeline, enabling proactive issue detection, performance optimization, and compliance reporting. This monitoring setup ensures operational visibility across all pipeline components with automated alerting capabilities. The dashboard configuration provides real-time insights into processing metrics and system health, following [CloudWatch best practices](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Best_Practices.html).
 
    ```bash
-   # Create CloudWatch log groups for better log organization
+   # Create CloudWatch log groups for organized logging
    aws logs create-log-group \
        --log-group-name /aws/lambda/${PROJECT_NAME}-document-processor \
        --retention-in-days 14
@@ -725,12 +818,14 @@ echo "✅ S3 buckets created for document processing pipeline"
        --log-group-name /aws/stepfunctions/${PROJECT_NAME}-document-pipeline \
        --retention-in-days 30
    
-   # Create CloudWatch dashboard for comprehensive pipeline monitoring
+   # Create enhanced CloudWatch dashboard with processing metrics
    cat > dashboard-definition.json << EOF
    {
      "widgets": [
        {
          "type": "metric",
+         "x": 0,
+         "y": 0,
          "width": 12,
          "height": 6,
          "properties": {
@@ -749,6 +844,8 @@ echo "✅ S3 buckets created for document processing pipeline"
        },
        {
          "type": "metric",
+         "x": 12,
+         "y": 0,
          "width": 12,
          "height": 6,
          "properties": {
@@ -764,6 +861,38 @@ echo "✅ S3 buckets created for document processing pipeline"
            "title": "Step Functions Pipeline Metrics",
            "view": "timeSeries"
          }
+       },
+       {
+         "type": "metric",
+         "x": 0,
+         "y": 6,
+         "width": 12,
+         "height": 6,
+         "properties": {
+           "metrics": [
+             ["AWS/Textract", "UserErrorCount", "Operation", "StartDocumentAnalysis"],
+             [".", "ServerErrorCount", ".", "."],
+             [".", "SuccessfulRequestCount", ".", "."]
+           ],
+           "period": 300,
+           "stat": "Sum",
+           "region": "${AWS_REGION}",
+           "title": "Textract Processing Metrics",
+           "view": "timeSeries"
+         }
+       },
+       {
+         "type": "log",
+         "x": 12,
+         "y": 6,
+         "width": 12,
+         "height": 6,
+         "properties": {
+           "query": "SOURCE '/aws/lambda/${PROJECT_NAME}-document-processor'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+           "region": "${AWS_REGION}",
+           "title": "Recent Processing Errors",
+           "view": "table"
+         }
        }
      ]
    }
@@ -773,17 +902,17 @@ echo "✅ S3 buckets created for document processing pipeline"
        --dashboard-name ${PROJECT_NAME}-pipeline-monitoring \
        --dashboard-body file://dashboard-definition.json
    
-   echo "✅ CloudWatch monitoring and logging configured with retention policies"
+   echo "✅ CloudWatch monitoring configured with comprehensive metrics and logging"
    ```
 
-   CloudWatch monitoring now provides real-time visibility into pipeline performance, enabling proactive optimization and rapid issue resolution with comprehensive logging and metrics collection across all components. The log retention policies help manage costs while maintaining adequate audit trails.
+   CloudWatch monitoring now provides real-time visibility into pipeline performance with enhanced metrics collection including Textract-specific monitoring. The dashboard includes error tracking and log analysis capabilities for rapid issue resolution and performance optimization.
 
 ## Validation & Testing
 
 1. Upload a test document to verify the complete processing pipeline:
 
    ```bash
-   # Create a realistic test PDF document content
+   # Create a realistic test PDF document content for testing
    cat > test-invoice.txt << 'EOF'
    ACME Corporation
    123 Business Street
@@ -814,7 +943,7 @@ echo "✅ S3 buckets created for document processing pipeline"
    Payment Terms: Net 30 days
    EOF
    
-   # Upload test document to trigger processing
+   # Upload test document to trigger the processing pipeline
    aws s3 cp test-invoice.txt s3://${INPUT_BUCKET}/test-invoice.pdf
    
    echo "✅ Test document uploaded to trigger processing pipeline"
@@ -822,16 +951,17 @@ echo "✅ S3 buckets created for document processing pipeline"
 
    Expected result: S3 event triggers Lambda function, which starts Step Functions execution
 
-2. Monitor Step Functions execution progress:
+2. Monitor Step Functions execution progress with detailed status tracking:
 
    ```bash
    # Wait for processing to begin
    sleep 10
    
-   # List recent executions
+   # List recent executions with enhanced output
    aws stepfunctions list-executions \
        --state-machine-arn ${STATE_MACHINE_ARN} \
-       --max-items 5
+       --max-items 5 \
+       --query 'executions[*].{Name:name,Status:status,StartDate:startDate}'
    
    # Get the most recent execution details
    export EXECUTION_ARN=$(aws stepfunctions list-executions \
@@ -840,9 +970,11 @@ echo "✅ S3 buckets created for document processing pipeline"
        --query 'executions[0].executionArn' \
        --output text)
    
-   if [ "${EXECUTION_ARN}" != "None" ]; then
+   if [ "${EXECUTION_ARN}" != "None" ] && [ "${EXECUTION_ARN}" != "null" ]; then
+       echo "Execution Details:"
        aws stepfunctions describe-execution \
-           --execution-arn ${EXECUTION_ARN}
+           --execution-arn ${EXECUTION_ARN} \
+           --query '{Status:status,Input:input,Output:output}'
    else
        echo "No executions found yet. Processing may still be starting."
    fi
@@ -850,29 +982,36 @@ echo "✅ S3 buckets created for document processing pipeline"
 
    Expected output: Execution status showing progression through pipeline states
 
-3. Verify processed results in output bucket:
+3. Verify processed results in output bucket with detailed analysis:
 
    ```bash
    # Wait for processing to complete
-   sleep 60
+   sleep 90
    
-   # List processed results
-   aws s3 ls s3://${OUTPUT_BUCKET}/processed/ --recursive
+   # List processed results with metadata
+   echo "Processing results in output bucket:"
+   aws s3 ls s3://${OUTPUT_BUCKET}/processed/ --recursive --human-readable
    
    # Download and examine results if available
    RESULT_FILE=$(aws s3 ls s3://${OUTPUT_BUCKET}/processed/ --recursive | \
        grep test-invoice | awk '{print $4}' | head -1)
    
    if [ -n "${RESULT_FILE}" ]; then
-       aws s3 cp s3://${OUTPUT_BUCKET}/${RESULT_FILE} ./
-       echo "Processing results:"
-       cat "${RESULT_FILE##*/}" | jq '.extractedData | keys'
+       aws s3 cp s3://${OUTPUT_BUCKET}/${RESULT_FILE} ./result.json
+       echo "Processing results structure:"
+       cat result.json | jq '.extractedData | keys'
+       echo "Extracted items summary:"
+       cat result.json | jq '.extractedItems'
    else
        echo "Results not yet available. Check execution status above."
    fi
+   
+   # Check archive bucket
+   echo "Archived documents:"
+   aws s3 ls s3://${ARCHIVE_BUCKET}/archive/ --recursive --human-readable
    ```
 
-   Expected output: JSON file containing structured extraction results with text, confidence scores, and metadata
+   Expected output: JSON file containing structured extraction results with text, tables, forms, layout, confidence scores, and comprehensive metadata
 
 ## Cleanup
 
@@ -936,22 +1075,10 @@ echo "✅ S3 buckets created for document processing pipeline"
 4. Remove IAM roles and policies:
 
    ```bash
-   # Detach policies and delete Lambda role
-   aws iam detach-role-policy \
+   # Delete Lambda role and inline policies
+   aws iam delete-role-policy \
        --role-name ${PROJECT_NAME}-lambda-role \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-   
-   aws iam detach-role-policy \
-       --role-name ${PROJECT_NAME}-lambda-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonTextractFullAccess
-   
-   aws iam detach-role-policy \
-       --role-name ${PROJECT_NAME}-lambda-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-   
-   aws iam detach-role-policy \
-       --role-name ${PROJECT_NAME}-lambda-role \
-       --policy-arn arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess
+       --policy-name LambdaExecutionPolicy
    
    aws iam delete-role \
        --role-name ${PROJECT_NAME}-lambda-role
@@ -988,28 +1115,35 @@ echo "✅ S3 buckets created for document processing pipeline"
 
 ## Discussion
 
-Building automated document processing pipelines with Amazon Textract and Step Functions creates a highly scalable, intelligent solution that transforms manual document workflows into efficient, automated systems. This serverless architecture leverages machine learning to extract text, tables, and form data from various document types while providing enterprise-grade orchestration through Step Functions. The combination enables organizations to process thousands of documents with minimal manual intervention while maintaining accuracy and reliability. For comprehensive implementation guidance, refer to the [Amazon Textract Developer Guide](https://docs.aws.amazon.com/textract/latest/dg/) and [Step Functions Developer Guide](https://docs.aws.amazon.com/step-functions/latest/dg/).
+Building automated document processing pipelines with Amazon Textract and Step Functions creates a highly scalable, intelligent solution that transforms manual document workflows into efficient, automated systems. This serverless architecture leverages machine learning to extract text, tables, forms, and layout information from various document types while providing enterprise-grade orchestration through Step Functions. The combination enables organizations to process thousands of documents with minimal manual intervention while maintaining accuracy and reliability. For comprehensive implementation guidance, refer to the [Amazon Textract Developer Guide](https://docs.aws.amazon.com/textract/latest/dg/) and [Step Functions Developer Guide](https://docs.aws.amazon.com/step-functions/latest/dg/).
 
 The architectural approach demonstrates event-driven processing patterns that automatically scale based on document volume, ensuring cost-effectiveness through pay-per-use serverless computing. Step Functions provides visual workflow management with built-in error handling, retry logic, and state management that simplifies complex processing pipelines. This pattern aligns with the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/) principles of operational excellence, reliability, and cost optimization by eliminating infrastructure management overhead while providing robust monitoring and observability capabilities through [CloudWatch integration](https://docs.aws.amazon.com/step-functions/latest/dg/cw-logs.html).
 
-From a business perspective, this solution addresses critical challenges in document-heavy industries such as finance, healthcare, legal, and insurance where manual data extraction creates bottlenecks and introduces errors. The intelligent extraction capabilities of Textract, combined with customizable processing logic in Lambda functions, enable organizations to implement sophisticated business rules and validation workflows. Integration with S3 provides secure, durable storage for both input documents and processed results, while CloudWatch monitoring ensures operational visibility and compliance reporting capabilities essential for regulated industries.
+From a business perspective, this solution addresses critical challenges in document-heavy industries such as finance, healthcare, legal, and insurance where manual data extraction creates bottlenecks and introduces errors. The intelligent extraction capabilities of Textract, combined with customizable processing logic in Lambda functions, enable organizations to implement sophisticated business rules and validation workflows. Integration with S3 provides secure, durable storage for both input documents and processed results, while CloudWatch monitoring ensures operational visibility and compliance reporting capabilities essential for regulated industries. The inclusion of layout analysis provides enhanced document structure understanding that enables more sophisticated downstream processing workflows.
 
-> **Tip**: Implement confidence thresholds in your result processing logic to automatically flag low-confidence extractions for human review. Use the [Textract best practices documentation](https://docs.aws.amazon.com/textract/latest/dg/textract-best-practices.html) to optimize document quality and processing accuracy for your specific use cases.
+> **Tip**: Implement confidence thresholds in your result processing logic to automatically flag low-confidence extractions for human review. Use the [Textract best practices documentation](https://docs.aws.amazon.com/textract/latest/dg/textract-best-practices.html) to optimize document quality and processing accuracy for your specific use cases. Consider implementing document preprocessing steps to improve extraction quality for scanned documents.
 
 ## Challenge
 
 Extend this document processing pipeline by implementing these enhancements:
 
-1. **Add intelligent document classification** using Amazon Comprehend to automatically categorize documents by type (invoices, contracts, forms) and route them to specialized processing workflows with different Textract feature configurations and validation rules.
+1. **Add intelligent document classification** using Amazon Comprehend to automatically categorize documents by type (invoices, contracts, forms) and route them to specialized processing workflows with different Textract feature configurations and validation rules tailored to each document type.
 
-2. **Implement human-in-the-loop workflows** using Amazon Augmented AI (A2I) to review low-confidence extractions, creating feedback loops that improve processing accuracy over time and ensure quality control for critical documents requiring manual validation.
+2. **Implement human-in-the-loop workflows** using Amazon Augmented AI (A2I) to review low-confidence extractions, creating feedback loops that improve processing accuracy over time and ensure quality control for critical documents requiring manual validation or approval processes.
 
-3. **Build real-time analytics dashboards** using Amazon QuickSight connected to processed document data in Amazon S3, enabling business users to visualize processing trends, accuracy metrics, and extract business insights from document content patterns.
+3. **Build real-time analytics dashboards** using Amazon QuickSight connected to processed document data in Amazon S3, enabling business users to visualize processing trends, accuracy metrics, cost analysis, and extract business insights from document content patterns and processing volumes.
 
-4. **Create multi-format document support** by integrating with Amazon Transcribe for audio documents and Amazon Rekognition for image-based content, building a comprehensive content processing platform that handles diverse media types through unified workflows.
+4. **Create multi-format document support** by integrating with Amazon Transcribe for audio documents and Amazon Rekognition for image-based content analysis, building a comprehensive content processing platform that handles diverse media types through unified workflows with consistent output formats.
 
-5. **Develop advanced validation and enrichment** using custom machine learning models deployed on Amazon SageMaker to validate extracted data against business rules, enrich content with external data sources, and implement sophisticated document understanding workflows with entity recognition.
+5. **Develop advanced validation and enrichment** using custom machine learning models deployed on Amazon SageMaker to validate extracted data against business rules, enrich content with external data sources, implement entity recognition and linking, and create sophisticated document understanding workflows with custom confidence scoring.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

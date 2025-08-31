@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Audit Logs, Eventarc, Cloud Functions, Cloud Logging
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, compliance, audit, event-driven, monitoring, automation
 recipe-generator-version: 1.3
@@ -368,15 +368,17 @@ echo "✅ Required APIs enabled for compliance monitoring"
    }
    EOF
    
-   # Deploy the Cloud Function
+   # Deploy the Cloud Function with Node.js 20 runtime
    gcloud functions deploy ${FUNCTION_NAME} \
+       --gen2 \
        --runtime=nodejs20 \
        --trigger-event-filters="type=google.cloud.audit.log.v1.written" \
        --trigger-location=${REGION} \
        --entry-point=analyzeAuditLog \
        --set-env-vars="TOPIC_NAME=${TOPIC_NAME},DATASET_NAME=${DATASET_NAME}" \
        --timeout=540s \
-       --memory=512MB
+       --memory=512MB \
+       --source=.
    
    echo "✅ Cloud Function deployed: ${FUNCTION_NAME}"
    ```
@@ -388,12 +390,26 @@ echo "✅ Required APIs enabled for compliance monitoring"
    Eventarc provides the event routing infrastructure that connects Cloud Audit Logs to your compliance detection function. This managed service ensures reliable delivery of audit events with automatic retry logic and dead letter handling, guaranteeing that no compliance-relevant events are missed even during high-volume periods or system maintenance windows.
 
    ```bash
+   # Create service account for Eventarc trigger
+   gcloud iam service-accounts create eventarc-trigger-sa \
+       --display-name="Eventarc Trigger Service Account"
+   
+   # Grant necessary permissions
+   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:eventarc-trigger-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/eventarc.eventReceiver"
+   
+   gcloud functions add-iam-policy-binding ${FUNCTION_NAME} \
+       --region=${REGION} \
+       --member="serviceAccount:eventarc-trigger-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/cloudfunctions.invoker"
+   
    # Create Eventarc trigger for Cloud Audit Logs
    gcloud eventarc triggers create ${TRIGGER_NAME} \
        --location=${REGION} \
        --destination-run-service=${FUNCTION_NAME} \
        --event-filters="type=google.cloud.audit.log.v1.written" \
-       --service-account=${PROJECT_ID}@appspot.gserviceaccount.com
+       --service-account=eventarc-trigger-sa@${PROJECT_ID}.iam.gserviceaccount.com
    
    # Verify trigger creation
    gcloud eventarc triggers describe ${TRIGGER_NAME} \
@@ -425,15 +441,19 @@ echo "✅ Required APIs enabled for compliance monitoring"
      - logType: ADMIN_READ
    EOF
    
-   # Apply audit configuration
-   gcloud logging sinks create compliance-audit-sink \
-       bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/${DATASET_NAME} \
-       --log-filter='protoPayload.@type="type.googleapis.com/google.cloud.audit.AuditLog"'
+   # Apply audit configuration using IAM policy
+   gcloud projects get-iam-policy ${PROJECT_ID} \
+       --format=json > policy.json
    
    # Create log-based metric for compliance monitoring
    gcloud logging metrics create compliance_violations \
        --description="Count of compliance violations detected" \
        --log-filter='resource.type="cloud_function" AND textPayload:"violation"'
+   
+   # Create log sink to BigQuery for audit logs
+   gcloud logging sinks create compliance-audit-sink \
+       bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/${DATASET_NAME} \
+       --log-filter='protoPayload.@type="type.googleapis.com/google.cloud.audit.AuditLog"'
    
    echo "✅ Enhanced audit logging configured"
    ```
@@ -581,6 +601,11 @@ echo "✅ Required APIs enabled for compliance monitoring"
        --region=${REGION} \
        --quiet
    
+   # Delete service account
+   gcloud iam service-accounts delete \
+       eventarc-trigger-sa@${PROJECT_ID}.iam.gserviceaccount.com \
+       --quiet
+   
    echo "✅ Function and trigger deleted"
    ```
 
@@ -641,4 +666,9 @@ Extend this compliance monitoring solution by implementing these advanced capabi
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

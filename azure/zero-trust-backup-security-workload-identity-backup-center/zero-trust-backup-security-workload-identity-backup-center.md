@@ -4,12 +4,12 @@ id: 7a9b2c4d
 category: security
 difficulty: 300
 subject: azure
-services: Azure Workload Identity, Azure Backup Center, Azure Key Vault
+services: Azure Workload Identity, Azure Backup Center, Azure Key Vault, Recovery Services Vault
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: zero-trust, backup, security, identity, workload-identity, key-vault, backup-center
 recipe-generator-version: 1.3
@@ -235,13 +235,13 @@ echo "✅ Required Azure resource providers registered"
    az backup vault create \
        --name ${RECOVERY_VAULT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --storage-redundancy GeoRedundant
+       --location ${LOCATION}
    
    # Configure vault security settings
    az backup vault backup-properties set \
        --name ${RECOVERY_VAULT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
+       --backup-storage-redundancy GeoRedundant \
        --cross-region-restore-flag true \
        --soft-delete-feature-state Enabled
    
@@ -261,83 +261,52 @@ echo "✅ Required Azure resource providers registered"
    Backup policies define the security and retention requirements for protected resources while integrating with Microsoft Entra ID for access control. These policies implement zero-trust principles by requiring explicit verification for backup operations and maintaining immutable backup records for compliance and security purposes.
 
    ```bash
-   # Create enhanced backup policy for VMs
+   # Create enhanced backup policy for VMs with proper JSON format
    az backup policy create \
        --name "ZeroTrustVMPolicy" \
        --resource-group ${RESOURCE_GROUP} \
        --vault-name ${RECOVERY_VAULT_NAME} \
        --backup-management-type AzureIaasVM \
-       --policy '{
-         "schedulePolicy": {
-           "schedulePolicyType": "SimpleSchedulePolicy",
-           "scheduleRunFrequency": "Daily",
-           "scheduleRunTimes": ["2024-01-01T02:00:00Z"],
-           "scheduleRunDays": null
-         },
-         "retentionPolicy": {
-           "retentionPolicyType": "LongTermRetentionPolicy",
-           "dailySchedule": {
-             "retentionTimes": ["2024-01-01T02:00:00Z"],
-             "retentionDuration": {
-               "count": 30,
-               "durationType": "Days"
-             }
-           },
-           "weeklySchedule": {
-             "daysOfTheWeek": ["Sunday"],
-             "retentionTimes": ["2024-01-01T02:00:00Z"],
-             "retentionDuration": {
-               "count": 12,
-               "durationType": "Weeks"
-             }
-           },
-           "monthlySchedule": {
-             "retentionScheduleFormatType": "Weekly",
-             "retentionScheduleWeekly": {
-               "daysOfTheWeek": ["Sunday"],
-               "weeksOfTheMonth": ["First"]
-             },
-             "retentionTimes": ["2024-01-01T02:00:00Z"],
-             "retentionDuration": {
-               "count": 12,
-               "durationType": "Months"
-             }
-           }
-         }
-       }'
-   
-   # Create backup policy for SQL databases
-   az backup policy create \
-       --name "ZeroTrustSQLPolicy" \
-       --resource-group ${RESOURCE_GROUP} \
-       --vault-name ${RECOVERY_VAULT_NAME} \
-       --backup-management-type AzureWorkload \
-       --workload-type MSSQL \
-       --policy '{
-         "settings": {
-           "timeZone": "UTC",
-           "issqlcompression": true,
-           "isEncryption": true
-         },
-         "subProtectionPolicy": [{
-           "policyType": "Full",
-           "schedulePolicy": {
-             "schedulePolicyType": "SimpleSchedulePolicy",
-             "scheduleRunFrequency": "Daily",
-             "scheduleRunTimes": ["2024-01-01T02:00:00Z"]
-           },
-           "retentionPolicy": {
-             "retentionPolicyType": "LongTermRetentionPolicy",
-             "dailySchedule": {
-               "retentionTimes": ["2024-01-01T02:00:00Z"],
-               "retentionDuration": {
-                 "count": 30,
-                 "durationType": "Days"
-               }
-             }
-           }
-         }]
-       }'
+       --policy "$(cat <<'EOF'
+{
+  "schedulePolicy": {
+    "schedulePolicyType": "SimpleSchedulePolicy",
+    "scheduleRunFrequency": "Daily",
+    "scheduleRunTimes": ["2024-01-01T02:00:00Z"]
+  },
+  "retentionPolicy": {
+    "retentionPolicyType": "LongTermRetentionPolicy",
+    "dailySchedule": {
+      "retentionTimes": ["2024-01-01T02:00:00Z"],
+      "retentionDuration": {
+        "count": 30,
+        "durationType": "Days"
+      }
+    },
+    "weeklySchedule": {
+      "daysOfTheWeek": ["Sunday"],
+      "retentionTimes": ["2024-01-01T02:00:00Z"],
+      "retentionDuration": {
+        "count": 12,
+        "durationType": "Weeks"
+      }
+    },
+    "monthlySchedule": {
+      "retentionScheduleFormatType": "Weekly",
+      "retentionScheduleWeekly": {
+        "daysOfTheWeek": ["Sunday"],
+        "weeksOfTheMonth": ["First"]
+      },
+      "retentionTimes": ["2024-01-01T02:00:00Z"],
+      "retentionDuration": {
+        "count": 12,
+        "durationType": "Months"
+      }
+    }
+  }
+}
+EOF
+)"
    
    echo "✅ Zero-trust backup policies created"
    ```
@@ -387,7 +356,7 @@ echo "✅ Required Azure resource providers registered"
        --name ${VM_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --image UbuntuLTS \
+       --image "Ubuntu2204" \
        --size Standard_B2s \
        --nics "nic-backup-test" \
        --authentication-type password \
@@ -490,21 +459,24 @@ echo "✅ Required Azure resource providers registered"
    az keyvault certificate create \
        --vault-name ${KEY_VAULT_NAME} \
        --name "backup-encryption-cert" \
-       --policy '{
-         "issuerParameters": {
-           "name": "Self"
-         },
-         "keyProperties": {
-           "exportable": true,
-           "keySize": 2048,
-           "keyType": "RSA",
-           "reuseKey": false
-         },
-         "x509CertificateProperties": {
-           "subject": "CN=backup-encryption",
-           "validityInMonths": 12
-         }
-       }'
+       --policy "$(cat <<'EOF'
+{
+  "issuerParameters": {
+    "name": "Self"
+  },
+  "keyProperties": {
+    "exportable": true,
+    "keySize": 2048,
+    "keyType": "RSA",
+    "reuseKey": false
+  },
+  "x509CertificateProperties": {
+    "subject": "CN=backup-encryption",
+    "validityInMonths": 12
+  }
+}
+EOF
+)"
    
    echo "✅ Backup secrets stored in Key Vault"
    ```
@@ -732,4 +704,9 @@ Extend this zero-trust backup security solution by implementing these advanced c
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

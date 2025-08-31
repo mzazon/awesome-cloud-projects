@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: Aurora DSQL, EventBridge, Lambda, CloudWatch
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: disaster-recovery, multi-region, database, aurora-dsql, eventbridge, monitoring, high-availability
 recipe-generator-version: 1.3
@@ -37,7 +37,7 @@ graph TB
         CW1[CloudWatch]
     end
     
-    subgraph "Secondary Region (us-west-2)"
+    subgraph "Secondary Region (us-east-2)"
         APP2[Application Layer]
         DSQL2[Aurora DSQL Cluster]
         EB2[EventBridge]
@@ -45,7 +45,7 @@ graph TB
         CW2[CloudWatch]
     end
     
-    subgraph "Witness Region (us-west-1)"
+    subgraph "Witness Region (us-west-2)"
         WITNESS[DSQL Witness]
     end
     
@@ -92,8 +92,9 @@ graph TB
 ```bash
 # Set environment variables for multi-region deployment
 export PRIMARY_REGION="us-east-1"
-export SECONDARY_REGION="us-west-2"
-export WITNESS_REGION="us-west-1"
+export SECONDARY_REGION="us-east-2"
+export WITNESS_REGION="us-west-2"
+export AWS_REGION=$(aws configure get region)
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
     --query Account --output text)
 
@@ -104,7 +105,6 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --output text --query RandomPassword)
 
 # Set resource naming variables
-export CLUSTER_PREFIX="dr-dsql-${RANDOM_SUFFIX}"
 export LAMBDA_FUNCTION_NAME="dr-monitor-${RANDOM_SUFFIX}"
 export EVENTBRIDGE_RULE_NAME="dr-health-monitor-${RANDOM_SUFFIX}"
 export SNS_TOPIC_NAME="dr-alerts-${RANDOM_SUFFIX}"
@@ -123,40 +123,36 @@ echo "Witness Region: ${WITNESS_REGION}"
 
    ```bash
    # Create primary Aurora DSQL cluster in us-east-1
-   aws dsql create-cluster \
+   echo "Creating primary Aurora DSQL cluster..."
+   PRIMARY_CLUSTER_RESPONSE=$(aws dsql create-cluster \
        --region ${PRIMARY_REGION} \
-       --cluster-identifier ${CLUSTER_PREFIX}-primary \
-       --multi-region-properties "{\"witnessRegion\":\"${WITNESS_REGION}\"}" \
-       --tags Key=Project,Value=DisasterRecovery \
-               Key=Environment,Value=Production \
-               Key=CostCenter,Value=Infrastructure
+       --multi-region-properties '{"witnessRegion":"'${WITNESS_REGION}'"}' \
+       --tags '[{"key":"Project","value":"DisasterRecovery"},{"key":"Environment","value":"Production"},{"key":"CostCenter","value":"Infrastructure"}]')
    
-   # Wait for primary cluster to become available
-   echo "⏳ Waiting for primary cluster to become available..."
-   aws dsql wait cluster-available \
+   # Extract cluster identifier from response
+   PRIMARY_CLUSTER_ID=$(echo $PRIMARY_CLUSTER_RESPONSE | jq -r '.identifier')
+   
+   # Wait for primary cluster to become active
+   echo "⏳ Waiting for primary cluster to become active..."
+   aws dsql wait cluster-active \
        --region ${PRIMARY_REGION} \
-       --identifier ${CLUSTER_PREFIX}-primary
+       --identifier ${PRIMARY_CLUSTER_ID}
    
-   # Store the primary cluster identifier
-   PRIMARY_CLUSTER_ID="${CLUSTER_PREFIX}-primary"
-   
-   # Create secondary Aurora DSQL cluster in us-west-2
-   aws dsql create-cluster \
+   # Create secondary Aurora DSQL cluster in us-east-2
+   echo "Creating secondary Aurora DSQL cluster..."
+   SECONDARY_CLUSTER_RESPONSE=$(aws dsql create-cluster \
        --region ${SECONDARY_REGION} \
-       --cluster-identifier ${CLUSTER_PREFIX}-secondary \
-       --multi-region-properties "{\"witnessRegion\":\"${WITNESS_REGION}\"}" \
-       --tags Key=Project,Value=DisasterRecovery \
-               Key=Environment,Value=Production \
-               Key=CostCenter,Value=Infrastructure
+       --multi-region-properties '{"witnessRegion":"'${WITNESS_REGION}'"}' \
+       --tags '[{"key":"Project","value":"DisasterRecovery"},{"key":"Environment","value":"Production"},{"key":"CostCenter","value":"Infrastructure"}]')
    
-   # Wait for secondary cluster to become available
-   echo "⏳ Waiting for secondary cluster to become available..."
-   aws dsql wait cluster-available \
+   # Extract cluster identifier from response
+   SECONDARY_CLUSTER_ID=$(echo $SECONDARY_CLUSTER_RESPONSE | jq -r '.identifier')
+   
+   # Wait for secondary cluster to become active
+   echo "⏳ Waiting for secondary cluster to become active..."
+   aws dsql wait cluster-active \
        --region ${SECONDARY_REGION} \
-       --identifier ${CLUSTER_PREFIX}-secondary
-   
-   # Store the secondary cluster identifier
-   SECONDARY_CLUSTER_ID="${CLUSTER_PREFIX}-secondary"
+       --identifier ${SECONDARY_CLUSTER_ID}
    
    echo "✅ Aurora DSQL clusters created in both regions"
    echo "Primary Cluster: ${PRIMARY_CLUSTER_ID}"
@@ -180,7 +176,7 @@ echo "Witness Region: ${WITNESS_REGION}"
    aws dsql update-cluster \
        --region ${PRIMARY_REGION} \
        --identifier ${PRIMARY_CLUSTER_ID} \
-       --multi-region-properties "{\"witnessRegion\":\"${WITNESS_REGION}\",\"clusters\":[\"${SECONDARY_CLUSTER_ARN}\"]}"
+       --multi-region-properties '{"witnessRegion":"'${WITNESS_REGION}'","clusters":["'${SECONDARY_CLUSTER_ARN}'"]}'
    
    # Get the ARN of the primary cluster for reverse peering
    PRIMARY_CLUSTER_ARN=$(aws dsql get-cluster \
@@ -192,11 +188,17 @@ echo "Witness Region: ${WITNESS_REGION}"
    aws dsql update-cluster \
        --region ${SECONDARY_REGION} \
        --identifier ${SECONDARY_CLUSTER_ID} \
-       --multi-region-properties "{\"witnessRegion\":\"${WITNESS_REGION}\",\"clusters\":[\"${PRIMARY_CLUSTER_ARN}\"]}"
+       --multi-region-properties '{"witnessRegion":"'${WITNESS_REGION}'","clusters":["'${PRIMARY_CLUSTER_ARN}'"]}'
    
    # Wait for clusters to complete peering process
    echo "⏳ Waiting for cluster peering to complete..."
-   sleep 30
+   aws dsql wait cluster-active \
+       --region ${PRIMARY_REGION} \
+       --identifier ${PRIMARY_CLUSTER_ID}
+   
+   aws dsql wait cluster-active \
+       --region ${SECONDARY_REGION} \
+       --identifier ${SECONDARY_CLUSTER_ID}
    
    # Verify peering status
    aws dsql get-cluster \
@@ -633,7 +635,7 @@ echo "Witness Region: ${WITNESS_REGION}"
                "properties": {
                    "metrics": [
                        ["Aurora/DSQL/DisasterRecovery", "ClusterHealth", "ClusterID", "CLUSTER_PRIMARY", "Region", "us-east-1"],
-                       ["Aurora/DSQL/DisasterRecovery", "ClusterHealth", "ClusterID", "CLUSTER_SECONDARY", "Region", "us-west-2"]
+                       ["Aurora/DSQL/DisasterRecovery", "ClusterHealth", "ClusterID", "CLUSTER_SECONDARY", "Region", "us-east-2"]
                    ],
                    "period": 300,
                    "stat": "Average",
@@ -945,16 +947,36 @@ echo "Witness Region: ${WITNESS_REGION}"
    aws dsql update-cluster \
        --region ${PRIMARY_REGION} \
        --identifier ${PRIMARY_CLUSTER_ID} \
-       --multi-region-properties "{\"witnessRegion\":\"${WITNESS_REGION}\",\"clusters\":[]}"
+       --multi-region-properties '{"witnessRegion":"'${WITNESS_REGION}'","clusters":[]}'
    
    aws dsql update-cluster \
        --region ${SECONDARY_REGION} \
        --identifier ${SECONDARY_CLUSTER_ID} \
-       --multi-region-properties "{\"witnessRegion\":\"${WITNESS_REGION}\",\"clusters\":[]}"
+       --multi-region-properties '{"witnessRegion":"'${WITNESS_REGION}'","clusters":[]}'
    
    # Wait for peering removal to complete
    echo "⏳ Waiting for cluster peering removal..."
    sleep 30
+   
+   # Disable deletion protection and delete clusters
+   aws dsql update-cluster \
+       --region ${PRIMARY_REGION} \
+       --identifier ${PRIMARY_CLUSTER_ID} \
+       --no-deletion-protection-enabled
+   
+   aws dsql update-cluster \
+       --region ${SECONDARY_REGION} \
+       --identifier ${SECONDARY_CLUSTER_ID} \
+       --no-deletion-protection-enabled
+   
+   # Wait for updates to complete
+   aws dsql wait cluster-active \
+       --region ${PRIMARY_REGION} \
+       --identifier ${PRIMARY_CLUSTER_ID}
+   
+   aws dsql wait cluster-active \
+       --region ${SECONDARY_REGION} \
+       --identifier ${SECONDARY_CLUSTER_ID}
    
    # Delete Aurora DSQL clusters
    aws dsql delete-cluster \
@@ -973,7 +995,7 @@ echo "Witness Region: ${WITNESS_REGION}"
 
 ## Discussion
 
-Building comprehensive multi-region disaster recovery with Aurora DSQL represents a paradigm shift from traditional database high availability approaches. Aurora DSQL's active-active architecture eliminates the complexity and failure points of primary-secondary configurations by providing simultaneous read-write access across regions with strong consistency guarantees. This distributed design ensures that applications experience zero downtime during regional failures while maintaining ACID transaction properties across geographic boundaries. The witness region concept provides additional resilience by enabling cluster membership decisions even during complex network partition scenarios. For comprehensive architectural guidance, reference the [Aurora DSQL documentation](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/what-is-aurora-dsql.html) and [multi-region deployment best practices](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/disaster-recovery-resiliency.html).
+Building comprehensive multi-region disaster recovery with Aurora DSQL represents a paradigm shift from traditional database high availability approaches. Aurora DSQL's active-active architecture eliminates the complexity and failure points of primary-secondary configurations by providing simultaneous read-write access across regions with strong consistency guarantees. This distributed design ensures that applications experience zero downtime during regional failures while maintaining ACID transaction properties across geographic boundaries. The witness region concept provides additional resilience by enabling cluster membership decisions even during complex network partition scenarios. For comprehensive architectural guidance, reference the [Aurora DSQL documentation](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/what-is-aurora-dsql.html) and [multi-region deployment best practices](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/configuring-multi-region-clusters.html).
 
 The EventBridge and Lambda integration creates an intelligent monitoring and alerting system that operates independently of the database infrastructure itself. This separation of concerns ensures that monitoring capabilities remain operational even during database-related incidents, providing continuous oversight and automated response capabilities. EventBridge's event-driven architecture enables sophisticated orchestration patterns that can coordinate disaster recovery actions across multiple regions and services. The enhanced Lambda functions implement custom CloudWatch metrics, exponential backoff retry logic, and comprehensive error handling to ensure reliable monitoring operations. For implementation best practices, review the [EventBridge documentation](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-what-is.html), [Lambda best practices](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html), and [CloudWatch custom metrics guide](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/publishingMetrics.html).
 
@@ -1001,4 +1023,11 @@ Extend this disaster recovery solution by implementing these advanced enhancemen
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Resource Graph, Azure Cost Management, Power BI, Azure Logic Apps
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-management, automation, reporting, governance, powerbi, resource-graph
 recipe-generator-version: 1.3
@@ -156,7 +156,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Key Vault configured with cost governance secrets"
    ```
 
-   The Key Vault now securely stores cost thresholds and configuration data that will be accessed by Logic Apps for automated cost monitoring. This approach follows Azure security best practices by separating sensitive configuration from application logic while maintaining compliance audit trails.
+   The Key Vault now securely stores cost thresholds and configuration data that will be accessed by Logic Apps for automated cost monitoring. This approach follows Azure security best practices by separating sensitive configuration from application logic while maintaining compliance audit trails through Azure RBAC.
 
 2. **Set Up Azure Resource Graph Query Infrastructure**:
 
@@ -180,7 +180,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    
    # Test Resource Graph query for cost-relevant resources
    az graph query \
-       --query "resources | where type in~ ['microsoft.compute/virtualmachines', 'microsoft.storage/storageaccounts', 'microsoft.sql/servers'] | project name, type, resourceGroup, location, subscriptionId | limit 10"
+       --graph-query "resources | where type in~ ['microsoft.compute/virtualmachines', 'microsoft.storage/storageaccounts', 'microsoft.sql/servers'] | project name, type, resourceGroup, location, subscriptionId | limit 10"
    
    echo "✅ Resource Graph infrastructure configured and tested"
    ```
@@ -267,7 +267,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    # Create sample cost query for testing
    az rest \
        --method POST \
-       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.CostManagement/query?api-version=2021-10-01" \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.CostManagement/query?api-version=2025-03-01" \
        --headers "Content-Type=application/json" \
        --body '{
            "type": "Usage",
@@ -292,7 +292,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Cost Management API integration configured with proper permissions"
    ```
 
-   The Logic App now has the necessary permissions to access Cost Management APIs and query cost data across subscriptions. This integration enables automated cost analysis and threshold monitoring that drives the governance workflows.
+   The Logic App now has the necessary permissions to access Cost Management APIs and query cost data across subscriptions. This integration enables automated cost analysis and threshold monitoring that drives the governance workflows using the latest API version.
 
 5. **Create Action Groups for Cost Alert Notifications**:
 
@@ -307,13 +307,13 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --action email cost-admin admin@company.com \
        --action webhook cost-webhook https://hooks.slack.com/services/YOUR/WEBHOOK/URL
    
-   # Create budget alert for monthly cost threshold
-   az consumption budget create \
+   # Create budget using updated consumption budget API
+   az consumption budget create-with-rg \
        --budget-name "monthly-cost-governance" \
        --amount 10000 \
-       --time-grain Monthly \
-       --time-period-start-date "2025-01-01" \
-       --time-period-end-date "2025-12-31" \
+       --category "Cost" \
+       --time-grain "Monthly" \
+       --time-period start="2025-01-01" end="2025-12-31" \
        --resource-group ${RESOURCE_GROUP} \
        --notifications '{
            "Actual_GreaterThan_80_Percent": {
@@ -359,7 +359,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    
    # Generate sample cost data for Power BI testing
    az graph query \
-       --query "resources | where type in~ ['microsoft.compute/virtualmachines', 'microsoft.storage/storageaccounts'] | project name, type, resourceGroup, location, subscriptionId, tags | limit 100" \
+       --graph-query "resources | where type in~ ['microsoft.compute/virtualmachines', 'microsoft.storage/storageaccounts'] | project name, type, resourceGroup, location, subscriptionId, tags | limit 100" \
        --output table > /tmp/resource-inventory.csv
    
    # Upload sample data to storage for Power BI consumption
@@ -421,7 +421,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    
    # Execute cost analysis query and save results
    az graph query \
-       --query "$(cat /tmp/cost-analysis-query.kql)" \
+       --graph-query "$(cat /tmp/cost-analysis-query.kql)" \
        --output json > /tmp/cost-analysis-results.json
    
    # Upload query results to storage for Power BI
@@ -457,7 +457,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    
    # Execute tag compliance analysis
    az graph query \
-       --query "$(cat /tmp/tag-compliance-query.kql)" \
+       --graph-query "$(cat /tmp/tag-compliance-query.kql)" \
        --output json > /tmp/tag-compliance-results.json
    
    az storage blob upload \
@@ -558,11 +558,11 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
            }
        }'
    
-   # Grant additional permissions for Logic App Key Vault access
-   az keyvault set-policy \
-       --name ${KEY_VAULT_NAME} \
-       --object-id ${LOGIC_APP_PRINCIPAL_ID} \
-       --secret-permissions get list
+   # Grant Key Vault Secrets User role to Logic App for RBAC model
+   az role assignment create \
+       --role "Key Vault Secrets User" \
+       --assignee ${LOGIC_APP_PRINCIPAL_ID} \
+       --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.KeyVault/vaults/${KEY_VAULT_NAME}"
    
    # Grant storage account access to Logic App
    az role assignment create \
@@ -579,7 +579,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Logic Apps workflow configured for automated cost governance"
    ```
 
-   The Logic Apps workflow is now fully configured to execute automated cost governance processes, including threshold monitoring, Resource Graph analysis, and data storage for Power BI reporting. This serverless orchestration ensures consistent and scalable cost management across your Azure environment.
+   The Logic Apps workflow is now fully configured to execute automated cost governance processes, including threshold monitoring, Resource Graph analysis, and data storage for Power BI reporting. This serverless orchestration ensures consistent and scalable cost management across your Azure environment using the recommended RBAC model for Key Vault access.
 
 ## Validation & Testing
 
@@ -588,11 +588,11 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Test Resource Graph connectivity and query execution
    az graph query \
-       --query "resources | summarize count() by type | order by count_ desc | limit 10"
+       --graph-query "resources | summarize count() by type | order by count_ desc | limit 10"
    
    # Verify tag compliance query results
    az graph query \
-       --query "resources | where type =~ 'microsoft.compute/virtualmachines' | extend hasOwnerTag = isnotempty(tags['Owner']) | summarize VMs = count(), TaggedVMs = countif(hasOwnerTag) by subscriptionId"
+       --graph-query "resources | where type =~ 'microsoft.compute/virtualmachines' | extend hasOwnerTag = isnotempty(tags['Owner']) | summarize VMs = count(), TaggedVMs = countif(hasOwnerTag) by subscriptionId"
    ```
 
    Expected output: Table showing resource counts by type and tag compliance statistics.
@@ -600,10 +600,10 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 2. **Test Cost Management API Integration**:
 
    ```bash
-   # Verify Cost Management API access
+   # Verify Cost Management API access with latest API version
    az rest \
        --method POST \
-       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.CostManagement/query?api-version=2021-10-01" \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.CostManagement/query?api-version=2025-03-01" \
        --headers "Content-Type=application/json" \
        --body '{
            "type": "Usage",
@@ -677,7 +677,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --notification-type "email"
    
    # Check budget alert configuration
-   az consumption budget show \
+   az consumption budget show-with-rg \
        --budget-name "monthly-cost-governance" \
        --resource-group ${RESOURCE_GROUP} \
        --output json
@@ -708,7 +708,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --resource-group ${RESOURCE_GROUP}
    
    # Delete budget configuration
-   az consumption budget delete \
+   az consumption budget delete-with-rg \
        --budget-name "monthly-cost-governance" \
        --resource-group ${RESOURCE_GROUP}
    
@@ -758,13 +758,13 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 This automated cost governance solution demonstrates the power of combining Azure Resource Graph's querying capabilities with Cost Management APIs and Power BI's visualization platform. The architecture provides real-time visibility into Azure spending patterns while enabling proactive cost management through automated alerts and executive reporting. This approach is particularly valuable for organizations with complex, multi-subscription Azure environments where manual cost monitoring becomes impractical and error-prone.
 
-The Resource Graph integration enables sophisticated resource analysis that goes beyond simple cost aggregation. By querying resource metadata, tags, and configurations, organizations can identify cost optimization opportunities such as underutilized resources, improperly sized instances, and tag compliance issues that impact cost allocation and chargeback processes. The [Azure Resource Graph documentation](https://docs.microsoft.com/en-us/azure/governance/resource-graph/) provides comprehensive guidance on advanced querying capabilities and best practices for large-scale resource analysis.
+The Resource Graph integration enables sophisticated resource analysis that goes beyond simple cost aggregation. By querying resource metadata, tags, and configurations, organizations can identify cost optimization opportunities such as underutilized resources, improperly sized instances, and tag compliance issues that impact cost allocation and chargeback processes. The [Azure Resource Graph documentation](https://learn.microsoft.com/en-us/azure/governance/resource-graph/) provides comprehensive guidance on advanced querying capabilities and best practices for large-scale resource analysis.
 
-Azure Logic Apps serves as the orchestration layer that transforms static queries into dynamic, automated workflows. The serverless nature of Logic Apps ensures cost-effective operations while providing the reliability and scalability needed for enterprise cost governance. Integration with Azure Key Vault ensures secure handling of sensitive configuration data, while managed identities eliminate the need for credential management. For detailed Logic Apps patterns and best practices, refer to the [Azure Logic Apps documentation](https://docs.microsoft.com/en-us/azure/logic-apps/).
+Azure Logic Apps serves as the orchestration layer that transforms static queries into dynamic, automated workflows. The serverless nature of Logic Apps ensures cost-effective operations while providing the reliability and scalability needed for enterprise cost governance. Integration with Azure Key Vault using the recommended RBAC model ensures secure handling of sensitive configuration data, while managed identities eliminate the need for credential management. For detailed Logic Apps patterns and best practices, refer to the [Azure Logic Apps documentation](https://learn.microsoft.com/en-us/azure/logic-apps/).
 
-The Power BI integration creates executive-level dashboards that translate technical resource data into business insights. By automating data refresh from Azure storage, the solution ensures that cost reports remain current and actionable. The combination of Resource Graph data with Cost Management APIs provides a comprehensive view of both resource inventory and associated costs, enabling data-driven decision making for cost optimization initiatives. The [Power BI Azure connectors documentation](https://docs.microsoft.com/en-us/power-bi/connect-data/service-azure-and-power-bi) offers additional guidance on advanced analytics scenarios and visualization best practices.
+The Power BI integration creates executive-level dashboards that translate technical resource data into business insights. By automating data refresh from Azure storage, the solution ensures that cost reports remain current and actionable. The combination of Resource Graph data with Cost Management APIs provides a comprehensive view of both resource inventory and associated costs, enabling data-driven decision making for cost optimization initiatives. The [Power BI Azure connectors documentation](https://learn.microsoft.com/en-us/power-bi/connect-data/service-azure-and-power-bi) offers additional guidance on advanced analytics scenarios and visualization best practices.
 
-> **Tip**: Implement tag governance policies using Azure Policy before deploying this solution to ensure consistent resource tagging that supports accurate cost allocation and reporting. The [Azure Policy documentation](https://docs.microsoft.com/en-us/azure/governance/policy/) provides comprehensive guidance on policy definitions and enforcement strategies.
+> **Tip**: Implement tag governance policies using Azure Policy before deploying this solution to ensure consistent resource tagging that supports accurate cost allocation and reporting. The [Azure Policy documentation](https://learn.microsoft.com/en-us/azure/governance/policy/) provides comprehensive guidance on policy definitions and enforcement strategies.
 
 ## Challenge
 
@@ -782,4 +782,9 @@ Extend this cost governance solution by implementing these advanced capabilities
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

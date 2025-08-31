@@ -1,0 +1,619 @@
+# Google Cloud Infrastructure Manager Configuration
+# Weather Dashboard with Cloud Functions and Storage
+# 
+# This configuration deploys a complete serverless weather dashboard solution
+# consisting of:
+# - Cloud Function for weather API proxy
+# - Cloud Storage bucket for static website hosting
+# - IAM bindings for public access
+# - Required API enablement
+
+# Infrastructure Manager imports and configuration
+imports:
+  - path: templates/function/main.py
+    name: weather_function_source
+
+# Input variables for customization
+variables:
+  # Project configuration
+  - name: project_id
+    description: "Google Cloud Project ID where resources will be created"
+    type: string
+    required: true
+
+  - name: region
+    description: "GCP region for resource deployment"
+    type: string
+    default: "us-central1"
+
+  - name: function_name
+    description: "Name for the weather API Cloud Function"
+    type: string
+    default: "weather-api"
+
+  - name: bucket_name
+    description: "Name for the Cloud Storage bucket (must be globally unique)"
+    type: string
+    required: true
+
+  - name: weather_api_key
+    description: "OpenWeatherMap API key for weather data access"
+    type: string
+    required: true
+    sensitive: true
+
+  # Resource configuration
+  - name: function_memory
+    description: "Memory allocation for Cloud Function in MB"
+    type: string
+    default: "256M"
+
+  - name: function_timeout
+    description: "Timeout for Cloud Function in seconds"
+    type: string
+    default: "60s"
+
+  - name: storage_class
+    description: "Storage class for the bucket"
+    type: string
+    default: "STANDARD"
+
+# Main resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: cloudfunctions_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudfunctions.googleapis.com
+      parent: projects/$(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: storage_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/storage.googleapis.com
+      parent: projects/$(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: cloudbuild_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Cloud Storage bucket for static website hosting
+  - name: weather_dashboard_bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.bucket_name)
+      project: $(var.project_id)
+      location: $(var.region)
+      storageClass: $(var.storage_class)
+      # Enable static website hosting
+      website:
+        mainPageSuffix: index.html
+        notFoundPage: 404.html
+      # Configure CORS for API access
+      cors:
+        - origin: ["*"]
+          method: ["GET", "POST", "OPTIONS"]
+          responseHeader: ["Content-Type", "Access-Control-Allow-Origin"]
+          maxAgeSeconds: 3600
+      # Uniform bucket-level access for simplified IAM
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Public access prevention - will be overridden by IAM binding
+      publicAccessPrevention: inherited
+    metadata:
+      dependsOn:
+        - storage_api
+
+  # IAM binding to make bucket publicly readable
+  - name: bucket_public_access
+    type: gcp-types/storage-v1:buckets/setIamPolicy
+    properties:
+      bucket: $(ref.weather_dashboard_bucket.name)
+      project: $(var.project_id)
+      policy:
+        bindings:
+          - role: roles/storage.objectViewer
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - weather_dashboard_bucket
+
+  # Cloud Function source code archive
+  - name: function_source_archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      name: weather-function-source.zip
+      bucket: $(ref.weather_dashboard_bucket.name)
+      # Base64 encoded ZIP file containing the function source
+      # This would contain main.py and requirements.txt
+      source:
+        # Function source code (main.py)
+        main.py: |
+          import functions_framework
+          import requests
+          import json
+          import os
+          from flask import jsonify
+
+          @functions_framework.http
+          def get_weather(request):
+              """HTTP Cloud Function to fetch weather data."""
+              
+              # Enable CORS for browser requests
+              if request.method == 'OPTIONS':
+                  headers = {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Max-Age': '3600'
+                  }
+                  return ('', 204, headers)
+              
+              # Set CORS headers for actual request
+              headers = {
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'GET',
+                  'Access-Control-Allow-Headers': 'Content-Type'
+              }
+              
+              try:
+                  # Get city from query parameter, default to San Francisco
+                  city = request.args.get('city', 'San Francisco')
+                  api_key = os.environ.get('WEATHER_API_KEY')
+                  
+                  if not api_key:
+                      return jsonify({'error': 'API key not configured'}), 500
+                  
+                  # Call OpenWeatherMap API using city name query
+                  url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=imperial"
+                  response = requests.get(url, timeout=10)
+                  
+                  if response.status_code == 200:
+                      weather_data = response.json()
+                      
+                      # Transform data for frontend
+                      simplified_data = {
+                          'city': weather_data['name'],
+                          'country': weather_data['sys']['country'],
+                          'temperature': round(weather_data['main']['temp']),
+                          'description': weather_data['weather'][0]['description'].title(),
+                          'humidity': weather_data['main']['humidity'],
+                          'pressure': weather_data['main']['pressure'],
+                          'wind_speed': weather_data['wind']['speed'],
+                          'icon': weather_data['weather'][0]['icon'],
+                          'timestamp': weather_data['dt']
+                      }
+                      
+                      return (jsonify(simplified_data), 200, headers)
+                  else:
+                      return (jsonify({'error': 'Weather data not found'}), 404, headers)
+                      
+              except Exception as e:
+                  return (jsonify({'error': str(e)}), 500, headers)
+        
+        # Function dependencies (requirements.txt)
+        requirements.txt: |
+          functions-framework==3.*
+          requests==2.*
+          flask==2.*
+    metadata:
+      dependsOn:
+        - weather_dashboard_bucket
+
+  # Cloud Function for weather API
+  - name: weather_api_function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      function:
+        name: projects/$(var.project_id)/locations/$(var.region)/functions/$(var.function_name)
+        description: "Serverless weather API proxy function"
+        # Source code configuration
+        sourceArchiveUrl: gs://$(ref.weather_dashboard_bucket.name)/weather-function-source.zip
+        # Runtime configuration
+        runtime: python311
+        entryPoint: get_weather
+        # Resource allocation
+        availableMemoryMb: 256
+        timeout: $(var.function_timeout)
+        # Environment variables
+        environmentVariables:
+          WEATHER_API_KEY: $(var.weather_api_key)
+        # HTTP trigger configuration
+        httpsTrigger:
+          securityLevel: SECURE_OPTIONAL
+        # Service account (uses default compute service account)
+        serviceAccountEmail: $(var.project_id)@appspot.gserviceaccount.com
+        # Labels for organization
+        labels:
+          deployment-tool: infrastructure-manager
+          recipe: weather-dashboard
+          component: api-function
+    metadata:
+      dependsOn:
+        - cloudfunctions_api
+        - function_source_archive
+
+  # IAM binding to allow unauthenticated invocation of the function
+  - name: function_public_access
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions/setIamPolicy
+    properties:
+      resource: $(ref.weather_api_function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - weather_api_function
+
+  # Website files in Cloud Storage
+  - name: index_html
+    type: gcp-types/storage-v1:objects
+    properties:
+      name: index.html
+      bucket: $(ref.weather_dashboard_bucket.name)
+      contentType: text/html
+      # HTML content for the weather dashboard
+      source: |
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Weather Dashboard</title>
+            <style>
+                * {
+                    margin: 0;
+                    padding: 0;
+                    box-sizing: border-box;
+                }
+                
+                body {
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #74b9ff, #0984e3);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                }
+                
+                .dashboard {
+                    background: rgba(255, 255, 255, 0.9);
+                    border-radius: 20px;
+                    padding: 2rem;
+                    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+                    backdrop-filter: blur(10px);
+                    max-width: 500px;
+                    width: 90%;
+                }
+                
+                .header {
+                    text-align: center;
+                    margin-bottom: 2rem;
+                }
+                
+                .header h1 {
+                    color: #2d3436;
+                    margin-bottom: 1rem;
+                }
+                
+                .search-box {
+                    display: flex;
+                    margin-bottom: 2rem;
+                }
+                
+                .search-box input {
+                    flex: 1;
+                    padding: 12px;
+                    border: 2px solid #ddd;
+                    border-radius: 10px 0 0 10px;
+                    font-size: 16px;
+                    outline: none;
+                }
+                
+                .search-box button {
+                    padding: 12px 20px;
+                    background: #0984e3;
+                    color: white;
+                    border: none;
+                    border-radius: 0 10px 10px 0;
+                    cursor: pointer;
+                    font-size: 16px;
+                }
+                
+                .weather-info {
+                    text-align: center;
+                    display: none;
+                }
+                
+                .temperature {
+                    font-size: 4rem;
+                    font-weight: bold;
+                    color: #2d3436;
+                    margin: 1rem 0;
+                }
+                
+                .description {
+                    font-size: 1.5rem;
+                    color: #636e72;
+                    margin-bottom: 2rem;
+                }
+                
+                .details {
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 1rem;
+                    margin-top: 2rem;
+                }
+                
+                .detail-item {
+                    background: rgba(116, 185, 255, 0.1);
+                    padding: 1rem;
+                    border-radius: 10px;
+                    text-align: center;
+                }
+                
+                .detail-label {
+                    font-size: 0.9rem;
+                    color: #636e72;
+                    margin-bottom: 0.5rem;
+                }
+                
+                .detail-value {
+                    font-size: 1.2rem;
+                    font-weight: bold;
+                    color: #2d3436;
+                }
+                
+                .loading {
+                    text-align: center;
+                    padding: 2rem;
+                    display: none;
+                }
+                
+                .error {
+                    background: #ff6b6b;
+                    color: white;
+                    padding: 1rem;
+                    border-radius: 10px;
+                    margin: 1rem 0;
+                    display: none;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="dashboard">
+                <div class="header">
+                    <h1>🌤️ Weather Dashboard</h1>
+                </div>
+                
+                <div class="search-box">
+                    <input type="text" id="cityInput" placeholder="Enter city name..." value="San Francisco">
+                    <button onclick="getWeather()">Get Weather</button>
+                </div>
+                
+                <div class="loading" id="loading">
+                    <p>Loading weather data...</p>
+                </div>
+                
+                <div class="error" id="error"></div>
+                
+                <div class="weather-info" id="weatherInfo">
+                    <div class="temperature" id="temperature"></div>
+                    <div class="description" id="description"></div>
+                    <div class="city" id="cityName"></div>
+                    
+                    <div class="details">
+                        <div class="detail-item">
+                            <div class="detail-label">Humidity</div>
+                            <div class="detail-value" id="humidity"></div>
+                        </div>
+                        <div class="detail-item">
+                            <div class="detail-label">Pressure</div>
+                            <div class="detail-value" id="pressure"></div>
+                        </div>
+                        <div class="detail-item">
+                            <div class="detail-label">Wind Speed</div>
+                            <div class="detail-value" id="windSpeed"></div>
+                        </div>
+                        <div class="detail-item">
+                            <div class="detail-label">Last Updated</div>
+                            <div class="detail-value" id="timestamp"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <script>
+                // Function URL will be populated during deployment
+                const FUNCTION_URL = 'FUNCTION_URL_PLACEHOLDER';
+                
+                async function getWeather() {
+                    const city = document.getElementById('cityInput').value;
+                    const loading = document.getElementById('loading');
+                    const error = document.getElementById('error');
+                    const weatherInfo = document.getElementById('weatherInfo');
+                    
+                    // Show loading state
+                    loading.style.display = 'block';
+                    error.style.display = 'none';
+                    weatherInfo.style.display = 'none';
+                    
+                    try {
+                        const response = await fetch(`${FUNCTION_URL}?city=${encodeURIComponent(city)}`);
+                        const data = await response.json();
+                        
+                        if (response.ok) {
+                            displayWeather(data);
+                        } else {
+                            showError(data.error || 'Failed to fetch weather data');
+                        }
+                    } catch (err) {
+                        showError('Network error: Please check your connection');
+                    } finally {
+                        loading.style.display = 'none';
+                    }
+                }
+                
+                function displayWeather(data) {
+                    document.getElementById('temperature').textContent = `${data.temperature}°F`;
+                    document.getElementById('description').textContent = data.description;
+                    document.getElementById('cityName').textContent = `${data.city}, ${data.country}`;
+                    document.getElementById('humidity').textContent = `${data.humidity}%`;
+                    document.getElementById('pressure').textContent = `${data.pressure} hPa`;
+                    document.getElementById('windSpeed').textContent = `${data.wind_speed} mph`;
+                    document.getElementById('timestamp').textContent = new Date().toLocaleTimeString();
+                    
+                    document.getElementById('weatherInfo').style.display = 'block';
+                }
+                
+                function showError(message) {
+                    const errorDiv = document.getElementById('error');
+                    errorDiv.textContent = message;
+                    errorDiv.style.display = 'block';
+                }
+                
+                // Allow Enter key to trigger search
+                document.getElementById('cityInput').addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        getWeather();
+                    }
+                });
+                
+                // Load default weather on page load
+                window.onload = function() {
+                    getWeather();
+                };
+            </script>
+        </body>
+        </html>
+    metadata:
+      dependsOn:
+        - weather_dashboard_bucket
+
+  # 404 error page
+  - name: error_404_html
+    type: gcp-types/storage-v1:objects
+    properties:
+      name: 404.html
+      bucket: $(ref.weather_dashboard_bucket.name)
+      contentType: text/html
+      source: |
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Page Not Found - Weather Dashboard</title>
+            <style>
+                body {
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #74b9ff, #0984e3);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    margin: 0;
+                }
+                
+                .error-container {
+                    background: rgba(255, 255, 255, 0.9);
+                    border-radius: 20px;
+                    padding: 3rem;
+                    text-align: center;
+                    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+                    backdrop-filter: blur(10px);
+                }
+                
+                .error-code {
+                    font-size: 6rem;
+                    font-weight: bold;
+                    color: #ff6b6b;
+                    margin-bottom: 1rem;
+                }
+                
+                .error-message {
+                    font-size: 1.5rem;
+                    color: #2d3436;
+                    margin-bottom: 2rem;
+                }
+                
+                .back-button {
+                    background: #0984e3;
+                    color: white;
+                    padding: 12px 24px;
+                    border: none;
+                    border-radius: 10px;
+                    font-size: 1rem;
+                    cursor: pointer;
+                    text-decoration: none;
+                    display: inline-block;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="error-container">
+                <div class="error-code">404</div>
+                <div class="error-message">Oops! The weather page you're looking for doesn't exist.</div>
+                <a href="/" class="back-button">Return to Weather Dashboard</a>
+            </div>
+        </body>
+        </html>
+    metadata:
+      dependsOn:
+        - weather_dashboard_bucket
+
+# Output values for reference and verification
+outputs:
+  - name: function_url
+    description: "URL of the deployed weather API Cloud Function"
+    value: $(ref.weather_api_function.httpsTrigger.url)
+
+  - name: website_url
+    description: "URL of the weather dashboard website"
+    value: https://storage.googleapis.com/$(ref.weather_dashboard_bucket.name)/index.html
+
+  - name: bucket_name
+    description: "Name of the created Cloud Storage bucket"
+    value: $(ref.weather_dashboard_bucket.name)
+
+  - name: function_name
+    description: "Name of the deployed Cloud Function"
+    value: $(ref.weather_api_function.name)
+
+  - name: project_id
+    description: "Project ID where resources were deployed"
+    value: $(var.project_id)
+
+  - name: region
+    description: "Region where resources were deployed"
+    value: $(var.region)
+
+# Deployment metadata
+metadata:
+  version: "1.0"
+  description: "Weather Dashboard with Cloud Functions and Storage - Infrastructure Manager Template"
+  author: "Generated by Infrastructure as Code generator"
+  tags:
+    - serverless
+    - weather
+    - dashboard
+    - cloud-functions
+    - cloud-storage
+  estimated_cost: "$0.01-$0.50/month"
+  difficulty: "beginner"

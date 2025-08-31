@@ -1,0 +1,937 @@
+# Infrastructure Manager Configuration for Interactive Quiz Generation with Vertex AI
+# This configuration deploys a complete quiz generation system using Vertex AI's Gemini models,
+# Cloud Functions for serverless processing, and Cloud Storage for data management.
+
+# Configure the Google Cloud provider
+terraform:
+  required_providers:
+    google:
+      source: hashicorp/google
+      version: ~> 6.8.0
+  required_version: ">= 1.0"
+
+# Variables for customizing the deployment
+variable "project_id":
+  description: "Google Cloud Project ID for the quiz generation system"
+  type: string
+
+variable "region":
+  description: "GCP region for resource deployment"
+  type: string
+  default: "us-central1"
+
+variable "zone":
+  description: "GCP zone for compute resources"
+  type: string
+  default: "us-central1-a"
+
+variable "bucket_suffix":
+  description: "Unique suffix for the Cloud Storage bucket name"
+  type: string
+  default: null
+
+variable "function_suffix":
+  description: "Unique suffix for Cloud Function names"
+  type: string
+  default: null
+
+# Local values for resource naming and configuration
+locals:
+  # Generate random suffixes if not provided
+  bucket_suffix = var.bucket_suffix != null ? var.bucket_suffix : substr(sha256(var.project_id), 0, 6)
+  function_suffix = var.function_suffix != null ? var.function_suffix : substr(sha256(var.project_id), 0, 6)
+  
+  # Resource names with unique suffixes
+  bucket_name = "quiz-materials-${local.bucket_suffix}"
+  service_account_name = "quiz-ai-service"
+  
+  # Function names
+  generator_function_name = "quiz-generator-${local.function_suffix}"
+  delivery_function_name = "quiz-delivery-${local.function_suffix}"
+  scoring_function_name = "quiz-scoring-${local.function_suffix}"
+  
+  # Common labels for resource organization
+  common_labels = {
+    purpose = "quiz-generation"
+    environment = "demo"
+    managed-by = "infrastructure-manager"
+  }
+  
+  # Required APIs for the quiz generation system
+  required_apis = [
+    "aiplatform.googleapis.com",          # Vertex AI for quiz generation
+    "cloudfunctions.googleapis.com",      # Cloud Functions for serverless compute
+    "storage.googleapis.com",             # Cloud Storage for data management
+    "cloudbuild.googleapis.com",          # Cloud Build for function deployment
+    "artifactregistry.googleapis.com",    # Artifact Registry for container storage
+    "logging.googleapis.com",             # Cloud Logging for observability
+    "monitoring.googleapis.com"           # Cloud Monitoring for performance tracking
+  ]
+}
+
+# Configure the Google Cloud provider with project and region
+provider "google":
+  project = var.project_id
+  region  = var.region
+  zone    = var.zone
+
+# Enable required Google Cloud APIs for the quiz generation system
+resource "google_project_service" "required_apis":
+  for_each = toset(local.required_apis)
+  
+  project = var.project_id
+  service = each.value
+  
+  # Prevent disabling APIs when the resource is destroyed
+  disable_on_destroy = false
+  
+  # Ensure APIs are enabled before creating dependent resources
+  provisioner "local-exec":
+    command = "echo 'Enabled API: ${each.value}'"
+  
+  timeouts {
+    create = "30m"
+    update = "40m"
+  }
+
+# Create service account for AI/ML services with proper permissions
+resource "google_service_account" "quiz_ai_service":
+  account_id   = local.service_account_name
+  display_name = "Quiz Generation AI Service"
+  description  = "Service account for Vertex AI quiz generation and Cloud Storage access"
+  project      = var.project_id
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Grant Vertex AI User role for AI model access
+resource "google_project_iam_member" "ai_platform_user":
+  project = var.project_id
+  role    = "roles/aiplatform.user"
+  member  = "serviceAccount:${google_service_account.quiz_ai_service.email}"
+  
+  depends_on = [google_service_account.quiz_ai_service]
+}
+
+# Grant Cloud Storage Object Admin role for content and quiz management
+resource "google_project_iam_member" "storage_object_admin":
+  project = var.project_id
+  role    = "roles/storage.objectAdmin"
+  member  = "serviceAccount:${google_service_account.quiz_ai_service.email}"
+  
+  depends_on = [google_service_account.quiz_ai_service]
+}
+
+# Grant Cloud Functions Invoker role for internal function communication
+resource "google_project_iam_member" "functions_invoker":
+  project = var.project_id
+  role    = "roles/cloudfunctions.invoker"
+  member  = "serviceAccount:${google_service_account.quiz_ai_service.email}"
+  
+  depends_on = [google_service_account.quiz_ai_service]
+}
+
+# Create Cloud Storage bucket for learning materials and quiz data
+resource "google_storage_bucket" "quiz_materials":
+  name     = local.bucket_name
+  project  = var.project_id
+  location = var.region
+  
+  # Enable uniform bucket-level access for consistent security
+  uniform_bucket_level_access = true
+  
+  # Enable versioning for content tracking and recovery
+  versioning {
+    enabled = true
+  }
+  
+  # Configure lifecycle management for cost optimization
+  lifecycle_rule {
+    # Transition to Nearline storage after 30 days
+    condition {
+      age = 30
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+  
+  lifecycle_rule {
+    # Transition to Coldline storage after 90 days
+    condition {
+      age = 90
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
+  }
+  
+  lifecycle_rule {
+    # Delete objects after 7 years for compliance
+    condition {
+      age = 2555  # 7 years in days
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  # Apply common labels for resource organization
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create bucket folders for organized content management
+resource "google_storage_bucket_object" "uploads_folder":
+  name   = "uploads/.keep"
+  bucket = google_storage_bucket.quiz_materials.name
+  content = "# This folder stores uploaded learning materials"
+  
+  depends_on = [google_storage_bucket.quiz_materials]
+}
+
+resource "google_storage_bucket_object" "quizzes_folder":
+  name   = "quizzes/.keep"
+  bucket = google_storage_bucket.quiz_materials.name
+  content = "# This folder stores generated quiz JSON files"
+  
+  depends_on = [google_storage_bucket.quiz_materials]
+}
+
+resource "google_storage_bucket_object" "results_folder":
+  name   = "results/.keep"
+  bucket = google_storage_bucket.quiz_materials.name
+  content = "# This folder stores quiz results and student submissions"
+  
+  depends_on = [google_storage_bucket.quiz_materials]
+}
+
+# Create ZIP archive for quiz generation function source code
+data "archive_file" "quiz_generator_source":
+  type        = "zip"
+  output_path = "quiz-generator-source.zip"
+  
+  source {
+    content = <<-EOT
+import json
+import os
+from typing import Dict, List, Any
+from google.cloud import aiplatform
+from google.cloud import storage
+import vertexai
+from vertexai.generative_models import GenerativeModel
+import functions_framework
+from flask import Request, jsonify
+
+# Initialize Vertex AI
+PROJECT_ID = os.environ.get('GCP_PROJECT', os.environ.get('GOOGLE_CLOUD_PROJECT'))
+REGION = os.environ.get('REGION', 'us-central1')
+
+vertexai.init(project=PROJECT_ID, location=REGION)
+model = GenerativeModel("gemini-1.5-flash-002")
+
+@functions_framework.http
+def generate_quiz(request: Request) -> Any:
+    """Generate quiz from uploaded content using Vertex AI."""
+    
+    if request.method == 'OPTIONS':
+        return _handle_cors()
+    
+    try:
+        # Parse request data
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return jsonify({'error': 'No JSON data provided'}), 400
+        
+        content_text = request_json.get('content', '')
+        question_count = request_json.get('question_count', 5)
+        difficulty = request_json.get('difficulty', 'medium')
+        
+        if not content_text:
+            return jsonify({'error': 'Content text is required'}), 400
+        
+        # Generate quiz using Vertex AI
+        quiz = _generate_quiz_with_ai(content_text, question_count, difficulty)
+        
+        # Store quiz in Cloud Storage
+        quiz_id = _store_quiz(quiz)
+        
+        response = jsonify({
+            'quiz_id': quiz_id,
+            'quiz': quiz,
+            'status': 'success'
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
+        
+    except Exception as e:
+        error_response = jsonify({'error': str(e), 'status': 'error'})
+        error_response.headers.add('Access-Control-Allow-Origin', '*')
+        return error_response, 500
+
+def _generate_quiz_with_ai(content: str, count: int, difficulty: str) -> Dict:
+    """Use Vertex AI to generate quiz questions from content."""
+    
+    prompt = f"""
+    Based on the following educational content, generate {count} quiz questions at {difficulty} difficulty level.
+    
+    Create a mix of question types:
+    - Multiple choice (4 options each)
+    - True/False
+    - Short answer
+    
+    Content:
+    {content[:4000]}  # Limit content to stay within token limits
+    
+    Return the response as valid JSON with this structure:
+    {{
+        "title": "Quiz Title",
+        "questions": [
+            {{
+                "type": "multiple_choice",
+                "question": "Question text",
+                "options": ["A", "B", "C", "D"],
+                "correct_answer": 0,
+                "explanation": "Why this answer is correct"
+            }},
+            {{
+                "type": "true_false",
+                "question": "Question text",
+                "correct_answer": true,
+                "explanation": "Explanation"
+            }},
+            {{
+                "type": "short_answer",
+                "question": "Question text",
+                "sample_answer": "Expected answer",
+                "explanation": "Explanation"
+            }}
+        ]
+    }}
+    """
+    
+    response = model.generate_content(prompt)
+    
+    try:
+        # Clean response text and parse as JSON
+        response_text = response.text.strip()
+        if response_text.startswith('```json'):
+            response_text = response_text[7:-3].strip()
+        elif response_text.startswith('```'):
+            response_text = response_text[3:-3].strip()
+        
+        quiz_data = json.loads(response_text)
+        
+        # Validate quiz structure
+        if 'questions' not in quiz_data or not quiz_data['questions']:
+            raise ValueError("Invalid quiz structure")
+            
+        return quiz_data
+        
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"Error parsing AI response: {e}. Using fallback quiz.")
+        # Fallback if AI doesn't return valid JSON
+        return {
+            "title": "Generated Quiz",
+            "questions": [{
+                "type": "multiple_choice",
+                "question": "What is the main topic of the provided content?",
+                "options": ["Topic A", "Topic B", "Topic C", "Topic D"],
+                "correct_answer": 0,
+                "explanation": "Based on content analysis"
+            }]
+        }
+
+def _store_quiz(quiz_data: Dict) -> str:
+    """Store generated quiz in Cloud Storage."""
+    
+    storage_client = storage.Client()
+    bucket_name = os.environ.get('BUCKET_NAME')
+    bucket = storage_client.bucket(bucket_name)
+    
+    # Generate unique quiz ID
+    quiz_id = f"quiz_{os.urandom(8).hex()}"
+    blob_name = f"quizzes/{quiz_id}.json"
+    
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(
+        json.dumps(quiz_data, indent=2),
+        content_type='application/json'
+    )
+    
+    return quiz_id
+
+def _handle_cors():
+    """Handle CORS preflight requests."""
+    response = jsonify({'status': 'ok'})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    return response
+EOT
+    filename = "main.py"
+  }
+  
+  source {
+    content = <<-EOT
+google-cloud-aiplatform==1.75.0
+google-cloud-storage==2.18.0
+functions-framework==3.8.1
+Flask==3.0.3
+PyPDF2==3.0.1
+python-docx==1.1.2
+EOT
+    filename = "requirements.txt"
+  }
+}
+
+# Upload quiz generator function source to Cloud Storage
+resource "google_storage_bucket_object" "quiz_generator_source":
+  name   = "functions/quiz-generator-source.zip"
+  bucket = google_storage_bucket.quiz_materials.name
+  source = data.archive_file.quiz_generator_source.output_path
+  
+  depends_on = [google_storage_bucket.quiz_materials]
+}
+
+# Deploy Quiz Generation Cloud Function with Vertex AI integration
+resource "google_cloudfunctions_function" "quiz_generator":
+  name     = local.generator_function_name
+  project  = var.project_id
+  region   = var.region
+  
+  description = "Generates interactive quizzes using Vertex AI Gemini models"
+  runtime     = "python312"
+  
+  # Function source code configuration
+  source_archive_bucket = google_storage_bucket.quiz_materials.name
+  source_archive_object = google_storage_bucket_object.quiz_generator_source.name
+  
+  # Function execution configuration
+  entry_point = "generate_quiz"
+  timeout     = 300  # 5 minutes for AI processing
+  
+  # Resource allocation for AI workloads
+  available_memory_mb = 512
+  
+  # HTTP trigger configuration
+  trigger {
+    https_trigger {}
+  }
+  
+  # Environment variables for function configuration
+  environment_variables = {
+    BUCKET_NAME = google_storage_bucket.quiz_materials.name
+    REGION      = var.region
+  }
+  
+  # Service account for secure AI access
+  service_account_email = google_service_account.quiz_ai_service.email
+  
+  # Apply common labels
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket_object.quiz_generator_source,
+    google_service_account.quiz_ai_service
+  ]
+}
+
+# Create ZIP archive for quiz delivery function
+data "archive_file" "quiz_delivery_source":
+  type        = "zip"
+  output_path = "quiz-delivery-source.zip"
+  
+  source {
+    content = <<-EOT
+import json
+import os
+from google.cloud import storage
+import functions_framework
+from flask import Request, jsonify
+
+@functions_framework.http
+def deliver_quiz(request: Request):
+    """Deliver quiz to students with proper formatting."""
+    
+    if request.method == 'OPTIONS':
+        return _handle_cors()
+    
+    try:
+        # Get quiz ID from request
+        quiz_id = request.args.get('quiz_id')
+        if not quiz_id:
+            return jsonify({'error': 'Quiz ID required'}), 400
+        
+        # Retrieve quiz from storage
+        quiz_data = _get_quiz_from_storage(quiz_id)
+        if not quiz_data:
+            return jsonify({'error': 'Quiz not found'}), 404
+        
+        # Format quiz for delivery (remove answers for student view)
+        student_quiz = _format_for_students(quiz_data)
+        
+        response = jsonify({
+            'quiz_id': quiz_id,
+            'quiz': student_quiz,
+            'status': 'success'
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
+        
+    except Exception as e:
+        error_response = jsonify({'error': str(e)})
+        error_response.headers.add('Access-Control-Allow-Origin', '*')
+        return error_response, 500
+
+def _get_quiz_from_storage(quiz_id: str):
+    """Retrieve quiz from Cloud Storage."""
+    
+    storage_client = storage.Client()
+    bucket_name = os.environ.get('BUCKET_NAME')
+    bucket = storage_client.bucket(bucket_name)
+    
+    blob_name = f"quizzes/{quiz_id}.json"
+    blob = bucket.blob(blob_name)
+    
+    if not blob.exists():
+        return None
+    
+    quiz_content = blob.download_as_text()
+    return json.loads(quiz_content)
+
+def _format_for_students(quiz_data):
+    """Remove correct answers for student delivery."""
+    
+    formatted_quiz = {
+        'title': quiz_data.get('title', 'Quiz'),
+        'questions': []
+    }
+    
+    for i, question in enumerate(quiz_data.get('questions', [])):
+        student_question = {
+            'id': i,
+            'type': question['type'],
+            'question': question['question']
+        }
+        
+        if question['type'] == 'multiple_choice':
+            student_question['options'] = question['options']
+        
+        formatted_quiz['questions'].append(student_question)
+    
+    return formatted_quiz
+
+def _handle_cors():
+    """Handle CORS preflight requests."""
+    response = jsonify({'status': 'ok'})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, OPTIONS')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    return response
+EOT
+    filename = "main.py"
+  }
+  
+  source {
+    content = <<-EOT
+google-cloud-storage==2.18.0
+functions-framework==3.8.1
+Flask==3.0.3
+EOT
+    filename = "requirements.txt"
+  }
+}
+
+# Upload quiz delivery function source to Cloud Storage
+resource "google_storage_bucket_object" "quiz_delivery_source":
+  name   = "functions/quiz-delivery-source.zip"
+  bucket = google_storage_bucket.quiz_materials.name
+  source = data.archive_file.quiz_delivery_source.output_path
+  
+  depends_on = [google_storage_bucket.quiz_materials]
+}
+
+# Deploy Quiz Delivery Cloud Function
+resource "google_cloudfunctions_function" "quiz_delivery":
+  name     = local.delivery_function_name
+  project  = var.project_id
+  region   = var.region
+  
+  description = "Delivers quizzes to students with answer keys removed"
+  runtime     = "python312"
+  
+  # Function source code configuration
+  source_archive_bucket = google_storage_bucket.quiz_materials.name
+  source_archive_object = google_storage_bucket_object.quiz_delivery_source.name
+  
+  # Function execution configuration
+  entry_point = "deliver_quiz"
+  timeout     = 60  # 1 minute for quiz delivery
+  
+  # Resource allocation for delivery workloads
+  available_memory_mb = 256
+  
+  # HTTP trigger configuration
+  trigger {
+    https_trigger {}
+  }
+  
+  # Environment variables
+  environment_variables = {
+    BUCKET_NAME = google_storage_bucket.quiz_materials.name
+  }
+  
+  # Service account for storage access
+  service_account_email = google_service_account.quiz_ai_service.email
+  
+  # Apply common labels
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket_object.quiz_delivery_source,
+    google_service_account.quiz_ai_service
+  ]
+}
+
+# Create ZIP archive for quiz scoring function
+data "archive_file" "quiz_scoring_source":
+  type        = "zip"
+  output_path = "quiz-scoring-source.zip"
+  
+  source {
+    content = <<-EOT
+import json
+import os
+from datetime import datetime
+from google.cloud import storage
+import functions_framework
+from flask import Request, jsonify
+
+@functions_framework.http
+def score_quiz(request: Request):
+    """Score submitted quiz and provide feedback."""
+    
+    if request.method == 'OPTIONS':
+        return _handle_cors()
+    
+    try:
+        # Parse submission data
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return jsonify({'error': 'No submission data'}), 400
+        
+        quiz_id = request_json.get('quiz_id')
+        student_answers = request_json.get('answers', {})
+        student_id = request_json.get('student_id', 'anonymous')
+        
+        # Get original quiz with answers
+        quiz_data = _get_quiz_from_storage(quiz_id)
+        if not quiz_data:
+            return jsonify({'error': 'Quiz not found'}), 404
+        
+        # Calculate score and feedback
+        results = _calculate_score(quiz_data, student_answers)
+        
+        # Store results
+        result_id = _store_results(quiz_id, student_id, student_answers, results)
+        
+        response = jsonify({
+            'result_id': result_id,
+            'score': results['score'],
+            'total_questions': results['total_questions'],
+            'percentage': results['percentage'],
+            'feedback': results['feedback'],
+            'status': 'success'
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
+        
+    except Exception as e:
+        error_response = jsonify({'error': str(e)})
+        error_response.headers.add('Access-Control-Allow-Origin', '*')
+        return error_response, 500
+
+def _get_quiz_from_storage(quiz_id: str):
+    """Retrieve quiz from Cloud Storage."""
+    
+    storage_client = storage.Client()
+    bucket_name = os.environ.get('BUCKET_NAME')
+    bucket = storage_client.bucket(bucket_name)
+    
+    blob_name = f"quizzes/{quiz_id}.json"
+    blob = bucket.blob(blob_name)
+    
+    if not blob.exists():
+        return None
+    
+    quiz_content = blob.download_as_text()
+    return json.loads(quiz_content)
+
+def _calculate_score(quiz_data, student_answers):
+    """Calculate score and provide detailed feedback."""
+    
+    questions = quiz_data.get('questions', [])
+    correct_count = 0
+    total_questions = len(questions)
+    feedback = []
+    
+    for i, question in enumerate(questions):
+        question_id = str(i)
+        student_answer = student_answers.get(question_id)
+        
+        is_correct = False
+        explanation = question.get('explanation', 'No explanation available')
+        
+        if question['type'] == 'multiple_choice':
+            correct_answer = question['correct_answer']
+            is_correct = student_answer == correct_answer
+            
+        elif question['type'] == 'true_false':
+            correct_answer = question['correct_answer']
+            is_correct = student_answer == correct_answer
+            
+        elif question['type'] == 'short_answer':
+            # Simple text matching for short answers
+            correct_answer = question.get('sample_answer', '').lower()
+            student_text = str(student_answer).lower() if student_answer else ''
+            is_correct = correct_answer in student_text or student_text in correct_answer
+        
+        if is_correct:
+            correct_count += 1
+        
+        feedback.append({
+            'question_id': i,
+            'question': question['question'],
+            'correct': is_correct,
+            'explanation': explanation
+        })
+    
+    percentage = (correct_count / total_questions * 100) if total_questions > 0 else 0
+    
+    return {
+        'score': correct_count,
+        'total_questions': total_questions,
+        'percentage': round(percentage, 2),
+        'feedback': feedback
+    }
+
+def _store_results(quiz_id, student_id, answers, results):
+    """Store quiz results in Cloud Storage."""
+    
+    storage_client = storage.Client()
+    bucket_name = os.environ.get('BUCKET_NAME')
+    bucket = storage_client.bucket(bucket_name)
+    
+    result_id = f"result_{os.urandom(8).hex()}"
+    blob_name = f"results/{result_id}.json"
+    
+    result_data = {
+        'result_id': result_id,
+        'quiz_id': quiz_id,
+        'student_id': student_id,
+        'timestamp': datetime.utcnow().isoformat(),
+        'answers': answers,
+        'results': results
+    }
+    
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(
+        json.dumps(result_data, indent=2),
+        content_type='application/json'
+    )
+    
+    return result_id
+
+def _handle_cors():
+    """Handle CORS preflight requests."""
+    response = jsonify({'status': 'ok'})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    return response
+EOT
+    filename = "main.py"
+  }
+  
+  source {
+    content = <<-EOT
+google-cloud-storage==2.18.0
+functions-framework==3.8.1
+Flask==3.0.3
+EOT
+    filename = "requirements.txt"
+  }
+}
+
+# Upload quiz scoring function source to Cloud Storage
+resource "google_storage_bucket_object" "quiz_scoring_source":
+  name   = "functions/quiz-scoring-source.zip"
+  bucket = google_storage_bucket.quiz_materials.name
+  source = data.archive_file.quiz_scoring_source.output_path
+  
+  depends_on = [google_storage_bucket.quiz_materials]
+}
+
+# Deploy Quiz Scoring Cloud Function
+resource "google_cloudfunctions_function" "quiz_scoring":
+  name     = local.scoring_function_name
+  project  = var.project_id
+  region   = var.region
+  
+  description = "Scores quiz submissions and provides detailed feedback"
+  runtime     = "python312"
+  
+  # Function source code configuration
+  source_archive_bucket = google_storage_bucket.quiz_materials.name
+  source_archive_object = google_storage_bucket_object.quiz_scoring_source.name
+  
+  # Function execution configuration
+  entry_point = "score_quiz"
+  timeout     = 60  # 1 minute for scoring
+  
+  # Resource allocation for scoring workloads
+  available_memory_mb = 256
+  
+  # HTTP trigger configuration
+  trigger {
+    https_trigger {}
+  }
+  
+  # Environment variables
+  environment_variables = {
+    BUCKET_NAME = google_storage_bucket.quiz_materials.name
+  }
+  
+  # Service account for storage access
+  service_account_email = google_service_account.quiz_ai_service.email
+  
+  # Apply common labels
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket_object.quiz_scoring_source,
+    google_service_account.quiz_ai_service
+  ]
+}
+
+# Allow unauthenticated access to quiz generation function
+resource "google_cloudfunctions_function_iam_member" "generator_public_access":
+  project        = var.project_id
+  region         = var.region
+  cloud_function = google_cloudfunctions_function.quiz_generator.name
+  role           = "roles/cloudfunctions.invoker"
+  member         = "allUsers"
+  
+  depends_on = [google_cloudfunctions_function.quiz_generator]
+}
+
+# Allow unauthenticated access to quiz delivery function
+resource "google_cloudfunctions_function_iam_member" "delivery_public_access":
+  project        = var.project_id
+  region         = var.region
+  cloud_function = google_cloudfunctions_function.quiz_delivery.name
+  role           = "roles/cloudfunctions.invoker"
+  member         = "allUsers"
+  
+  depends_on = [google_cloudfunctions_function.quiz_delivery]
+}
+
+# Allow unauthenticated access to quiz scoring function
+resource "google_cloudfunctions_function_iam_member" "scoring_public_access":
+  project        = var.project_id
+  region         = var.region
+  cloud_function = google_cloudfunctions_function.quiz_scoring.name
+  role           = "roles/cloudfunctions.invoker"
+  member         = "allUsers"
+  
+  depends_on = [google_cloudfunctions_function.quiz_scoring]
+}
+
+# Output important resource information for testing and integration
+output "quiz_generation_system_info":
+  description = "Complete information about the deployed quiz generation system"
+  value = {
+    # Storage information
+    storage = {
+      bucket_name = google_storage_bucket.quiz_materials.name
+      bucket_url  = google_storage_bucket.quiz_materials.url
+    }
+    
+    # Service account information
+    service_account = {
+      email = google_service_account.quiz_ai_service.email
+      name  = google_service_account.quiz_ai_service.name
+    }
+    
+    # Function URLs for API integration
+    function_urls = {
+      quiz_generator = google_cloudfunctions_function.quiz_generator.https_trigger_url
+      quiz_delivery  = google_cloudfunctions_function.quiz_delivery.https_trigger_url
+      quiz_scoring   = google_cloudfunctions_function.quiz_scoring.https_trigger_url
+    }
+    
+    # Function names for management
+    function_names = {
+      quiz_generator = google_cloudfunctions_function.quiz_generator.name
+      quiz_delivery  = google_cloudfunctions_function.quiz_delivery.name
+      quiz_scoring   = google_cloudfunctions_function.quiz_scoring.name
+    }
+    
+    # Project and region information
+    deployment = {
+      project_id = var.project_id
+      region     = var.region
+      zone       = var.zone
+    }
+  }
+}
+
+# Output individual URLs for easy access during testing
+output "quiz_generator_url":
+  description = "URL for the quiz generation API endpoint"
+  value = google_cloudfunctions_function.quiz_generator.https_trigger_url
+}
+
+output "quiz_delivery_url":
+  description = "URL for the quiz delivery API endpoint"
+  value = google_cloudfunctions_function.quiz_delivery.https_trigger_url
+}
+
+output "quiz_scoring_url":
+  description = "URL for the quiz scoring API endpoint"
+  value = google_cloudfunctions_function.quiz_scoring.https_trigger_url
+}
+
+output "storage_bucket_name":
+  description = "Name of the Cloud Storage bucket for learning materials"
+  value = google_storage_bucket.quiz_materials.name
+}
+
+output "deployment_summary":
+  description = "Summary of deployed resources for the quiz generation system"
+  value = <<-EOT
+Quiz Generation System Deployed Successfully!
+
+🎯 Quiz Generator: ${google_cloudfunctions_function.quiz_generator.https_trigger_url}
+📚 Quiz Delivery:  ${google_cloudfunctions_function.quiz_delivery.https_trigger_url}
+📊 Quiz Scoring:   ${google_cloudfunctions_function.quiz_scoring.https_trigger_url}
+💾 Storage Bucket: ${google_storage_bucket.quiz_materials.name}
+
+Test the system by sending a POST request to the Quiz Generator URL with:
+{
+  "content": "Your educational content here...",
+  "question_count": 3,
+  "difficulty": "medium"
+}
+
+The system uses Vertex AI Gemini models for intelligent quiz generation,
+Cloud Functions for serverless processing, and Cloud Storage for data management.
+EOT
+}

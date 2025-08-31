@@ -1,0 +1,684 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Simple Password Generator with Lambda and S3
+  Creates a secure serverless password generator using AWS Lambda for computation 
+  and S3 for encrypted storage. This template follows AWS Well-Architected 
+  Framework security principles with least privilege access and encryption at rest.
+
+# ============================================================================
+# METADATA
+# ============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+          - PythonRuntime
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - EnableS3Versioning
+          - S3StorageClass
+    ParameterLabels:
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+      Environment:
+        default: "Deployment Environment"
+      LambdaTimeout:
+        default: "Lambda Function Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Allocation (MB)"
+      PythonRuntime:
+        default: "Python Runtime Version"
+      EnableS3Versioning:
+        default: "Enable S3 Object Versioning"
+      S3StorageClass:
+        default: "S3 Storage Class"
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: 'password-generator'
+    Description: 'Prefix for all resource names to ensure uniqueness'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Deployment environment (affects resource naming and configuration)'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds (3-900)'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+    Description: 'Lambda function memory allocation in MB'
+
+  PythonRuntime:
+    Type: String
+    Default: 'python3.12'
+    AllowedValues:
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+      - 'python3.12'
+    Description: 'Python runtime version for Lambda function'
+
+  EnableS3Versioning:
+    Type: String
+    Default: 'Enabled'
+    AllowedValues:
+      - 'Enabled'
+      - 'Suspended'
+    Description: 'Enable S3 object versioning for password history'
+
+  S3StorageClass:
+    Type: String
+    Default: 'STANDARD'
+    AllowedValues:
+      - 'STANDARD'
+      - 'STANDARD_IA'
+      - 'ONEZONE_IA'
+    Description: 'S3 storage class for password files'
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableVersioning: !Equals [!Ref EnableS3Versioning, 'Enabled']
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+
+  # ------------------------------------------------------------------------
+  # S3 BUCKET FOR PASSWORD STORAGE
+  # ------------------------------------------------------------------------
+  PasswordStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !Ref EnableS3Versioning
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DeleteOldVersions'
+            Status: 'Enabled'
+            NoncurrentVersionExpirationInDays: !If [IsProduction, 90, 30]
+          - Id: 'TransitionToIA'
+            Status: 'Enabled'
+            Transition:
+              StorageClass: !Ref S3StorageClass
+              TransitionInDays: !If [IsProduction, 30, 7]
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref PasswordStorageLogGroup
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ResourcePrefix}-${Environment}-bucket'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Password Storage'
+        - Key: 'Security'
+          Value: 'Encrypted'
+
+  # ------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP FOR S3 NOTIFICATIONS
+  # ------------------------------------------------------------------------
+  PasswordStorageLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ResourcePrefix}-${Environment}'
+      RetentionInDays: !If [IsProduction, 365, 14]
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ResourcePrefix}-${Environment}-s3-logs'
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # ------------------------------------------------------------------------
+  # IAM ROLE FOR LAMBDA FUNCTION
+  # ------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'S3PasswordStoragePolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt PasswordStorageBucket.Arn
+                  - !Sub '${PasswordStorageBucket.Arn}/*'
+                Condition:
+                  StringEquals:
+                    's3:x-amz-server-side-encryption': 'AES256'
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-${Environment}-*'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ResourcePrefix}-${Environment}-lambda-role'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Lambda Execution Role'
+
+  # ------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP FOR LAMBDA
+  # ------------------------------------------------------------------------
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-${Environment}-function'
+      RetentionInDays: !If [IsProduction, 365, 14]
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ResourcePrefix}-${Environment}-lambda-logs'
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # ------------------------------------------------------------------------
+  # LAMBDA FUNCTION FOR PASSWORD GENERATION
+  # ------------------------------------------------------------------------
+  PasswordGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-${Environment}-function'
+      Runtime: !Ref PythonRuntime
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref PasswordStorageBucket
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import secrets
+          import string
+          from datetime import datetime
+          import logging
+          import os
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          # Initialize S3 client
+          s3_client = boto3.client('s3')
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+          ENVIRONMENT = os.environ.get('ENVIRONMENT', 'dev')
+          
+          def lambda_handler(event, context):
+              """
+              AWS Lambda function to generate secure passwords and store them in S3.
+              
+              Event Parameters:
+                - length (int): Password length (8-128, default: 16)
+                - include_uppercase (bool): Include uppercase letters (default: True)
+                - include_lowercase (bool): Include lowercase letters (default: True)
+                - include_numbers (bool): Include numbers (default: True)
+                - include_symbols (bool): Include symbols (default: True)
+                - name (str): Password name/identifier (default: timestamp-based)
+              
+              Returns:
+                - 200: Password generated successfully with metadata
+                - 400: Invalid parameters
+                - 500: Internal server error
+              """
+              
+              try:
+                  # Parse request parameters from event body or direct event
+                  if isinstance(event.get('body'), str):
+                      body = json.loads(event['body'])
+                  elif event.get('body'):
+                      body = event['body']
+                  else:
+                      body = event
+                  
+                  # Extract and validate password parameters
+                  length = body.get('length', 16)
+                  include_uppercase = body.get('include_uppercase', True)
+                  include_lowercase = body.get('include_lowercase', True)
+                  include_numbers = body.get('include_numbers', True)
+                  include_symbols = body.get('include_symbols', True)
+                  password_name = body.get('name', f'password_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+                  
+                  # Parameter validation
+                  if not isinstance(length, int) or length < 8 or length > 128:
+                      raise ValueError("Password length must be an integer between 8 and 128 characters")
+                  
+                  if not isinstance(password_name, str) or not password_name.strip():
+                      raise ValueError("Password name must be a non-empty string")
+                  
+                  # Sanitize password name for S3 key
+                  password_name = "".join(c for c in password_name if c.isalnum() or c in '-_').strip()
+                  if not password_name:
+                      password_name = f'password_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+                  
+                  # Build character set based on parameters
+                  charset = ""
+                  if include_lowercase:
+                      charset += string.ascii_lowercase
+                  if include_uppercase:
+                      charset += string.ascii_uppercase
+                  if include_numbers:
+                      charset += string.digits
+                  if include_symbols:
+                      charset += "!@#$%^&*()_+-=[]{}|;:,.<>?"
+                  
+                  if not charset:
+                      raise ValueError("At least one character type must be selected")
+                  
+                  # Generate cryptographically secure password
+                  password = ''.join(secrets.choice(charset) for _ in range(length))
+                  
+                  # Calculate password entropy for security assessment
+                  entropy = length * (len(charset) ** (1/length)).bit_length()
+                  
+                  # Create comprehensive password metadata
+                  timestamp = datetime.now()
+                  password_data = {
+                      'password': password,
+                      'metadata': {
+                          'length': length,
+                          'charset_size': len(charset),
+                          'estimated_entropy_bits': round(entropy, 2),
+                          'created_at': timestamp.isoformat(),
+                          'created_by': context.function_name if context else 'unknown',
+                          'environment': ENVIRONMENT,
+                          'parameters': {
+                              'include_uppercase': include_uppercase,
+                              'include_lowercase': include_lowercase,
+                              'include_numbers': include_numbers,
+                              'include_symbols': include_symbols
+                          }
+                      }
+                  }
+                  
+                  # Store password in S3 with encryption
+                  s3_key = f'passwords/{timestamp.strftime("%Y/%m/%d")}/{password_name}.json'
+                  
+                  try:
+                      s3_client.put_object(
+                          Bucket=BUCKET_NAME,
+                          Key=s3_key,
+                          Body=json.dumps(password_data, indent=2, ensure_ascii=False),
+                          ContentType='application/json',
+                          ServerSideEncryption='AES256',
+                          Metadata={
+                              'password-name': password_name,
+                              'created-at': timestamp.isoformat(),
+                              'environment': ENVIRONMENT,
+                              'function-version': context.function_version if context else 'unknown'
+                          }
+                      )
+                      
+                      logger.info(f"Password generated and stored successfully: {s3_key}")
+                      
+                  except Exception as s3_error:
+                      logger.error(f"Failed to store password in S3: {str(s3_error)}")
+                      raise Exception(f"Failed to store password: {str(s3_error)}")
+                  
+                  # Return success response (without actual password for security)
+                  response_data = {
+                      'message': 'Password generated and stored successfully',
+                      'password_name': password_name,
+                      's3_location': {
+                          'bucket': BUCKET_NAME,
+                          'key': s3_key
+                      },
+                      'metadata': {
+                          'length': length,
+                          'charset_size': len(charset),
+                          'estimated_entropy_bits': round(entropy, 2),
+                          'created_at': password_data['metadata']['created_at'],
+                          'environment': ENVIRONMENT
+                      }
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'X-Request-ID': context.aws_request_id if context else 'unknown'
+                      },
+                      'body': json.dumps(response_data, indent=2)
+                  }
+                  
+              except ValueError as ve:
+                  logger.warning(f"Invalid parameters: {str(ve)}")
+                  return {
+                      'statusCode': 400,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'X-Request-ID': context.aws_request_id if context else 'unknown'
+                      },
+                      'body': json.dumps({
+                          'error': 'Invalid parameters',
+                          'message': str(ve)
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Unexpected error generating password: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'X-Request-ID': context.aws_request_id if context else 'unknown'
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': 'An unexpected error occurred while generating the password'
+                      })
+                  }
+      DeadLetterQueue:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ResourcePrefix}-${Environment}-function'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Password Generation'
+
+  # ------------------------------------------------------------------------
+  # SQS DEAD LETTER QUEUE FOR LAMBDA FAILURES
+  # ------------------------------------------------------------------------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-${Environment}-dlq'
+      MessageRetentionPeriod: !If [IsProduction, 1209600, 86400] # 14 days for prod, 1 day for dev
+      VisibilityTimeoutSeconds: 60
+      KmsMasterKeyId: 'alias/aws/sqs'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ResourcePrefix}-${Environment}-dlq'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Lambda Dead Letter Queue'
+
+  # ------------------------------------------------------------------------
+  # LAMBDA FUNCTION VERSION AND ALIAS
+  # ------------------------------------------------------------------------
+  PasswordGeneratorFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref PasswordGeneratorFunction
+      Description: !Sub 'Version for ${Environment} environment'
+
+  PasswordGeneratorFunctionAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref PasswordGeneratorFunction
+      FunctionVersion: !GetAtt PasswordGeneratorFunctionVersion.Version
+      Name: !Ref Environment
+      Description: !Sub 'Alias for ${Environment} environment'
+
+  # ------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS FOR MONITORING
+  # ------------------------------------------------------------------------
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-${Environment}-lambda-errors'
+      AlarmDescription: 'Alarm for Lambda function errors'
+      MetricName: 'Errors'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref PasswordGeneratorFunction
+      AlarmActions:
+        - !Ref SNSErrorTopic
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-${Environment}-lambda-duration'
+      AlarmDescription: 'Alarm for Lambda function duration'
+      MetricName: 'Duration'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref PasswordGeneratorFunction
+
+  # ------------------------------------------------------------------------
+  # SNS TOPIC FOR ERROR NOTIFICATIONS (PRODUCTION ONLY)
+  # ------------------------------------------------------------------------
+  SNSErrorTopic:
+    Type: AWS::SNS::Topic
+    Condition: IsProduction
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-${Environment}-errors'
+      DisplayName: 'Password Generator Error Notifications'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ResourcePrefix}-${Environment}-error-topic'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Error Notifications'
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  
+  # S3 Bucket Information
+  S3BucketName:
+    Description: 'Name of the S3 bucket storing generated passwords'
+    Value: !Ref PasswordStorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketArn:
+    Description: 'ARN of the S3 bucket storing generated passwords'
+    Value: !GetAtt PasswordStorageBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  S3BucketDomainName:
+    Description: 'Domain name of the S3 bucket'
+    Value: !GetAtt PasswordStorageBucket.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketDomainName'
+
+  # Lambda Function Information
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function for password generation'
+    Value: !Ref PasswordGeneratorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function for password generation'
+    Value: !GetAtt PasswordGeneratorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaFunctionAliasArn:
+    Description: 'ARN of the Lambda function alias'
+    Value: !Ref PasswordGeneratorFunctionAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionAliasArn'
+
+  # IAM Role Information
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # CloudWatch Log Groups
+  LambdaLogGroupName:
+    Description: 'Name of the CloudWatch log group for Lambda function'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaLogGroupName'
+
+  S3LogGroupName:
+    Description: 'Name of the CloudWatch log group for S3 notifications'
+    Value: !Ref PasswordStorageLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-S3LogGroupName'
+
+  # Dead Letter Queue
+  DeadLetterQueueUrl:
+    Description: 'URL of the SQS Dead Letter Queue'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+
+  DeadLetterQueueArn:
+    Description: 'ARN of the SQS Dead Letter Queue'
+    Value: !GetAtt DeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueArn'
+
+  # SNS Topic (Production Only)
+  SNSErrorTopicArn:
+    Condition: IsProduction
+    Description: 'ARN of the SNS topic for error notifications'
+    Value: !Ref SNSErrorTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSErrorTopicArn'
+
+  # Usage Instructions
+  UsageInstructions:
+    Description: 'Instructions for using the password generator'
+    Value: !Sub |
+      To generate a password, invoke the Lambda function with the following payload:
+      {
+        "length": 16,
+        "include_uppercase": true,
+        "include_lowercase": true,
+        "include_numbers": true,
+        "include_symbols": true,
+        "name": "my-password"
+      }
+      
+      AWS CLI Example:
+      aws lambda invoke --function-name ${PasswordGeneratorFunction} --payload '{"length": 20, "name": "test-password"}' response.json
+      
+      Generated passwords are stored in S3 bucket: ${PasswordStorageBucket}
+
+  # Cost Optimization Tips
+  CostOptimization:
+    Description: 'Tips for optimizing costs'
+    Value: !Sub |
+      Cost Optimization Tips:
+      1. Lambda is billed per invocation and duration - this function typically executes in <100ms
+      2. S3 storage costs are minimal for small JSON files
+      3. Consider S3 lifecycle policies to transition old passwords to cheaper storage classes
+      4. Monitor CloudWatch logs retention to manage log storage costs
+      5. Use reserved capacity for Lambda if you have predictable usage patterns
+      
+      Current Configuration:
+      - Lambda Memory: ${LambdaMemorySize}MB
+      - Lambda Timeout: ${LambdaTimeout}s
+      - S3 Storage Class: ${S3StorageClass}
+      - Log Retention: ${LambdaLogGroup} days
+
+  # Security Information
+  SecurityFeatures:
+    Description: 'Security features implemented in this stack'
+    Value: !Sub |
+      Security Features:
+      1. S3 bucket encryption using AES-256
+      2. S3 public access blocked completely
+      3. IAM role with least privilege permissions
+      4. SQS DLQ encryption using AWS managed keys
+      5. SNS topic encryption (production only)
+      6. Passwords stored with metadata and timestamps
+      7. CloudWatch logs for audit trails
+      8. Lambda function uses Python secrets module for cryptographic security
+      
+      Best Practices Implemented:
+      - Resource-based access control
+      - Environment-specific configurations
+      - Comprehensive logging and monitoring
+      - Error handling and dead letter queues

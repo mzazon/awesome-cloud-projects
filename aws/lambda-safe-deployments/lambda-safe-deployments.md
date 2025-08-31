@@ -4,14 +4,14 @@ id: a586b6a9
 category: serverless
 difficulty: 300
 subject: aws
-services: lambda,api,gateway,cloudwatch,iam
+services: lambda,api-gateway,cloudwatch,iam
 estimated-time: 60 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: lambda,api,gateway,cloudwatch,iam
+tags: lambda,api-gateway,cloudwatch,iam
 recipe-generator-version: 1.3
 ---
 
@@ -73,7 +73,7 @@ graph TB
 4. Familiarity with JSON and command-line operations
 5. Estimated cost: $1-5 for testing resources (Lambda invocations, API Gateway calls)
 
-> **Note**: Ensure your Lambda execution role has CloudWatch Logs permissions for monitoring
+> **Note**: Ensure your Lambda execution role has CloudWatch Logs permissions for monitoring deployment health and performance metrics.
 
 ## Preparation
 
@@ -102,7 +102,7 @@ echo "Role Name: $ROLE_NAME"
 
 1. **Create IAM Role for Lambda Function**:
 
-   Lambda functions require an execution role with appropriate permissions to access AWS services and write logs. This role follows the principle of least privilege by granting only the minimum permissions needed for basic function execution.
+   Lambda functions require an execution role with appropriate permissions to access AWS services and write logs. This role follows the principle of least privilege by granting only the minimum permissions needed for basic function execution and CloudWatch Logs integration.
 
    ```bash
    # Create trust policy for Lambda service
@@ -135,7 +135,7 @@ echo "Role Name: $ROLE_NAME"
    echo "✅ Created IAM role: $ROLE_ARN"
    ```
 
-   > **Note**: The `AWSLambdaBasicExecutionRole` managed policy provides permissions for CloudWatch Logs operations. For production functions requiring additional AWS service access, create custom policies with specific permissions rather than using overly broad managed policies.
+   > **Note**: The `AWSLambdaBasicExecutionRole` managed policy provides permissions for CloudWatch Logs operations essential for monitoring deployment patterns. For production functions requiring additional AWS service access, create custom policies with specific permissions rather than using overly broad managed policies.
 
 2. **Create Initial Lambda Function (Version 1)**:
 
@@ -169,10 +169,10 @@ echo "Role Name: $ROLE_NAME"
    # Package the function
    zip function-v1.zip lambda_function_v1.py
    
-   # Create the Lambda function
+   # Create the Lambda function with current Python runtime
    aws lambda create-function \
        --function-name $FUNCTION_NAME \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role $ROLE_ARN \
        --handler lambda_function_v1.lambda_handler \
        --zip-file fileb://function-v1.zip \
@@ -184,11 +184,11 @@ echo "Role Name: $ROLE_NAME"
    echo "✅ Created Lambda function: $FUNCTION_NAME"
    ```
 
-   The function is now deployed and active in the AWS Lambda environment. This initial version represents our blue environment and serves as the stable baseline for all future deployments. The function's Python runtime and basic response structure establish the API contract that subsequent versions must maintain.
+   The function is now deployed and active in the AWS Lambda environment using the latest Python 3.13 runtime. This initial version represents our blue environment and serves as the stable baseline for all future deployments. The function's response structure establishes the API contract that subsequent versions must maintain for seamless traffic routing.
 
 3. **Publish Version 1 and Create Production Alias**:
 
-   Function versioning creates immutable snapshots of Lambda code and configuration, while aliases provide mutable pointers that enable traffic routing between versions. This combination forms the foundation of safe deployment practices by separating code deployment from traffic routing decisions.
+   Function versioning creates immutable snapshots of Lambda code and configuration, while aliases provide mutable pointers that enable traffic routing between versions. This combination forms the foundation of safe deployment practices by separating code deployment from traffic routing decisions, enabling sophisticated deployment patterns.
 
    ```bash
    # Publish version 1
@@ -209,7 +209,7 @@ echo "Role Name: $ROLE_NAME"
    echo "✅ Created version $VERSION_1 and production alias"
    ```
 
-   Version 1 is now published as an immutable artifact, and the production alias provides a stable endpoint for traffic routing. This setup enables us to deploy new versions without affecting production traffic until we explicitly update the alias routing configuration.
+   Version 1 is now published as an immutable artifact, and the production alias provides a stable endpoint for traffic routing. This setup enables us to deploy new versions without affecting production traffic until we explicitly update the alias routing configuration, providing the foundation for both canary and blue-green deployment patterns.
 
 4. **Create API Gateway Integration**:
 
@@ -244,7 +244,7 @@ echo "Role Name: $ROLE_NAME"
    echo "✅ Created API Gateway: $API_ID"
    ```
 
-   The API Gateway is now configured with a structured resource hierarchy that supports our deployment demonstration. This REST API provides the stable external interface while the underlying Lambda integration can be modified to support different deployment patterns without affecting client applications.
+   The API Gateway is now configured with a structured resource hierarchy that supports our deployment demonstration. This REST API provides the stable external interface while the underlying Lambda integration can be modified to support different deployment patterns without affecting client applications or requiring API redeployments.
 
 5. **Configure Lambda Integration with Production Alias**:
 
@@ -279,11 +279,11 @@ echo "Role Name: $ROLE_NAME"
    echo "✅ Configured Lambda integration with production alias"
    ```
 
-   The integration is now complete with proper permissions and proxy configuration. API Gateway can invoke our Lambda function through the production alias, which will route requests to the appropriate version based on our deployment strategy. This architecture supports both blue-green and canary deployment patterns.
+   The integration is now complete with proper permissions and proxy configuration. API Gateway can invoke our Lambda function through the production alias, which will route requests to the appropriate version based on our deployment strategy. This architecture supports both blue-green and canary deployment patterns while maintaining API stability.
 
 6. **Deploy API and Test Version 1**:
 
-   API Gateway deployments create immutable snapshots of API configuration and make them available at specific stage endpoints. Deploying to a production stage establishes the live environment where our deployment patterns will be demonstrated and validated.
+   API Gateway deployments create immutable snapshots of API configuration and make them available at specific stage endpoints. Deploying to a production stage establishes the live environment where our deployment patterns will be demonstrated and validated against real traffic.
 
    ```bash
    # Deploy API to prod stage
@@ -308,7 +308,7 @@ echo "Role Name: $ROLE_NAME"
 
 7. **Create Version 2 for Canary Deployment**:
 
-   Function versions in Lambda are immutable snapshots of your function code and configuration. Creating a new version enables safe deployment testing while maintaining the ability to route traffic between different code versions.
+   Function versions in Lambda are immutable snapshots of your function code and configuration. Creating a new version enables safe deployment testing while maintaining the ability to route traffic between different code versions, supporting both canary testing and eventual blue-green promotion strategies.
 
    ```bash
    # Create function code for version 2
@@ -356,11 +356,11 @@ echo "Role Name: $ROLE_NAME"
    echo "✅ Created and published version $VERSION_2"
    ```
 
-   Version 2 is now available as an immutable deployment artifact alongside Version 1. Both versions coexist independently, enabling us to implement sophisticated traffic routing strategies. The green environment is ready for canary testing and eventual promotion to full production traffic.
+   Version 2 is now available as an immutable deployment artifact alongside Version 1. Both versions coexist independently, enabling us to implement sophisticated traffic routing strategies. The green environment is ready for canary testing and eventual promotion to full production traffic based on performance metrics and business requirements.
 
 8. **Implement Canary Deployment (10% Traffic to Version 2)**:
 
-   Canary deployments gradually shift production traffic to new versions, allowing real-world validation with minimal risk. Lambda aliases support weighted routing to distribute traffic between function versions based on specified percentages.
+   Canary deployments gradually shift production traffic to new versions, allowing real-world validation with minimal risk exposure. Lambda aliases support weighted routing to distribute traffic between function versions based on specified percentages, enabling sophisticated deployment strategies that balance risk and validation needs.
 
    ```bash
    # Update production alias with weighted routing
@@ -382,13 +382,13 @@ echo "Role Name: $ROLE_NAME"
    done
    ```
 
-   This weighted routing configuration enables real-world validation of Version 2 with minimal risk exposure. The alias now intelligently distributes traffic between versions, providing production data for performance and stability assessment before full deployment.
+   This weighted routing configuration enables real-world validation of Version 2 with minimal risk exposure. The alias now intelligently distributes traffic between versions using Lambda's probabilistic routing model, providing production data for performance and stability assessment before full deployment. This approach follows AWS best practices for canary deployments.
 
-   > **Warning**: Monitor canary deployments closely through CloudWatch metrics. Set up alarms for error rates, latency, and other key performance indicators to detect issues before they affect a significant portion of your traffic. Have rollback procedures ready in case problems are detected.
+   > **Warning**: Monitor canary deployments closely through CloudWatch metrics. Set up alarms for error rates, latency, and other key performance indicators to detect issues before they affect a significant portion of your traffic. Have rollback procedures ready in case problems are detected. See the [AWS Lambda monitoring documentation](https://docs.aws.amazon.com/lambda/latest/dg/monitoring-metrics.html) for comprehensive guidance.
 
 9. **Monitor Deployment with CloudWatch Metrics**:
 
-   CloudWatch provides comprehensive observability for Lambda functions, capturing invocation metrics, error rates, duration, and custom metrics across all function versions. Implementing proactive monitoring during deployments enables data-driven decisions about traffic promotion and rollback scenarios.
+   CloudWatch provides comprehensive observability for Lambda functions, capturing invocation metrics, error rates, duration, and custom metrics across all function versions. Implementing proactive monitoring during deployments enables data-driven decisions about traffic promotion and rollback scenarios, essential for production deployment patterns.
 
    ```bash
    # Create CloudWatch alarm for error rate monitoring
@@ -419,63 +419,63 @@ echo "Role Name: $ROLE_NAME"
    echo "✅ CloudWatch monitoring configured"
    ```
 
-   Monitoring infrastructure is now in place to track deployment health and performance characteristics. The error rate alarm provides automated detection of issues that might require rollback, while metrics collection enables comparison between function versions during canary phases.
+   Monitoring infrastructure is now in place to track deployment health and performance characteristics across both function versions. The error rate alarm provides automated detection of issues that might require rollback, while metrics collection enables comparison between function versions during canary phases, supporting data-driven deployment decisions.
 
 10. **Complete Blue-Green Deployment (100% Traffic to Version 2)**:
 
-     Blue-green deployment completion involves promoting the green environment (Version 2) to receive all production traffic, effectively making it the new blue environment. This binary switch provides immediate rollback capability while ensuring zero-downtime transitions between major releases.
+    Blue-green deployment completion involves promoting the green environment (Version 2) to receive all production traffic, effectively making it the new blue environment. This binary switch provides immediate rollback capability while ensuring zero-downtime transitions between major releases, following AWS Well-Architected reliability principles.
 
-     ```bash
-     # Promote version 2 to receive 100% of traffic
-     aws lambda update-alias \
-         --function-name $FUNCTION_NAME \
-         --name production \
-         --function-version $VERSION_2 \
-         --routing-config '{}'
-     
-     echo "✅ Blue-green deployment completed: 100% traffic to v2"
-     
-     # Verify full deployment
-     echo "Testing full deployment to version 2:"
-     for i in {1..5}; do
-         echo "Request $i:"
-         curl -s $API_URL | jq -r '.body' | jq -r '.version + " - " + .environment'
-         sleep 1
-     done
-     ```
+    ```bash
+    # Promote version 2 to receive 100% of traffic
+    aws lambda update-alias \
+        --function-name $FUNCTION_NAME \
+        --name production \
+        --function-version $VERSION_2 \
+        --routing-config '{}'
+    
+    echo "✅ Blue-green deployment completed: 100% traffic to v2"
+    
+    # Verify full deployment
+    echo "Testing full deployment to version 2:"
+    for i in {1..5}; do
+        echo "Request $i:"
+        curl -s $API_URL | jq -r '.body' | jq -r '.version + " - " + .environment'
+        sleep 1
+    done
+    ```
 
-     The deployment is now complete with 100% of traffic routed to Version 2. The previous Version 1 remains available for instant rollback if issues are detected. This blue-green pattern provides the confidence to deploy major changes while maintaining high availability and fast recovery capabilities.
+    The deployment is now complete with 100% of traffic routed to Version 2. The previous Version 1 remains available for instant rollback if issues are detected. This blue-green pattern provides the confidence to deploy major changes while maintaining high availability and fast recovery capabilities essential for production systems.
 
 11. **Implement Rollback Capability**:
 
-     Rollback capability is essential for production resilience, enabling immediate reversion to stable versions when issues are detected. Lambda aliases provide instant rollback through simple alias updates, without requiring new deployments or code changes. This capability is crucial for maintaining service availability during incident response.
+    Rollback capability is essential for production resilience, enabling immediate reversion to stable versions when issues are detected. Lambda aliases provide instant rollback through simple alias updates, without requiring new deployments or code changes. This capability is crucial for maintaining service availability during incident response and follows AWS operational excellence principles.
 
-     ```bash
-     # Demonstrate instant rollback to version 1
-     echo "Simulating rollback to version 1..."
-     aws lambda update-alias \
-         --function-name $FUNCTION_NAME \
-         --name production \
-         --function-version $VERSION_1 \
-         --routing-config '{}'
-     
-     echo "✅ Rollback completed"
-     
-     # Test rollback
-     echo "Testing rollback:"
-     curl -s $API_URL | jq -r '.body' | jq -r '.version + " - " + .environment'
-     
-     # Restore to version 2 for cleanup
-     aws lambda update-alias \
-         --function-name $FUNCTION_NAME \
-         --name production \
-         --function-version $VERSION_2 \
-         --routing-config '{}'
-     
-     echo "✅ Restored to version 2"
-     ```
+    ```bash
+    # Demonstrate instant rollback to version 1
+    echo "Simulating rollback to version 1..."
+    aws lambda update-alias \
+        --function-name $FUNCTION_NAME \
+        --name production \
+        --function-version $VERSION_1 \
+        --routing-config '{}'
+    
+    echo "✅ Rollback completed"
+    
+    # Test rollback
+    echo "Testing rollback:"
+    curl -s $API_URL | jq -r '.body' | jq -r '.version + " - " + .environment'
+    
+    # Restore to version 2 for cleanup
+    aws lambda update-alias \
+        --function-name $FUNCTION_NAME \
+        --name production \
+        --function-version $VERSION_2 \
+        --routing-config '{}'
+    
+    echo "✅ Restored to version 2"
+    ```
 
-     Rollback testing demonstrates the power of alias-based deployment patterns. The ability to instantly switch between versions provides confidence for deploying changes and ensures rapid recovery from any issues. This capability is fundamental to DevOps practices and continuous deployment strategies.
+    Rollback testing demonstrates the power of alias-based deployment patterns. The ability to instantly switch between versions provides confidence for deploying changes and ensures rapid recovery from any issues. This capability is fundamental to DevOps practices and continuous deployment strategies, enabling teams to deploy with confidence.
 
 ## Validation & Testing
 
@@ -592,34 +592,41 @@ echo "Role Name: $ROLE_NAME"
 
 ## Discussion
 
-This recipe demonstrates sophisticated Lambda deployment patterns that enable zero-downtime deployments and gradual rollout strategies. The key architectural decision involves using Lambda function versions and aliases to create immutable deployment artifacts while maintaining flexible traffic routing capabilities.
+This recipe demonstrates sophisticated Lambda deployment patterns that enable zero-downtime deployments and gradual rollout strategies following AWS Well-Architected Framework principles. The key architectural decision involves using Lambda function versions and aliases to create immutable deployment artifacts while maintaining flexible traffic routing capabilities essential for modern serverless applications.
 
-**Blue-Green Deployments** provide immediate switching between stable environments, offering instant rollback capabilities when issues are detected. This pattern is ideal for major releases where you want to validate the entire deployment before exposing users to changes. The alias mechanism allows seamless switching without changing API Gateway configurations or client code.
+**Blue-Green Deployments** provide immediate switching between stable environments, offering instant rollback capabilities when issues are detected. This pattern is ideal for major releases where you want to validate the entire deployment before exposing users to changes. The alias mechanism allows seamless switching without changing API Gateway configurations or client code, supporting the AWS operational excellence pillar through simplified operations and fast recovery.
 
-**Canary Deployments** offer a more conservative approach by gradually shifting traffic percentages to new versions. This strategy enables real-world testing with a subset of production traffic, allowing teams to monitor metrics, error rates, and performance characteristics before full deployment. The weighted routing feature makes this pattern particularly powerful for risk-averse organizations.
+**Canary Deployments** offer a more conservative approach by gradually shifting traffic percentages to new versions. This strategy enables real-world testing with a subset of production traffic, allowing teams to monitor metrics, error rates, and performance characteristics before full deployment. The weighted routing feature makes this pattern particularly powerful for risk-averse organizations while supporting data-driven deployment decisions based on real performance metrics.
 
-**Monitoring Integration** is crucial for successful deployment patterns. CloudWatch metrics provide visibility into function performance, error rates, and invocation patterns across different versions. Setting up automated alarms ensures rapid detection of issues during canary phases, enabling quick rollback decisions before problems affect the majority of users.
+**Monitoring Integration** is crucial for successful deployment patterns and aligns with AWS observability best practices. CloudWatch metrics provide visibility into function performance, error rates, and invocation patterns across different versions. Setting up automated alarms ensures rapid detection of issues during canary phases, enabling quick rollback decisions before problems affect the majority of users. This approach supports both the reliability and performance efficiency pillars of the Well-Architected Framework.
 
-> **Tip**: Consider implementing automated rollback triggers based on CloudWatch alarms that can automatically revert to the previous version when error thresholds are exceeded.
+> **Tip**: Consider implementing automated rollback triggers based on CloudWatch alarms that can automatically revert to the previous version when error thresholds are exceeded. See the [AWS Lambda deployment best practices documentation](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html) for comprehensive guidance.
 
-> **Note**: Function versions are immutable in Lambda, ensuring that deployed code cannot be accidentally modified. This immutability is fundamental to reliable deployment patterns and audit compliance.
+> **Note**: Function versions are immutable in Lambda, ensuring that deployed code cannot be accidentally modified. This immutability is fundamental to reliable deployment patterns and audit compliance, supporting both security and operational excellence pillars.
 
-> **Tip**: Use AWS SAM or CDK for production deployments to manage the entire deployment pipeline including automated testing, gradual traffic shifting, and rollback automation. See the [AWS SAM documentation](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/automating-updates-to-serverless-apps.html) for automated deployment patterns.
+> **Tip**: Use AWS SAM or CDK for production deployments to manage the entire deployment pipeline including automated testing, gradual traffic shifting, and rollback automation. See the [AWS SAM documentation](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/automating-updates-to-serverless-apps.html) for automated deployment patterns and the [AWS Lambda alias routing documentation](https://docs.aws.amazon.com/lambda/latest/dg/configuring-alias-routing.html) for advanced traffic routing strategies.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Automated Deployment Pipeline**: Integrate with AWS CodePipeline and CodeDeploy for Lambda to automate the entire deployment process including automated testing, canary analysis, and promotion decisions.
+1. **Automated Deployment Pipeline**: Integrate with AWS CodePipeline and CodeDeploy for Lambda to automate the entire deployment process including automated testing, canary analysis, and promotion decisions based on CloudWatch metrics.
 
-2. **Advanced Monitoring**: Implement custom CloudWatch metrics and AWS X-Ray tracing to monitor version-specific performance characteristics, latency distributions, and detailed error analysis during deployments.
+2. **Advanced Monitoring**: Implement custom CloudWatch metrics and AWS X-Ray tracing to monitor version-specific performance characteristics, latency distributions, and detailed error analysis during deployments for better observability.
 
-3. **Multi-Environment Strategy**: Extend the pattern to support development, staging, and production environments with different deployment strategies and approval gates between environments.
+3. **Multi-Environment Strategy**: Extend the pattern to support development, staging, and production environments with different deployment strategies and approval gates between environments using AWS Organizations and cross-account deployments.
 
-4. **Configuration Management**: Add AWS Systems Manager Parameter Store or AWS Secrets Manager integration to manage environment-specific configurations that change between versions without code modifications.
+4. **Configuration Management**: Add AWS Systems Manager Parameter Store or AWS Secrets Manager integration to manage environment-specific configurations that change between versions without code modifications, supporting the security pillar.
 
-5. **Chaos Engineering**: Implement fault injection testing during canary deployments to validate system resilience and automated rollback mechanisms under adverse conditions.
+5. **Chaos Engineering**: Implement fault injection testing during canary deployments to validate system resilience and automated rollback mechanisms under adverse conditions using AWS Fault Injection Simulator.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

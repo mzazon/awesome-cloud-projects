@@ -4,12 +4,12 @@ id: a7b3c8d9
 category: networking
 difficulty: 200
 subject: azure
-services: Azure Traffic Manager, Azure Application Gateway, Azure Monitor, Azure DNS
+services: Traffic Manager, Application Gateway, Virtual Machine Scale Sets, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: traffic-manager, application-gateway, load-balancing, global-distribution, high-availability, ssl-termination
 recipe-generator-version: 1.3
@@ -99,7 +99,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Global Administrator or Contributor permissions
-2. Azure CLI v2.50.0 or later installed and configured (or Azure Cloud Shell)
+2. Azure CLI v2.60.0 or later installed and configured (or Azure Cloud Shell)
 3. Basic understanding of DNS, load balancing, and web application architecture
 4. Knowledge of Azure networking concepts and resource groups
 5. Estimated cost: $150-300 per month for multi-region deployment (varies by traffic volume and instance sizes)
@@ -109,7 +109,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for consistent resource naming
+# Set environment variables for Azure resources
 export RESOURCE_GROUP_PRIMARY="rg-global-traffic-primary"
 export RESOURCE_GROUP_SECONDARY="rg-global-traffic-secondary"
 export RESOURCE_GROUP_TERTIARY="rg-global-traffic-tertiary"
@@ -131,17 +131,17 @@ export APP_GATEWAY_TERTIARY="agw-tertiary-${RANDOM_SUFFIX}"
 az group create \
     --name ${RESOURCE_GROUP_PRIMARY} \
     --location ${LOCATION_PRIMARY} \
-    --tags environment=production purpose=global-traffic-distribution
+    --tags purpose=recipe environment=demo
 
 az group create \
     --name ${RESOURCE_GROUP_SECONDARY} \
     --location ${LOCATION_SECONDARY} \
-    --tags environment=production purpose=global-traffic-distribution
+    --tags purpose=recipe environment=demo
 
 az group create \
     --name ${RESOURCE_GROUP_TERTIARY} \
     --location ${LOCATION_TERTIARY} \
-    --tags environment=production purpose=global-traffic-distribution
+    --tags purpose=recipe environment=demo
 
 echo "✅ Resource groups created in all regions"
 echo "Primary: ${RESOURCE_GROUP_PRIMARY} (${LOCATION_PRIMARY})"
@@ -429,6 +429,9 @@ echo "Tertiary: ${RESOURCE_GROUP_TERTIARY} (${LOCATION_TERTIARY})"
    Backend pools define the target servers that Application Gateway will route traffic to within each region. These pools must be configured with the appropriate VM Scale Set instances to ensure proper traffic distribution. Dynamic backend pool membership ensures that scaling events are automatically reflected in the load balancing configuration.
 
    ```bash
+   # Wait for VM Scale Sets to be ready
+   sleep 60
+   
    # Configure backend pool for primary region
    az network application-gateway address-pool update \
        --resource-group ${RESOURCE_GROUP_PRIMARY} \
@@ -437,7 +440,7 @@ echo "Tertiary: ${RESOURCE_GROUP_TERTIARY} (${LOCATION_TERTIARY})"
        --servers $(az vmss nic list \
            --resource-group ${RESOURCE_GROUP_PRIMARY} \
            --vmss-name vmss-primary \
-           --query "[].ipConfigurations[0].privateIpAddress" \
+           --query "[].ipConfigurations[0].privateIPAddress" \
            --output tsv | tr '\n' ' ')
    
    # Configure backend pool for secondary region
@@ -448,7 +451,7 @@ echo "Tertiary: ${RESOURCE_GROUP_TERTIARY} (${LOCATION_TERTIARY})"
        --servers $(az vmss nic list \
            --resource-group ${RESOURCE_GROUP_SECONDARY} \
            --vmss-name vmss-secondary \
-           --query "[].ipConfigurations[0].privateIpAddress" \
+           --query "[].ipConfigurations[0].privateIPAddress" \
            --output tsv | tr '\n' ' ')
    
    # Configure backend pool for tertiary region
@@ -459,7 +462,7 @@ echo "Tertiary: ${RESOURCE_GROUP_TERTIARY} (${LOCATION_TERTIARY})"
        --servers $(az vmss nic list \
            --resource-group ${RESOURCE_GROUP_TERTIARY} \
            --vmss-name vmss-tertiary \
-           --query "[].ipConfigurations[0].privateIpAddress" \
+           --query "[].ipConfigurations[0].privateIPAddress" \
            --output tsv | tr '\n' ' ')
    
    echo "✅ Application Gateway backend pools configured with VM Scale Set instances"
@@ -550,15 +553,14 @@ echo "Tertiary: ${RESOURCE_GROUP_TERTIARY} (${LOCATION_TERTIARY})"
    Web Application Firewall policies provide centralized security rule management for protecting applications against common web attacks. Each region requires a comprehensive WAF policy that includes OWASP rule sets, custom rules, and appropriate security configurations to protect against threats while maintaining application performance.
 
    ```bash
-   # Create WAF policy for primary region
+   # Create WAF policy for primary region with latest OWASP version
    az network application-gateway waf-policy create \
        --resource-group ${RESOURCE_GROUP_PRIMARY} \
        --name waf-policy-primary \
        --location ${LOCATION_PRIMARY} \
        --type OWASP \
        --version 3.2 \
-       --mode Prevention \
-       --state Enabled
+       --policy-settings mode=Prevention state=Enabled
    
    # Create WAF policy for secondary region
    az network application-gateway waf-policy create \
@@ -567,8 +569,7 @@ echo "Tertiary: ${RESOURCE_GROUP_TERTIARY} (${LOCATION_TERTIARY})"
        --location ${LOCATION_SECONDARY} \
        --type OWASP \
        --version 3.2 \
-       --mode Prevention \
-       --state Enabled
+       --policy-settings mode=Prevention state=Enabled
    
    # Create WAF policy for tertiary region
    az network application-gateway waf-policy create \
@@ -577,13 +578,12 @@ echo "Tertiary: ${RESOURCE_GROUP_TERTIARY} (${LOCATION_TERTIARY})"
        --location ${LOCATION_TERTIARY} \
        --type OWASP \
        --version 3.2 \
-       --mode Prevention \
-       --state Enabled
+       --policy-settings mode=Prevention state=Enabled
    
    echo "✅ WAF policies created and configured for all regions"
    ```
 
-   The WAF policies are now configured with OWASP rule sets in prevention mode, providing comprehensive protection against common web attacks including SQL injection, cross-site scripting, and other security threats. These policies enhance the security posture of the global application infrastructure.
+   The WAF policies are now configured with OWASP 3.2 rule sets in prevention mode, providing comprehensive protection against common web attacks including SQL injection, cross-site scripting, and other security threats. These policies enhance the security posture of the global application infrastructure.
 
 10. **Enable Monitoring and Diagnostics**:
 
@@ -614,7 +614,7 @@ echo "Tertiary: ${RESOURCE_GROUP_TERTIARY} (${LOCATION_TERTIARY})"
         --metrics '[{"category": "AllMetrics", "enabled": true}]' \
         --logs '[{"category": "ProbeHealthStatusEvents", "enabled": true}]'
     
-    # Enable diagnostics for Application Gateways
+    # Enable diagnostics for primary Application Gateway
     az monitor diagnostic-settings create \
         --resource $(az network application-gateway show \
             --resource-group ${RESOURCE_GROUP_PRIMARY} \
@@ -675,7 +675,7 @@ echo "Tertiary: ${RESOURCE_GROUP_TERTIARY} (${LOCATION_TERTIARY})"
    nslookup ${TRAFFIC_MANAGER_FQDN}
    
    # Test global endpoint access
-   curl -H "Host: ${TRAFFIC_MANAGER_FQDN}" http://${TRAFFIC_MANAGER_FQDN}
+   curl http://${TRAFFIC_MANAGER_FQDN}
    ```
 
    Expected output: DNS resolution should return the IP address of the closest regional endpoint based on your location.
@@ -802,7 +802,7 @@ Azure Traffic Manager and Application Gateway provide a powerful combination for
 
 The performance routing method implemented in this solution continuously measures network latency between users and regional endpoints, automatically directing traffic to the fastest responding region. This dynamic routing capability significantly reduces application response times for global users while providing automatic failover in case of regional outages. The integration of Application Gateway's WAF capabilities adds an essential security layer that protects against common web attacks including SQL injection, cross-site scripting, and other OWASP top 10 threats. For comprehensive security best practices, refer to the [Azure Application Gateway security documentation](https://docs.microsoft.com/en-us/azure/application-gateway/security-baseline).
 
-From an operational perspective, the combination of Azure Monitor, Log Analytics, and Application Insights provides comprehensive visibility into the global traffic distribution system. The monitoring solution tracks key performance indicators including response times, error rates, and threat detection events across all regions. This telemetry data enables proactive performance optimization and rapid incident response. The [Azure Traffic Manager monitoring guide](https://docs.microsoft.com/en-us/azure/traffic-manager/traffic-manager-monitoring) provides detailed information on endpoint health monitoring and alerting configurations.
+From an operational perspective, the combination of Azure Monitor, Log Analytics, and Application Insights provides comprehensive visibility into the global traffic distribution system. The monitoring solution tracks key performance indicators including response times, error rates, and threat detection events across all regions. This telemetry data enables proactive performance optimization and rapid incident response. The [Azure Traffic Manager monitoring guide](https://docs.microsoft.com/en-us/azure/traffic-manager/traffic-manager-monitoring) provides detailed information on endpoint health monitoring and alerting configurations. This architecture also supports compliance requirements by maintaining audit trails and enabling geographic data residency controls through regional deployment strategies.
 
 > **Tip**: Implement custom health probes for Application Gateway backend pools to ensure more granular health monitoring of your applications. Configure probe intervals and thresholds based on your application's specific requirements to optimize failover times and reduce false positives.
 
@@ -822,4 +822,9 @@ Extend this global traffic distribution solution by implementing these advanced 
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

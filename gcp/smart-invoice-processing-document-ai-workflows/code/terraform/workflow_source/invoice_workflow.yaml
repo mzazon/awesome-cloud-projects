@@ -1,0 +1,404 @@
+# Cloud Workflow for Intelligent Invoice Processing
+# This workflow orchestrates the complete invoice processing pipeline using
+# Document AI for data extraction, business rules for validation, and 
+# Cloud Tasks for approval routing and notifications.
+
+main:
+  params: [event]
+  steps:
+    - init:
+        assign:
+          - project_id: "${project_id}"
+          - location: "${region}"
+          - processor_id: "${processor_id}"
+          - bucket_name: "${bucket_name}"
+          - task_queue_name: "${task_queue_name}"
+          - function_url: "${function_url}"
+          - manager_threshold: ${manager_threshold}
+          - director_threshold: ${director_threshold}
+          - executive_threshold: ${executive_threshold}
+          - file_path: $${default(event.data.name, "unknown")}
+          - invoice_data: {}
+          - processing_errors: []
+          - workflow_start_time: $${time.format(time.now())}
+    
+    - log_workflow_start:
+        call: sys.log
+        args:
+          text: $${"Starting invoice processing workflow for file: " + file_path + " at " + workflow_start_time}
+          severity: "INFO"
+    
+    - validate_input_file:
+        switch:
+          - condition: $${not("incoming/" in file_path)}
+            steps:
+              - log_invalid_path:
+                  call: sys.log
+                  args:
+                    text: $${"File not in incoming folder, skipping processing: " + file_path}
+                    severity: "INFO"
+              - return_skipped:
+                  return: {"status": "skipped", "reason": "file_not_in_incoming_folder", "file_path": file_path}
+          - condition: $${not(text.match_regex(file_path, ".*\\.pdf$$"))}
+            steps:
+              - log_invalid_format:
+                  call: sys.log
+                  args:
+                    text: $${"File is not a PDF, skipping processing: " + file_path}
+                    severity: "INFO"
+              - return_skipped:
+                  return: {"status": "skipped", "reason": "not_pdf_file", "file_path": file_path}
+    
+    - extract_invoice_data:
+        try:
+          call: http.post
+          args:
+            url: $${"https://" + location + "-documentai.googleapis.com/v1/" + processor_id + ":process"}
+            auth:
+              type: OAuth2
+            headers:
+              Content-Type: "application/json"
+            body:
+              inputDocuments:
+                gcsPrefix:
+                  gcsUriPrefix: $${"gs://" + bucket_name + "/" + file_path}
+              documentOutputConfig:
+                gcsOutputConfig:
+                  gcsUri: $${"gs://" + bucket_name + "/processed/"}
+                  fieldMask: "text,entities,pages.pageNumber"
+          result: docai_response
+        except:
+          as: e
+          steps:
+            - log_extraction_error:
+                call: sys.log
+                args:
+                  text: $${"Document AI processing failed for " + file_path + ": " + e.message}
+                  severity: "ERROR"
+            - move_to_failed_folder:
+                call: move_failed_document
+                args:
+                  source_path: $${file_path}
+                  bucket_name: $${bucket_name}
+                  error_reason: "document_ai_extraction_failed"
+            - return_extraction_error:
+                return: {"status": "failed", "error": "document_extraction_failed", "details": e.message}
+    
+    - parse_document_entities:
+        assign:
+          - entities: $${default(docai_response.body.document.entities, [])}
+          - invoice_data:
+              supplier_name: "Unknown"
+              total_amount: "0"
+              invoice_date: ""
+              invoice_id: ""
+              due_date: ""
+              line_items: []
+              confidence_scores: {}
+    
+    - extract_invoice_fields:
+        for:
+          value: entity
+          in: $${entities}
+          steps:
+            - process_entity:
+                switch:
+                  - condition: $${entity.type == "supplier_name"}
+                    assign:
+                      - invoice_data.supplier_name: $${default(entity.mentionText, "Unknown")}
+                      - invoice_data.confidence_scores.supplier_name: $${default(entity.confidence, 0)}
+                  - condition: $${entity.type == "total_amount"}
+                    assign:
+                      - invoice_data.total_amount: $${default(entity.mentionText, "0")}
+                      - invoice_data.confidence_scores.total_amount: $${default(entity.confidence, 0)}
+                  - condition: $${entity.type == "invoice_date"}
+                    assign:
+                      - invoice_data.invoice_date: $${default(entity.mentionText, "")}
+                      - invoice_data.confidence_scores.invoice_date: $${default(entity.confidence, 0)}
+                  - condition: $${entity.type == "invoice_id"}
+                    assign:
+                      - invoice_data.invoice_id: $${default(entity.mentionText, "")}
+                      - invoice_data.confidence_scores.invoice_id: $${default(entity.confidence, 0)}
+                  - condition: $${entity.type == "due_date"}
+                    assign:
+                      - invoice_data.due_date: $${default(entity.mentionText, "")}
+                      - invoice_data.confidence_scores.due_date: $${default(entity.confidence, 0)}
+                  - condition: $${entity.type == "line_item"}
+                    assign:
+                      - invoice_data.line_items: $${list.concat(invoice_data.line_items, [entity.mentionText])}
+    
+    - validate_extracted_data:
+        assign:
+          - validation_errors: []
+          - amount_numeric: 0
+    
+    - check_supplier_name:
+        switch:
+          - condition: $${invoice_data.supplier_name == "Unknown" or invoice_data.supplier_name == ""}
+            assign:
+              - validation_errors: $${list.concat(validation_errors, ["Missing or invalid supplier name"])}
+    
+    - check_total_amount:
+        try:
+          assign:
+            - amount_clean: $${text.replace_all(text.replace_all(invoice_data.total_amount, "$$", ""), ",", "")}
+            - amount_numeric: $${double(amount_clean)}
+        except:
+          assign:
+            - validation_errors: $${list.concat(validation_errors, ["Invalid or missing total amount"])}
+            - amount_numeric: 0
+    
+    - validate_amount_range:
+        switch:
+          - condition: $${amount_numeric <= 0}
+            assign:
+              - validation_errors: $${list.concat(validation_errors, ["Amount must be greater than zero"])}
+          - condition: $${amount_numeric > 1000000}
+            assign:
+              - validation_errors: $${list.concat(validation_errors, ["Amount exceeds maximum limit of $$1,000,000"])}
+    
+    - check_confidence_scores:
+        switch:
+          - condition: $${invoice_data.confidence_scores.supplier_name < 0.8}
+            assign:
+              - validation_errors: $${list.concat(validation_errors, ["Low confidence in supplier name extraction"])}
+          - condition: $${invoice_data.confidence_scores.total_amount < 0.8}
+            assign:
+              - validation_errors: $${list.concat(validation_errors, ["Low confidence in amount extraction"])}
+    
+    - handle_validation_failures:
+        switch:
+          - condition: $${len(validation_errors) > 0}
+            steps:
+              - log_validation_errors:
+                  call: sys.log
+                  args:
+                    text: $${"Invoice validation failed for " + file_path + ": " + text.join(validation_errors, ", ")}
+                    severity: "WARNING"
+              - move_to_failed_folder:
+                  call: move_failed_document
+                  args:
+                    source_path: $${file_path}
+                    bucket_name: $${bucket_name}
+                    error_reason: "validation_failed"
+              - return_validation_error:
+                  return: 
+                    status: "failed"
+                    error: "validation_failed"
+                    validation_errors: $${validation_errors}
+                    extracted_data: $${invoice_data}
+    
+    - determine_approval_level:
+        switch:
+          - condition: $${amount_numeric >= executive_threshold}
+            assign:
+              - approval_level: "executive"
+              - approver_threshold: $${executive_threshold}
+          - condition: $${amount_numeric >= director_threshold}
+            assign:
+              - approval_level: "director"
+              - approver_threshold: $${director_threshold}
+          - condition: $${amount_numeric >= manager_threshold}
+            assign:
+              - approval_level: "manager"
+              - approver_threshold: $${manager_threshold}
+          - default:
+            assign:
+              - approval_level: "auto_approved"
+              - approver_threshold: 0
+    
+    - log_approval_routing:
+        call: sys.log
+        args:
+          text: $${"Invoice routing determined - Amount: $$" + string(amount_numeric) + ", Level: " + approval_level + ", Threshold: $$" + string(approver_threshold)}
+          severity: "INFO"
+    
+    - create_approval_task:
+        switch:
+          - condition: $${approval_level != "auto_approved"}
+            steps:
+              - enqueue_approval_task:
+                  try:
+                    call: http.post
+                    args:
+                      url: $${"https://cloudtasks.googleapis.com/v2/projects/" + project_id + "/locations/" + location + "/queues/" + task_queue_name + "/tasks"}
+                      auth:
+                        type: OAuth2
+                      headers:
+                        Content-Type: "application/json"
+                      body:
+                        task:
+                          httpRequest:
+                            httpMethod: "POST"
+                            url: $${function_url}
+                            headers:
+                              Content-Type: "application/json"
+                            body: $${base64.encode(json.encode({
+                              "invoice_data": invoice_data,
+                              "approval_level": approval_level,
+                              "file_path": file_path,
+                              "workflow_execution_id": sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID"),
+                              "processing_timestamp": workflow_start_time,
+                              "amount_numeric": amount_numeric,
+                              "approver_threshold": approver_threshold
+                            }))}
+                          scheduleTime: $${time.format(time.now())}
+                    result: task_response
+                  except:
+                    as: e
+                    steps:
+                      - log_task_creation_error:
+                          call: sys.log
+                          args:
+                            text: $${"Failed to create approval task for " + file_path + ": " + e.message}
+                            severity: "ERROR"
+                      - assign_task_error:
+                          assign:
+                            - task_response: {"error": e.message}
+          - default:
+            steps:
+              - log_auto_approval:
+                  call: sys.log
+                  args:
+                    text: $${"Invoice auto-approved - Amount: $$" + string(amount_numeric) + " below threshold: $$" + string(manager_threshold)}
+                    severity: "INFO"
+              - assign_auto_approval:
+                  assign:
+                    - task_response: {"status": "auto_approved"}
+    
+    - move_to_processed_folder:
+        try:
+          call: http.post
+          args:
+            url: $${"https://storage.googleapis.com/storage/v1/b/" + bucket_name + "/o/" + text.url_encode(file_path) + "/copyTo/b/" + bucket_name + "/o/" + text.url_encode("processed/" + text.split(file_path, "/")[-1])}
+            auth:
+              type: OAuth2
+            headers:
+              Content-Type: "application/json"
+          result: copy_response
+        except:
+          as: e
+          steps:
+            - log_move_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to move processed file " + file_path + ": " + e.message}
+                  severity: "WARNING"
+    
+    - delete_original_file:
+        try:
+          call: http.delete
+          args:
+            url: $${"https://storage.googleapis.com/storage/v1/b/" + bucket_name + "/o/" + text.url_encode(file_path)}
+            auth:
+              type: OAuth2
+          result: delete_response
+        except:
+          as: e
+          steps:
+            - log_delete_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to delete original file " + file_path + ": " + e.message}
+                  severity: "WARNING"
+    
+    - log_workflow_completion:
+        call: sys.log
+        args:
+          text: $${"Invoice processing completed successfully for: " + file_path + " | Amount: $$" + string(amount_numeric) + " | Approval Level: " + approval_level}
+          severity: "INFO"
+    
+    - return_success:
+        return:
+          status: "success"
+          file_path: $${file_path}
+          invoice_data: $${invoice_data}
+          approval_level: $${approval_level}
+          amount_numeric: $${amount_numeric}
+          approver_threshold: $${approver_threshold}
+          task_created: $${default(task_response.name, "auto_approved")}
+          processing_duration: $${time.format(time.now())}
+          validation_passed: true
+          confidence_scores: $${invoice_data.confidence_scores}
+
+# Subworkflow for handling failed document processing
+move_failed_document:
+  params: [source_path, bucket_name, error_reason]
+  steps:
+    - log_failure_move:
+        call: sys.log
+        args:
+          text: $${"Moving failed document to failed folder: " + source_path + " | Reason: " + error_reason}
+          severity: "WARNING"
+    
+    - copy_to_failed_folder:
+        try:
+          call: http.post
+          args:
+            url: $${"https://storage.googleapis.com/storage/v1/b/" + bucket_name + "/o/" + text.url_encode(source_path) + "/copyTo/b/" + bucket_name + "/o/" + text.url_encode("failed/" + text.split(source_path, "/")[-1])}
+            auth:
+              type: OAuth2
+            headers:
+              Content-Type: "application/json"
+          result: copy_result
+        except:
+          as: e
+          steps:
+            - log_copy_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to copy file to failed folder: " + e.message}
+                  severity: "ERROR"
+    
+    - delete_original_failed:
+        try:
+          call: http.delete
+          args:
+            url: $${"https://storage.googleapis.com/storage/v1/b/" + bucket_name + "/o/" + text.url_encode(source_path)}
+            auth:
+              type: OAuth2
+          result: delete_result
+        except:
+          as: e
+          steps:
+            - log_delete_failed_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to delete original failed file: " + e.message}
+                  severity: "ERROR"
+    
+    - create_error_metadata:
+        try:
+          call: http.post
+          args:
+            url: $${"https://storage.googleapis.com/upload/storage/v1/b/" + bucket_name + "/o"}
+            auth:
+              type: OAuth2
+            headers:
+              Content-Type: "application/json"
+            query:
+              name: $${"failed/" + text.split(source_path, "/")[-1] + ".error.json"}
+            body:
+              metadata:
+                contentType: "application/json"
+              data: $${base64.encode(json.encode({
+                "original_file": source_path,
+                "error_reason": error_reason,
+                "timestamp": time.format(time.now()),
+                "workflow_execution_id": sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")
+              }))}
+          result: metadata_result
+        except:
+          as: e
+          steps:
+            - log_metadata_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to create error metadata: " + e.message}
+                  severity: "WARNING"
+    
+    - return_move_result:
+        return:
+          moved_to_failed: true
+          error_reason: $${error_reason}
+          timestamp: $${time.format(time.now())}

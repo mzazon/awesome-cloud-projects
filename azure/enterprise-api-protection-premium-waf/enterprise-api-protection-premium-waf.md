@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure API Management Premium, Azure Web Application Firewall, Azure Cache for Redis Enterprise, Azure Application Insights
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: api-security, web-application-firewall, enterprise-performance, threat-protection, intelligent-caching
 recipe-generator-version: 1.3
@@ -88,7 +88,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Contributor or Owner permissions for resource creation
-2. Azure CLI v2.50.0 or later installed and configured (or Azure Cloud Shell)
+2. Azure CLI v2.58.0 or later installed and configured (or Azure Cloud Shell)
 3. Understanding of API security concepts and enterprise networking principles
 4. Familiarity with REST APIs, JSON, and web application security fundamentals
 5. Estimated cost: $300-500 USD for premium services during testing period (24-48 hours)
@@ -98,7 +98,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for consistent resource naming
+# Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-enterprise-api-security"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
@@ -193,10 +193,11 @@ echo "✅ Environment configured with suffix: ${RANDOM_SUFFIX}"
    
    # Wait for Redis deployment to complete
    echo "⏳ Waiting for Redis Enterprise deployment (this may take 10-15 minutes)..."
-   az redis show \
+   az redis wait \
        --resource-group ${RESOURCE_GROUP} \
        --name ${REDIS_NAME} \
-       --query provisioningState --output tsv
+       --created \
+       --timeout 1800
    
    echo "✅ Redis Enterprise cache deployed successfully"
    ```
@@ -235,11 +236,12 @@ echo "✅ Environment configured with suffix: ${RANDOM_SUFFIX}"
    az network front-door waf-policy create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${WAF_POLICY_NAME} \
+       --sku Premium_AzureFrontDoor \
        --mode Prevention \
-       --enabled true
+       --disabled false
    
-   # Configure OWASP Core Rule Set 3.2
-   az network front-door waf-policy managed-rule-set add \
+   # Configure OWASP Core Rule Set 2.1 (latest available)
+   az network front-door waf-policy managed-rules add \
        --policy-name ${WAF_POLICY_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --type Microsoft_DefaultRuleSet \
@@ -247,7 +249,7 @@ echo "✅ Environment configured with suffix: ${RANDOM_SUFFIX}"
        --action Block
    
    # Add bot protection ruleset
-   az network front-door waf-policy managed-rule-set add \
+   az network front-door waf-policy managed-rules add \
        --policy-name ${WAF_POLICY_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --type Microsoft_BotManagerRuleSet \
@@ -353,16 +355,6 @@ echo "✅ Environment configured with suffix: ${RANDOM_SUFFIX}"
         <ip-filter action="allow">
             <address-range from="0.0.0.0" to="255.255.255.255" />
         </ip-filter>
-        
-        <!-- Request validation -->
-        <validate-jwt header-name="Authorization" failed-validation-httpcode="401">
-            <issuer-signing-keys>
-                <key>{{jwt-signing-key}}</key>
-            </issuer-signing-keys>
-            <audiences>
-                <audience>api://default</audience>
-            </audiences>
-        </validate-jwt>
         
         <!-- Cache lookup for GET requests -->
         <cache-lookup vary-by-developer="false" vary-by-developer-groups="false">
@@ -481,7 +473,7 @@ EOF
         --weight 1000 \
         --enabled-state Enabled
     
-    # Create route with WAF policy
+    # Create route with WAF policy association
     az afd route create \
         --resource-group ${RESOURCE_GROUP} \
         --profile-name ${FRONT_DOOR_NAME} \
@@ -493,6 +485,14 @@ EOF
         --forwarding-protocol MatchRequest \
         --https-redirect Enabled \
         --enable-compression true
+    
+    # Associate WAF policy with the security policy
+    az afd security-policy create \
+        --resource-group ${RESOURCE_GROUP} \
+        --profile-name ${FRONT_DOOR_NAME} \
+        --security-policy-name api-security \
+        --domains "/subscriptions/${SUBSCRIPTION_ID}/resourcegroups/${RESOURCE_GROUP}/providers/Microsoft.Cdn/profiles/${FRONT_DOOR_NAME}/afdEndpoints/api-endpoint" \
+        --waf-policy ${WAF_POLICY_ID}
     
     echo "✅ WAF policy associated with Front Door and API Management origin configured"
     ```
@@ -529,14 +529,12 @@ EOF
        --endpoint-name api-endpoint \
        --query hostName --output tsv)
    
-   # Test API endpoint (should receive 401 due to JWT validation)
+   # Test API endpoint through Front Door
    curl -v https://${FD_ENDPOINT}/api/v1/get \
-       -H "Accept: application/json"
+       -H "Accept: application/json" \
+       -H "Ocp-Apim-Subscription-Key: test"
    
-   # Test with subscription key (if configured)
-   curl -v https://${FD_ENDPOINT}/api/v1/get \
-       -H "Ocp-Apim-Subscription-Key: YOUR_SUBSCRIPTION_KEY" \
-       -H "Accept: application/json"
+   echo "Front Door endpoint: https://${FD_ENDPOINT}"
    ```
 
    Expected output: API should respond through Front Door with appropriate security headers and WAF protection active.
@@ -666,4 +664,9 @@ Extend this enterprise API security solution by implementing these advanced enha
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

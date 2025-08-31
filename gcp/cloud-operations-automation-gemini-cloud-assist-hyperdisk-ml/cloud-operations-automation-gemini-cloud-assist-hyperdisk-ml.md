@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Gemini Cloud Assist, Hyperdisk ML, Cloud Monitoring, Vertex AI
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai-automation, ml-operations, intelligent-infrastructure, cloud-optimization, devops-ai
 recipe-generator-version: 1.3
@@ -85,7 +85,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and appropriate permissions for Compute Engine, Vertex AI, Cloud Monitoring, and Hyperdisk ML
-2. Google Cloud CLI (gcloud) installed and configured (version 400.0.0 or later)
+2. Google Cloud CLI (gcloud) installed and configured (version 468.0.0 or later)
 3. Basic understanding of machine learning operations, cloud automation concepts, and Kubernetes
 4. Access to Gemini Cloud Assist (private preview access required)
 5. Estimated cost: $50-100 for resources created during this recipe (varies based on compute usage and storage provisioned)
@@ -134,7 +134,7 @@ export DATASET_BUCKET="ml-datasets-${PROJECT_ID}-${RANDOM_SUFFIX}"
 
 1. **Create Hyperdisk ML Volume for High-Performance Storage**:
 
-   Hyperdisk ML provides the highest read-only throughput in Google Cloud, specifically designed for machine learning workloads that require massive parallel data access. With up to 1,200,000 MiB/s throughput and the ability to attach to up to 2,500 instances simultaneously, it's ideal for distributed ML training and inference workloads that need to read large datasets efficiently.
+   Hyperdisk ML provides the highest read-only throughput in Google Cloud, specifically designed for machine learning workloads that require massive parallel data access. With up to 1,200 GiB/s throughput and the ability to attach to up to 2,500 instances simultaneously, it's ideal for distributed ML training and inference workloads that need to read large datasets efficiently.
 
    ```bash
    # Create Hyperdisk ML volume with optimized configuration
@@ -346,7 +346,7 @@ export DATASET_BUCKET="ml-datasets-${PROJECT_ID}-${RANDOM_SUFFIX}"
    
    # Deploy the automation function
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime=python39 \
+       --runtime=python311 \
        --trigger=http \
        --entry-point=ml_ops_automation \
        --memory=512MB \
@@ -518,7 +518,7 @@ export DATASET_BUCKET="ml-datasets-${PROJECT_ID}-${RANDOM_SUFFIX}"
    # Check Hyperdisk ML volume status and performance metrics
    gcloud compute disks describe ${HYPERDISK_NAME} \
        --zone=${ZONE} \
-       --format="table(name,type,status,sizeGb,provisionedIops)"
+       --format="table(name,type,status,sizeGb,provisionedThroughput)"
    
    # Verify volume attachment capabilities
    THROUGHPUT=$(gcloud compute disks describe ${HYPERDISK_NAME} \
@@ -664,7 +664,7 @@ export DATASET_BUCKET="ml-datasets-${PROJECT_ID}-${RANDOM_SUFFIX}"
 
 This recipe demonstrates the powerful combination of Google Cloud's AI-powered operations tools with high-performance storage specifically designed for machine learning workloads. Gemini Cloud Assist represents a paradigm shift in cloud operations, moving from reactive manual management to proactive AI-driven automation that continuously optimizes infrastructure based on real-time analysis and predictive modeling.
 
-Hyperdisk ML's ultra-high throughput capabilities (up to 1,200,000 MiB/s) and ability to attach to thousands of instances simultaneously make it ideal for distributed ML training scenarios where data access patterns can significantly impact training time and costs. The integration with Vertex AI and GKE creates a cohesive platform where storage performance, compute scaling, and intelligent automation work together to optimize ML workload execution.
+Hyperdisk ML's ultra-high throughput capabilities (up to 1,200 GiB/s) and ability to attach to thousands of instances simultaneously make it ideal for distributed ML training scenarios where data access patterns can significantly impact training time and costs. The integration with Vertex AI and GKE creates a cohesive platform where storage performance, compute scaling, and intelligent automation work together to optimize ML workload execution.
 
 The architectural pattern established here follows Google Cloud's best practices for ML operations, implementing observability-driven automation where monitoring data feeds into AI-powered decision engines. This approach enables organizations to achieve both operational efficiency and cost optimization while maintaining the performance requirements of demanding ML workloads. The use of Cloud Scheduler ensures that optimization routines run continuously, creating a self-managing infrastructure that adapts to changing workload patterns.
 
@@ -690,4 +690,9 @@ Extend this intelligent operations automation platform by implementing these adv
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

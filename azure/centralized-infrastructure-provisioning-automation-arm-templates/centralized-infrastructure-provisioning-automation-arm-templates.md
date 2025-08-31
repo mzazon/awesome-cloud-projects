@@ -4,12 +4,12 @@ id: 9f3e7a2b
 category: devops
 difficulty: 200
 subject: azure
-services: Azure Automation, Azure Resource Manager, Azure CLI, Azure Storage
+services: Azure Automation, Azure Resource Manager, Azure Storage, Azure Monitor
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: automation, infrastructure-as-code, arm-templates, devops, deployment, provisioning
 recipe-generator-version: 1.3
@@ -90,7 +90,7 @@ graph TB
 4. Understanding of Azure Resource Manager concepts
 5. Estimated cost: $5-15 per month for automation resources
 
-> **Note**: This recipe uses Azure Automation's PowerShell 7.2 runtime which provides improved performance and compatibility with modern Azure modules.
+> **Note**: This recipe uses Azure Automation's PowerShell 7.4 runtime which provides improved performance and compatibility with modern Azure modules.
 
 ## Preparation
 
@@ -163,7 +163,9 @@ echo "✅ Log Analytics workspace created for monitoring"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --sku Standard_LRS \
-       --kind StorageV2
+       --kind StorageV2 \
+       --allow-blob-public-access false \
+       --https-only true
 
    # Get storage account key
    STORAGE_KEY=$(az storage account keys list \
@@ -194,10 +196,10 @@ echo "✅ Log Analytics workspace created for monitoring"
        --role "Contributor" \
        --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}"
 
-   # Assign Storage Blob Data Contributor for template access
+   # Assign Storage File Data SMB Share Contributor for template access
    az role assignment create \
        --assignee ${MANAGED_IDENTITY_ID} \
-       --role "Storage Blob Data Contributor" \
+       --role "Storage File Data SMB Share Contributor" \
        --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}"
 
    echo "✅ RBAC permissions configured for managed identity"
@@ -251,7 +253,7 @@ echo "✅ Log Analytics workspace created for monitoring"
        "resources": [
            {
                "type": "Microsoft.Storage/storageAccounts",
-               "apiVersion": "2021-09-01",
+               "apiVersion": "2023-05-01",
                "name": "[variables('storageAccountName')]",
                "location": "[parameters('location')]",
                "tags": {
@@ -264,12 +266,13 @@ echo "✅ Log Analytics workspace created for monitoring"
                "kind": "StorageV2",
                "properties": {
                    "allowBlobPublicAccess": false,
-                   "supportsHttpsTrafficOnly": true
+                   "supportsHttpsTrafficOnly": true,
+                   "minimumTlsVersion": "TLS1_2"
                }
            },
            {
                "type": "Microsoft.Network/virtualNetworks",
-               "apiVersion": "2021-05-01",
+               "apiVersion": "2023-09-01",
                "name": "[variables('virtualNetworkName')]",
                "location": "[parameters('location')]",
                "tags": {
@@ -448,38 +451,29 @@ echo "✅ Log Analytics workspace created for monitoring"
 
    The PowerShell runbook is now configured with comprehensive deployment logic, error handling, and logging capabilities. This automation script provides enterprise-grade infrastructure deployment with built-in rollback strategies and audit logging.
 
-6. **Configure Automation Account Modules**:
+6. **Install Required PowerShell Modules**:
 
    Azure Automation requires specific PowerShell modules to interact with Azure services. Installing the latest Az modules ensures compatibility with current Azure services and access to new features. Module management is critical for maintaining runbook reliability and security.
 
    ```bash
-   # Install required Az modules in Automation Account
-   az automation module install \
-       --resource-group ${RESOURCE_GROUP} \
-       --automation-account-name ${AUTOMATION_ACCOUNT} \
-       --name "Az.Accounts" \
-       --module-version "latest"
-
-   az automation module install \
-       --resource-group ${RESOURCE_GROUP} \
-       --automation-account-name ${AUTOMATION_ACCOUNT} \
-       --name "Az.Resources" \
-       --module-version "latest"
-
-   az automation module install \
-       --resource-group ${RESOURCE_GROUP} \
-       --automation-account-name ${AUTOMATION_ACCOUNT} \
-       --name "Az.Storage" \
-       --module-version "latest"
-
+   # Install required Az modules from PowerShell Gallery
+   # Note: Module installation is now done through Browse Gallery in Azure portal
+   echo "⏳ Installing required PowerShell modules..."
+   echo "Navigate to Automation Account > Modules > Browse Gallery"
+   echo "Install the following modules:"
+   echo "- Az.Accounts"
+   echo "- Az.Resources" 
+   echo "- Az.Storage"
+   echo "- Az.Profile"
+   
    # Wait for module installation to complete
    echo "⏳ Waiting for module installation to complete..."
-   sleep 60
+   echo "This process typically takes 10-15 minutes per module"
 
-   echo "✅ Required PowerShell modules installed"
+   echo "✅ Required PowerShell modules installation initiated"
    ```
 
-   The Automation Account now has the necessary PowerShell modules for Azure resource management and storage operations. These modules provide the foundation for reliable runbook execution and Azure service integration.
+   The Automation Account module installation has been initiated using the Browse Gallery feature. These modules provide the foundation for reliable runbook execution and Azure service integration following current Azure Automation best practices.
 
 7. **Create Deployment Target Resource Group**:
 
@@ -515,7 +509,10 @@ echo "✅ Log Analytics workspace created for monitoring"
        --resource-group ${RESOURCE_GROUP} \
        --automation-account-name ${AUTOMATION_ACCOUNT} \
        --name "Deploy-Infrastructure" \
-       --parameters resourceGroupName=${TARGET_RESOURCE_GROUP} storageAccountName=${STORAGE_ACCOUNT} templateName=infrastructure-template.json environment=demo \
+       --parameters resourceGroupName=${TARGET_RESOURCE_GROUP} \
+           storageAccountName=${STORAGE_ACCOUNT} \
+           templateName=infrastructure-template.json \
+           environment=demo \
        --query "jobId" \
        --output tsv)
 
@@ -607,6 +604,11 @@ echo "✅ Log Analytics workspace created for monitoring"
        --output table
    
    # Verify rollback mechanism (if needed)
+   DEPLOYMENT_NAME=$(az deployment group list \
+       --resource-group ${TARGET_RESOURCE_GROUP} \
+       --query "[0].name" \
+       --output tsv)
+   
    az deployment group show \
        --resource-group ${TARGET_RESOURCE_GROUP} \
        --name ${DEPLOYMENT_NAME} \
@@ -675,15 +677,15 @@ echo "✅ Log Analytics workspace created for monitoring"
 
 ## Discussion
 
-Azure Automation combined with ARM templates provides a robust foundation for enterprise infrastructure provisioning that addresses the challenges of manual deployment processes. This automated approach ensures consistent deployments across environments while reducing human error and operational overhead. The solution demonstrates how Azure's native automation capabilities can be leveraged to create scalable, secure infrastructure deployment pipelines. For comprehensive guidance on Azure Automation best practices, see the [Azure Automation documentation](https://docs.microsoft.com/en-us/azure/automation/) and [ARM template best practices](https://docs.microsoft.com/en-us/azure/azure-resource-manager/templates/best-practices).
+Azure Automation combined with ARM templates provides a robust foundation for enterprise infrastructure provisioning that addresses the challenges of manual deployment processes. This automated approach ensures consistent deployments across environments while reducing human error and operational overhead. The solution demonstrates how Azure's native automation capabilities can be leveraged to create scalable, secure infrastructure deployment pipelines. For comprehensive guidance on Azure Automation best practices, see the [Azure Automation documentation](https://learn.microsoft.com/en-us/azure/automation/) and [ARM template best practices](https://learn.microsoft.com/en-us/azure/azure-resource-manager/templates/best-practices).
 
-The managed identity integration eliminates the security risks associated with stored credentials while providing seamless authentication to Azure resources. This approach follows Azure's [Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of security and operational excellence. The centralized template storage in Azure Files ensures version control and access management while enabling template reuse across multiple deployment scenarios.
+The managed identity integration eliminates the security risks associated with stored credentials while providing seamless authentication to Azure resources. This approach follows Azure's [Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles of security and operational excellence. The centralized template storage in Azure Files ensures version control and access management while enabling template reuse across multiple deployment scenarios.
 
-From an operational perspective, the automated deployment pipeline with rollback capabilities provides confidence in production deployments. The comprehensive logging and monitoring integration with Azure Monitor enables proactive issue detection and troubleshooting. For detailed monitoring strategies, review the [Azure Monitor best practices](https://docs.microsoft.com/en-us/azure/azure-monitor/logs/best-practices-logs) and [enterprise monitoring architecture](https://docs.microsoft.com/en-us/azure/azure-monitor/fundamentals/enterprise-monitoring-architecture) documentation.
+From an operational perspective, the automated deployment pipeline with rollback capabilities provides confidence in production deployments. The comprehensive logging and monitoring integration with Azure Monitor enables proactive issue detection and troubleshooting. For detailed monitoring strategies, review the [Azure Monitor best practices](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/best-practices-logs) and [enterprise monitoring architecture](https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/enterprise-monitoring-architecture) documentation.
 
-Cost optimization is achieved through the consumption-based pricing model of Azure Automation and the efficient resource utilization enabled by automated scaling and deployment strategies. The solution supports enterprise governance requirements through RBAC integration and audit logging capabilities. For additional cost optimization guidance, see the [Azure cost management documentation](https://docs.microsoft.com/en-us/azure/cost-management-billing/).
+Cost optimization is achieved through the consumption-based pricing model of Azure Automation and the efficient resource utilization enabled by automated scaling and deployment strategies. The solution supports enterprise governance requirements through RBAC integration and audit logging capabilities. For additional cost optimization guidance, see the [Azure cost management documentation](https://learn.microsoft.com/en-us/azure/cost-management-billing/).
 
-> **Tip**: Implement Azure Policy integration with your automation workflows to ensure deployed resources comply with organizational standards and regulatory requirements. Use Azure DevOps or GitHub Actions for advanced CI/CD pipeline integration.
+> **Tip**: Implement Azure Policy integration with your automation workflows to ensure deployed resources comply with organizational standards and regulatory requirements. Use Azure DevOps or GitHub Actions for advanced CI/CD pipeline integration with the current PowerShell 7.4 runtime environment.
 
 ## Challenge
 
@@ -701,4 +703,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

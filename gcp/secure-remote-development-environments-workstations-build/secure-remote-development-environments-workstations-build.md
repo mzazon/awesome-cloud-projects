@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Workstations, Cloud Build, Cloud Source Repositories, IAM
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: remote-development, security, cicd, workstations, build-automation, source-control
 recipe-generator-version: 1.3
@@ -162,19 +162,20 @@ echo "✅ Required APIs enabled for secure development environment"
        --region ${REGION} \
        --network "projects/${PROJECT_ID}/global/networks/dev-vpc" \
        --subnetwork "projects/${PROJECT_ID}/regions/${REGION}/subnetworks/dev-subnet" \
-       --labels "environment=development,security=high" \
-       --async
+       --labels "environment=development,security=high"
    
    # Wait for cluster creation to complete
    echo "Waiting for workstation cluster creation..."
-   gcloud workstations clusters describe ${WORKSTATION_CLUSTER} \
-       --region ${REGION} \
-       --format "value(state)" | while read state; do
-           if [[ "$state" == "STATE_RUNNING" ]]; then
-               break
-           fi
-           sleep 30
-       done
+   while true; do
+       STATE=$(gcloud workstations clusters describe ${WORKSTATION_CLUSTER} \
+           --region ${REGION} \
+           --format "value(state)")
+       if [[ "$STATE" == "STATE_RUNNING" ]]; then
+           break
+       fi
+       echo "Cluster state: $STATE - waiting..."
+       sleep 30
+   done
    
    echo "✅ Cloud Workstations cluster created and running"
    ```
@@ -230,32 +231,32 @@ echo "✅ Required APIs enabled for secure development environment"
    
    # Create sample application files
    cat > app.py << 'EOF'
-   from flask import Flask
-   
-   app = Flask(__name__)
-   
-   @app.route('/')
-   def hello():
-       return "Hello from Secure Development Environment!"
-   
-   if __name__ == '__main__':
-       app.run(host='0.0.0.0', port=8080)
-   EOF
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route('/')
+def hello():
+    return "Hello from Secure Development Environment!"
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
+EOF
    
    cat > requirements.txt << 'EOF'
-   Flask==2.3.3
-   gunicorn==21.2.0
-   EOF
+Flask==2.3.3
+gunicorn==21.2.0
+EOF
    
    cat > Dockerfile << 'EOF'
-   FROM python:3.11-slim
-   WORKDIR /app
-   COPY requirements.txt .
-   RUN pip install -r requirements.txt
-   COPY . .
-   EXPOSE 8080
-   CMD ["gunicorn", "--bind", "0.0.0.0:8080", "app:app"]
-   EOF
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+EXPOSE 8080
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "app:app"]
+EOF
    
    # Commit and push initial code to secure repository
    git add .
@@ -295,17 +296,15 @@ echo "✅ Required APIs enabled for secure development environment"
    ```bash
    # Create private Cloud Build pool configuration
    cat > private-pool.yaml << EOF
-   name: projects/${PROJECT_ID}/locations/${REGION}/workerPools/${BUILD_POOL}
-   displayName: "Secure Development Build Pool"
-   machineType: e2-medium
-   diskSizeGb: 100
-   workerConfig:
-     machineType: e2-medium
-     diskSizeGb: 100
-   networkConfig:
-     peeredNetwork: projects/${PROJECT_ID}/global/networks/dev-vpc
-     peeredNetworkIpRange: 10.1.0.0/24
-   EOF
+name: projects/${PROJECT_ID}/locations/${REGION}/workerPools/${BUILD_POOL}
+displayName: "Secure Development Build Pool"
+workerConfig:
+  machineType: e2-medium
+  diskSizeGb: 100
+networkConfig:
+  peeredNetwork: projects/${PROJECT_ID}/global/networks/dev-vpc
+  peeredNetworkIpRange: 10.1.0.0/24
+EOF
    
    # Create the private build pool
    gcloud builds worker-pools create ${BUILD_POOL} \
@@ -333,27 +332,27 @@ echo "✅ Required APIs enabled for secure development environment"
    
    # Create Cloud Build configuration file template
    cat > cloudbuild-template.yaml << EOF
-   steps:
-   # Build container image
-   - name: 'gcr.io/cloud-builders/docker'
-     args: ['build', '-t', '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}-images/app:\$BUILD_ID', '.']
-   
-   # Push image to Artifact Registry
-   - name: 'gcr.io/cloud-builders/docker'
-     args: ['push', '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}-images/app:\$BUILD_ID']
-   
-   # Run security scan (placeholder)
-   - name: 'gcr.io/cloud-builders/gcloud'
-     args: ['artifacts', 'docker', 'images', 'scan', '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}-images/app:\$BUILD_ID', '--location=${REGION}']
-   
-   images:
-   - '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}-images/app:\$BUILD_ID'
-   
-   options:
-     pool:
-       name: 'projects/${PROJECT_ID}/locations/${REGION}/workerPools/${BUILD_POOL}'
-     logging: CLOUD_LOGGING_ONLY
-   EOF
+steps:
+# Build container image
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}-images/app:\$BUILD_ID', '.']
+
+# Push image to Artifact Registry
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['push', '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}-images/app:\$BUILD_ID']
+
+# Run security scan
+- name: 'gcr.io/cloud-builders/gcloud'
+  args: ['artifacts', 'docker', 'images', 'scan', '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}-images/app:\$BUILD_ID', '--location=${REGION}']
+
+images:
+- '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}-images/app:\$BUILD_ID'
+
+options:
+  pool:
+    name: 'projects/${PROJECT_ID}/locations/${REGION}/workerPools/${BUILD_POOL}'
+  logging: CLOUD_LOGGING_ONLY
+EOF
    
    echo "✅ Cloud Build trigger configured for automated secure builds"
    echo "Template cloudbuild.yaml created - add this to your repository"
@@ -574,4 +573,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

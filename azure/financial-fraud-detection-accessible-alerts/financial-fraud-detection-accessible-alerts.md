@@ -4,12 +4,12 @@ id: f8a3b2c1
 category: security
 difficulty: 200
 subject: azure
-services: Azure AI Metrics Advisor, Azure AI Immersive Reader, Azure Logic Apps
+services: Azure AI Metrics Advisor, Azure AI Immersive Reader, Azure Logic Apps, Azure Storage
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: fraud-detection, financial-services, ai-anomaly-detection, accessibility, compliance
 recipe-generator-version: 1.3
@@ -71,7 +71,7 @@ graph TB
 4. Sample financial transaction data or access to financial systems
 5. Estimated cost: $50-100 per month for development/testing workloads
 
-> **Note**: Azure AI Metrics Advisor will be retired on October 1, 2026. Consider migrating to Azure AI Anomaly Detector for new implementations following the same architectural patterns.
+> **Warning**: Azure AI Metrics Advisor will be retired on October 1, 2026. Consider migrating to [Azure AI Anomaly Detector](https://learn.microsoft.com/en-us/azure/ai-services/anomaly-detector/) for new implementations following the same architectural patterns.
 
 ## Preparation
 
@@ -234,7 +234,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
    # Create sample transaction data file
    cat > sample-transactions.json << 'EOF'
    {
-     "timestamp": "2025-07-12T10:00:00Z",
+     "timestamp": "2025-07-23T10:00:00Z",
      "metrics": [
        {
          "name": "transaction_volume",
@@ -470,7 +470,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --name "fraud-detection-failures" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.CognitiveServices/accounts/${METRICS_ADVISOR_NAME}" \
-       --condition "count static avg errors > 5 within 5m" \
+       --condition "avg Errors > 5" \
        --description "Alert when fraud detection service experiences failures" \
        --evaluation-frequency 1m \
        --window-size 5m \
@@ -515,7 +515,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        "description": "Transaction volume exceeded normal patterns by 250%",
        "affectedMetrics": ["transaction_volume", "average_amount"],
        "confidenceScore": 0.89,
-       "timestamp": "2025-07-12T14:30:00Z"
+       "timestamp": "2025-07-23T14:30:00Z"
      }
    }
    EOF
@@ -652,4 +652,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

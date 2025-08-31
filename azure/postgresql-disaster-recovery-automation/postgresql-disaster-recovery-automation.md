@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Database for PostgreSQL, Azure Backup, Azure Monitor, Azure Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: postgresql, database, disaster-recovery, backup, monitoring, automation
 recipe-generator-version: 1.3
@@ -79,15 +79,15 @@ graph TB
 4. Knowledge of Azure Resource Manager templates and monitoring concepts
 5. Estimated cost: $150-300/month for production workloads (varies by region and retention)
 
-> **Note**: This solution requires Premium or General Purpose service tiers for Azure Database for PostgreSQL Flexible Server to enable geo-redundant backups and read replicas.
+> **Note**: This solution requires General Purpose or Memory Optimized service tiers for Azure Database for PostgreSQL Flexible Server to enable geo-redundant backups and read replicas.
 
 ## Preparation
 
 ```bash
 # Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-postgres-dr-${RANDOM_SUFFIX}"
-export LOCATION="East US"
-export SECONDARY_LOCATION="West US 2"
+export LOCATION="eastus"
+export SECONDARY_LOCATION="westus2"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
@@ -110,13 +110,13 @@ export AUTOMATION_ACCOUNT="aa-postgres-${RANDOM_SUFFIX}"
 # Create primary resource group
 az group create \
     --name ${RESOURCE_GROUP} \
-    --location "${LOCATION}" \
+    --location ${LOCATION} \
     --tags purpose=disaster-recovery environment=production
 
 # Create secondary resource group for DR
 az group create \
     --name "${RESOURCE_GROUP}-secondary" \
-    --location "${SECONDARY_LOCATION}" \
+    --location ${SECONDARY_LOCATION} \
     --tags purpose=disaster-recovery environment=production
 
 echo "✅ Resource groups created successfully"
@@ -133,7 +133,7 @@ echo "✅ Resource groups created successfully"
    az postgres flexible-server create \
        --name ${PG_SERVER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
+       --location ${LOCATION} \
        --admin-user ${PG_ADMIN_USER} \
        --admin-password ${PG_ADMIN_PASSWORD} \
        --sku-name Standard_D4s_v3 \
@@ -165,10 +165,10 @@ echo "✅ Resource groups created successfully"
    ```bash
    # Create read replica in secondary region
    az postgres flexible-server replica create \
-       --name ${PG_REPLICA_NAME} \
+       --replica-name ${PG_REPLICA_NAME} \
        --resource-group "${RESOURCE_GROUP}-secondary" \
        --source-server ${PG_SERVER_NAME} \
-       --location "${SECONDARY_LOCATION}" \
+       --location ${SECONDARY_LOCATION} \
        --tags environment=production purpose=replica
    
    # Configure replica firewall rules
@@ -200,7 +200,7 @@ echo "✅ Resource groups created successfully"
    az dataprotection backup-vault create \
        --name ${BACKUP_VAULT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
+       --location ${LOCATION} \
        --storage-settings datastore-type=VaultStore \
            type=GeoRedundant \
        --tags purpose=backup environment=production
@@ -209,40 +209,45 @@ echo "✅ Resource groups created successfully"
    az dataprotection backup-vault create \
        --name ${BACKUP_VAULT_SECONDARY} \
        --resource-group "${RESOURCE_GROUP}-secondary" \
-       --location "${SECONDARY_LOCATION}" \
+       --location ${SECONDARY_LOCATION} \
        --storage-settings datastore-type=VaultStore \
            type=GeoRedundant \
        --tags purpose=backup environment=production
+   
+   # Create a backup policy template for PostgreSQL
+   cat > backup-policy.json << 'EOF'
+   {
+       "datasourceTypes": ["Microsoft.DBforPostgreSQL/flexibleServers"],
+       "objectType": "BackupPolicy",
+       "policyRules": [
+           {
+               "backupParameters": {
+                   "backupType": "Full",
+                   "objectType": "AzureBackupParams"
+               },
+               "trigger": {
+                   "schedule": {
+                       "repeatingTimeIntervals": ["R/2025-01-01T02:00:00+00:00/P1D"]
+                   },
+                   "objectType": "ScheduleBasedTriggerContext"
+               },
+               "dataStore": {
+                   "dataStoreType": "VaultStore",
+                   "objectType": "DataStoreInfoBase"
+               },
+               "name": "BackupDaily",
+               "objectType": "AzureBackupRule"
+           }
+       ]
+   }
+   EOF
    
    # Create backup policy for PostgreSQL
    az dataprotection backup-policy create \
        --name "PostgreSQLBackupPolicy" \
        --resource-group ${RESOURCE_GROUP} \
        --vault-name ${BACKUP_VAULT_NAME} \
-       --policy '{
-           "datasourceTypes": ["Microsoft.DBforPostgreSQL/flexibleServers"],
-           "objectType": "BackupPolicy",
-           "policyRules": [
-               {
-                   "backupParameters": {
-                       "backupType": "Full",
-                       "objectType": "AzureBackupParams"
-                   },
-                   "trigger": {
-                       "schedule": {
-                           "repeatingTimeIntervals": ["R/2024-01-01T02:00:00+00:00/P1D"]
-                       },
-                       "objectType": "ScheduleBasedTriggerContext"
-                   },
-                   "dataStore": {
-                       "dataStoreType": "VaultStore",
-                       "objectType": "DataStoreInfoBase"
-                   },
-                   "name": "BackupDaily",
-                   "objectType": "AzureBackupRule"
-               }
-           ]
-       }'
+       --policy @backup-policy.json
    
    echo "✅ Backup vaults and policies created"
    ```
@@ -258,7 +263,7 @@ echo "✅ Resource groups created successfully"
    az monitor log-analytics workspace create \
        --workspace-name ${LOG_ANALYTICS_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
+       --location ${LOCATION} \
        --tags purpose=monitoring environment=production
    
    # Get workspace ID for configuration
@@ -308,7 +313,7 @@ echo "✅ Resource groups created successfully"
    az storage account create \
        --name ${STORAGE_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
+       --location ${LOCATION} \
        --sku Standard_GRS \
        --kind StorageV2 \
        --access-tier Hot \
@@ -351,7 +356,7 @@ echo "✅ Resource groups created successfully"
    az automation account create \
        --name ${AUTOMATION_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
+       --location ${LOCATION} \
        --tags purpose=automation environment=production
    
    # Create automation credential for PostgreSQL admin
@@ -379,18 +384,25 @@ echo "✅ Resource groups created successfully"
    Import-Module Az.PostgreSQL
    Import-Module Az.Monitor
    
-   # Authenticate using managed identity
+   # Authenticate using system-assigned managed identity
    Connect-AzAccount -Identity
    
-   # Promote read replica to primary
-   Write-Output "Promoting read replica to primary server..."
+   # Promote read replica to standalone server
+   Write-Output "Promoting read replica to standalone server..."
    
    try {
-       # Stop replication and promote replica
-       Stop-AzPostgreSqlFlexibleServerReplica -Name $ReplicaServerName -ResourceGroupName $SecondaryResourceGroup
+       # Use the replica promote command instead of stop-replication
+       $result = Invoke-AzRestMethod `
+           -Uri "https://management.azure.com/subscriptions/$env:SUBSCRIPTION_ID/resourceGroups/$SecondaryResourceGroup/providers/Microsoft.DBforPostgreSQL/flexibleServers/$ReplicaServerName/promote?api-version=2023-06-01-preview" `
+           -Method POST `
+           -Payload '{"promoteMode": "standalone", "promoteOption": "planned"}'
        
-       # Update DNS or application connection strings here
-       Write-Output "Replica promoted successfully"
+       if ($result.StatusCode -eq 200 -or $result.StatusCode -eq 202) {
+           Write-Output "Replica promoted successfully to standalone server"
+           Write-Output "New primary server: $ReplicaServerName"
+       } else {
+           throw "Promotion failed with status code: $($result.StatusCode)"
+       }
        
        # Send notification
        Write-Output "Disaster recovery completed for server: $ReplicaServerName"
@@ -431,7 +443,7 @@ echo "✅ Resource groups created successfully"
        --name "PostgreSQL-ConnectionFailures" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DBforPostgreSQL/flexibleServers/${PG_SERVER_NAME}" \
-       --condition "count static failed_connections > 10" \
+       --condition "count static connections_failed > 10" \
        --window-size 5m \
        --evaluation-frequency 1m \
        --severity 2 \
@@ -442,7 +454,7 @@ echo "✅ Resource groups created successfully"
        --name "PostgreSQL-ReplicationLag" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DBforPostgreSQL/flexibleServers/${PG_SERVER_NAME}" \
-       --condition "average static replica_lag > 300" \
+       --condition "average static replica_lag_in_seconds > 300" \
        --window-size 5m \
        --evaluation-frequency 1m \
        --severity 1 \
@@ -453,7 +465,7 @@ echo "✅ Resource groups created successfully"
        --name "PostgreSQL-BackupFailures" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DBforPostgreSQL/flexibleServers/${PG_SERVER_NAME}" \
-       --condition "count static backup_failures > 0" \
+       --condition "count static backup_storage_used > 0" \
        --window-size 15m \
        --evaluation-frequency 5m \
        --severity 1 \
@@ -475,6 +487,9 @@ echo "✅ Resource groups created successfully"
        --resource-group ${RESOURCE_GROUP} \
        --query fullyQualifiedDomainName \
        --output tsv)
+   
+   # Install psql client if not available
+   which psql || echo "Install PostgreSQL client: sudo apt-get install postgresql-client"
    
    # Create database and sample data
    psql "postgresql://${PG_ADMIN_USER}:${PG_ADMIN_PASSWORD}@${PG_FQDN}:5432/postgres" << 'EOF'
@@ -550,10 +565,10 @@ echo "✅ Resource groups created successfully"
    psql "postgresql://${PG_ADMIN_USER}:${PG_ADMIN_PASSWORD}@${PG_REPLICA_FQDN}:5432/production_db" \
        -c "SELECT COUNT(*) FROM customer_data;"
    
-   # Check replication lag
+   # Check replication lag using metrics
    az monitor metrics list \
        --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DBforPostgreSQL/flexibleServers/${PG_SERVER_NAME}" \
-       --metric "replica_lag" \
+       --metric "replica_lag_in_seconds" \
        --interval PT1M \
        --output table
    ```
@@ -584,19 +599,21 @@ echo "✅ Resource groups created successfully"
 
    ```bash
    # Test runbook execution (dry run)
-   az automation runbook start \
+   JOB_ID=$(az automation runbook start \
        --name "PostgreSQL-DisasterRecovery" \
        --automation-account-name ${AUTOMATION_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --parameters ResourceGroupName=${RESOURCE_GROUP} \
                    ReplicaServerName=${PG_REPLICA_NAME} \
-                   SecondaryResourceGroup="${RESOURCE_GROUP}-secondary"
+                   SecondaryResourceGroup="${RESOURCE_GROUP}-secondary" \
+       --query jobId \
+       --output tsv)
    
    # Monitor runbook execution
-   az automation job list \
+   az automation job show \
        --automation-account-name ${AUTOMATION_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
-       --output table
+       --job-id ${JOB_ID}
    ```
 
    Expected output: Runbook should execute successfully and provide disaster recovery status.
@@ -742,11 +759,11 @@ echo "✅ Resource groups created successfully"
 
 Azure Database for PostgreSQL Flexible Server with Azure Backup creates a comprehensive disaster recovery solution that addresses both regional outages and data corruption scenarios. The combination of zone-redundant high availability, geo-redundant backups, and cross-region read replicas provides multiple layers of protection with different Recovery Time Objectives (RTO) and Recovery Point Objectives (RPO). This architecture follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) reliability principles while maintaining cost-effectiveness through automated management.
 
-The disaster recovery strategy leverages Azure's native capabilities to minimize operational overhead while maximizing data protection. Read replicas provide near-instantaneous failover capabilities with RPO measured in seconds, while the backup infrastructure ensures long-term data retention and compliance requirements. For comprehensive guidance on PostgreSQL disaster recovery patterns, see the [Azure Database for PostgreSQL documentation](https://docs.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-business-continuity) and [backup best practices](https://docs.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-backup-restore).
+The disaster recovery strategy leverages Azure's native capabilities to minimize operational overhead while maximizing data protection. Read replicas provide near-instantaneous failover capabilities with RPO measured in seconds, while the backup infrastructure ensures long-term data retention and compliance requirements. For comprehensive guidance on PostgreSQL disaster recovery patterns, see the [Azure Database for PostgreSQL documentation](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-business-continuity) and [backup best practices](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-backup-restore).
 
-The monitoring and automation components create a proactive disaster recovery posture that reduces human intervention and accelerates recovery times. Azure Monitor's integration with Azure Automation enables event-driven recovery workflows that can automatically promote read replicas or trigger backup restores based on predefined conditions. This approach significantly reduces the Mean Time to Recovery (MTTR) while maintaining audit trails and compliance documentation. For detailed monitoring strategies, review the [Azure Monitor documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/platform/metrics-supported#microsoftdbforpostgresqlflexibleservers).
+The monitoring and automation components create a proactive disaster recovery posture that reduces human intervention and accelerates recovery times. Azure Monitor's integration with Azure Automation enables event-driven recovery workflows that can automatically promote read replicas or trigger backup restores based on predefined conditions. This approach significantly reduces the Mean Time to Recovery (MTTR) while maintaining audit trails and compliance documentation. For detailed monitoring strategies, review the [Azure Monitor documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/metrics-supported#microsoftdbforpostgresqlflexibleservers).
 
-From a cost optimization perspective, the solution balances comprehensive protection with operational efficiency. The geo-redundant backup storage incurs additional costs but provides essential cross-region protection, while read replicas serve dual purposes for both disaster recovery and read scaling. Consider implementing [Azure Cost Management](https://docs.microsoft.com/en-us/azure/cost-management-billing/costs/quick-acm-cost-analysis) policies to monitor disaster recovery costs and optimize resource utilization based on actual recovery requirements.
+From a cost optimization perspective, the solution balances comprehensive protection with operational efficiency. The geo-redundant backup storage incurs additional costs but provides essential cross-region protection, while read replicas serve dual purposes for both disaster recovery and read scaling. Consider implementing [Azure Cost Management](https://learn.microsoft.com/en-us/azure/cost-management-billing/costs/quick-acm-cost-analysis) policies to monitor disaster recovery costs and optimize resource utilization based on actual recovery requirements.
 
 > **Tip**: Regularly test disaster recovery procedures using the read replica promotion process to ensure recovery workflows function correctly. Use Azure Monitor's synthetic monitoring capabilities to validate application connectivity during failover scenarios and maintain updated recovery documentation.
 
@@ -766,4 +783,9 @@ Extend this disaster recovery solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

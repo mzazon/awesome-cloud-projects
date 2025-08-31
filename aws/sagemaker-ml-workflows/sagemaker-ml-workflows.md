@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: sagemaker, step-functions, s3, iam
 estimated-time: 240 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: machine-learning, sagemaker, step-functions, mlops, automation
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Enterprise data science teams struggle with operationalizing machine learning mo
 
 ## Solution
 
-This solution creates an end-to-end ML pipeline using Amazon SageMaker for model training and deployment, orchestrated by AWS Step Functions for workflow management. The pipeline automates data preprocessing, model training with hyperparameter tuning, model evaluation, and conditional deployment based on performance metrics, while providing comprehensive monitoring and rollback capabilities.
+This solution creates an end-to-end ML pipeline using Amazon SageMaker for model training and deployment, orchestrated by AWS Step Functions for workflow management. The pipeline automates data preprocessing, model training with evaluation metrics, model validation, and conditional deployment based on performance thresholds, while providing comprehensive monitoring and rollback capabilities through visual workflow management.
 
 ## Architecture Diagram
 
@@ -76,10 +76,10 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for SageMaker, Step Functions, S3, and IAM
+1. AWS account with appropriate permissions for SageMaker, Step Functions, S3, Lambda, and IAM
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic knowledge of machine learning concepts and Python
-4. Understanding of containerization and Docker concepts
+4. Understanding of AWS IAM roles and policies
 5. Estimated cost: $50-100 for training jobs and endpoints during testing
 
 > **Note**: This recipe uses SageMaker training instances and endpoints which incur charges. Ensure you complete the cleanup steps to avoid ongoing costs.
@@ -106,6 +106,16 @@ export STEP_FUNCTIONS_ROLE_NAME="StepFunctionsMLRole-${RANDOM_SUFFIX}"
 # Create S3 bucket for ML artifacts
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
 
+# Enable versioning and encryption for data protection
+aws s3api put-bucket-versioning \
+    --bucket ${S3_BUCKET_NAME} \
+    --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+    --bucket ${S3_BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
 # Create folder structure in S3
 aws s3api put-object --bucket ${S3_BUCKET_NAME} \
     --key raw-data/
@@ -123,7 +133,7 @@ echo "✅ S3 bucket and folder structure created"
 
 1. **Create IAM Roles for SageMaker and Step Functions**:
 
-   IAM roles provide the secure foundation for our ML pipeline by establishing least-privilege access patterns. SageMaker requires specific permissions to access S3 data, create training jobs, and manage model artifacts, while Step Functions needs permissions to orchestrate the entire workflow. Understanding these role relationships is crucial for enterprise ML operations where security and compliance are paramount.
+   IAM roles provide the secure foundation for our ML pipeline by establishing least-privilege access patterns following AWS security best practices. SageMaker requires specific permissions to access S3 data, create training jobs, and manage model artifacts, while Step Functions needs permissions to orchestrate the entire workflow. These roles implement the principle of least privilege, ensuring each service can only access the resources necessary for its specific function.
 
    ```bash
    # Create SageMaker execution role
@@ -159,11 +169,11 @@ echo "✅ S3 bucket and folder structure created"
    echo "✅ SageMaker role created: ${SAGEMAKER_ROLE_ARN}"
    ```
 
-   The SageMaker role is now established with the necessary permissions to access S3 resources and manage ML jobs. This role enables SageMaker to securely access training data, store model artifacts, and execute processing jobs without requiring hardcoded credentials in your code.
+   The SageMaker role is now established with the necessary permissions to access S3 resources and manage ML jobs. This role enables SageMaker to securely access training data, store model artifacts, and execute processing jobs without requiring hardcoded credentials in your code, following AWS security best practices.
 
 2. **Create Step Functions Execution Role**:
 
-   Step Functions serves as the orchestration layer for our ML pipeline, requiring permissions to invoke SageMaker services, manage S3 resources, and coordinate workflow execution. This separation of concerns allows Step Functions to act as the conductor while SageMaker handles the heavy lifting of ML operations, creating a scalable and maintainable architecture.
+   Step Functions serves as the orchestration layer for our ML pipeline, coordinating multiple AWS services in a visual workflow. This role requires permissions to invoke SageMaker services, manage S3 resources, call Lambda functions, and coordinate workflow execution. The separation of concerns allows Step Functions to act as the conductor while SageMaker handles the heavy lifting of ML operations.
 
    ```bash
    # Create Step Functions trust policy
@@ -232,9 +242,9 @@ echo "✅ S3 bucket and folder structure created"
        {
          "Effect": "Allow",
          "Action": [
-           "sns:Publish"
+           "lambda:InvokeFunction"
          ],
-         "Resource": "*"
+         "Resource": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:EvaluateModel"
        }
      ]
    }
@@ -253,26 +263,26 @@ echo "✅ S3 bucket and folder structure created"
    echo "✅ Step Functions role created: ${STEP_FUNCTIONS_ROLE_ARN}"
    ```
 
-   The Step Functions orchestration role is now configured with the precise permissions needed to manage the entire ML workflow. This role enables secure delegation of tasks to SageMaker while maintaining audit trails and ensuring compliance with security best practices.
+   The Step Functions orchestration role is now configured with the precise permissions needed to manage the entire ML workflow. This role enables secure delegation of tasks to SageMaker and Lambda while maintaining audit trails and ensuring compliance with AWS security best practices.
 
 3. **Create Sample Training Data and Upload to S3**:
 
-   High-quality training data forms the foundation of any successful ML pipeline. For this example, we'll use the Boston Housing dataset to demonstrate regression techniques, but the pipeline architecture supports any dataset format. Understanding data preparation and storage patterns is essential for scaling ML operations across different domains and use cases.
+   High-quality training data forms the foundation of any successful ML pipeline. For this example, we'll use the California Housing dataset, which is the recommended replacement for the deprecated Boston Housing dataset. This dataset demonstrates regression techniques and the pipeline architecture supports any dataset format for scalable ML operations.
 
    ```bash
-   # Create sample dataset (Boston Housing for regression)
+   # Create sample dataset (California Housing for regression)
    cat > generate_sample_data.py << 'EOF'
    import pandas as pd
    import numpy as np
-   from sklearn.datasets import load_boston
+   from sklearn.datasets import fetch_california_housing
    from sklearn.model_selection import train_test_split
    
-   # Load Boston Housing dataset
-   boston = load_boston()
-   X, y = boston.data, boston.target
+   # Load California Housing dataset (recommended replacement for Boston Housing)
+   california = fetch_california_housing(as_frame=True)
+   X, y = california.data, california.target
    
    # Create DataFrame
-   df = pd.DataFrame(X, columns=boston.feature_names)
+   df = pd.DataFrame(X)
    df['target'] = y
    
    # Split into train and test sets
@@ -284,6 +294,8 @@ echo "✅ S3 bucket and folder structure created"
    
    print(f"Training data shape: {train_df.shape}")
    print(f"Test data shape: {test_df.shape}")
+   print(f"Features: {list(california.feature_names)}")
+   print(f"Target mean: {y.mean():.2f}")
    EOF
    
    python generate_sample_data.py
@@ -295,11 +307,11 @@ echo "✅ S3 bucket and folder structure created"
    echo "✅ Sample data uploaded to S3"
    ```
 
-   The training and test datasets are now stored in S3, establishing the data foundation for our ML pipeline. S3 provides 99.999999999% (11 9's) durability and serves as the single source of truth for all ML artifacts, enabling reproducible experiments and model versioning.
+   The training and test datasets are now stored in S3, establishing the data foundation for our ML pipeline. S3 provides 99.999999999% (11 9's) durability and serves as the single source of truth for all ML artifacts, enabling reproducible experiments and model versioning with built-in encryption and versioning enabled.
 
 4. **Create Data Preprocessing Script**:
 
-   Data preprocessing standardizes input features and ensures consistent model performance across different datasets. SageMaker Processing Jobs provide managed infrastructure for these transformations, allowing data scientists to focus on business logic rather than infrastructure management. This approach scales automatically and integrates seamlessly with the broader ML workflow.
+   Data preprocessing standardizes input features and ensures consistent model performance across different datasets. SageMaker Processing Jobs provide managed infrastructure for these transformations, automatically scaling compute resources and integrating seamlessly with the broader ML workflow. This approach allows data scientists to focus on business logic rather than infrastructure management.
 
    ```bash
    # Create preprocessing script
@@ -325,7 +337,7 @@ echo "✅ S3 bucket and folder structure created"
        X = df.drop('target', axis=1)
        y = df['target']
        
-       # Apply preprocessing
+       # Apply preprocessing with StandardScaler
        scaler = StandardScaler()
        X_scaled = scaler.fit_transform(X)
        
@@ -336,12 +348,13 @@ echo "✅ S3 bucket and folder structure created"
        # Save processed data
        processed_df.to_csv(args.output_data, index=False)
        
-       # Save scaler for inference
+       # Save scaler for inference consistency
        scaler_path = os.path.join(os.path.dirname(args.output_data), 'scaler.pkl')
        joblib.dump(scaler, scaler_path)
        
        print(f"Processed data saved to: {args.output_data}")
        print(f"Scaler saved to: {scaler_path}")
+       print(f"Feature scaling completed for {X.shape[1]} features")
    
    if __name__ == '__main__':
        main()
@@ -353,11 +366,11 @@ echo "✅ S3 bucket and folder structure created"
    echo "✅ Preprocessing script uploaded to S3"
    ```
 
-   The preprocessing script is now available in S3 and ready for execution by SageMaker Processing Jobs. This script standardizes features using scikit-learn's StandardScaler and saves the scaler artifact for consistent transformations during inference, ensuring model predictions remain accurate in production.
+   The preprocessing script is now available in S3 and ready for execution by SageMaker Processing Jobs. This script standardizes features using scikit-learn's StandardScaler and saves the scaler artifact for consistent transformations during inference, ensuring model predictions remain accurate in production environments.
 
 5. **Create Training Script with Model Evaluation**:
 
-   Model training and evaluation form the core of the ML pipeline, where algorithms learn patterns from data and generate performance metrics. This script implements best practices including separate training/testing, comprehensive metrics calculation, and artifact management. Understanding these patterns enables reliable model development and deployment decisions.
+   Model training and evaluation form the core of the ML pipeline, where algorithms learn patterns from data and generate performance metrics for automated quality gates. This script implements MLOps best practices including separate training/validation datasets, comprehensive metrics calculation, and proper artifact management for production deployment decisions.
 
    ```bash
    # Create training script
@@ -369,8 +382,7 @@ echo "✅ S3 bucket and folder structure created"
    import joblib
    import json
    from sklearn.ensemble import RandomForestRegressor
-   from sklearn.linear_model import LinearRegression
-   from sklearn.metrics import mean_squared_error, r2_score
+   from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
    import tarfile
    
    def main():
@@ -383,7 +395,7 @@ echo "✅ S3 bucket and folder structure created"
        args = parser.parse_args()
        
        # Read training data
-       train_df = pd.read_csv(os.path.join(args.train, 'train.csv'))
+       train_df = pd.read_csv(os.path.join(args.train, 'train_processed.csv'))
        test_df = pd.read_csv(os.path.join(args.test, 'test.csv'))
        
        # Prepare features and targets
@@ -392,30 +404,42 @@ echo "✅ S3 bucket and folder structure created"
        X_test = test_df.drop('target', axis=1)
        y_test = test_df['target']
        
-       # Train Random Forest model
-       rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
+       # Train Random Forest model with optimized parameters
+       rf_model = RandomForestRegressor(
+           n_estimators=100, 
+           max_depth=10, 
+           min_samples_split=5,
+           random_state=42,
+           n_jobs=-1
+       )
        rf_model.fit(X_train, y_train)
        
        # Make predictions
        y_pred_train = rf_model.predict(X_train)
        y_pred_test = rf_model.predict(X_test)
        
-       # Calculate metrics
+       # Calculate comprehensive metrics
        train_rmse = np.sqrt(mean_squared_error(y_train, y_pred_train))
        test_rmse = np.sqrt(mean_squared_error(y_test, y_pred_test))
        train_r2 = r2_score(y_train, y_pred_train)
        test_r2 = r2_score(y_test, y_pred_test)
+       train_mae = mean_absolute_error(y_train, y_pred_train)
+       test_mae = mean_absolute_error(y_test, y_pred_test)
        
        # Save model
        model_path = os.path.join(args.model_dir, 'model.pkl')
        joblib.dump(rf_model, model_path)
        
-       # Save evaluation metrics
+       # Save evaluation metrics for automated quality gates
        metrics = {
            'train_rmse': float(train_rmse),
            'test_rmse': float(test_rmse),
            'train_r2': float(train_r2),
-           'test_r2': float(test_r2)
+           'test_r2': float(test_r2),
+           'train_mae': float(train_mae),
+           'test_mae': float(test_mae),
+           'feature_count': int(X_train.shape[1]),
+           'training_samples': int(X_train.shape[0])
        }
        
        metrics_path = os.path.join(args.output_data_dir, 'evaluation.json')
@@ -424,6 +448,7 @@ echo "✅ S3 bucket and folder structure created"
        
        print(f"Model saved to: {model_path}")
        print(f"Evaluation metrics: {metrics}")
+       print(f"Model performance - Test R²: {test_r2:.4f}, Test RMSE: {test_rmse:.4f}")
    
    if __name__ == '__main__':
        main()
@@ -435,13 +460,13 @@ echo "✅ S3 bucket and folder structure created"
    echo "✅ Training script uploaded to S3"
    ```
 
-   The training script implements a Random Forest regressor with comprehensive evaluation metrics including RMSE and R² scores for both training and test sets. These metrics enable automated decision-making in the pipeline, ensuring only high-quality models proceed to deployment while maintaining detailed audit trails.
+   The training script implements a Random Forest regressor with comprehensive evaluation metrics including RMSE, R², and MAE scores for both training and test sets. These metrics enable automated decision-making in the pipeline, ensuring only high-quality models proceed to deployment while maintaining detailed audit trails for model performance tracking.
 
-> **Warning**: Model evaluation thresholds should be carefully tuned based on business requirements. A test R² score threshold of 0.7 is used in this example, but production systems may require different performance criteria.
+> **Warning**: Model evaluation thresholds should be carefully tuned based on business requirements. A test R² score threshold of 0.7 is used in this example, but production systems may require different performance criteria based on the specific use case and domain requirements.
 
 6. **Create Model Inference Script**:
 
-   Model inference scripts define how trained models process new data in production environments. SageMaker endpoints use these scripts to handle HTTP requests, perform predictions, and return results in the expected format. Understanding inference patterns is crucial for deploying models that meet production performance and reliability requirements.
+   Model inference scripts define how trained models process new data in production environments, handling real-time HTTP requests through SageMaker endpoints. These scripts must implement specific functions that SageMaker expects for model loading, input parsing, prediction, and output formatting, ensuring optimal performance and reliability for production inference scenarios.
 
    ```bash
    # Create inference script
@@ -450,10 +475,12 @@ echo "✅ S3 bucket and folder structure created"
    import json
    import numpy as np
    import pandas as pd
+   import os
    
    def model_fn(model_dir):
        """Load model for inference"""
-       model = joblib.load(f"{model_dir}/model.pkl")
+       model_path = os.path.join(model_dir, 'model.pkl')
+       model = joblib.load(model_path)
        return model
    
    def input_fn(request_body, request_content_type):
@@ -462,21 +489,25 @@ echo "✅ S3 bucket and folder structure created"
            input_data = json.loads(request_body)
            return np.array(input_data['instances'])
        elif request_content_type == 'text/csv':
-           return pd.read_csv(request_body).values
+           from io import StringIO
+           return pd.read_csv(StringIO(request_body)).values
        else:
            raise ValueError(f"Unsupported content type: {request_content_type}")
    
    def predict_fn(input_data, model):
-       """Make prediction"""
+       """Make prediction using the loaded model"""
        predictions = model.predict(input_data)
        return predictions
    
    def output_fn(predictions, accept):
-       """Format output"""
+       """Format output for client consumption"""
        if accept == 'application/json':
-           return json.dumps({'predictions': predictions.tolist()})
+           return json.dumps({
+               'predictions': predictions.tolist(),
+               'model_type': 'RandomForestRegressor'
+           })
        else:
-           return str(predictions)
+           return str(predictions.tolist())
    EOF
    
    # Upload inference script to S3
@@ -485,11 +516,11 @@ echo "✅ S3 bucket and folder structure created"
    echo "✅ Inference script uploaded to S3"
    ```
 
-   The inference script is now configured to handle multiple input formats and provide consistent prediction outputs. This flexible approach supports various client applications and integration patterns while maintaining optimal performance for real-time inference scenarios.
+   The inference script is now configured to handle multiple input formats and provide consistent prediction outputs with enhanced error handling. This flexible approach supports various client applications and integration patterns while maintaining optimal performance for real-time inference scenarios and proper response formatting.
 
 7. **Create Step Functions State Machine Definition**:
 
-   Step Functions provides visual workflow orchestration with built-in error handling, retry logic, and monitoring capabilities. This state machine definition creates a robust ML pipeline that coordinates preprocessing, training, evaluation, and deployment while implementing conditional logic based on model performance. Understanding state machine patterns enables scalable and reliable ML operations.
+   Step Functions provides visual workflow orchestration with built-in error handling, retry logic, and comprehensive monitoring capabilities. This state machine definition creates a robust ML pipeline that coordinates preprocessing, training, evaluation, and conditional deployment while implementing quality gates based on model performance metrics and comprehensive error recovery.
 
    ```bash
    # Create state machine definition
@@ -505,7 +536,7 @@ echo "✅ S3 bucket and folder structure created"
            "ProcessingJobName.$": "$.PreprocessingJobName",
            "RoleArn": "${SAGEMAKER_ROLE_ARN}",
            "AppSpecification": {
-             "ImageUri": "683313688378.dkr.ecr.${AWS_REGION}.amazonaws.com/sagemaker-scikit-learn:1.0-1-cpu-py3",
+             "ImageUri": "246618743249.dkr.ecr.${AWS_REGION}.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3",
              "ContainerEntrypoint": [
                "python3",
                "/opt/ml/processing/input/code/preprocessing.py"
@@ -558,6 +589,14 @@ echo "✅ S3 bucket and folder structure created"
              "ErrorEquals": ["States.ALL"],
              "Next": "ProcessingJobFailed"
            }
+         ],
+         "Retry": [
+           {
+             "ErrorEquals": ["States.TaskFailed"],
+             "IntervalSeconds": 30,
+             "MaxAttempts": 2,
+             "BackoffRate": 2.0
+           }
          ]
        },
        "ModelTraining": {
@@ -567,7 +606,7 @@ echo "✅ S3 bucket and folder structure created"
            "TrainingJobName.$": "$.TrainingJobName",
            "RoleArn": "${SAGEMAKER_ROLE_ARN}",
            "AlgorithmSpecification": {
-             "TrainingImage": "683313688378.dkr.ecr.${AWS_REGION}.amazonaws.com/sagemaker-scikit-learn:1.0-1-cpu-py3",
+             "TrainingImage": "246618743249.dkr.ecr.${AWS_REGION}.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3",
              "TrainingInputMode": "File"
            },
            "InputDataConfig": [
@@ -624,6 +663,14 @@ echo "✅ S3 bucket and folder structure created"
              "ErrorEquals": ["States.ALL"],
              "Next": "TrainingJobFailed"
            }
+         ],
+         "Retry": [
+           {
+             "ErrorEquals": ["States.TaskFailed"],
+             "IntervalSeconds": 60,
+             "MaxAttempts": 2,
+             "BackoffRate": 2.0
+           }
          ]
        },
        "ModelEvaluation": {
@@ -636,13 +683,14 @@ echo "✅ S3 bucket and folder structure created"
              "S3Bucket": "${S3_BUCKET_NAME}"
            }
          },
+         "ResultPath": "$.EvaluationResult",
          "Next": "CheckModelPerformance"
        },
        "CheckModelPerformance": {
          "Type": "Choice",
          "Choices": [
            {
-             "Variable": "$.Payload.test_r2",
+             "Variable": "$.EvaluationResult.Payload.test_r2",
              "NumericGreaterThan": 0.7,
              "Next": "CreateModel"
            }
@@ -656,7 +704,7 @@ echo "✅ S3 bucket and folder structure created"
            "ModelName.$": "$.ModelName",
            "ExecutionRoleArn": "${SAGEMAKER_ROLE_ARN}",
            "PrimaryContainer": {
-             "Image": "683313688378.dkr.ecr.${AWS_REGION}.amazonaws.com/sagemaker-scikit-learn:1.0-1-cpu-py3",
+             "Image": "246618743249.dkr.ecr.${AWS_REGION}.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3",
              "ModelDataUrl.$": "$.ModelDataUrl",
              "Environment": {
                "SAGEMAKER_PROGRAM": "inference.py",
@@ -699,17 +747,17 @@ echo "✅ S3 bucket and folder structure created"
        "ProcessingJobFailed": {
          "Type": "Fail",
          "Error": "ProcessingJobFailed",
-         "Cause": "The data preprocessing job failed"
+         "Cause": "The data preprocessing job failed after retries"
        },
        "TrainingJobFailed": {
          "Type": "Fail",
          "Error": "TrainingJobFailed",
-         "Cause": "The model training job failed"
+         "Cause": "The model training job failed after retries"
        },
        "ModelPerformanceInsufficient": {
          "Type": "Fail",
          "Error": "ModelPerformanceInsufficient",
-         "Cause": "Model performance does not meet the required threshold"
+         "Cause": "Model performance does not meet the required threshold (R² > 0.7)"
        }
      }
    }
@@ -718,11 +766,11 @@ echo "✅ S3 bucket and folder structure created"
    echo "✅ State machine definition created"
    ```
 
-   The Step Functions state machine is now defined with comprehensive error handling and conditional deployment logic. This orchestration pattern ensures only high-performing models reach production while providing clear visibility into pipeline execution status and failure points.
+   The Step Functions state machine is now defined with comprehensive error handling, retry logic, and conditional deployment based on model performance. This orchestration pattern ensures only high-performing models reach production while providing clear visibility into pipeline execution status and automated recovery from transient failures.
 
 8. **Create Lambda Function for Model Evaluation**:
 
-   Lambda functions provide serverless compute for custom business logic within the ML pipeline. This evaluation function implements quality gates by analyzing model performance metrics and determining deployment eligibility. Understanding serverless integration patterns enables flexible and cost-effective pipeline customization.
+   Lambda functions provide serverless compute for custom business logic within the ML pipeline, implementing quality gates by analyzing model performance metrics and determining deployment eligibility. This evaluation function enables flexible and cost-effective pipeline customization with automatic scaling and pay-per-invocation pricing.
 
    ```bash
    # Create Lambda function for model evaluation
@@ -730,6 +778,7 @@ echo "✅ S3 bucket and folder structure created"
    import json
    import boto3
    import os
+   from botocore.exceptions import ClientError
    
    def lambda_handler(event, context):
        s3 = boto3.client('s3')
@@ -741,23 +790,40 @@ echo "✅ S3 bucket and folder structure created"
        try:
            # Download evaluation metrics from S3
            evaluation_key = f"model-artifacts/{training_job_name}/output/evaluation.json"
+           
+           print(f"Attempting to retrieve evaluation metrics from s3://{s3_bucket}/{evaluation_key}")
            response = s3.get_object(Bucket=s3_bucket, Key=evaluation_key)
            evaluation_data = json.loads(response['Body'].read())
            
-           return {
-               'statusCode': 200,
-               'body': evaluation_data
-           }
+           # Log evaluation metrics for monitoring
+           print(f"Model evaluation metrics: {evaluation_data}")
+           
+           # Return metrics for decision making
+           return evaluation_data
        
-       except Exception as e:
+       except ClientError as e:
+           error_code = e.response['Error']['Code']
+           print(f"S3 Error ({error_code}): {e.response['Error']['Message']}")
            return {
-               'statusCode': 500,
-               'body': {'error': str(e)}
+               'error': f"Failed to retrieve evaluation metrics: {error_code}",
+               'test_r2': 0.0  # Fail safe value to prevent deployment
+           }
+       except json.JSONDecodeError as e:
+           print(f"JSON parsing error: {str(e)}")
+           return {
+               'error': "Invalid evaluation metrics format",
+               'test_r2': 0.0
+           }
+       except Exception as e:
+           print(f"Unexpected error: {str(e)}")
+           return {
+               'error': f"Evaluation failed: {str(e)}",
+               'test_r2': 0.0
            }
    EOF
    
    # Create deployment package
-   zip -r evaluate_model.zip evaluate_model.py
+   zip -q evaluate_model.zip evaluate_model.py
    
    # Create Lambda function
    LAMBDA_ROLE_ARN=$(aws iam create-role \
@@ -787,24 +853,25 @@ echo "✅ S3 bucket and folder structure created"
        --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
    
    # Wait for role to be ready
-   sleep 10
+   sleep 15
    
    aws lambda create-function \
        --function-name EvaluateModel \
-       --runtime python3.9 \
+       --runtime python3.11 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler evaluate_model.lambda_handler \
        --zip-file fileb://evaluate_model.zip \
-       --timeout 30
+       --timeout 60 \
+       --memory-size 256
    
    echo "✅ Lambda function created for model evaluation"
    ```
 
-   The Lambda evaluation function is now deployed and ready to process model metrics from S3. This serverless component enables dynamic decision-making based on model performance, implementing quality gates that prevent poor-performing models from reaching production environments.
+   The Lambda evaluation function is now deployed with enhanced error handling and logging capabilities. This serverless component enables dynamic decision-making based on model performance, implementing robust quality gates that prevent poor-performing models from reaching production environments while providing detailed diagnostic information.
 
 9. **Create and Deploy Step Functions State Machine**:
 
-   Deploying the Step Functions state machine activates the ML pipeline orchestration layer. This visual workflow provides comprehensive monitoring, retry logic, and execution history while coordinating complex multi-service interactions. The state machine serves as the central control plane for all ML operations.
+   Deploying the Step Functions state machine activates the ML pipeline orchestration layer, providing a visual workflow interface with comprehensive monitoring capabilities. This state machine serves as the central control plane for all ML operations, coordinating complex multi-service interactions with built-in error handling and execution history tracking.
 
    ```bash
    # Create Step Functions state machine
@@ -819,16 +886,17 @@ echo "✅ S3 bucket and folder structure created"
        --output text)
    
    echo "✅ Step Functions state machine created: ${STATE_MACHINE_ARN}"
+   echo "View in AWS Console: https://${AWS_REGION}.console.aws.amazon.com/states/home?region=${AWS_REGION}#/statemachines/view/${STATE_MACHINE_ARN}"
    ```
 
-   The Step Functions state machine is now active and ready to orchestrate ML pipeline executions. This provides a scalable foundation for automated model training and deployment with built-in monitoring and error handling capabilities.
+   The Step Functions state machine is now active and ready to orchestrate ML pipeline executions. This provides a scalable foundation for automated model training and deployment with built-in monitoring, error handling, and visual workflow management capabilities accessible through the AWS Console.
 
 10. **Execute the ML Pipeline**:
 
-    Pipeline execution triggers the complete ML workflow from data preprocessing through model deployment. Understanding execution patterns and monitoring strategies enables reliable operations and troubleshooting of complex ML workflows. This end-to-end automation reduces manual errors and ensures consistent model deployment processes.
+    Pipeline execution triggers the complete ML workflow from data preprocessing through model deployment, demonstrating the end-to-end automation capabilities. Understanding execution patterns and monitoring strategies enables reliable operations and troubleshooting of complex ML workflows while ensuring consistent and repeatable model deployment processes.
 
     ```bash
-    # Generate unique job names
+    # Generate unique job names with timestamp
     TIMESTAMP=$(date +%Y%m%d%H%M%S)
     PREPROCESSING_JOB_NAME="preprocessing-${TIMESTAMP}"
     TRAINING_JOB_NAME="training-${TIMESTAMP}"
@@ -856,15 +924,15 @@ echo "✅ S3 bucket and folder structure created"
         --query 'executionArn' --output text)
     
     echo "✅ Pipeline execution started: ${EXECUTION_ARN}"
-    echo "Monitor execution in AWS Console or use:"
-    echo "aws stepfunctions describe-execution --execution-arn ${EXECUTION_ARN}"
+    echo "Monitor execution in AWS Console: https://${AWS_REGION}.console.aws.amazon.com/states/home?region=${AWS_REGION}#/executions/details/${EXECUTION_ARN}"
+    echo "Or use CLI: aws stepfunctions describe-execution --execution-arn ${EXECUTION_ARN}"
     ```
 
-    The ML pipeline execution is now running, coordinating data preprocessing, model training, evaluation, and conditional deployment. The unique execution identifier enables tracking and monitoring throughout the workflow lifecycle.
+    The ML pipeline execution is now running, coordinating data preprocessing, model training, evaluation, and conditional deployment. The unique execution identifier enables comprehensive tracking and monitoring throughout the workflow lifecycle with real-time visibility into each step's progress.
 
 11. **Monitor Pipeline Execution**:
 
-    Monitoring pipeline execution provides visibility into workflow progress and enables proactive issue resolution. Step Functions provides detailed execution history and state transitions, while CloudWatch logs capture detailed information from each stage. Understanding monitoring patterns is essential for maintaining reliable ML operations.
+    Monitoring pipeline execution provides visibility into workflow progress and enables proactive issue resolution through real-time status tracking. Step Functions provides detailed execution history and state transitions, while CloudWatch logs capture detailed information from each stage, essential for maintaining reliable ML operations at scale.
 
     ```bash
     # Function to check execution status
@@ -874,23 +942,47 @@ echo "✅ S3 bucket and folder structure created"
             --query 'status' --output text
     }
     
-    # Wait for execution to complete
+    # Function to get execution details
+    get_execution_details() {
+        aws stepfunctions describe-execution \
+            --execution-arn ${EXECUTION_ARN} \
+            --query '{status:status,startDate:startDate,endDate:endDate}' \
+            --output table
+    }
+    
+    # Wait for execution to complete with enhanced monitoring
     echo "Monitoring pipeline execution..."
+    EXECUTION_START_TIME=$(date +%s)
+    
     while true; do
         STATUS=$(check_execution_status)
-        echo "Current status: ${STATUS}"
+        CURRENT_TIME=$(date +%s)
+        ELAPSED_TIME=$((CURRENT_TIME - EXECUTION_START_TIME))
+        
+        echo "Status: ${STATUS} | Elapsed: ${ELAPSED_TIME}s | $(date)"
         
         if [ "$STATUS" = "SUCCEEDED" ]; then
             echo "✅ Pipeline execution completed successfully!"
+            get_execution_details
             break
         elif [ "$STATUS" = "FAILED" ]; then
             echo "❌ Pipeline execution failed"
             aws stepfunctions describe-execution \
                 --execution-arn ${EXECUTION_ARN} \
-                --query 'error' --output text
+                --query '{error:error,cause:cause}' \
+                --output table
             break
         elif [ "$STATUS" = "TIMED_OUT" ]; then
-            echo "❌ Pipeline execution timed out"
+            echo "⏰ Pipeline execution timed out"
+            break
+        elif [ "$STATUS" = "ABORTED" ]; then
+            echo "🛑 Pipeline execution was aborted"
+            break
+        fi
+        
+        # Timeout after 30 minutes
+        if [ $ELAPSED_TIME -gt 1800 ]; then
+            echo "⏰ Monitoring timeout reached (30 minutes)"
             break
         fi
         
@@ -898,18 +990,19 @@ echo "✅ S3 bucket and folder structure created"
     done
     ```
 
-    The monitoring loop provides real-time visibility into pipeline execution status, enabling immediate response to success or failure conditions. This proactive monitoring approach ensures rapid identification and resolution of any pipeline issues.
+    The monitoring loop provides real-time visibility into pipeline execution status with enhanced logging and timeout handling. This proactive monitoring approach ensures rapid identification and resolution of any pipeline issues while providing comprehensive execution tracking and diagnostic information.
 
 12. **Test the Deployed Model Endpoint**:
 
-    Testing the deployed model endpoint validates the complete ML pipeline functionality and ensures the model is ready for production use. SageMaker endpoints provide real-time inference capabilities with automatic scaling and monitoring. Understanding inference testing patterns ensures reliable model deployment and performance validation.
+    Testing the deployed model endpoint validates the complete ML pipeline functionality and ensures the model is ready for production use with proper input/output handling. SageMaker endpoints provide real-time inference capabilities with automatic scaling, monitoring, and built-in security features for production workloads.
 
     ```bash
-    # Test the deployed model endpoint
+    # Test the deployed model endpoint with sample data
     cat > test-prediction.json << 'EOF'
     {
       "instances": [
-        [0.02729, 0.0, 7.07, 0, 0.469, 7.185, 61.1, 4.9671, 2, 242, 17.8, 392.83, 4.03]
+        [8.3252, 41.0, 6.984126984126984, 1.0238095238095237, 322.0, 2.5555555555555554, 37.88, -122.23],
+        [8.3014, 21.0, 6.238137082601054, 0.9711649365628111, 2401.0, 2.109841827768014, 37.86, -122.22]
       ]
     }
     EOF
@@ -921,13 +1014,21 @@ echo "✅ S3 bucket and folder structure created"
         --body file://test-prediction.json \
         prediction-output.json
     
-    echo "✅ Prediction result:"
-    cat prediction-output.json
+    echo "✅ Prediction results:"
+    cat prediction-output.json | python -m json.tool
+    
+    # Test endpoint health and performance
+    echo ""
+    echo "📊 Endpoint Status:"
+    aws sagemaker describe-endpoint \
+        --endpoint-name ${ENDPOINT_NAME} \
+        --query '{Status:EndpointStatus,CreationTime:CreationTime,LastModifiedTime:LastModifiedTime}' \
+        --output table
     ```
 
-    The model endpoint is now validated and ready for production inference requests. This successful test confirms the entire ML pipeline functions correctly from data preprocessing through real-time prediction serving.
+    The model endpoint is now validated and ready for production inference requests with comprehensive health monitoring. This successful test confirms the entire ML pipeline functions correctly from data preprocessing through real-time prediction serving, with proper response formatting and error handling capabilities.
 
-> **Tip**: Consider implementing automated endpoint health checks and performance monitoring using CloudWatch alarms to ensure continuous model availability and optimal response times in production environments.
+> **Tip**: Consider implementing automated endpoint health checks and performance monitoring using CloudWatch alarms and custom metrics to ensure continuous model availability, optimal response times, and automated alerting for production environments. This enables proactive monitoring and maintenance of deployed ML models.
 
 ## Validation & Testing
 
@@ -937,50 +1038,70 @@ echo "✅ S3 bucket and folder structure created"
    # List all executions for the state machine
    aws stepfunctions list-executions \
        --state-machine-arn ${STATE_MACHINE_ARN} \
-       --query 'executions[*].[name,status,startDate]' \
+       --query 'executions[*].[name,status,startDate,stopDate]' \
        --output table
    ```
 
-   Expected output: Table showing execution history with SUCCEEDED status
+   Expected output: Table showing execution history with SUCCEEDED status and execution timestamps
 
 2. **Check Model Artifacts in S3**:
 
    ```bash
-   # List model artifacts
-   aws s3 ls s3://${S3_BUCKET_NAME}/model-artifacts/ --recursive
+   # List model artifacts with details
+   aws s3 ls s3://${S3_BUCKET_NAME}/model-artifacts/ --recursive --human-readable
    
    # Check processed data
-   aws s3 ls s3://${S3_BUCKET_NAME}/processed-data/
+   aws s3 ls s3://${S3_BUCKET_NAME}/processed-data/ --human-readable
+   
+   # Verify code artifacts
+   aws s3 ls s3://${S3_BUCKET_NAME}/code/
    ```
+
+   Expected output: Files showing preprocessing outputs, model artifacts, and uploaded code scripts
 
 3. **Verify SageMaker Endpoint Status**:
 
    ```bash
-   # Check endpoint status
+   # Check endpoint status and configuration
    aws sagemaker describe-endpoint \
        --endpoint-name ${ENDPOINT_NAME} \
-       --query 'EndpointStatus' --output text
+       --query '{Status:EndpointStatus,InstanceType:ProductionVariants[0].InstanceType,CreationTime:CreationTime}' \
+       --output table
    ```
 
-   Expected output: `InService`
+   Expected output: `InService` status with endpoint configuration details
 
-4. **Test Model Performance**:
+4. **Test Model Performance Metrics**:
 
    ```bash
-   # Download and check evaluation metrics
+   # Download and analyze evaluation metrics
    aws s3 cp s3://${S3_BUCKET_NAME}/model-artifacts/${TRAINING_JOB_NAME}/output/evaluation.json .
    
-   echo "Model evaluation metrics:"
-   cat evaluation.json
+   echo "📈 Model Evaluation Metrics:"
+   cat evaluation.json | python -c "
+   import json, sys
+   data = json.load(sys.stdin)
+   print(f'Test R² Score: {data[\"test_r2\"]:.4f}')
+   print(f'Test RMSE: {data[\"test_rmse\"]:.4f}')
+   print(f'Test MAE: {data[\"test_mae\"]:.4f}')
+   print(f'Training Samples: {data[\"training_samples\"]}')
+   print(f'Feature Count: {data[\"feature_count\"]}')
+   "
    ```
+
+   Expected output: Model performance metrics showing R² > 0.7 threshold and other regression metrics
 
 ## Cleanup
 
 1. **Delete SageMaker Endpoint and Configuration**:
 
    ```bash
-   # Delete endpoint
+   # Delete endpoint (incurs ongoing costs)
    aws sagemaker delete-endpoint \
+       --endpoint-name ${ENDPOINT_NAME}
+   
+   # Wait for endpoint deletion
+   aws sagemaker wait endpoint-deleted \
        --endpoint-name ${ENDPOINT_NAME}
    
    # Delete endpoint configuration
@@ -1056,7 +1177,14 @@ echo "✅ S3 bucket and folder structure created"
 5. **Delete S3 Bucket and Contents**:
 
    ```bash
-   # Delete all objects in bucket
+   # Delete all objects in bucket (including versioned objects)
+   aws s3api delete-objects \
+       --bucket ${S3_BUCKET_NAME} \
+       --delete "$(aws s3api list-object-versions \
+           --bucket ${S3_BUCKET_NAME} \
+           --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}')"
+   
+   # Delete any remaining objects
    aws s3 rm s3://${S3_BUCKET_NAME} --recursive
    
    # Delete bucket
@@ -1068,7 +1196,7 @@ echo "✅ S3 bucket and folder structure created"
 6. **Clean Up Local Files**:
 
    ```bash
-   # Remove local files
+   # Remove local files created during setup
    rm -f sagemaker-trust-policy.json
    rm -f step-functions-trust-policy.json
    rm -f step-functions-sagemaker-policy.json
@@ -1091,30 +1219,39 @@ echo "✅ S3 bucket and folder structure created"
 
 ## Discussion
 
-This comprehensive ML pipeline solution demonstrates the power of combining Amazon SageMaker's machine learning capabilities with AWS Step Functions' workflow orchestration to create robust, production-ready ML pipelines. The architecture separates concerns by using SageMaker for ML-specific tasks while Step Functions handles the coordination and conditional logic, creating a scalable and maintainable system that can adapt to changing business requirements.
+This comprehensive ML pipeline solution demonstrates the power of combining Amazon SageMaker's machine learning capabilities with AWS Step Functions' workflow orchestration to create robust, production-ready ML pipelines following AWS Well-Architected Framework principles. The architecture separates concerns by using SageMaker for ML-specific tasks while Step Functions handles the coordination and conditional logic, creating a scalable and maintainable system that adapts to changing business requirements while ensuring high availability and fault tolerance.
 
-The pipeline implements several MLOps best practices including automated data preprocessing, model evaluation with performance thresholds, conditional deployment based on model quality, and comprehensive error handling. The use of Step Functions provides visual monitoring of pipeline execution and makes it easy to identify bottlenecks or failures in the ML workflow, while SageMaker's managed services reduce operational overhead and enable data scientists to focus on model development rather than infrastructure management.
+The pipeline implements several MLOps best practices including automated data preprocessing with feature scaling, comprehensive model evaluation with multiple performance metrics, conditional deployment based on model quality thresholds, and comprehensive error handling with retry logic. The use of Step Functions provides visual monitoring of pipeline execution and makes it easy to identify bottlenecks or failures in the ML workflow, while SageMaker's managed services reduce operational overhead and enable data scientists to focus on model development rather than infrastructure management, following the AWS operational excellence pillar.
 
-Key architectural decisions include using SageMaker Processing Jobs for data preprocessing to leverage managed infrastructure, implementing model evaluation as a Lambda function for custom logic, and using conditional steps in Step Functions to ensure only high-quality models are deployed. The pipeline also demonstrates how to integrate different AWS services seamlessly through Step Functions' native service integrations, creating a cohesive workflow that spans multiple services while maintaining clear separation of responsibilities.
+Key architectural decisions include using SageMaker Processing Jobs for data preprocessing to leverage managed infrastructure and automatic scaling, implementing model evaluation as a Lambda function for custom logic and cost optimization, and using conditional steps in Step Functions to ensure only high-quality models are deployed. The pipeline demonstrates how to integrate different AWS services seamlessly through Step Functions' native service integrations, creating a cohesive workflow that spans multiple services while maintaining clear separation of responsibilities and implementing proper IAM security controls following the principle of least privilege.
 
-The solution is designed for scalability and can be extended to handle larger datasets, more complex preprocessing steps, and advanced ML techniques like hyperparameter tuning and ensemble methods. The modular design makes it easy to swap out components or add new steps without affecting the overall pipeline structure, enabling iterative improvement and customization for specific business use cases. This approach reduces deployment risks and ensures consistent model quality across different environments.
+The solution is designed for scalability and cost optimization, supporting larger datasets, more complex preprocessing steps, and advanced ML techniques through modular components that can be easily extended or replaced. The serverless architecture enables automatic scaling based on demand while the modular design makes it easy to swap out components or add new steps without affecting the overall pipeline structure, enabling iterative improvement and customization for specific business use cases while maintaining reliability and reducing deployment risks through automated quality gates.
 
-> **Tip**: Consider implementing automated model monitoring and retraining triggers by adding CloudWatch alarms that monitor model performance metrics and automatically trigger pipeline executions when performance degrades.
+For more information on AWS ML best practices, see the [Amazon SageMaker Developer Guide](https://docs.aws.amazon.com/sagemaker/latest/dg/) and [AWS Step Functions Developer Guide](https://docs.aws.amazon.com/step-functions/latest/dg/). Additionally, refer to the [AWS Well-Architected Machine Learning Lens](https://docs.aws.amazon.com/wellarchitected/latest/machine-learning-lens/welcome.html) for comprehensive guidance on building ML workloads following AWS best practices.
+
+> **Tip**: Consider implementing automated model monitoring and retraining triggers by adding CloudWatch alarms that monitor model performance metrics, data drift detection, and automatically trigger pipeline executions when performance degrades below acceptable thresholds. This enables continuous model improvement and maintains model accuracy over time in production environments.
 
 ## Challenge
 
 Extend this ML pipeline by implementing these advanced enhancements:
 
-1. **Add Hyperparameter Tuning**: Integrate SageMaker Hyperparameter Tuning Jobs to automatically optimize model parameters before training the final model.
+1. **Add Hyperparameter Tuning**: Integrate SageMaker Hyperparameter Tuning Jobs to automatically optimize model parameters using Bayesian optimization before training the final model, improving model performance and reducing manual tuning effort.
 
-2. **Implement A/B Testing**: Create a multi-variant endpoint deployment that splits traffic between the new model and the previous version, with automated rollback based on performance metrics.
+2. **Implement A/B Testing**: Create a multi-variant endpoint deployment that splits traffic between the new model and the previous version, with automated rollback based on performance metrics and business KPIs collected through CloudWatch.
 
-3. **Add Model Registry Integration**: Enhance the pipeline to register models in SageMaker Model Registry with approval workflows for production deployment.
+3. **Add Model Registry Integration**: Enhance the pipeline to register models in SageMaker Model Registry with approval workflows, model versioning, and automated deployment promotion across development, staging, and production environments.
 
-4. **Create Multi-Environment Pipeline**: Extend the pipeline to support deployment across development, staging, and production environments with different approval gates.
+4. **Create Multi-Environment Pipeline**: Extend the pipeline to support deployment across multiple AWS accounts and regions with different approval gates, compliance checks, and environment-specific configurations using AWS Organizations and cross-account IAM roles.
 
-5. **Implement Real-time Monitoring**: Add CloudWatch custom metrics and alarms to monitor model drift, data quality, and endpoint performance with automated alerting and remediation.
+5. **Implement Real-time Monitoring**: Add CloudWatch custom metrics, alarms, and dashboard visualizations to monitor model drift, data quality, endpoint performance, and business metrics with automated alerting and remediation workflows using Amazon SNS and AWS Lambda.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Virtual Desktop, Azure Reserved VM Instances, Azure Cost Management, Azure Logic Apps
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: azure-virtual-desktop, reserved-instances, cost-optimization, automation, logic-apps
 recipe-generator-version: 1.3
@@ -152,8 +152,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --location ${LOCATION} \
        --host-pool-type Pooled \
        --load-balancer-type BreadthFirst \
+       --preferred-app-group-type Desktop \
        --max-session-limit 10 \
-       --personal-desktop-assignment-type Automatic \
        --tags department=shared workload-type=pooled cost-center=100
    
    echo "✅ AVD workspace and host pool created with cost optimization tags"
@@ -173,8 +173,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --amount 1000 \
        --category Cost \
        --time-grain Monthly \
-       --time-period start-date=$(date -d "first day of this month" +%Y-%m-%d) \
-       --notifications actual=80 forecasted=100
+       --start-date $(date -d "first day of this month" +%Y-%m-%d) \
+       --end-date $(date -d "last day of next month" +%Y-%m-%d)
    
    # Create resource tags for cost attribution
    export DEPT_A_TAG="department=finance"
@@ -184,7 +184,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Cost Management budget configured with automated alerts"
    ```
 
-   The budget system now provides real-time cost monitoring with alerts at 80% actual usage and 100% forecasted usage. This proactive approach enables timely interventions before cost overruns occur, while departmental tags enable precise cost attribution and chargeback mechanisms.
+   The budget system now provides real-time cost monitoring with monthly tracking. This proactive approach enables timely interventions before cost overruns occur, while departmental tags enable precise cost attribution and chargeback mechanisms across organizational units.
 
 3. **Create Logic App for Automated Cost Analysis and Optimization**:
 
@@ -288,8 +288,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --name vmss-avd-${RANDOM_SUFFIX} \
        --resource-type Microsoft.Compute/virtualMachineScaleSets \
        --tags cost-center=100 department=shared \
-                workload=virtual-desktop optimization=auto-scaling \
-                billing-code=AVD-PROD environment=production
+               workload=virtual-desktop optimization=auto-scaling \
+               billing-code=AVD-PROD environment=production
    
    # Create Log Analytics workspace for monitoring
    az monitor log-analytics workspace create \
@@ -390,7 +390,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --output table
    ```
 
-   Expected output: Budget showing $1000 monthly limit with 80% and 100% alert thresholds, usage data displaying cost attribution by department tags.
+   Expected output: Budget showing $1000 monthly limit with proper start and end dates, usage data displaying cost attribution by department tags.
 
 3. **Validate Logic App and Function App Deployment**:
 
@@ -513,4 +513,9 @@ Extend this cost optimization solution by implementing these advanced capabiliti
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

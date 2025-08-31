@@ -1,0 +1,551 @@
+# Infrastructure Manager Configuration for Personal Expense Tracker
+# This configuration deploys a complete expense tracking application using
+# Google App Engine and Cloud SQL with PostgreSQL
+
+metadata:
+  description: "Personal Expense Tracker with App Engine and Cloud SQL"
+  version: "1.0"
+  labels:
+    recipe: "expense-tracker-app-engine-sql" 
+    category: "compute"
+    difficulty: "100"
+
+# Input parameters for customization
+imports:
+  - path: https://www.googleapis.com/compute/v1/projects/PROJECT_ID
+    name: project
+
+# Template variables for resource configuration
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    default: "expense-tracker-project"
+    
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+    
+  zone:
+    type: string  
+    description: "Google Cloud zone for resources"
+    default: "us-central1-a"
+    
+  # Database configuration
+  database_instance_name:
+    type: string
+    description: "Cloud SQL instance name"
+    default: "expense-db"
+    
+  database_name:
+    type: string
+    description: "PostgreSQL database name"
+    default: "expenses"
+    
+  database_user:
+    type: string
+    description: "Database user for application"
+    default: "expense_user"
+    
+  database_password:
+    type: string
+    description: "Database password (will be generated if not provided)"
+    default: ""
+    
+  # Application configuration
+  app_engine_region:
+    type: string
+    description: "App Engine application region"
+    default: "us-central"
+    
+  max_instances:
+    type: integer
+    description: "Maximum App Engine instances"
+    default: 2
+    minimum: 1
+    maximum: 10
+
+# Main resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: app-engine-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: appengine.googleapis.com
+      
+  - name: sql-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: sql.googleapis.com
+      
+  - name: cloud-resource-manager-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudresourcemanager.googleapis.com
+
+  # Generate random password for database if not provided
+  - name: database-password-generator
+    type: gcp-types/runtimeconfig-v1beta1:runtimeconfig.configs.variables
+    properties:
+      parent: $(ref.runtime-config.name)
+      variable: database-password
+      text: |
+        $( if variables.database_password == "" then
+             base64encode(random(32))
+           else
+             variables.database_password
+           fi )
+    metadata:
+      dependsOn:
+        - runtime-config
+
+  # Runtime configuration for storing generated values
+  - name: runtime-config
+    type: gcp-types/runtimeconfig-v1beta1:runtimeconfig.configs
+    properties:
+      config: expense-tracker-config
+      description: "Configuration for expense tracker application"
+
+  # App Engine Application - must be created first
+  - name: app-engine-application
+    type: gcp-types/appengine-v1:apps
+    properties:
+      id: $(variables.project_id)
+      locationId: $(variables.app_engine_region)
+      servingStatus: SERVING
+    metadata:
+      dependsOn:
+        - app-engine-api
+
+  # Cloud SQL Instance with PostgreSQL 17
+  - name: sql-instance
+    type: gcp-types/sqladmin-v1:instances
+    properties:
+      name: $(variables.database_instance_name)
+      project: $(variables.project_id)
+      region: $(variables.region)
+      databaseVersion: POSTGRES_17
+      
+      # Instance configuration
+      settings:
+        tier: db-f1-micro
+        activationPolicy: ALWAYS
+        dataDiskType: PD_SSD
+        dataDiskSizeGb: 10
+        pricingPlan: PER_USE
+        replicationType: SYNCHRONOUS
+        
+        # High availability and backup configuration
+        availabilityType: ZONAL
+        backupConfiguration:
+          enabled: true
+          startTime: "02:00"
+          pointInTimeRecoveryEnabled: true
+          transactionLogRetentionDays: 7
+          
+        # Security and access configuration
+        ipConfiguration:
+          # Enable authorized networks for initial setup
+          # In production, use private IP or Cloud SQL Proxy
+          authorizedNetworks:
+            - name: "allow-all-temporary"
+              value: "0.0.0.0/0"
+          ipv4Enabled: true
+          requireSsl: false
+          
+        # Maintenance window configuration
+        maintenanceWindow:
+          hour: 3
+          day: 7  # Sunday
+          updateTrack: stable
+          
+        # Enable deletion protection
+        deletionProtectionEnabled: false  # Set to true for production
+        
+        # Database flags for performance optimization
+        databaseFlags:
+          - name: "log_statement"
+            value: "all"
+          - name: "log_min_duration_statement"
+            value: "1000"
+            
+        # Storage auto-resize configuration
+        storageAutoResize: true
+        storageAutoResizeLimit: 100
+        
+      # Root password configuration
+      rootPassword: $(ref.database-password-generator.text)
+      
+    metadata:
+      dependsOn:
+        - sql-api
+        - database-password-generator
+
+  # Wait for SQL instance to be ready
+  - name: sql-instance-wait
+    type: gcp-types/runtimeconfig-v1beta1:runtimeconfig.configs.waiters
+    properties:
+      parent: $(ref.runtime-config.name)
+      waiter: sql-instance-ready
+      timeout: 600s  # 10 minutes
+      success:
+        cardinality:
+          number: 1
+          path: /sql-instance-ready
+    metadata:
+      dependsOn:
+        - sql-instance
+
+  # Application database creation
+  - name: application-database
+    type: gcp-types/sqladmin-v1:databases
+    properties:
+      project: $(variables.project_id)
+      instance: $(ref.sql-instance.name)
+      name: $(variables.database_name)
+      charset: UTF8
+      collation: en_US.UTF8
+    metadata:
+      dependsOn:
+        - sql-instance
+
+  # Database user for application
+  - name: application-user
+    type: gcp-types/sqladmin-v1:users
+    properties:
+      project: $(variables.project_id)
+      instance: $(ref.sql-instance.name)
+      name: $(variables.database_user)
+      password: $(ref.database-password-generator.text)
+      type: BUILT_IN
+    metadata:
+      dependsOn:
+        - sql-instance
+        - application-database
+
+  # Service account for App Engine application
+  - name: app-engine-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: expense-tracker-sa
+      displayName: "Expense Tracker App Engine Service Account"
+      description: "Service account for expense tracker App Engine application"
+    metadata:
+      dependsOn:
+        - cloud-resource-manager-api
+
+  # IAM binding for Cloud SQL Client role
+  - name: sql-client-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicyBindings
+    properties:
+      resource: $(variables.project_id)
+      policyBinding:
+        role: roles/cloudsql.client
+        members:
+          - serviceAccount:$(ref.app-engine-service-account.email)
+    metadata:
+      dependsOn:
+        - app-engine-service-account
+
+  # IAM binding for Cloud SQL Instance User role
+  - name: sql-instance-user-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicyBindings
+    properties:
+      resource: $(variables.project_id)
+      policyBinding:
+        role: roles/cloudsql.instanceUser
+        members:
+          - serviceAccount:$(ref.app-engine-service-account.email)
+    metadata:
+      dependsOn:
+        - app-engine-service-account
+
+  # Database schema initialization (using Cloud Build for SQL execution)
+  - name: database-schema-build
+    type: gcp-types/cloudbuild-v1:projects.builds
+    properties:
+      projectId: $(variables.project_id)
+      build:
+        steps:
+          # Step 1: Create schema initialization script
+          - name: 'gcr.io/cloud-builders/gcloud'
+            entrypoint: 'bash'
+            args:
+              - '-c'
+              - |
+                cat > init_schema.sql << 'EOF'
+                -- Create expenses table with proper constraints and indexes
+                CREATE TABLE IF NOT EXISTS expenses (
+                    id SERIAL PRIMARY KEY,
+                    description VARCHAR(255) NOT NULL,
+                    amount DECIMAL(10,2) NOT NULL CHECK (amount > 0),
+                    category VARCHAR(100) NOT NULL,
+                    date_created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                -- Create indexes for performance
+                CREATE INDEX IF NOT EXISTS idx_expenses_date_created ON expenses (date_created DESC);
+                CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses (category);
+
+                -- Grant necessary privileges to application user
+                GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE expenses TO $(variables.database_user);
+                GRANT USAGE, SELECT ON SEQUENCE expenses_id_seq TO $(variables.database_user);
+
+                -- Insert sample data for testing
+                INSERT INTO expenses (description, amount, category) VALUES 
+                    ('Coffee at local cafe', 4.50, 'Food & Dining'),
+                    ('Bus fare to work', 2.25, 'Transportation'),
+                    ('Monthly Netflix subscription', 15.99, 'Entertainment')
+                ON CONFLICT DO NOTHING;
+                EOF
+                
+          # Step 2: Execute schema against Cloud SQL instance
+          - name: 'gcr.io/cloud-builders/gcloud'
+            args:
+              - 'sql'
+              - 'connect'
+              - '$(ref.sql-instance.name)'
+              - '--user=postgres'
+              - '--database=$(variables.database_name)'
+              - '--quiet'
+            stdin: 'init_schema.sql'
+            
+    metadata:
+      dependsOn:
+        - application-database
+        - application-user
+
+  # App Engine version deployment configuration
+  - name: app-engine-version
+    type: gcp-types/appengine-v1:apps.services.versions
+    properties:
+      appsId: $(variables.project_id)
+      servicesId: default
+      versionsId: v1
+      
+      # Application runtime configuration
+      runtime: python39
+      env: standard
+      threadsafe: true
+      
+      # Environment variables for database connection
+      envVariables:
+        SECRET_KEY: "production-secret-key-$(random(16))"
+        DB_NAME: $(variables.database_name)
+        DB_USER: $(variables.database_user)
+        DB_PASSWORD: $(ref.database-password-generator.text)
+        CLOUD_SQL_CONNECTION_NAME: $(ref.sql-instance.connectionName)
+        GAE_ENV: "standard"
+      
+      # Automatic scaling configuration
+      automaticScaling:
+        minIdleInstances: 0
+        maxIdleInstances: 1
+        minTotalInstances: 0
+        maxTotalInstances: $(variables.max_instances)
+        targetCpuUtilization: 0.6
+        targetThroughputUtilization: 0.6
+        
+      # Resource allocation
+      resources:
+        cpu: 1
+        memoryGb: 0.5
+        diskSizeGb: 10
+        
+      # Request handlers configuration
+      handlers:
+        - urlRegex: '/static/.*'
+          staticFiles:
+            path: 'static'
+            uploadPathRegex: 'static/(.*)'
+            
+        - urlRegex: '/.*'
+          script:
+            scriptPath: 'auto'
+            
+      # Health check configuration
+      livenessCheck:
+        path: "/"
+        checkInterval: "30s"
+        timeout: "4s"
+        failureThreshold: 2
+        successThreshold: 2
+        
+      readinessCheck:
+        path: "/"
+        checkInterval: "5s"
+        timeout: "4s"
+        failureThreshold: 2
+        successThreshold: 2
+        appStartTimeout: "300s"
+        
+      # Network configuration
+      network:
+        forwardedPorts:
+          - 8080
+        instanceTag: "expense-tracker"
+        
+      # Service account configuration
+      serviceAccount: $(ref.app-engine-service-account.email)
+      
+    metadata:
+      dependsOn:
+        - app-engine-application
+        - sql-instance
+        - application-database
+        - application-user
+        - sql-client-binding
+        - sql-instance-user-binding
+        - database-schema-build
+
+  # Traffic allocation to the new version
+  - name: traffic-allocation
+    type: gcp-types/appengine-v1:apps.services
+    properties:
+      appsId: $(variables.project_id)
+      servicesId: default
+      split:
+        allocations:
+          v1: 1.0
+    metadata:
+      dependsOn:
+        - app-engine-version
+
+  # Cloud Monitoring alert policy for high database connections
+  - name: sql-connection-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "High Cloud SQL Connections"
+      documentation:
+        content: "Alert when Cloud SQL instance has high connection usage"
+      conditions:
+        - displayName: "Cloud SQL connection usage"
+          conditionThreshold:
+            filter: 'resource.type="cloudsql_database" AND metric.type="cloudsql.googleapis.com/database/network/connections"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 80
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - "resource.project_id"
+                  - "resource.database_id"
+      enabled: true
+      combiner: OR
+    metadata:
+      dependsOn:
+        - sql-instance
+
+  # Budget alert for cost monitoring
+  - name: budget-alert
+    type: gcp-types/billingbudgets-v1:billingAccounts.budgets
+    properties:
+      parent: "billingAccounts/$(ref.project.defaultServiceAccount)"
+      displayName: "Expense Tracker Budget"
+      amount:
+        specifiedAmount:
+          currencyCode: "USD"
+          units: "50"  # $50 monthly budget
+      budgetFilter:
+        projects:
+          - "projects/$(variables.project_id)"
+        services:
+          - "services/6F81-5844-456A"  # App Engine
+          - "services/9662-B51E-5089"  # Cloud SQL
+      thresholdRules:
+        - thresholdPercent: 0.8
+          spendBasis: CURRENT_SPEND
+        - thresholdPercent: 1.0
+          spendBasis: CURRENT_SPEND
+      allUpdatesRule:
+        monitoringNotificationChannels: []
+        disableDefaultIamRecipients: false
+
+# Output values for verification and integration
+outputs:
+  # Application information
+  application_url:
+    description: "URL of the deployed expense tracker application"
+    value: "https://$(variables.project_id).appspot.com"
+    
+  app_engine_service:
+    description: "App Engine service name"
+    value: $(ref.app-engine-application.id)
+    
+  app_engine_version:
+    description: "App Engine version ID"
+    value: $(ref.app-engine-version.id)
+    
+  # Database information
+  sql_instance_name:
+    description: "Cloud SQL instance name"
+    value: $(ref.sql-instance.name)
+    
+  sql_connection_name:
+    description: "Cloud SQL connection name for App Engine"
+    value: $(ref.sql-instance.connectionName)
+    
+  database_name:
+    description: "PostgreSQL database name"
+    value: $(variables.database_name)
+    
+  database_user:
+    description: "Database user for application"
+    value: $(variables.database_user)
+    
+  # Security information
+  service_account_email:
+    description: "Service account email for the application"
+    value: $(ref.app-engine-service-account.email)
+    
+  # Monitoring information
+  sql_instance_ip:
+    description: "Cloud SQL instance IP address"
+    value: $(ref.sql-instance.ipAddresses[0].ipAddress)
+    
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(variables.project_id)
+    
+  region:
+    description: "Deployment region"
+    value: $(variables.region)
+
+# Deployment metadata
+deployment:
+  description: |
+    This Infrastructure Manager configuration deploys a complete personal expense 
+    tracker application using Google App Engine and Cloud SQL. The deployment 
+    includes:
+    
+    - App Engine application with Python 3.9 runtime
+    - Cloud SQL PostgreSQL 17 instance with proper security configuration
+    - Database schema initialization with sample data
+    - IAM service accounts with least privilege access
+    - Monitoring and alerting for database connections
+    - Budget alerts for cost control
+    - Automatic scaling configuration
+    
+    The application provides a web interface for tracking personal expenses with
+    categories, amounts, and timestamps, backed by a fully managed PostgreSQL
+    database with automated backups and maintenance.
+    
+  estimated_cost: "$1.00-$3.00 per month for light usage"
+  
+  prerequisites:
+    - "Google Cloud Project with billing enabled"
+    - "App Engine Admin API enabled"
+    - "Cloud SQL Admin API enabled"
+    - "Cloud Resource Manager API enabled"
+    - "Appropriate IAM permissions for resource creation"
+    
+  security_considerations:
+    - "Database accessible from all IPs (0.0.0.0/0) for demo purposes"
+    - "SSL not required for database connections (demo configuration)"
+    - "Consider using private IP and Cloud SQL Proxy for production"
+    - "Service account follows least privilege principle"
+    - "Automated backups enabled with point-in-time recovery"

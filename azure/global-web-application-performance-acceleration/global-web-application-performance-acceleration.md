@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure App Service, Azure Cache for Redis, Azure CDN, Azure Database for PostgreSQL
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: performance, caching, cdn, redis, web-application
 recipe-generator-version: 1.3
@@ -232,7 +232,7 @@ echo "✅ PostgreSQL server created: ${DB_SERVER}"
        --endpoint-name ${CDN_ENDPOINT} \
        --order 1 \
        --rule-name "StaticAssets" \
-       --match-variable RequestPath \
+       --match-variable UrlPath \
        --operator BeginsWith \
        --match-values "/static/" "/images/" "/css/" "/js/" \
        --action-name CacheExpiration \
@@ -246,7 +246,7 @@ echo "✅ PostgreSQL server created: ${DB_SERVER}"
        --endpoint-name ${CDN_ENDPOINT} \
        --order 2 \
        --rule-name "ApiEndpoints" \
-       --match-variable RequestPath \
+       --match-variable UrlPath \
        --operator BeginsWith \
        --match-values "/api/" \
        --action-name CacheExpiration \
@@ -353,11 +353,14 @@ echo "✅ PostgreSQL server created: ${DB_SERVER}"
    });
    EOF
    
+   # Create ZIP file for deployment
+   zip -r webapp-sample.zip . -x "*.zip"
+   
    # Deploy to Azure App Service
-   az webapp deployment source config-zip \
+   az webapp deploy \
        --resource-group ${RESOURCE_GROUP} \
        --name ${WEB_APP} \
-       --src webapp-sample.zip
+       --src-path webapp-sample.zip
    
    echo "✅ Sample application deployed with Redis caching"
    ```
@@ -369,27 +372,34 @@ echo "✅ PostgreSQL server created: ${DB_SERVER}"
    Application Insights provides comprehensive monitoring and analytics for web applications, enabling performance tracking, error detection, and optimization insights. Integration with both App Service and Redis cache provides complete visibility into application performance and caching effectiveness.
 
    ```bash
+   # Create Log Analytics workspace (required for Application Insights)
+   export LOG_WORKSPACE="log-workspace-${RANDOM_SUFFIX}"
+   az monitor log-analytics workspace create \
+       --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${LOG_WORKSPACE} \
+       --location ${LOCATION} \
+       --tags purpose=performance-demo
+   
    # Create Application Insights resource
    az monitor app-insights component create \
        --resource-group ${RESOURCE_GROUP} \
        --app ${WEB_APP}-insights \
        --location ${LOCATION} \
-       --kind web \
+       --workspace ${LOG_WORKSPACE} \
        --tags purpose=performance-demo
    
-   # Get instrumentation key
-   export INSIGHTS_KEY=$(az monitor app-insights component show \
+   # Get connection string
+   export INSIGHTS_CONNECTION=$(az monitor app-insights component show \
        --resource-group ${RESOURCE_GROUP} \
        --app ${WEB_APP}-insights \
-       --query instrumentationKey --output tsv)
+       --query connectionString --output tsv)
    
    # Configure web app with Application Insights
    az webapp config appsettings set \
        --resource-group ${RESOURCE_GROUP} \
        --name ${WEB_APP} \
        --settings \
-       APPINSIGHTS_INSTRUMENTATIONKEY=${INSIGHTS_KEY} \
-       APPLICATIONINSIGHTS_CONNECTION_STRING="InstrumentationKey=${INSIGHTS_KEY}"
+       APPLICATIONINSIGHTS_CONNECTION_STRING="${INSIGHTS_CONNECTION}"
    
    echo "✅ Application Insights configured for performance monitoring"
    ```
@@ -518,7 +528,13 @@ echo "✅ PostgreSQL server created: ${DB_SERVER}"
        --resource-group ${RESOURCE_GROUP} \
        --app ${WEB_APP}-insights
    
-   echo "✅ Application Insights deleted"
+   # Delete Log Analytics workspace
+   az monitor log-analytics workspace delete \
+       --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${LOG_WORKSPACE} \
+       --yes
+   
+   echo "✅ Application Insights and Log Analytics deleted"
    ```
 
 2. **Remove CDN endpoint and profile**:
@@ -612,4 +628,9 @@ Extend this solution by implementing these performance enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

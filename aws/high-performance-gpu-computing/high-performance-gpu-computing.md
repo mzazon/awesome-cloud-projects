@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: ec2, cloudwatch, systems-manager, sns
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: gpu-computing, machine-learning, high-performance-computing, spot-instances
 recipe-generator-version: 1.3
@@ -85,7 +85,7 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of GPU computing concepts and CUDA programming
 4. Knowledge of machine learning frameworks (PyTorch, TensorFlow) and HPC applications
-5. Estimated cost: $50-200 for P4 instances, $5-20 for G4 instances during testing (varies by region and usage)
+5. Estimated cost: $80-300 for P4 instances, $8-30 for G4 instances during testing (varies by region and usage)
 
 > **Warning**: GPU instances are significantly more expensive than standard instances. Always terminate resources when not in use to avoid unexpected charges.
 
@@ -138,13 +138,13 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
        --output text --query GroupId)
    
    # Allow SSH access (restrict source as needed)
-   aws ec2 authorize-securitygroup-ingress \
+   aws ec2 authorize-security-group-ingress \
        --group-id ${SECURITY_GROUP_ID} \
        --protocol tcp --port 22 \
        --cidr 0.0.0.0/0
    
-   # Allow Jupyter/TensorBoard access
-   aws ec2 authorize-securitygroup-ingress \
+   # Allow Jupyter/TensorBoard access within security group
+   aws ec2 authorize-security-group-ingress \
        --group-id ${SECURITY_GROUP_ID} \
        --protocol tcp --port 8888 \
        --source-group ${SECURITY_GROUP_ID}
@@ -213,6 +213,9 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
    aws iam create-instance-profile \
        --instance-profile-name ${GPU_IAM_ROLE}
    
+   # Wait for instance profile to be available
+   sleep 10
+   
    aws iam add-role-to-instance-profile \
        --instance-profile-name ${GPU_IAM_ROLE} \
        --role-name ${GPU_IAM_ROLE}
@@ -253,45 +256,58 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
    # Create comprehensive user data script
    cat > gpu-userdata.sh << 'EOF'
    #!/bin/bash
-   yum update -y
-   yum install -y awscli
+   set -e
    
-   # Install NVIDIA drivers
-   aws s3 cp --recursive \
-       s3://ec2-linux-nvidia-drivers/latest/ .
-   chmod +x NVIDIA-Linux-x86_64*.run
-   ./NVIDIA-Linux-x86_64*.run --silent
+   # Update system and install prerequisites
+   apt-get update -y
+   apt-get install -y awscli curl wget python3-pip
+   
+   # Install NVIDIA drivers using AWS provided packages
+   # The Deep Learning AMI already includes drivers, but this ensures latest version
+   if ! nvidia-smi > /dev/null 2>&1; then
+       aws s3 cp --recursive \
+           s3://ec2-linux-nvidia-drivers/latest/ . \
+           --region us-east-1
+       chmod +x NVIDIA-Linux-x86_64*.run
+       ./NVIDIA-Linux-x86_64*.run --silent --no-cc-version-check
+   fi
    
    # Install Docker for containerized workloads
-   yum install -y docker
+   curl -fsSL https://get.docker.com -o get-docker.sh
+   sh get-docker.sh
    systemctl start docker
    systemctl enable docker
-   usermod -aG docker ec2-user
+   usermod -aG docker ubuntu
    
    # Install NVIDIA Container Toolkit
    distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-   curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | \
-       rpm --import -
+   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+       gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
    curl -s -L \
-       https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.repo \
-       | tee /etc/yum.repos.d/nvidia-docker.repo
-   yum install -y nvidia-docker2
+       https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
+       sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+       tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+   apt-get update
+   apt-get install -y nvidia-container-toolkit
+   nvidia-ctk runtime configure --runtime=docker
    systemctl restart docker
    
-   # Install Python and ML frameworks
-   amazon-linux-extras install python3.8 -y
-   pip3 install torch torchvision torchaudio \
-       tensorflow-gpu jupyter matplotlib pandas numpy
+   # Install Python ML frameworks optimized for GPU
+   pip3 install --upgrade pip
+   pip3 install torch torchvision torchaudio --index-url \
+       https://download.pytorch.org/whl/cu121
+   pip3 install tensorflow jupyter matplotlib pandas numpy scikit-learn
    
    # Install CloudWatch agent
-   wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
-   rpm -U ./amazon-cloudwatch-agent.rpm
+   wget https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+   dpkg -i amazon-cloudwatch-agent.deb
    
-   # Configure GPU monitoring
+   # Configure GPU monitoring with correct metric names
    cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWCONFIG'
    {
        "agent": {
-           "metrics_collection_interval": 60
+           "metrics_collection_interval": 60,
+           "run_as_user": "cwagent"
        },
        "metrics": {
            "namespace": "GPU/EC2",
@@ -299,9 +315,12 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
                "nvidia_gpu": {
                    "measurement": [
                        "utilization_gpu",
-                       "utilization_memory",
+                       "utilization_memory", 
                        "temperature_gpu",
-                       "power_draw"
+                       "power_draw",
+                       "memory_total",
+                       "memory_used",
+                       "memory_free"
                    ],
                    "metrics_collection_interval": 60
                }
@@ -329,10 +348,10 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
    P4 instances feature NVIDIA A100 Tensor Core GPUs, delivering exceptional performance for machine learning training workloads. The Deep Learning AMI provides pre-configured environments with optimized drivers and frameworks. Launching a P4 instance establishes your high-performance computing platform capable of accelerating complex ML training jobs that would take days or weeks on CPU-only infrastructure.
 
    ```bash
-   # Get the latest Deep Learning AMI
+   # Get the latest Deep Learning AMI for Ubuntu
    DLAMI_ID=$(aws ec2 describe-images \
        --owners amazon \
-       --filters "Name=name,Values=Deep Learning AMI*Ubuntu*" \
+       --filters "Name=name,Values=Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)*" \
        "Name=state,Values=available" \
        --query "Images | sort_by(@, &CreationDate) | [-1].ImageId" \
        --output text)
@@ -361,12 +380,40 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
    Spot Fleet requests enable cost-optimized GPU computing by utilizing spare EC2 capacity at significant discounts (up to 90% off On-Demand pricing). G4 instances with NVIDIA T4 GPUs are ideal for inference workloads, graphics applications, and development tasks. This approach balances performance with cost efficiency for GPU workloads that can tolerate occasional interruptions.
 
    ```bash
+   # Check if spot fleet role exists, create if needed
+   if ! aws iam get-role --role-name aws-ec2-spot-fleet-tagging-role >/dev/null 2>&1; then
+       echo "Creating spot fleet service role..."
+       
+       cat > spot-fleet-trust-policy.json << 'EOF'
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Principal": {
+           "Service": "spotfleet.amazonaws.com"
+         },
+         "Action": "sts:AssumeRole"
+       }
+     ]
+   }
+   EOF
+       
+       aws iam create-role \
+           --role-name aws-ec2-spot-fleet-tagging-role \
+           --assume-role-policy-document file://spot-fleet-trust-policy.json
+       
+       aws iam attach-role-policy \
+           --role-name aws-ec2-spot-fleet-tagging-role \
+           --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+   fi
+   
    # Create Spot Fleet configuration for G4 instances
    cat > g4-spot-fleet-config.json << EOF
    {
        "SpotPrice": "0.50",
        "TargetCapacity": 2,
-       "AllocationStrategy": "lowestPrice",
+       "AllocationStrategy": "diversified",
        "IamFleetRole": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/aws-ec2-spot-fleet-tagging-role",
        "LaunchSpecifications": [
            {
@@ -398,67 +445,20 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
                        ]
                    }
                ]
-           },
-           {
-               "ImageId": "${DLAMI_ID}",
-               "InstanceType": "g4dn.2xlarge",
-               "KeyName": "${GPU_KEYPAIR_NAME}",
-               "SecurityGroups": [
-                   {
-                       "GroupId": "${SECURITY_GROUP_ID}"
-                   }
-               ],
-               "SubnetId": "${DEFAULT_SUBNET}",
-               "IamInstanceProfile": {
-                   "Name": "${GPU_IAM_ROLE}"
-               },
-               "UserData": "$(base64 -w 0 gpu-userdata.sh)",
-               "TagSpecifications": [
-                   {
-                       "ResourceType": "instance",
-                       "Tags": [
-                           {
-                               "Key": "Name",
-                               "Value": "G4-Spot-Graphics"
-                           },
-                           {
-                               "Key": "Purpose",
-                               "Value": "GPU-Workload"
-                           }
-                       ]
-                   }
-               ]
            }
        ]
    }
    EOF
    
-   # Request Spot Fleet (if spot fleet role exists)
-   if aws iam get-role --role-name aws-ec2-spot-fleet-tagging-role >/dev/null 2>&1; then
-       SPOT_FLEET_ID=$(aws ec2 request-spot-fleet \
-           --spot-fleet-request-config file://g4-spot-fleet-config.json \
-           --query "SpotFleetRequestId" --output text)
-       echo "✅ G4 Spot Fleet requested: ${SPOT_FLEET_ID}"
-   else
-       echo "⚠️  Spot Fleet role not found. Creating G4 instance directly..."
-       
-       G4_INSTANCE_ID=$(aws ec2 run-instances \
-           --image-id ${DLAMI_ID} \
-           --instance-type g4dn.xlarge \
-           --key-name ${GPU_KEYPAIR_NAME} \
-           --security-group-ids ${SECURITY_GROUP_ID} \
-           --subnet-id ${DEFAULT_SUBNET} \
-           --iam-instance-profile Name=${GPU_IAM_ROLE} \
-           --user-data file://gpu-userdata.sh \
-           --tag-specifications \
-           'ResourceType=instance,Tags=[{Key=Name,Value=G4-Inference},{Key=Purpose,Value=GPU-Workload}]' \
-           --query "Instances[0].InstanceId" --output text)
-       
-       echo "✅ G4 instance launched: ${G4_INSTANCE_ID}"
-   fi
+   # Request Spot Fleet
+   SPOT_FLEET_ID=$(aws ec2 request-spot-fleet \
+       --spot-fleet-request-config file://g4-spot-fleet-config.json \
+       --query "SpotFleetRequestId" --output text)
+   
+   echo "✅ G4 Spot Fleet requested: ${SPOT_FLEET_ID}"
    ```
 
-   The Spot Fleet or G4 instance is now configured for cost-effective GPU computing. This setup provides T4 GPU capabilities at reduced costs, making GPU computing accessible for development, testing, and inference workloads that don't require the full power of A100 GPUs.
+   The Spot Fleet is now configured for cost-effective GPU computing. This setup provides T4 GPU capabilities at reduced costs, making GPU computing accessible for development, testing, and inference workloads that don't require the full power of A100 GPUs.
 
 8. **Set Up GPU Performance Monitoring**:
 
@@ -474,7 +474,7 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
                "x": 0, "y": 0, "width": 12, "height": 6,
                "properties": {
                    "metrics": [
-                       [ "GPU/EC2", "utilization_gpu", "InstanceId", "${P4_INSTANCE_ID}" ]
+                       [ "GPU/EC2", "nvidia_smi_utilization_gpu", "InstanceId", "${P4_INSTANCE_ID}" ]
                    ],
                    "period": 300,
                    "stat": "Average",
@@ -487,7 +487,7 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
                "x": 12, "y": 0, "width": 12, "height": 6,
                "properties": {
                    "metrics": [
-                       [ "GPU/EC2", "utilization_memory", "InstanceId", "${P4_INSTANCE_ID}" ]
+                       [ "GPU/EC2", "nvidia_smi_utilization_memory", "InstanceId", "${P4_INSTANCE_ID}" ]
                    ],
                    "period": 300,
                    "stat": "Average",
@@ -500,7 +500,7 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
                "x": 0, "y": 6, "width": 12, "height": 6,
                "properties": {
                    "metrics": [
-                       [ "GPU/EC2", "temperature_gpu", "InstanceId", "${P4_INSTANCE_ID}" ]
+                       [ "GPU/EC2", "nvidia_smi_temperature_gpu", "InstanceId", "${P4_INSTANCE_ID}" ]
                    ],
                    "period": 300,
                    "stat": "Average",
@@ -513,7 +513,7 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
                "x": 12, "y": 6, "width": 12, "height": 6,
                "properties": {
                    "metrics": [
-                       [ "GPU/EC2", "power_draw", "InstanceId", "${P4_INSTANCE_ID}" ]
+                       [ "GPU/EC2", "nvidia_smi_power_draw", "InstanceId", "${P4_INSTANCE_ID}" ]
                    ],
                    "period": 300,
                    "stat": "Average",
@@ -544,7 +544,7 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
    aws cloudwatch put-metric-alarm \
        --alarm-name "GPU-High-Temperature" \
        --alarm-description "GPU temperature too high" \
-       --metric-name temperature_gpu \
+       --metric-name nvidia_smi_temperature_gpu \
        --namespace GPU/EC2 \
        --statistic Average \
        --period 300 \
@@ -558,7 +558,7 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
    aws cloudwatch put-metric-alarm \
        --alarm-name "GPU-Low-Utilization" \
        --alarm-description "GPU utilization too low" \
-       --metric-name utilization_gpu \
+       --metric-name nvidia_smi_utilization_gpu \
        --namespace GPU/EC2 \
        --statistic Average \
        --period 1800 \
@@ -588,13 +588,13 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
     from datetime import datetime
     
     def get_gpu_metrics():
-        """Get GPU metrics using nvidia-ml-py"""
+        """Get GPU metrics using nvidia-smi"""
         try:
             result = subprocess.run([
                 'nvidia-smi', 
                 '--query-gpu=utilization.gpu,utilization.memory,temperature.gpu,power.draw',
                 '--format=csv,noheader,nounits'
-            ], capture_output=True, text=True)
+            ], capture_output=True, text=True, timeout=30)
             
             if result.returncode == 0:
                 metrics = result.stdout.strip().split(', ')
@@ -660,7 +660,7 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
             result = subprocess.run([
                 'curl', '-s', 
                 'http://169.254.169.254/latest/meta-data/instance-id'
-            ], capture_output=True, text=True)
+            ], capture_output=True, text=True, timeout=10)
             instance_id = result.stdout.strip()
         except:
             instance_id = "unknown"
@@ -714,7 +714,7 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
                 try:
                     metrics = cloudwatch.get_metric_statistics(
                         Namespace='GPU/EC2',
-                        MetricName='utilization_gpu',
+                        MetricName='nvidia_smi_utilization_gpu',
                         Dimensions=[
                             {'Name': 'InstanceId', 'Value': instance_id}
                         ],
@@ -811,7 +811,7 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
        --dimensions Name=InstanceId,Value=${P4_INSTANCE_ID}
    ```
 
-   Expected output: GPU metrics (utilization_gpu, temperature_gpu, etc.)
+   Expected output: GPU metrics (nvidia_smi_utilization_gpu, nvidia_smi_temperature_gpu, etc.)
 
 4. **Test Machine Learning Workload**:
 
@@ -857,7 +857,7 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
    # Get current GPU utilization
    aws cloudwatch get-metric-statistics \
        --namespace GPU/EC2 \
-       --metric-name utilization_gpu \
+       --metric-name nvidia_smi_utilization_gpu \
        --dimensions Name=InstanceId,Value=${P4_INSTANCE_ID} \
        --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
        --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
@@ -890,12 +890,6 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
            --spot-fleet-request-ids ${SPOT_FLEET_ID} \
            --terminate-instances
        echo "✅ Spot Fleet cancelled"
-   fi
-   
-   # Terminate any remaining G4 instances
-   if [ ! -z "${G4_INSTANCE_ID}" ]; then
-       aws ec2 terminate-instances --instance-ids ${G4_INSTANCE_ID}
-       echo "✅ G4 instance terminated"
    fi
    ```
 
@@ -966,37 +960,45 @@ echo "VPC: ${DEFAULT_VPC}, Subnet: ${DEFAULT_SUBNET}"
    # Remove local files
    rm -f gpu-trust-policy.json gpu-userdata.sh \
          g4-spot-fleet-config.json gpu-dashboard.json \
-         monitor-gpu.py cost-optimizer.py gpu-test.py
+         monitor-gpu.py cost-optimizer.py gpu-test.py \
+         spot-fleet-trust-policy.json
    
    echo "✅ All resources cleaned up successfully"
    ```
 
 ## Discussion
 
-This solution demonstrates enterprise-grade GPU-accelerated computing on AWS using EC2 P4 and G4 instances. The P4 instances leverage NVIDIA A100 GPUs specifically designed for machine learning training and high-performance computing workloads, providing up to 2.5x better price-performance than previous generation P3 instances. G4 instances use NVIDIA T4 GPUs optimized for machine learning inference, graphics workstations, and video processing applications.
+This solution demonstrates enterprise-grade GPU-accelerated computing on AWS using EC2 P4 and G4 instances. The P4 instances leverage NVIDIA A100 Tensor Core GPUs specifically designed for machine learning training and high-performance computing workloads, providing up to 2.5x better price-performance than previous generation P3 instances. G4 instances use NVIDIA T4 GPUs optimized for machine learning inference, graphics workstations, and video processing applications, following the [AWS GPU instances documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/gpu-instances.html).
 
-The implementation showcases several critical architectural decisions. First, automated GPU driver installation through user data scripts ensures consistent environment setup across instances. Second, the Spot Fleet configuration for G4 instances can reduce costs by up to 90% compared to On-Demand pricing, making GPU computing accessible for development and testing workloads. Third, comprehensive CloudWatch monitoring with custom GPU metrics enables proactive performance optimization and cost management.
+The implementation showcases several critical architectural decisions following AWS Well-Architected Framework principles. First, automated GPU driver installation through user data scripts ensures consistent environment setup across instances, utilizing the [AWS provided NVIDIA drivers](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/install-nvidia-driver.html). Second, the Spot Fleet configuration for G4 instances can reduce costs by up to 90% compared to On-Demand pricing, making GPU computing accessible for development and testing workloads. Third, comprehensive CloudWatch monitoring with custom GPU metrics enables proactive performance optimization and cost management using the [CloudWatch NVIDIA GPU monitoring capabilities](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Agent-NVIDIA-GPU.html).
 
-Cost optimization strategies include automated monitoring for low GPU utilization patterns, intelligent scaling based on workload demands, and proper resource tagging for chargeback and governance. The solution also implements security best practices through dedicated security groups, IAM roles with least privilege principles, and Systems Manager integration for secure instance management without SSH key exposure.
+Cost optimization strategies include automated monitoring for low GPU utilization patterns, intelligent scaling based on workload demands, and proper resource tagging for chargeback and governance. The solution also implements security best practices through dedicated security groups, IAM roles with least privilege principles, and Systems Manager integration for secure instance management without SSH key exposure, aligning with [AWS security best practices](https://docs.aws.amazon.com/security/latest/userguide/best-practices.html).
 
-Performance monitoring extends beyond basic instance metrics to include GPU-specific measurements such as utilization percentages, memory consumption, temperature monitoring, and power draw tracking. These metrics enable teams to optimize model training performance, prevent thermal throttling, and ensure efficient resource utilization across their GPU infrastructure.
+Performance monitoring extends beyond basic instance metrics to include GPU-specific measurements such as utilization percentages, memory consumption, temperature monitoring, and power draw tracking. These metrics enable teams to optimize model training performance, prevent thermal throttling, and ensure efficient resource utilization across their GPU infrastructure. The solution leverages CloudWatch agent's native GPU monitoring support to collect comprehensive metrics automatically.
 
-> **Tip**: Consider using AWS Batch with GPU instances for large-scale, job-based workloads that can benefit from automatic scaling and job queuing capabilities.
+> **Tip**: Consider using AWS Batch with GPU instances for large-scale, job-based workloads that can benefit from automatic scaling and job queuing capabilities. The [AWS Batch User Guide](https://docs.aws.amazon.com/batch/latest/userguide/gpu-jobs.html) provides detailed guidance on GPU job configurations.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Region GPU Deployment**: Configure cross-region GPU instance deployment with automated workload distribution based on regional pricing and availability, implementing intelligent job routing between us-east-1, us-west-2, and eu-west-1.
+1. **Multi-Region GPU Deployment**: Configure cross-region GPU instance deployment with automated workload distribution based on regional pricing and availability, implementing intelligent job routing between us-east-1, us-west-2, and eu-west-1 using AWS Global Accelerator and Route 53 health checks.
 
-2. **Advanced Auto Scaling**: Implement custom auto scaling policies that consider GPU utilization metrics, job queue depth, and cost optimization targets to automatically scale GPU clusters based on ML training pipeline demands.
+2. **Advanced Auto Scaling**: Implement custom auto scaling policies that consider GPU utilization metrics, job queue depth, and cost optimization targets to automatically scale GPU clusters based on ML training pipeline demands using AWS Application Auto Scaling and custom CloudWatch metrics.
 
-3. **Container Orchestration**: Deploy GPU workloads using Amazon EKS with GPU-enabled worker nodes, implementing horizontal pod autoscaling based on custom GPU metrics and queue depth using KEDA (Kubernetes Event-driven Autoscaling).
+3. **Container Orchestration**: Deploy GPU workloads using Amazon EKS with GPU-enabled worker nodes, implementing horizontal pod autoscaling based on custom GPU metrics and queue depth using KEDA (Kubernetes Event-driven Autoscaling) and the NVIDIA GPU Operator.
 
-4. **Cost Analytics Dashboard**: Build a comprehensive cost analysis dashboard using Amazon QuickSight that tracks GPU utilization efficiency, cost per training job, and provides recommendations for instance type optimization across different ML workload patterns.
+4. **Cost Analytics Dashboard**: Build a comprehensive cost analysis dashboard using Amazon QuickSight that tracks GPU utilization efficiency, cost per training job, and provides recommendations for instance type optimization across different ML workload patterns using AWS Cost and Usage Reports.
 
-5. **MLOps Integration**: Integrate with Amazon SageMaker for automated model training pipelines that dynamically provision GPU instances based on training job requirements, implementing automatic model versioning and deployment workflows.
+5. **MLOps Integration**: Integrate with Amazon SageMaker for automated model training pipelines that dynamically provision GPU instances based on training job requirements, implementing automatic model versioning and deployment workflows with SageMaker Pipelines and Model Registry.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

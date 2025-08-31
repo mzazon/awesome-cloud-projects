@@ -6,16 +6,16 @@ difficulty: 400
 subject: aws
 services: CloudWatch, Lambda, ECS, RDS
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: monitoring, cloudwatch, dashboards, custom-metrics, anomaly-detection
 recipe-generator-version: 1.3
 ---
 
-# Multi-Service Monitoring Dashboards
+# Multi-Service Monitoring Dashboards with CloudWatch Anomaly Detection
 
 ## Problem
 
@@ -104,13 +104,13 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with permissions for CloudWatch, Lambda, ECS, RDS, ElastiCache, and SNS
+1. AWS account with permissions for CloudWatch, Lambda, ECS, RDS, ElastiCache, SNS, and Cost Explorer
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of CloudWatch metrics, dashboards, and anomaly detection
 4. Knowledge of enterprise monitoring best practices and SLI/SLO concepts
 5. Estimated cost: $50-100/month for comprehensive monitoring (includes custom metrics, anomaly detection, and alarm actions)
 
-> **Note**: CloudWatch custom metrics cost $0.30 per metric per month. Plan your custom metrics strategy carefully to control costs.
+> **Note**: CloudWatch custom metrics cost $0.30 per metric per month. Plan your custom metrics strategy carefully to control costs using the [CloudWatch pricing documentation](https://aws.amazon.com/cloudwatch/pricing/).
 
 ## Preparation
 
@@ -147,24 +147,54 @@ aws iam create-role \
         ]
     }'
 
-# Attach necessary policies
+# Attach necessary policies following least privilege principle
 aws iam attach-role-policy \
     --role-name ${LAMBDA_ROLE_NAME} \
     --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
-aws iam attach-role-policy \
-    --role-name ${LAMBDA_ROLE_NAME} \
-    --policy-arn arn:aws:iam::aws:policy/CloudWatchFullAccess
+# Create custom policy for CloudWatch and Cost Explorer access
+cat > /tmp/monitoring-policy.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "cloudwatch:PutMetricData",
+                "cloudwatch:GetMetricStatistics",
+                "cloudwatch:ListMetrics"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "rds:DescribeDBInstances",
+                "elasticache:DescribeCacheClusters",
+                "ec2:DescribeInstances"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ce:GetCostAndUsage"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+EOF
+
+aws iam create-policy \
+    --policy-name ${PROJECT_NAME}-monitoring-policy \
+    --policy-document file:///tmp/monitoring-policy.json
 
 aws iam attach-role-policy \
     --role-name ${LAMBDA_ROLE_NAME} \
-    --policy-arn arn:aws:iam::aws:policy/AmazonRDSReadOnlyAccess
+    --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-monitoring-policy
 
-aws iam attach-role-policy \
-    --role-name ${LAMBDA_ROLE_NAME} \
-    --policy-arn arn:aws:iam::aws:policy/AmazonElastiCacheReadOnlyAccess
-
-echo "✅ IAM role created and policies attached"
+echo "✅ IAM role created with least privilege policies"
 ```
 
 ## Steps
@@ -187,7 +217,7 @@ echo "✅ IAM role created and policies attached"
        --name "${SNS_TOPIC_NAME}-info" \
        --query TopicArn --output text)
    
-   # Subscribe email to critical alerts
+   # Subscribe email to critical alerts (replace with your email)
    aws sns subscribe \
        --topic-arn ${SNS_CRITICAL_ARN} \
        --protocol email \
@@ -201,7 +231,7 @@ echo "✅ IAM role created and policies attached"
 
    The three-tier SNS topic structure now provides the messaging infrastructure for intelligent alert routing. Critical alerts will bypass normal notification channels and reach on-call engineers immediately, while warning and info alerts follow standard operational communication flows. This foundation supports advanced alerting patterns including escalation chains, alert suppression during maintenance windows, and integration with external incident management systems.
 
-   > **Tip**: Configure SNS message attributes and filtering for advanced routing capabilities. This enables dynamic notification routing based on alert metadata, service tags, and business hours.
+   > **Tip**: Configure SNS message attributes and filtering for advanced routing capabilities. This enables dynamic notification routing based on alert metadata, service tags, and business hours using [SNS message filtering](https://docs.aws.amazon.com/sns/latest/dg/sns-message-filtering.html).
 
 2. **Create Lambda Function for Business Metrics Collection**:
 
@@ -313,7 +343,7 @@ echo "✅ IAM role created and policies attached"
                }
            ]
            
-           # Submit metrics in batches
+           # Submit metrics in batches (CloudWatch limit: 20 metrics per request)
            for i in range(0, len(metrics), 20):
                batch = metrics[i:i+20]
                cloudwatch.put_metric_data(
@@ -351,6 +381,7 @@ echo "✅ IAM role created and policies attached"
            }
            
        except Exception as e:
+           print(f"Error publishing metrics: {str(e)}")
            return {
                'statusCode': 500,
                'body': json.dumps({'error': str(e)})
@@ -364,7 +395,7 @@ echo "✅ IAM role created and policies attached"
        ticket_score = max(0, 100 - (tickets * 2))          # Lower is better
        user_score = min(100, (users / 50))                 # Higher is better
        
-       # Weighted average
+       # Weighted average based on business impact
        weights = [0.25, 0.30, 0.20, 0.15, 0.10]
        scores = [response_score, error_score, nps_score, ticket_score, user_score]
        
@@ -375,14 +406,15 @@ echo "✅ IAM role created and policies attached"
    cd /tmp
    zip business-metrics.zip business-metrics.py
    
-   # Create Lambda function
+   # Create Lambda function with latest Python runtime
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-business-metrics \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler business-metrics.lambda_handler \
        --zip-file fileb://business-metrics.zip \
        --timeout 60 \
+       --memory-size 128 \
        --tags Project=${PROJECT_NAME}
    
    echo "✅ Business metrics Lambda function created"
@@ -464,6 +496,7 @@ echo "✅ IAM role created and policies attached"
            }
            
        except Exception as e:
+           print(f"Error checking infrastructure health: {str(e)}")
            return {
                'statusCode': 500,
                'body': json.dumps({'error': str(e)})
@@ -483,7 +516,8 @@ echo "✅ IAM role created and policies attached"
                    healthy_count += 1
            
            return (healthy_count / total_count) * 100
-       except:
+       except Exception as e:
+           print(f"Error checking RDS health: {str(e)}")
            return 50  # Assume degraded if can't check
    
    def check_elasticache_health():
@@ -500,13 +534,14 @@ echo "✅ IAM role created and policies attached"
                    healthy_count += 1
            
            return (healthy_count / total_count) * 100
-       except:
+       except Exception as e:
+           print(f"Error checking ElastiCache health: {str(e)}")
            return 50  # Assume degraded if can't check
    
    def check_compute_health():
        try:
            # Simplified compute health check
-           # In reality, you'd check ECS services, task health, etc.
+           # In production, check ECS services, task health, Auto Scaling groups
            instances = ec2.describe_instances(
                Filters=[
                    {'Name': 'instance-state-name', 'Values': ['running']}
@@ -517,7 +552,7 @@ echo "✅ IAM role created and policies attached"
            for reservation in instances['Reservations']:
                total_instances += len(reservation['Instances'])
            
-           # Simple health heuristic based on running instances
+           # Health heuristic based on running instances
            if total_instances == 0:
                return 100  # No instances to monitor
            elif total_instances >= 3:
@@ -527,7 +562,8 @@ echo "✅ IAM role created and policies attached"
            else:
                return 60   # Limited redundancy
                
-       except:
+       except Exception as e:
+           print(f"Error checking compute health: {str(e)}")
            return 50  # Assume degraded if can't check
    EOF
    
@@ -538,11 +574,12 @@ echo "✅ IAM role created and policies attached"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-infrastructure-health \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler infrastructure-health.lambda_handler \
        --zip-file fileb://infrastructure-health.zip \
        --timeout 120 \
+       --memory-size 128 \
        --tags Project=${PROJECT_NAME}
    
    echo "✅ Infrastructure health Lambda function created"
@@ -1128,8 +1165,8 @@ echo "✅ IAM role created and policies attached"
         --payload '{}' \
         /tmp/infra-response.json
     
-    # Wait a moment for metrics to be available
-    sleep 30
+    # Wait for metrics to be available in CloudWatch
+    sleep 60
     
     # Test alarm state (they should be in INSUFFICIENT_DATA initially)
     aws cloudwatch describe-alarms \
@@ -1139,6 +1176,11 @@ echo "✅ IAM role created and policies attached"
     
     echo "✅ Sample data generated and alarm states checked"
     echo "Dashboards will populate with data over the next few minutes"
+    echo ""
+    echo "Dashboard URLs:"
+    echo "Infrastructure: https://console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=${DASHBOARD_PREFIX}-Infrastructure"
+    echo "Business: https://console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=${DASHBOARD_PREFIX}-Business"
+    echo "Executive: https://console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=${DASHBOARD_PREFIX}-Executive"
     ```
 
     The monitoring system validation confirms that all components are functioning correctly and collecting metrics as designed. The initial INSUFFICIENT_DATA alarm states are expected and will transition to normal monitoring states as the system accumulates baseline data for anomaly detection algorithms. This testing phase is crucial for ensuring monitoring reliability during actual production incidents.
@@ -1235,6 +1277,7 @@ echo "✅ IAM role created and policies attached"
             }
             
         except Exception as e:
+            print(f"Error retrieving cost data: {str(e)}")
             return {
                 'statusCode': 500,
                 'body': json.dumps({'error': str(e)})
@@ -1247,11 +1290,12 @@ echo "✅ IAM role created and policies attached"
     
     aws lambda create-function \
         --function-name ${PROJECT_NAME}-cost-monitoring \
-        --runtime python3.9 \
+        --runtime python3.13 \
         --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
         --handler cost-monitoring.lambda_handler \
         --zip-file fileb://cost-monitoring.zip \
         --timeout 120 \
+        --memory-size 128 \
         --tags Project=${PROJECT_NAME}
     
     # Schedule daily cost monitoring
@@ -1293,7 +1337,7 @@ echo "✅ IAM role created and policies attached"
                 "width": 24,
                 "height": 6,
                 "properties": {
-                    "query": "SOURCE '/aws/lambda/${PROJECT_NAME}-business-metrics'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                    "query": "SOURCE '/aws/lambda/${PROJECT_NAME}-business-metrics'\\n| fields @timestamp, @message\\n| filter @message like /ERROR/\\n| sort @timestamp desc\\n| limit 20",
                     "region": "${AWS_REGION}",
                     "title": "Recent Monitoring Errors",
                     "view": "table"
@@ -1369,7 +1413,7 @@ echo "✅ IAM role created and policies attached"
     echo "Operations: https://console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=${DASHBOARD_PREFIX}-Operations"
     ```
 
-    The comprehensive dashboard ecosystem now provides role-specific monitoring views that serve different organizational needs. The four-dashboard approach ensures that technical teams, business stakeholders, executives, and operations personnel each have access to relevant information presented in formats optimized for their responsibilities and decision-making requirements. Explore [CloudWatch dashboard best practices](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Dashboards.html) for advanced visualization techniques and operational efficiency optimization.
+    The comprehensive dashboard ecosystem now provides role-specific monitoring views that serve different organizational needs. The four-dashboard approach ensures that technical teams, business stakeholders, executives, and operations personnel each have access to relevant information presented in formats optimized for their responsibilities and decision-making requirements. Explore [CloudWatch dashboard best practices](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/create_dashboard.html) for advanced visualization techniques and operational efficiency optimization.
 
 ## Validation & Testing
 
@@ -1473,27 +1517,27 @@ echo "✅ IAM role created and policies attached"
        --metric-name "HourlyRevenue" \
        --dimensions Name=Environment,Value=production \
                    Name=BusinessUnit,Value=ecommerce \
-       --stat "Average"
+       --stat "Average" 2>/dev/null
    
    aws cloudwatch delete-anomaly-detector \
        --namespace "Business/Metrics" \
        --metric-name "APIResponseTime" \
        --dimensions Name=Environment,Value=production \
                    Name=Service,Value=api-gateway \
-       --stat "Average"
+       --stat "Average" 2>/dev/null
    
    aws cloudwatch delete-anomaly-detector \
        --namespace "Business/Metrics" \
        --metric-name "ErrorRate" \
        --dimensions Name=Environment,Value=production \
                    Name=Service,Value=api-gateway \
-       --stat "Average"
+       --stat "Average" 2>/dev/null
    
    aws cloudwatch delete-anomaly-detector \
        --namespace "Infrastructure/Health" \
        --metric-name "OverallInfrastructureHealth" \
        --dimensions Name=Environment,Value=production \
-       --stat "Average"
+       --stat "Average" 2>/dev/null
    
    echo "✅ Anomaly detectors deleted"
    ```
@@ -1543,7 +1587,7 @@ echo "✅ IAM role created and policies attached"
    echo "✅ Lambda functions deleted"
    ```
 
-5. **Delete SNS Topics and IAM Role**:
+5. **Delete SNS Topics and IAM Resources**:
 
    ```bash
    # Delete SNS topics
@@ -1551,22 +1595,18 @@ echo "✅ IAM role created and policies attached"
    aws sns delete-topic --topic-arn ${SNS_WARNING_ARN}
    aws sns delete-topic --topic-arn ${SNS_INFO_ARN}
    
-   # Detach policies from IAM role
+   # Detach and delete custom policy
+   aws iam detach-role-policy \
+       --role-name ${LAMBDA_ROLE_NAME} \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-monitoring-policy
+   
+   aws iam delete-policy \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-monitoring-policy
+   
+   # Detach AWS managed policy
    aws iam detach-role-policy \
        --role-name ${LAMBDA_ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-   
-   aws iam detach-role-policy \
-       --role-name ${LAMBDA_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/CloudWatchFullAccess
-   
-   aws iam detach-role-policy \
-       --role-name ${LAMBDA_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/AmazonRDSReadOnlyAccess
-   
-   aws iam detach-role-policy \
-       --role-name ${LAMBDA_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/AmazonElastiCacheReadOnlyAccess
    
    # Delete IAM role
    aws iam delete-role \
@@ -1576,7 +1616,7 @@ echo "✅ IAM role created and policies attached"
    rm -f /tmp/business-metrics.py /tmp/business-metrics.zip
    rm -f /tmp/infrastructure-health.py /tmp/infrastructure-health.zip
    rm -f /tmp/cost-monitoring.py /tmp/cost-monitoring.zip
-   rm -f /tmp/*-dashboard.json
+   rm -f /tmp/*-dashboard.json /tmp/monitoring-policy.json
    rm -f /tmp/business-response.json /tmp/infra-response.json
    
    echo "✅ Cleanup complete"
@@ -1584,32 +1624,37 @@ echo "✅ IAM role created and policies attached"
 
 ## Discussion
 
-This advanced monitoring solution demonstrates enterprise-grade observability practices that go beyond basic CloudWatch metrics. By combining infrastructure monitoring with business metrics, the solution provides comprehensive visibility into both technical performance and business outcomes. The implementation showcases key enterprise monitoring concepts including composite health scores, anomaly detection, tiered alerting, and role-specific dashboards.
+This advanced monitoring solution demonstrates enterprise-grade observability practices that go beyond basic CloudWatch metrics. By combining infrastructure monitoring with business metrics, the solution provides comprehensive visibility into both technical performance and business outcomes. The implementation showcases key enterprise monitoring concepts including composite health scores, anomaly detection, tiered alerting, and role-specific dashboards following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
-The custom metrics collection approach enables organizations to track business-specific KPIs alongside traditional infrastructure metrics. This correlation between technical performance and business impact is crucial for prioritizing incidents and understanding the business value of infrastructure investments. The composite health score algorithm demonstrates how to create meaningful aggregated metrics that provide quick system status assessment.
+The custom metrics collection approach enables organizations to track business-specific KPIs alongside traditional infrastructure metrics. This correlation between technical performance and business impact is crucial for prioritizing incidents and understanding the business value of infrastructure investments. The composite health score algorithm demonstrates how to create meaningful aggregated metrics that provide quick system status assessment while following AWS security best practices.
 
-Anomaly detection represents a significant advancement over static threshold-based alerting. By using machine learning to establish normal metric patterns, the system can detect subtle performance degradations that might be missed by traditional alerting approaches. This proactive monitoring capability is essential for maintaining high service availability in complex distributed systems.
+Anomaly detection represents a significant advancement over static threshold-based alerting. By using machine learning to establish normal metric patterns, the system can detect subtle performance degradations that might be missed by traditional alerting approaches. This proactive monitoring capability is essential for maintaining high service availability in complex distributed systems as described in the [CloudWatch anomaly detection documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Anomaly_Detection.html).
 
-The multi-tier dashboard approach serves different organizational needs: technical teams require detailed infrastructure metrics, business stakeholders need revenue and user experience insights, and executives need high-level health summaries. This layered approach to monitoring visualization ensures that each audience receives relevant information without being overwhelmed by unnecessary detail.
+The multi-tier dashboard approach serves different organizational needs: technical teams require detailed infrastructure metrics, business stakeholders need revenue and user experience insights, and executives need high-level health summaries. This layered approach to monitoring visualization ensures that each audience receives relevant information without being overwhelmed by unnecessary detail. Cost monitoring integration demonstrates the importance of financial observability in cloud environments, helping organizations optimize spending while maintaining performance.
 
-Cost monitoring integration demonstrates the importance of financial observability in cloud environments. By tracking cost trends alongside performance metrics, organizations can identify cost optimization opportunities and understand the financial impact of scaling decisions.
-
-> **Tip**: Implement SLI (Service Level Indicators) and SLO (Service Level Objectives) metrics based on your business requirements. Use composite scores to track SLO compliance and alert when SLOs are at risk.
+> **Tip**: Implement SLI (Service Level Indicators) and SLO (Service Level Objectives) metrics based on your business requirements. Use composite scores to track SLO compliance and alert when SLOs are at risk using [AWS service level monitoring best practices](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_monitor_aws_resources.html).
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Implement SLI/SLO tracking** with automated SLO compliance reporting and burn rate alerting for different service tiers and customer segments.
+1. **Implement SLI/SLO tracking** with automated SLO compliance reporting and burn rate alerting for different service tiers and customer segments using CloudWatch Service Lens.
 
-2. **Create predictive analytics capabilities** using Amazon Forecast to predict resource utilization and business metrics, enabling proactive capacity planning.
+2. **Create predictive analytics capabilities** using Amazon Forecast to predict resource utilization and business metrics, enabling proactive capacity planning and cost optimization.
 
-3. **Build automated root cause analysis** using CloudWatch Insights correlations and machine learning to automatically identify the most likely causes of performance issues.
+3. **Build automated root cause analysis** using CloudWatch Insights correlations and machine learning to automatically identify the most likely causes of performance issues across services.
 
-4. **Implement multi-region monitoring correlation** to track performance across different AWS regions and identify regional performance variations.
+4. **Implement multi-region monitoring correlation** to track performance across different AWS regions and identify regional performance variations that could impact global user experience.
 
-5. **Create intelligent alert fatigue reduction** using machine learning to group related alerts, suppress duplicate notifications, and prioritize critical issues based on business impact.
+5. **Create intelligent alert fatigue reduction** using machine learning to group related alerts, suppress duplicate notifications, and prioritize critical issues based on business impact and historical patterns.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

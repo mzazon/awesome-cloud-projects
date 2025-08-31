@@ -1,0 +1,443 @@
+# Infrastructure Manager Configuration for Website Screenshot API
+# This configuration deploys Cloud Functions and Cloud Storage for automated website screenshots
+# 
+# Architecture:
+# - Cloud Storage bucket for screenshot storage with public read access
+# - Cloud Functions (2nd gen) with Puppeteer for screenshot generation
+# - IAM service account with appropriate permissions
+# - Proper networking and security configurations
+
+# Define the configuration metadata
+metadata:
+  name: website-screenshot-api
+  description: "Serverless screenshot API using Cloud Functions and Cloud Storage"
+  labels:
+    environment: production
+    application: screenshot-api
+    managed-by: infrastructure-manager
+
+# Define input variables for customization
+imports:
+  - path: variables.yaml
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .PROJECT_ID }}/services/cloudfunctions.googleapis.com
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .PROJECT_ID }}/services/storage.googleapis.com
+      
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .PROJECT_ID }}/services/cloudbuild.googleapis.com
+      
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .PROJECT_ID }}/services/run.googleapis.com
+
+  # Create Cloud Storage bucket for screenshot storage
+  - name: screenshot-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{ .BUCKET_NAME }}
+      location: {{ .REGION }}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: unspecified
+      versioning:
+        enabled: false
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30  # Delete screenshots older than 30 days
+              matchesStorageClass:
+                - STANDARD
+      cors:
+        - origin:
+            - "*"
+          method:
+            - GET
+            - HEAD
+          responseHeader:
+            - Content-Type
+            - Access-Control-Allow-Origin
+          maxAgeSeconds: 3600
+      labels:
+        purpose: screenshot-storage
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Configure bucket IAM policy for public read access
+  - name: bucket-public-access-policy
+    type: gcp-types/storage-v1:buckets/setIamPolicy
+    properties:
+      bucket: {{ .BUCKET_NAME }}
+      policy:
+        bindings:
+          - role: roles/storage.objectViewer
+            members:
+              - allUsers
+          - role: roles/storage.admin
+            members:
+              - serviceAccount:$(ref.screenshot-function-service-account.email)
+    metadata:
+      dependsOn:
+        - screenshot-storage-bucket
+        - screenshot-function-service-account
+
+  # Create service account for Cloud Function
+  - name: screenshot-function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: screenshot-function-sa
+      serviceAccount:
+        displayName: "Screenshot Function Service Account"
+        description: "Service account for the website screenshot Cloud Function"
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+
+  # Grant necessary IAM roles to the service account
+  - name: storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ .PROJECT_ID }}
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.screenshot-function-service-account.email)
+    metadata:
+      dependsOn:
+        - screenshot-function-service-account
+
+  - name: logs-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ .PROJECT_ID }}
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.screenshot-function-service-account.email)
+    metadata:
+      dependsOn:
+        - screenshot-function-service-account
+
+  - name: monitoring-metric-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ .PROJECT_ID }}
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.screenshot-function-service-account.email)
+    metadata:
+      dependsOn:
+        - screenshot-function-service-account
+
+  # Deploy Cloud Function (2nd generation) for screenshot generation
+  - name: screenshot-generator-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/{{ .PROJECT_ID }}/locations/{{ .REGION }}
+      functionId: {{ .FUNCTION_NAME }}
+      function:
+        description: "Generates website screenshots using Puppeteer"
+        buildConfig:
+          runtime: nodejs20
+          entryPoint: generateScreenshot
+          source:
+            storageSource:
+              bucket: {{ .BUCKET_NAME }}
+              object: source.zip
+          environmentVariables:
+            BUCKET_NAME: {{ .BUCKET_NAME }}
+        serviceConfig:
+          maxInstanceCount: 100
+          minInstanceCount: 0
+          availableMemory: 1Gi
+          timeoutSeconds: 540
+          maxInstanceRequestConcurrency: 1
+          availableCpu: "1"
+          environmentVariables:
+            BUCKET_NAME: {{ .BUCKET_NAME }}
+            NODE_ENV: production
+          serviceAccountEmail: $(ref.screenshot-function-service-account.email)
+          ingressSettings: ALLOW_ALL
+          allTrafficOnLatestRevision: true
+        labels:
+          managed-by: infrastructure-manager
+          application: screenshot-api
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - enable-run-api
+        - enable-cloudbuild-api
+        - screenshot-function-service-account
+        - screenshot-storage-bucket
+
+  # Configure Function IAM policy for unauthenticated access
+  - name: function-invoker-policy
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions.setIamPolicy
+    properties:
+      resource: projects/{{ .PROJECT_ID }}/locations/{{ .REGION }}/functions/{{ .FUNCTION_NAME }}
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - screenshot-generator-function
+
+  # Create Cloud Monitoring alert policy for function errors
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Screenshot Function Error Rate Alert"
+      documentation:
+        content: "Alert when screenshot function error rate exceeds threshold"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "High error rate"
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" resource.label.function_name="{{ .FUNCTION_NAME }}"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.1
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.label.function_name
+      alertStrategy:
+        autoClose: 86400s
+      enabled: true
+      notificationChannels: []
+    metadata:
+      dependsOn:
+        - screenshot-generator-function
+
+  # Create Cloud Storage notification for screenshot uploads
+  - name: screenshot-upload-notification
+    type: gcp-types/storage-v1:notifications
+    properties:
+      bucket: {{ .BUCKET_NAME }}
+      topic: projects/{{ .PROJECT_ID }}/topics/screenshot-uploads
+      payload_format: JSON_API_V1
+      event_types:
+        - OBJECT_FINALIZE
+      object_name_prefix: screenshot-
+    metadata:
+      dependsOn:
+        - screenshot-storage-bucket
+        - screenshot-upload-topic
+
+  # Create Pub/Sub topic for screenshot upload notifications
+  - name: screenshot-upload-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{ .PROJECT_ID }}/topics/screenshot-uploads
+      labels:
+        purpose: screenshot-notifications
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Enable Pub/Sub API
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .PROJECT_ID }}/services/pubsub.googleapis.com
+
+  # Create Cloud Monitoring dashboard for screenshot API metrics
+  - name: screenshot-api-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: "Screenshot API Dashboard"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "Function Invocations"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="cloud_function" resource.label.function_name="{{ .FUNCTION_NAME }}"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                    plotType: LINE
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "Invocations/sec"
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: "Function Execution Time"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="cloud_function" resource.label.function_name="{{ .FUNCTION_NAME }}" metric.type="cloudfunctions.googleapis.com/function/execution_time"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_MEAN
+                    plotType: LINE
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "Execution time (ms)"
+                  scale: LINEAR
+          - width: 12
+            height: 4
+            yPos: 4
+            widget:
+              title: "Storage Bucket Usage"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="gcs_bucket" resource.label.bucket_name="{{ .BUCKET_NAME }}" metric.type="storage.googleapis.com/storage/total_bytes"'
+                        aggregation:
+                          alignmentPeriod: 3600s
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_MEAN
+                    plotType: LINE
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "Storage (bytes)"
+                  scale: LINEAR
+    metadata:
+      dependsOn:
+        - screenshot-generator-function
+        - screenshot-storage-bucket
+
+# Define template variables with default values
+variables:
+  PROJECT_ID:
+    description: "Google Cloud Project ID"
+    type: string
+    default: "screenshot-api-project"
+    
+  REGION:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+    
+  BUCKET_NAME:
+    description: "Cloud Storage bucket name for screenshots"
+    type: string
+    default: "screenshot-api-bucket"
+    
+  FUNCTION_NAME:
+    description: "Cloud Function name"
+    type: string
+    default: "screenshot-generator"
+
+# Define outputs for integration and verification
+outputs:
+  function_url:
+    description: "Cloud Function trigger URL"
+    value: $(ref.screenshot-generator-function.serviceConfig.uri)
+    
+  bucket_name:
+    description: "Storage bucket name for screenshots"
+    value: $(ref.screenshot-storage-bucket.name)
+    
+  bucket_url:
+    description: "Storage bucket public URL"
+    value: "https://storage.googleapis.com/$(ref.screenshot-storage-bucket.name)"
+    
+  service_account_email:
+    description: "Service account email for the function"
+    value: $(ref.screenshot-function-service-account.email)
+    
+  monitoring_dashboard_url:
+    description: "Cloud Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.screenshot-api-dashboard.name)"
+    
+  pubsub_topic:
+    description: "Pub/Sub topic for screenshot notifications"
+    value: $(ref.screenshot-upload-topic.name)
+
+# Define configuration schema validation
+schema:
+  info:
+    title: "Website Screenshot API Infrastructure"
+    description: "Infrastructure Manager configuration for deploying a serverless screenshot API"
+    version: "1.0.0"
+  
+  required:
+    - PROJECT_ID
+    - REGION
+    - BUCKET_NAME
+    - FUNCTION_NAME
+  
+  properties:
+    PROJECT_ID:
+      type: string
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+      description: "Valid Google Cloud Project ID"
+      
+    REGION:
+      type: string
+      enum:
+        - us-central1
+        - us-east1
+        - us-west1
+        - europe-west1
+        - asia-southeast1
+      description: "Supported Google Cloud regions"
+      
+    BUCKET_NAME:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9-._]{1,61}[a-z0-9]$"
+      description: "Valid Cloud Storage bucket name"
+      
+    FUNCTION_NAME:
+      type: string
+      pattern: "^[a-z][a-z0-9-]{0,62}$"
+      description: "Valid Cloud Function name"
+
+# Define deployment policies and constraints
+policies:
+  # Enforce resource labeling
+  - constraint: gcp.resource.labels
+    description: "All resources must have required labels"
+    enforce: true
+    parameters:
+      required_labels:
+        - managed-by
+        - application
+        
+  # Enforce security best practices
+  - constraint: gcp.storage.bucket.uniform_access
+    description: "Storage buckets must use uniform bucket-level access"
+    enforce: true
+    
+  # Enforce function memory limits
+  - constraint: gcp.cloudfunctions.memory_limit
+    description: "Cloud Functions memory must not exceed 1GB"
+    enforce: true
+    parameters:
+      max_memory: "1Gi"
+      
+  # Enforce function timeout limits
+  - constraint: gcp.cloudfunctions.timeout_limit
+    description: "Cloud Functions timeout must not exceed 540 seconds"
+    enforce: true
+    parameters:
+      max_timeout: 540

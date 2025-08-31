@@ -1,0 +1,684 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Enterprise Identity Federation with Bedrock AgentCore - Secure AI agent identity management with SAML federation'
+
+# CloudFormation Parameters for customizable deployment
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'production'
+    Description: 'Environment name for resource tagging and identification'
+    AllowedValues:
+      - development
+      - staging
+      - production
+    ConstraintDescription: 'Must be development, staging, or production'
+
+  EnterpriseIdPMetadataURL:
+    Type: String
+    Description: 'SAML 2.0 metadata URL for your enterprise identity provider'
+    AllowedPattern: '^https://.*'
+    ConstraintDescription: 'Must be a valid HTTPS URL for SAML metadata'
+
+  EnterpriseIdPSSOURL:
+    Type: String
+    Description: 'Single Sign-On URL for your enterprise identity provider'
+    AllowedPattern: '^https://.*'
+    ConstraintDescription: 'Must be a valid HTTPS URL'
+
+  EnterpriseIdPSLOURL:
+    Type: String
+    Description: 'Single Logout URL for your enterprise identity provider'
+    AllowedPattern: '^https://.*'
+    ConstraintDescription: 'Must be a valid HTTPS URL'
+
+  ApplicationCallbackURL:
+    Type: String
+    Default: 'https://your-app.company.com/oauth/callback'
+    Description: 'OAuth callback URL for your enterprise application'
+    AllowedPattern: '^https://.*'
+    ConstraintDescription: 'Must be a valid HTTPS URL'
+
+  ApplicationLogoutURL:
+    Type: String
+    Default: 'https://your-app.company.com/logout'
+    Description: 'Logout URL for your enterprise application'
+    AllowedPattern: '^https://.*'
+    ConstraintDescription: 'Must be a valid HTTPS URL'
+
+  AuthorizedEmailDomains:
+    Type: CommaDelimitedList
+    Default: '@company.com,@enterprise.org'
+    Description: 'Comma-separated list of authorized email domains for AI agent access'
+
+  MaxAgentsPerUser:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 50
+    Description: 'Maximum number of AI agents per user (1-50)'
+
+  SessionDurationMinutes:
+    Type: Number
+    Default: 60
+    MinValue: 15
+    MaxValue: 480
+    Description: 'Session duration in minutes (15-480)'
+
+  EnableMFA:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable Multi-Factor Authentication for enhanced security'
+
+# Conditions for conditional resource creation
+Conditions:
+  IsProdEnvironment: !Equals [!Ref EnvironmentName, 'production']
+  MFAEnabled: !Equals [!Ref EnableMFA, 'true']
+  HasCustomDomain: !Not [!Equals [!Ref ApplicationCallbackURL, 'https://your-app.company.com/oauth/callback']]
+
+# CloudFormation Resources
+Resources:
+  # ==========================================
+  # IAM Role for Lambda Authentication Handler
+  # ==========================================
+  AuthHandlerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-auth-handler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoAndAgentCoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminListGroupsForUser
+                  - cognito-idp:AdminUpdateUserAttributes
+                Resource: !GetAtt EnterpriseUserPool.Arn
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadIdentity
+                  - bedrock-agentcore:CreateWorkloadIdentity
+                  - bedrock-agentcore:UpdateWorkloadIdentity
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/enterprise/agentcore/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: Enterprise-AI-Authentication
+        - Key: Project
+          Value: BedrockAgentCore
+
+  # ==========================================
+  # Lambda Function for Authentication Handling
+  # ==========================================
+  AuthenticationHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-auth-handler'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt AuthHandlerExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref EnterpriseUserPool
+          AUTHORIZED_DOMAINS: !Join [',', !Ref AuthorizedEmailDomains]
+          MAX_AGENTS_PER_USER: !Ref MaxAgentsPerUser
+          SESSION_DURATION: !Ref SessionDurationMinutes
+          ENVIRONMENT: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from typing import Dict, Any
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
+              """
+              Custom authentication handler for enterprise AI agent identity management.
+              Validates enterprise user context and determines agent access permissions.
+              """
+              try:
+                  trigger_source = event.get('triggerSource')
+                  user_attributes = event.get('request', {}).get('userAttributes', {})
+                  
+                  logger.info(f"Processing trigger: {trigger_source}")
+                  logger.info(f"User attributes: {json.dumps(user_attributes, default=str)}")
+                  
+                  if trigger_source == 'PostAuthentication_Authentication':
+                      # Process successful enterprise authentication
+                      email = user_attributes.get('email', '')
+                      department = user_attributes.get('custom:department', 'general')
+                      
+                      # Determine agent access based on department
+                      agent_permissions = determine_agent_permissions(department)
+                      
+                      # Store user session context for AgentCore access
+                      response = event
+                      response['response'] = {
+                          'agentPermissions': agent_permissions,
+                          'sessionDuration': int(os.environ.get('SESSION_DURATION', 60)) * 60
+                      }
+                      
+                      logger.info(f"Authentication successful for {email} with permissions: {agent_permissions}")
+                      return response
+                      
+                  elif trigger_source == 'PreAuthentication_Authentication':
+                      # Validate user eligibility for AI agent access
+                      email = user_attributes.get('email', '')
+                      
+                      # Check if user is authorized for AI agent management
+                      if not is_authorized_for_ai_agents(email):
+                          raise Exception("User not authorized for AI agent access")
+                      
+                      return event
+                      
+                  return event
+                  
+              except Exception as e:
+                  logger.error(f"Authentication error: {str(e)}")
+                  raise e
+          
+          def determine_agent_permissions(department: str) -> Dict[str, Any]:
+              """Determine AI agent access permissions based on user department."""
+              max_agents = int(os.environ.get('MAX_AGENTS_PER_USER', 10))
+              
+              permission_map = {
+                  'engineering': {
+                      'canCreateAgents': True,
+                      'canDeleteAgents': True,
+                      'maxAgents': max_agents,
+                      'allowedServices': ['bedrock', 's3', 'lambda', 'sagemaker']
+                  },
+                  'security': {
+                      'canCreateAgents': True,
+                      'canDeleteAgents': True,
+                      'maxAgents': max(5, max_agents // 2),
+                      'allowedServices': ['bedrock', 'iam', 'cloudtrail', 'guardduty']
+                  },
+                  'data-science': {
+                      'canCreateAgents': True,
+                      'canDeleteAgents': False,
+                      'maxAgents': max_agents,
+                      'allowedServices': ['bedrock', 's3', 'sagemaker', 'athena']
+                  },
+                  'general': {
+                      'canCreateAgents': False,
+                      'canDeleteAgents': False,
+                      'maxAgents': min(2, max_agents),
+                      'allowedServices': ['bedrock']
+                  }
+              }
+              
+              return permission_map.get(department, permission_map['general'])
+          
+          def is_authorized_for_ai_agents(email: str) -> bool:
+              """Check if user is authorized for AI agent management."""
+              authorized_domains = os.environ.get('AUTHORIZED_DOMAINS', '').split(',')
+              return any(domain.strip() in email for domain in authorized_domains if domain.strip())
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: Enterprise-AI-Authentication
+        - Key: Project
+          Value: BedrockAgentCore
+
+  # ==========================================
+  # Cognito User Pool for Enterprise Federation
+  # ==========================================
+  EnterpriseUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-enterprise-identity'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      MfaConfiguration: !If [MFAEnabled, 'OPTIONAL', 'OFF']
+      EnabledMfas: !If 
+        - MFAEnabled
+        - ['SMS_MFA', 'SOFTWARE_TOKEN_MFA']
+        - !Ref AWS::NoValue
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+          - Name: verified_phone_number
+            Priority: 2
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: department
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: employee_id
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      LambdaConfig:
+        PreAuthentication: !GetAtt AuthenticationHandler.Arn
+        PostAuthentication: !GetAtt AuthenticationHandler.Arn
+      UserPoolTags:
+        Environment: !Ref EnvironmentName
+        Purpose: Enterprise-AI-Identity
+        Project: BedrockAgentCore
+
+  # Permission for Cognito to invoke Lambda
+  CognitoLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthenticationHandler
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt EnterpriseUserPool.Arn
+
+  # ==========================================
+  # SAML Identity Provider Configuration
+  # ==========================================
+  SAMLIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Properties:
+      UserPoolId: !Ref EnterpriseUserPool
+      ProviderName: EnterpriseSSO
+      ProviderType: SAML
+      ProviderDetails:
+        MetadataURL: !Ref EnterpriseIdPMetadataURL
+        SSORedirectBindingURI: !Ref EnterpriseIdPSSOURL
+        SLORedirectBindingURI: !Ref EnterpriseIdPSLOURL
+      AttributeMapping:
+        email: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress'
+        name: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name'
+        'custom:department': 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/department'
+        'custom:employee_id': 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/employeeid'
+
+  # ==========================================
+  # User Pool Domain for OAuth flows
+  # ==========================================
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${AWS::StackName}-enterprise-auth'
+      UserPoolId: !Ref EnterpriseUserPool
+
+  # ==========================================
+  # User Pool App Client for OAuth Integration
+  # ==========================================
+  EnterpriseAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: AgentCore-Enterprise-Client
+      UserPoolId: !Ref EnterpriseUserPool
+      GenerateSecret: true
+      SupportedIdentityProviders:
+        - EnterpriseSSO
+        - COGNITO
+      CallbackURLs:
+        - !Ref ApplicationCallbackURL
+        - 'https://localhost:8080/callback'
+      LogoutURLs:
+        - !Ref ApplicationLogoutURL
+        - 'https://localhost:8080/logout'
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+        - aws.cognito.signin.user.admin
+      AllowedOAuthFlowsUserPoolClient: true
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      PreventUserExistenceErrors: ENABLED
+    DependsOn: SAMLIdentityProvider
+
+  # ==========================================
+  # IAM Policies for Agent Access Control
+  # ==========================================
+  AgentCoreAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-agentcore-access'
+      Description: 'Access policy for Bedrock AgentCore AI agents'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BedrockModelAccess
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+              - bedrock:ListFoundationModels
+              - bedrock:GetFoundationModel
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AWS::Region
+          - Sid: S3DataAccess
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !Sub '${EnterpriseDataBucket}'
+              - !Sub '${EnterpriseDataBucket}/*'
+          - Sid: CloudWatchLogging
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+          - Sid: SageMakerAccess
+            Effect: Allow
+            Action:
+              - sagemaker:InvokeEndpoint
+              - sagemaker:DescribeEndpoint
+            Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*'
+            Condition:
+              StringLike:
+                'sagemaker:endpoint-name': 'enterprise-*'
+          - Sid: SSMParameterAccess
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:GetParametersByPath
+            Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/enterprise/agentcore/*'
+
+  # ==========================================
+  # IAM Role for AI Agents
+  # ==========================================
+  AgentCoreExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-agentcore-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${AWS::StackName}-agentcore'
+      ManagedPolicyArns:
+        - !Ref AgentCoreAccessPolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: AgentCore-Execution
+        - Key: Project
+          Value: BedrockAgentCore
+
+  # ==========================================
+  # S3 Bucket for Enterprise AI Data
+  # ==========================================
+  EnterpriseDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-enterprise-ai-data-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldData
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: Enterprise-AI-Data
+        - Key: Project
+          Value: BedrockAgentCore
+
+  # ==========================================
+  # CloudWatch Log Group for S3 Access
+  # ==========================================
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${AWS::StackName}-enterprise-ai-data'
+      RetentionInDays: !If [IsProdEnvironment, 365, 30]
+
+  # ==========================================
+  # SSM Parameters for Integration Configuration
+  # ==========================================
+  IntegrationConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/enterprise/agentcore/${AWS::StackName}/integration-config'
+      Type: String
+      Value: !Sub |
+        {
+          "enterpriseIntegration": {
+            "cognitoUserPool": "${EnterpriseUserPool}",
+            "cognitoAppClient": "${EnterpriseAppClient}",
+            "authenticationFlow": "enterprise-saml-oauth",
+            "sessionDuration": ${SessionDurationMinutes},
+            "permissionMapping": {
+              "engineering": {
+                "maxAgents": ${MaxAgentsPerUser},
+                "allowedActions": ["create", "read", "update", "delete"],
+                "resourceAccess": ["bedrock", "s3", "lambda", "sagemaker"]
+              },
+              "security": {
+                "maxAgents": 5,
+                "allowedActions": ["create", "read", "update", "delete", "audit"],
+                "resourceAccess": ["bedrock", "iam", "cloudtrail", "guardduty"]
+              },
+              "data-science": {
+                "maxAgents": ${MaxAgentsPerUser},
+                "allowedActions": ["create", "read", "update"],
+                "resourceAccess": ["bedrock", "s3", "sagemaker", "athena"]
+              },
+              "general": {
+                "maxAgents": 2,
+                "allowedActions": ["read"],
+                "resourceAccess": ["bedrock"]
+              }
+            },
+            "securitySettings": {
+              "mfaEnabled": "${EnableMFA}",
+              "sessionTimeout": ${SessionDurationMinutes},
+              "authorizedDomains": "${AuthorizedEmailDomains}"
+            }
+          }
+        }
+      Description: 'Enterprise AI agent integration configuration'
+      Tags:
+        Environment: !Ref EnvironmentName
+        Purpose: AgentCore-Integration
+        Project: BedrockAgentCore
+
+  # ==========================================
+  # CloudWatch Alarms for Monitoring
+  # ==========================================
+  AuthenticationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-auth-failures'
+      AlarmDescription: 'Monitor authentication failures for enterprise AI agents'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AuthenticationHandler
+      TreatMissingData: notBreaching
+
+  UnauthorizedAccessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-unauthorized-access'
+      AlarmDescription: 'Monitor unauthorized access attempts to AI agent resources'
+      MetricName: UnauthorizedApiCalls
+      Namespace: AWS/Cognito
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+# CloudFormation Outputs
+Outputs:
+  UserPoolId:
+    Description: 'Cognito User Pool ID for enterprise authentication'
+    Value: !Ref EnterpriseUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolArn:
+    Description: 'Cognito User Pool ARN'
+    Value: !GetAtt EnterpriseUserPool.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolArn'
+
+  AppClientId:
+    Description: 'Cognito App Client ID for OAuth integration'
+    Value: !Ref EnterpriseAppClient
+    Export:
+      Name: !Sub '${AWS::StackName}-AppClientId'
+
+  UserPoolDomain:
+    Description: 'Cognito User Pool Domain for authentication'
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolDomain'
+
+  AuthenticationHandlerArn:
+    Description: 'Lambda function ARN for authentication handling'
+    Value: !GetAtt AuthenticationHandler.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AuthHandlerArn'
+
+  AgentCoreExecutionRoleArn:
+    Description: 'IAM role ARN for AI agent execution'
+    Value: !GetAtt AgentCoreExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentCoreRoleArn'
+
+  EnterpriseDataBucketName:
+    Description: 'S3 bucket name for enterprise AI data'
+    Value: !Ref EnterpriseDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketName'
+
+  IntegrationConfigParameter:
+    Description: 'SSM parameter path for integration configuration'
+    Value: !Ref IntegrationConfig
+    Export:
+      Name: !Sub '${AWS::StackName}-IntegrationConfig'
+
+  SAMLMetadataURL:
+    Description: 'SAML metadata URL for identity provider configuration'
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${EnterpriseUserPool}/.well-known/saml_metadata'
+    Export:
+      Name: !Sub '${AWS::StackName}-SAMLMetadataURL'
+
+  OAuthEndpoints:
+    Description: 'OAuth 2.0 endpoints for application integration'
+    Value: !Sub |
+      Authorization: https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize
+      Token: https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token
+      UserInfo: https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/userInfo
+    Export:
+      Name: !Sub '${AWS::StackName}-OAuthEndpoints'
+
+  DeploymentInstructions:
+    Description: 'Next steps for completing the enterprise identity federation setup'
+    Value: !Sub |
+      1. Configure your enterprise IdP with SAML metadata: https://cognito-idp.${AWS::Region}.amazonaws.com/${EnterpriseUserPool}/.well-known/saml_metadata
+      2. Update application OAuth configuration with Client ID: ${EnterpriseAppClient}
+      3. Request Bedrock AgentCore access through AWS console
+      4. Create AgentCore workload identities using the provided execution role
+      5. Test authentication flow with enterprise credentials
+      6. Monitor authentication metrics in CloudWatch console

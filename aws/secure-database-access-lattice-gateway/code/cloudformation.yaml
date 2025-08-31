@@ -1,0 +1,883 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Secure Database Access with VPC Lattice Resource Gateway
+  
+  This template deploys a complete VPC Lattice Resource Gateway solution for secure
+  cross-account database access. It creates an RDS MySQL instance, VPC Lattice 
+  Service Network, Resource Gateway, and all required networking and security components.
+  
+  The solution enables secure database sharing across AWS accounts without internet
+  exposure, using VPC Lattice networking and AWS RAM for resource sharing.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - PrivateSubnetIds
+          - DatabaseSubnetCidr
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DatabaseInstanceClass
+          - DatabaseAllocatedStorage
+          - DatabaseMasterUsername
+          - DatabaseMasterPassword
+          - DatabaseBackupRetentionPeriod
+      - Label:
+          default: "VPC Lattice Configuration"
+        Parameters:
+          - ServiceNetworkName
+          - ResourceGatewayName
+          - ResourceConfigurationName
+      - Label:
+          default: "Cross-Account Sharing"
+        Parameters:
+          - ConsumerAccountId
+          - ResourceShareName
+      - Label:
+          default: "Tagging"
+        Parameters:
+          - Environment
+          - Project
+    ParameterLabels:
+      VpcId:
+        default: "VPC ID"
+      PrivateSubnetIds:
+        default: "Private Subnet IDs"
+      DatabaseSubnetCidr:
+        default: "Database Subnet CIDR"
+      DatabaseInstanceClass:
+        default: "Database Instance Class"
+      DatabaseAllocatedStorage:
+        default: "Database Storage (GB)"
+      DatabaseMasterUsername:
+        default: "Database Master Username"
+      DatabaseMasterPassword:
+        default: "Database Master Password"
+      DatabaseBackupRetentionPeriod:
+        default: "Backup Retention Period (Days)"
+      ServiceNetworkName:
+        default: "Service Network Name"
+      ResourceGatewayName:
+        default: "Resource Gateway Name"
+      ResourceConfigurationName:
+        default: "Resource Configuration Name"
+      ConsumerAccountId:
+        default: "Consumer Account ID"
+      ResourceShareName:
+        default: "Resource Share Name"
+      Environment:
+        default: "Environment"
+      Project:
+        default: "Project Name"
+
+Parameters:
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      The VPC where the database and VPC Lattice resources will be deployed.
+      This VPC should have private subnets for secure database deployment.
+    ConstraintDescription: Must be a valid VPC ID in the current region
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      List of private subnet IDs for the database and resource gateway deployment.
+      Must be in different Availability Zones for high availability.
+      Minimum 2 subnets required.
+    ConstraintDescription: Must specify at least 2 subnet IDs in different AZs
+
+  DatabaseSubnetCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: >
+      CIDR block for the VPC to configure security group rules.
+      Used to allow database access from the VPC Lattice Resource Gateway.
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: Must be a valid CIDR notation (e.g., 10.0.0.0/16)
+
+  # Database Configuration
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: >
+      RDS instance class for the MySQL database.
+      Choose based on expected workload and performance requirements.
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.t3.xlarge
+      - db.t3.2xlarge
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+    ConstraintDescription: Must be a valid RDS instance class
+
+  DatabaseAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: >
+      Storage size for the RDS database in GB.
+      Minimum 20 GB, maximum 1000 GB for this template.
+    ConstraintDescription: Must be between 20 and 1000 GB
+
+  DatabaseMasterUsername:
+    Type: String
+    Default: admin
+    MinLength: 1
+    MaxLength: 63
+    Description: >
+      Master username for the RDS database.
+      Cannot be 'admin' in production; change for security.
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+
+  DatabaseMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    Description: >
+      Master password for the RDS database.
+      Must be at least 8 characters with uppercase, lowercase, number, and symbol.
+    AllowedPattern: ^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,128}$
+    ConstraintDescription: >
+      Must be 8-128 characters with at least one uppercase letter, 
+      one lowercase letter, one number, and one special character
+
+  DatabaseBackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: >
+      Number of days to retain automated database backups.
+      Recommended minimum 7 days for production workloads.
+    ConstraintDescription: Must be between 1 and 35 days
+
+  # VPC Lattice Configuration
+  ServiceNetworkName:
+    Type: String
+    Default: lattice-database-network
+    MinLength: 3
+    MaxLength: 63
+    Description: >
+      Name for the VPC Lattice Service Network.
+      Used to organize and manage service-to-service communication.
+    AllowedPattern: ^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?$
+    ConstraintDescription: >
+      Must be 3-63 characters, start and end with alphanumeric,
+      and can contain hyphens
+
+  ResourceGatewayName:
+    Type: String
+    Default: database-resource-gateway
+    MinLength: 3
+    MaxLength: 63
+    Description: >
+      Name for the VPC Lattice Resource Gateway.
+      Acts as the ingress point for database traffic.
+    AllowedPattern: ^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?$
+    ConstraintDescription: >
+      Must be 3-63 characters, start and end with alphanumeric,
+      and can contain hyphens
+
+  ResourceConfigurationName:
+    Type: String
+    Default: rds-database-config
+    MinLength: 3
+    MaxLength: 63
+    Description: >
+      Name for the Resource Configuration that defines database access.
+      Links the RDS database to the VPC Lattice Resource Gateway.
+    AllowedPattern: ^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?$
+    ConstraintDescription: >
+      Must be 3-63 characters, start and end with alphanumeric,
+      and can contain hyphens
+
+  # Cross-Account Sharing
+  ConsumerAccountId:
+    Type: String
+    Description: >
+      AWS Account ID that will consume the shared database resource.
+      This account will receive access through AWS RAM sharing.
+      Leave empty to skip cross-account sharing setup.
+    AllowedPattern: ^$|^\d{12}$
+    ConstraintDescription: Must be empty or a valid 12-digit AWS Account ID
+
+  ResourceShareName:
+    Type: String
+    Default: lattice-database-share
+    MinLength: 3
+    MaxLength: 255
+    Description: >
+      Name for the AWS RAM resource share.
+      Used to share the VPC Lattice Resource Configuration across accounts.
+    AllowedPattern: ^[a-zA-Z0-9]([a-zA-Z0-9\-\s]*[a-zA-Z0-9])?$
+    ConstraintDescription: >
+      Must be 3-255 characters, start and end with alphanumeric,
+      and can contain hyphens and spaces
+
+  # Tagging
+  Environment:
+    Type: String
+    Default: dev
+    Description: >
+      Environment name for resource tagging and identification.
+      Used to organize resources by deployment stage.
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  Project:
+    Type: String
+    Default: vpc-lattice-database
+    MinLength: 3
+    MaxLength: 50
+    Description: >
+      Project name for resource tagging and cost allocation.
+      Used to group related resources for billing and management.
+    AllowedPattern: ^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?$
+    ConstraintDescription: >
+      Must be 3-50 characters, start and end with alphanumeric,
+      and can contain hyphens
+
+Conditions:
+  # Condition to determine if cross-account sharing should be configured
+  EnableCrossAccountSharing: !Not [!Equals [!Ref ConsumerAccountId, ""]]
+  
+  # Condition to determine if this is a production environment
+  IsProduction: !Equals [!Ref Environment, "prod"]
+
+Resources:
+  # =============================================================================
+  # IAM Roles and Policies
+  # =============================================================================
+  
+  # Enhanced monitoring role for RDS (optional but recommended)
+  DatabaseEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-rds-monitoring-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-rds-monitoring-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # =============================================================================
+  # Security Groups
+  # =============================================================================
+  
+  # Security group for RDS database - allows access from Resource Gateway
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}-rds-security-group"
+      GroupDescription: >
+        Security group for RDS database accessed through VPC Lattice Resource Gateway.
+        Allows MySQL traffic from the Resource Gateway security group.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: MySQL access from VPC Lattice Resource Gateway
+          IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ResourceGatewaySecurityGroup
+        - Description: MySQL access from VPC CIDR for direct troubleshooting
+          IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref DatabaseSubnetCidr
+      SecurityGroupEgress:
+        - Description: All outbound traffic
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-rds-security-group"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # Security group for VPC Lattice Resource Gateway
+  ResourceGatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}-resource-gateway-sg"
+      GroupDescription: >
+        Security group for VPC Lattice Resource Gateway.
+        Allows outbound MySQL traffic to RDS database.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - Description: MySQL access to RDS database
+          IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+        - Description: HTTPS for VPC Lattice management
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-resource-gateway-sg"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # =============================================================================
+  # Database Infrastructure
+  # =============================================================================
+  
+  # DB Subnet Group for RDS instance
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub "${AWS::StackName}-db-subnet-group"
+      DBSubnetGroupDescription: >
+        Subnet group for VPC Lattice shared RDS database.
+        Spans multiple Availability Zones for high availability.
+      SubnetIds: !Ref PrivateSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-db-subnet-group"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # Random password for database (alternative to parameter)
+  DatabasePassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-database-password"
+      Description: >
+        Auto-generated password for RDS database master user.
+        Stored securely in AWS Secrets Manager with automatic rotation capability.
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DatabaseMasterUsername}"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+        RequireEachIncludedType: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-database-password"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # RDS Database Instance
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-shared-database"
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      Engine: mysql
+      EngineVersion: "8.0.35"  # Latest MySQL 8.0 LTS version
+      AllocatedStorage: !Ref DatabaseAllocatedStorage
+      StorageType: gp3  # Latest generation storage for better performance
+      StorageEncrypted: true
+      KmsKeyId: alias/aws/rds  # Use AWS managed key for encryption
+      
+      # Database Configuration
+      MasterUsername: !Ref DatabaseMasterUsername
+      ManageMasterUserPassword: true  # Use AWS managed password rotation
+      MasterUserSecret:
+        KmsKeyId: alias/aws/secretsmanager
+      
+      # Network Configuration
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: false  # Critical: Database must not be internet-accessible
+      
+      # Backup and Maintenance Configuration
+      BackupRetentionPeriod: !Ref DatabaseBackupRetentionPeriod
+      PreferredBackupWindow: "03:00-04:00"  # Low-traffic window
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"  # Weekly maintenance
+      
+      # Monitoring and Performance
+      MonitoringInterval: !If [IsProduction, 60, 0]  # Enhanced monitoring for production
+      MonitoringRoleArn: !If 
+        - IsProduction
+        - !GetAtt DatabaseEnhancedMonitoringRole.Arn
+        - !Ref AWS::NoValue
+      EnablePerformanceInsights: !If [IsProduction, true, false]
+      PerformanceInsightsRetentionPeriod: !If [IsProduction, 7, !Ref AWS::NoValue]
+      
+      # Security and Compliance
+      DeletionProtection: !If [IsProduction, true, false]
+      AutoMinorVersionUpgrade: true
+      
+      # Database Parameters
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-shared-database"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: VPCLatticeShared
+          Value: "true"
+
+  # Custom DB Parameter Group for security hardening
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub "${AWS::StackName}-mysql-params"
+      Description: >
+        Custom parameter group for MySQL database with security hardening.
+        Optimized for VPC Lattice access patterns and security requirements.
+      Family: mysql8.0
+      Parameters:
+        # Security parameters
+        local_infile: 0  # Disable LOCAL INFILE for security
+        log_bin_trust_function_creators: 1  # Required for some applications
+        
+        # Performance parameters
+        innodb_buffer_pool_size: "{DBInstanceClassMemory*3/4}"
+        max_connections: 1000
+        
+        # Logging parameters for audit and troubleshooting
+        general_log: !If [IsProduction, 0, 1]  # Enable general log in non-prod
+        slow_query_log: 1
+        long_query_time: 2
+        log_queries_not_using_indexes: 1
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-mysql-params"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # =============================================================================
+  # VPC Lattice Infrastructure
+  # =============================================================================
+  
+  # VPC Lattice Service Network
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub "${ServiceNetworkName}-${AWS::StackName}"
+      AuthType: AWS_IAM  # Use IAM for authentication and authorization
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceNetworkName}-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # VPC Lattice Resource Gateway
+  ResourceGateway:
+    Type: AWS::VpcLattice::ResourceGateway
+    Properties:
+      Name: !Sub "${ResourceGatewayName}-${AWS::StackName}"
+      VpcIdentifier: !Ref VpcId
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !Ref ResourceGatewaySecurityGroup
+      IpAddressType: IPV4
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourceGatewayName}-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # VPC Lattice Resource Configuration
+  ResourceConfiguration:
+    Type: AWS::VpcLattice::ResourceConfiguration
+    DependsOn: DatabaseInstance  # Ensure database is available before creating config
+    Properties:
+      Name: !Sub "${ResourceConfigurationName}-${AWS::StackName}"
+      Type: SINGLE
+      ResourceConfigurationDefinition:
+        DnsResource:
+          DomainName: !GetAtt DatabaseInstance.Endpoint.Address
+          IpAddressType: IPV4
+      ResourceGatewayIdentifier: !Ref ResourceGateway
+      Protocol: TCP
+      PortRanges:
+        - "3306"  # MySQL port
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourceConfigurationName}-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # Associate Resource Configuration with Service Network
+  ResourceConfigurationAssociation:
+    Type: AWS::VpcLattice::ResourceConfigurationAssociation
+    Properties:
+      ResourceConfigurationIdentifier: !Ref ResourceConfiguration
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-resource-config-association"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # Associate Service Network with VPC
+  ServiceNetworkVpcAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      VpcIdentifier: !Ref VpcId
+      SecurityGroupIds:
+        - !Ref ResourceGatewaySecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-service-network-vpc-association"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # =============================================================================
+  # Cross-Account Sharing (AWS RAM)
+  # =============================================================================
+  
+  # AWS RAM Resource Share for cross-account access
+  ResourceShare:
+    Type: AWS::RAM::ResourceShare
+    Condition: EnableCrossAccountSharing
+    Properties:
+      Name: !Sub "${ResourceShareName}-${AWS::StackName}"
+      AllowExternalPrincipals: true
+      Principals:
+        - !Ref ConsumerAccountId
+      ResourceArns:
+        - !Ref ResourceConfiguration
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourceShareName}-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # =============================================================================
+  # IAM Auth Policy for VPC Lattice
+  # =============================================================================
+  
+  # Custom resource to set IAM auth policy on Service Network
+  ServiceNetworkAuthPolicy:
+    Type: AWS::VpcLattice::AuthPolicy
+    Condition: EnableCrossAccountSharing
+    Properties:
+      ResourceIdentifier: !Ref ServiceNetwork
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:aws:iam::${ConsumerAccountId}:root"
+            Action:
+              - vpc-lattice-svcs:Invoke
+            Resource: "*"
+            Condition:
+              StringEquals:
+                vpc-lattice-svcs:SourceAccount: !Ref ConsumerAccountId
+
+  # =============================================================================
+  # CloudWatch Alarms and Monitoring
+  # =============================================================================
+  
+  # CloudWatch Alarm for high database connections
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-database-high-connections"
+      AlarmDescription: >
+        Monitors RDS database connections for capacity planning.
+        Triggers when connection count exceeds 80% of max_connections.
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 2
+      Threshold: 800  # 80% of 1000 max_connections
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-database-high-connections"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # CloudWatch Alarm for database CPU utilization
+  DatabaseCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-database-high-cpu"
+      AlarmDescription: >
+        Monitors RDS database CPU utilization for performance issues.
+        Triggers when CPU usage exceeds 80% for sustained periods.
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-database-high-cpu"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+Outputs:
+  # =============================================================================
+  # Database Information
+  # =============================================================================
+  
+  DatabaseInstanceId:
+    Description: >
+      RDS database instance identifier for management and monitoring.
+      Use this ID for AWS CLI operations and CloudWatch metrics.
+    Value: !Ref DatabaseInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-database-instance-id"
+
+  DatabaseEndpoint:
+    Description: >
+      RDS database endpoint for direct VPC access (not for VPC Lattice).
+      This endpoint is only accessible from within the VPC.
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-database-endpoint"
+
+  DatabasePort:
+    Description: >
+      RDS database port for connection configuration.
+      Standard MySQL port (3306) used for all connections.
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub "${AWS::StackName}-database-port"
+
+  DatabaseSecretArn:
+    Description: >
+      AWS Secrets Manager ARN containing database credentials.
+      Use this to retrieve database username and password programmatically.
+    Value: !Ref DatabaseInstance.MasterUserSecret.SecretArn
+    Export:
+      Name: !Sub "${AWS::StackName}-database-secret-arn"
+
+  # =============================================================================
+  # VPC Lattice Information
+  # =============================================================================
+  
+  ServiceNetworkId:
+    Description: >
+      VPC Lattice Service Network identifier for cross-account sharing.
+      Consumer accounts associate their VPCs with this service network.
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub "${AWS::StackName}-service-network-id"
+
+  ServiceNetworkArn:
+    Description: >
+      VPC Lattice Service Network ARN for IAM policies and RAM sharing.
+      Use this ARN for cross-account access configuration.
+    Value: !GetAtt ServiceNetwork.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-service-network-arn"
+
+  ResourceGatewayId:
+    Description: >
+      VPC Lattice Resource Gateway identifier for resource management.
+      This gateway provides ingress to the RDS database.
+    Value: !Ref ResourceGateway
+    Export:
+      Name: !Sub "${AWS::StackName}-resource-gateway-id"
+
+  ResourceGatewayArn:
+    Description: >
+      VPC Lattice Resource Gateway ARN for IAM policies and monitoring.
+      Use this ARN for CloudWatch metrics and access control.
+    Value: !GetAtt ResourceGateway.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-resource-gateway-arn"
+
+  ResourceConfigurationId:
+    Description: >
+      VPC Lattice Resource Configuration identifier for database access.
+      This configuration defines how the database is accessed through VPC Lattice.
+    Value: !Ref ResourceConfiguration
+    Export:
+      Name: !Sub "${AWS::StackName}-resource-configuration-id"
+
+  ResourceConfigurationArn:
+    Description: >
+      VPC Lattice Resource Configuration ARN for sharing and management.
+      This ARN is shared with consumer accounts through AWS RAM.
+    Value: !GetAtt ResourceConfiguration.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-resource-configuration-arn"
+
+  VpcLatticeDnsName:
+    Description: >
+      VPC Lattice generated DNS name for database access.
+      Consumer accounts use this DNS name to connect to the shared database.
+    Value: !GetAtt ResourceConfiguration.DnsEntry.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-vpc-lattice-dns-name"
+
+  # =============================================================================
+  # Cross-Account Sharing Information
+  # =============================================================================
+  
+  ResourceShareId:
+    Condition: EnableCrossAccountSharing
+    Description: >
+      AWS RAM Resource Share identifier for cross-account management.
+      Track sharing status and manage consumer account access.
+    Value: !Ref ResourceShare
+    Export:
+      Name: !Sub "${AWS::StackName}-resource-share-id"
+
+  ResourceShareArn:
+    Condition: EnableCrossAccountSharing
+    Description: >
+      AWS RAM Resource Share ARN for monitoring and governance.
+      Use this ARN to track resource sharing compliance and usage.
+    Value: !GetAtt ResourceShare.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-resource-share-arn"
+
+  ConsumerAccountId:
+    Condition: EnableCrossAccountSharing
+    Description: >
+      Consumer AWS Account ID with access to the shared database.
+      This account can accept the RAM invitation and access the database.
+    Value: !Ref ConsumerAccountId
+    Export:
+      Name: !Sub "${AWS::StackName}-consumer-account-id"
+
+  # =============================================================================
+  # Security Information
+  # =============================================================================
+  
+  DatabaseSecurityGroupId:
+    Description: >
+      Security Group ID for the RDS database.
+      Allows access from VPC Lattice Resource Gateway and VPC CIDR.
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-database-security-group-id"
+
+  ResourceGatewaySecurityGroupId:
+    Description: >
+      Security Group ID for the VPC Lattice Resource Gateway.
+      Allows outbound MySQL traffic to the RDS database.
+    Value: !Ref ResourceGatewaySecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-resource-gateway-security-group-id"
+
+  # =============================================================================
+  # Monitoring Information
+  # =============================================================================
+  
+  DatabaseConnectionsAlarmName:
+    Description: >
+      CloudWatch Alarm name for database connection monitoring.
+      Monitor this alarm for database capacity planning and scaling decisions.
+    Value: !Ref DatabaseConnectionsAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-database-connections-alarm"
+
+  DatabaseCPUAlarmName:
+    Description: >
+      CloudWatch Alarm name for database CPU monitoring.
+      Monitor this alarm for database performance and scaling decisions.
+    Value: !Ref DatabaseCPUAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-database-cpu-alarm"
+
+  # =============================================================================
+  # Connection Information
+  # =============================================================================
+  
+  DatabaseConnectionCommand:
+    Description: >
+      Example MySQL connection command using VPC Lattice DNS name.
+      Use this command from consumer account EC2 instances to connect.
+    Value: !Sub 
+      - "mysql -h ${VpcLatticeDns} -P 3306 -u ${Username} -p"
+      - VpcLatticeDns: !GetAtt ResourceConfiguration.DnsEntry.DomainName
+        Username: !Ref DatabaseMasterUsername
+    Export:
+      Name: !Sub "${AWS::StackName}-connection-command"
+
+  StackInformation:
+    Description: >
+      CloudFormation stack information and deployment summary.
+      Reference this for troubleshooting and documentation purposes.
+    Value: !Sub 
+      - |
+        Stack: ${StackName}
+        Region: ${Region}
+        Environment: ${Env}
+        Database: ${DbId}
+        VPC Lattice DNS: ${VpcLatticeDns}
+        Resource Share: ${ShareStatus}
+      - StackName: !Ref AWS::StackName
+        Region: !Ref AWS::Region
+        Env: !Ref Environment
+        DbId: !Ref DatabaseInstance
+        VpcLatticeDns: !GetAtt ResourceConfiguration.DnsEntry.DomainName
+        ShareStatus: !If [EnableCrossAccountSharing, "Enabled", "Disabled"]
+    Export:
+      Name: !Sub "${AWS::StackName}-stack-information"

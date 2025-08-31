@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Attestation Service, Azure Image Builder, Azure Container Registry, Azure Key Vault
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: container-security, supply-chain, attestation, image-building
 recipe-generator-version: 1.3
@@ -90,7 +90,7 @@ graph TB
 
 ```bash
 # Set environment variables for resource management
-export RESOURCE_GROUP="rg-container-supply-chain"
+export RESOURCE_GROUP="rg-container-supply-chain-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -161,7 +161,7 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
    Azure Key Vault provides centralized, secure storage for cryptographic keys and certificates used in the container signing process. By leveraging hardware security modules (HSMs) and Azure's encryption-at-rest capabilities, Key Vault ensures signing keys remain protected throughout their lifecycle. The integration with managed identities enables secure, auditable access without embedding credentials in code or configuration files.
 
    ```bash
-   # Create Key Vault
+   # Create Key Vault with RBAC authorization enabled
    az keyvault create \
        --name ${KEY_VAULT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -201,9 +201,9 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
        --sku Premium \
        --admin-enabled false
    
-   # Enable content trust
+   # Enable content trust (Note: Content trust is being deprecated - consider Notary Project for new implementations)
    az acr config content-trust update \
-       --name ${ACR_NAME} \
+       --registry ${ACR_NAME} \
        --status enabled
    
    # Grant Image Builder identity access to push images
@@ -211,11 +211,6 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
        --role "AcrPush" \
        --assignee ${IDENTITY_PRINCIPAL_ID} \
        --scope /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ContainerRegistry/registries/${ACR_NAME}
-   
-   # Create repository for trusted images
-   az acr repository create \
-       --name ${ACR_NAME} \
-       --repository trusted-apps
    
    echo "✅ Container Registry configured with content trust"
    ```
@@ -231,7 +226,7 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
    cat > image-template.json <<EOF
    {
      "type": "Microsoft.VirtualMachineImages/imageTemplates",
-     "apiVersion": "2024-02-01",
+     "apiVersion": "2022-07-01",
      "location": "${LOCATION}",
      "properties": {
        "buildTimeoutInMinutes": 60,
@@ -242,8 +237,8 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
        "source": {
          "type": "PlatformImage",
          "publisher": "Canonical",
-         "offer": "0001-com-ubuntu-server-focal",
-         "sku": "20_04-lts-gen2",
+         "offer": "0001-com-ubuntu-server-jammy",
+         "sku": "22_04-lts-gen2",
          "version": "latest"
        },
        "customize": [
@@ -260,7 +255,7 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
            "type": "Shell",
            "name": "BuildSecureContainer",
            "inline": [
-             "echo 'FROM ubuntu:20.04' > Dockerfile",
+             "echo 'FROM ubuntu:22.04' > Dockerfile",
              "echo 'RUN apt-get update && apt-get install -y curl' >> Dockerfile",
              "echo 'LABEL security.scan=passed' >> Dockerfile",
              "sudo docker build -t trusted-app:latest ."
@@ -269,10 +264,10 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
        ],
        "distribute": [
          {
-           "type": "SharedImage",
-           "galleryImageId": "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Compute/galleries/myGallery/images/trustedImage/versions/1.0.0",
-           "runOutputName": "trustedImageOutput",
-           "replicationRegions": ["${LOCATION}"]
+           "type": "ManagedImage",
+           "imageId": "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Compute/images/trustedImage",
+           "location": "${LOCATION}",
+           "runOutputName": "trustedImageOutput"
          }
        ],
        "identity": {
@@ -290,7 +285,7 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
        --resource-group ${RESOURCE_GROUP} \
        --resource-type Microsoft.VirtualMachineImages/imageTemplates \
        --name ${IMAGE_BUILDER_NAME} \
-       --api-version 2024-02-01 \
+       --api-version 2022-07-01 \
        --properties @image-template.json
    
    echo "✅ Image Builder template configured"
@@ -474,7 +469,7 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
        --resource-group ${RESOURCE_GROUP} \
        --resource-type Microsoft.VirtualMachineImages/imageTemplates \
        --name ${IMAGE_BUILDER_NAME} \
-       --api-version 2024-02-01 \
+       --api-version 2022-07-01 \
        --action Run
    
    # Monitor build progress
@@ -485,7 +480,7 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
        --resource-group ${RESOURCE_GROUP} \
        --resource-type Microsoft.VirtualMachineImages/imageTemplates \
        --name ${IMAGE_BUILDER_NAME} \
-       --api-version 2024-02-01 \
+       --api-version 2022-07-01 \
        --query 'properties.lastRunStatus.runState' \
        --output tsv)
    
@@ -552,7 +547,7 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
    ```bash
    # Verify content trust is enabled
    az acr config content-trust show \
-       --name ${ACR_NAME} \
+       --registry ${ACR_NAME} \
        --query 'status' \
        --output tsv
    ```
@@ -578,7 +573,7 @@ echo "✅ Managed identity created: ${MANAGED_IDENTITY}"
        --resource-group ${RESOURCE_GROUP} \
        --resource-type Microsoft.VirtualMachineImages/imageTemplates \
        --name ${IMAGE_BUILDER_NAME} \
-       --api-version 2024-02-01
+       --api-version 2022-07-01
    
    echo "✅ Image Builder template deleted"
    ```
@@ -648,7 +643,7 @@ Implementing a trusted container supply chain with Azure Attestation Service and
 
 The integration of Azure Image Builder with attestation services creates a reproducible, auditable build process that eliminates many common attack vectors in traditional CI/CD pipelines. By automating image creation and immediately verifying the build environment's integrity, organizations can prevent supply chain attacks where malicious code is injected during the build process. The [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/security/overview) emphasizes the importance of validating the integrity of deployment artifacts, which this solution addresses comprehensively.
 
-From a operational perspective, the combination of Azure Key Vault for key management and Azure Container Registry with content trust enabled creates multiple layers of security. Each signed image carries cryptographic proof of its origin and integrity, while the registry enforces signature verification on every operation. This follows the [Zero Trust security model](https://learn.microsoft.com/en-us/security/zero-trust/zero-trust-overview) principle of "never trust, always verify" by requiring explicit verification at each stage of the container lifecycle.
+From an operational perspective, the combination of Azure Key Vault for key management and Azure Container Registry with content trust enabled creates multiple layers of security. Each signed image carries cryptographic proof of its origin and integrity, while the registry enforces signature verification on every operation. This follows the [Zero Trust security model](https://learn.microsoft.com/en-us/security/zero-trust/zero-trust-overview) principle of "never trust, always verify" by requiring explicit verification at each stage of the container lifecycle. Note that Azure Container Registry content trust will be deprecated and replaced by [Notary Project](https://learn.microsoft.com/en-us/azure/container-registry/container-registry-content-trust-deprecation) solutions by March 2028.
 
 The solution also addresses compliance requirements by providing a complete audit trail from source code to production deployment. Every attestation event, key access, and image operation is logged and can be monitored through Azure Monitor and Azure Sentinel. For organizations in regulated industries, this level of auditability is essential for demonstrating compliance with standards like SOC 2, ISO 27001, and industry-specific regulations. The [Azure compliance documentation](https://learn.microsoft.com/en-us/azure/compliance/) provides detailed guidance on meeting various regulatory requirements.
 
@@ -670,4 +665,9 @@ Extend this trusted container supply chain implementation by exploring these adv
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

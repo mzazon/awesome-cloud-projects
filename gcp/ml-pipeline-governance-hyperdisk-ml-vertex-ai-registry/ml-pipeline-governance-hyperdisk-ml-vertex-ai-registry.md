@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Hyperdisk ML, Vertex AI Model Registry, Cloud Workflows, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: mlops, governance, model-registry, high-performance-storage, automation, vertex-ai
 recipe-generator-version: 1.3
@@ -69,7 +69,7 @@ graph TB
 2. Google Cloud CLI installed and configured (or Cloud Shell access)
 3. Basic understanding of machine learning pipelines and MLOps concepts
 4. Familiarity with Python for ML model development and governance scripts
-5. Estimated cost: $50-100 for running training workloads and storage during recipe execution
+5. Estimated cost: $60-120 for running training workloads, Hyperdisk ML storage (~$30/hour), and Vertex AI services during recipe execution
 
 > **Note**: This recipe follows Google Cloud MLOps best practices and the Well-Architected Framework. Review the [Vertex AI Model Registry documentation](https://cloud.google.com/vertex-ai/docs/model-registry/introduction) for additional governance guidance.
 
@@ -101,7 +101,7 @@ gcloud services enable storage.googleapis.com
 gcloud iam service-accounts create ml-governance-sa \
     --display-name="ML Governance Service Account"
 
-# Assign necessary IAM roles
+# Assign necessary IAM roles for ML governance
 gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="serviceAccount:ml-governance-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/aiplatform.user"
@@ -109,6 +109,10 @@ gcloud projects add-iam-policy-binding ${PROJECT_ID} \
 gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="serviceAccount:ml-governance-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/workflows.invoker"
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:ml-governance-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/monitoring.metricWriter"
 
 # Create Cloud Storage bucket for training data
 gsutil mb -p ${PROJECT_ID} \
@@ -152,7 +156,7 @@ echo "✅ Storage bucket created: ml-training-data-${RANDOM_SUFFIX}"
        --disk=name=ml-training-hyperdisk-${RANDOM_SUFFIX},mode=ro \
        --service-account=ml-governance-sa@${PROJECT_ID}.iam.gserviceaccount.com \
        --scopes=https://www.googleapis.com/auth/cloud-platform \
-       --image-family=debian-11 \
+       --image-family=debian-12 \
        --image-project=debian-cloud
    
    # Wait for instance to be ready
@@ -170,20 +174,24 @@ echo "✅ Storage bucket created: ml-training-data-${RANDOM_SUFFIX}"
    Vertex AI Model Registry serves as the central repository for managing ML model lifecycles, providing versioning, metadata tracking, and deployment management. This centralized approach ensures consistent model governance across development, staging, and production environments.
 
    ```bash
+   # Create sample model artifacts directory
+   gsutil -m cp -r gs://cloud-ml-data/img/flower_photos/ \
+       gs://ml-training-data-${RANDOM_SUFFIX}/sample-data/
+   
    # Create a model in Vertex AI Model Registry
    gcloud ai models upload \
        --region=${REGION} \
        --display-name=governance-demo-model-${RANDOM_SUFFIX} \
        --description="ML model with automated governance tracking" \
        --version-aliases=staging \
-       --container-image-uri=gcr.io/cloud-aiplatform/prediction/sklearn-cpu.1-0:latest \
+       --container-image-uri=us-docker.pkg.dev/vertex-ai/prediction/sklearn-cpu.1-3:latest \
        --artifact-uri=gs://ml-training-data-${RANDOM_SUFFIX}/models/
    
    # Store model ID for future reference
    export MODEL_ID=$(gcloud ai models list \
        --region=${REGION} \
        --filter="displayName:governance-demo-model-${RANDOM_SUFFIX}" \
-       --format="value(name)" | cut -d'/' -f6)
+       --format="value(name.basename())")
    
    echo "✅ Model registered in Vertex AI Model Registry with ID: ${MODEL_ID}"
    ```
@@ -197,17 +205,45 @@ echo "✅ Storage bucket created: ml-training-data-${RANDOM_SUFFIX}"
    ```bash
    # Create custom metrics for ML governance tracking
    cat > governance-metrics.yaml << EOF
-   displayName: "ML Governance Metrics Dashboard"
-   mosaicLayout:
-     tiles:
-     - width: 6
-       height: 4
-       widget:
-         title: "Model Training Performance"
-         scorecard:
-           timeSeriesQuery:
-             timeSeriesFilter:
-               filter: 'resource.type="gce_instance"'
+   {
+     "displayName": "ML Governance Metrics Dashboard",
+     "mosaicLayout": {
+       "tiles": [
+         {
+           "width": 6,
+           "height": 4,
+           "widget": {
+             "title": "Compute Instance Performance",
+             "scorecard": {
+               "timeSeriesQuery": {
+                 "timeSeriesFilter": {
+                   "filter": "resource.type=\"gce_instance\" AND resource.labels.instance_name=~\"ml-training-instance-.*\"",
+                   "aggregation": {
+                     "alignmentPeriod": "60s",
+                     "perSeriesAligner": "ALIGN_MEAN"
+                   }
+                 }
+               }
+             }
+           }
+         },
+         {
+           "width": 6,
+           "height": 4,
+           "widget": {
+             "title": "Hyperdisk ML Performance",
+             "scorecard": {
+               "timeSeriesQuery": {
+                 "timeSeriesFilter": {
+                   "filter": "resource.type=\"gce_disk\" AND resource.labels.disk_name=~\"ml-training-hyperdisk-.*\""
+                 }
+               }
+             }
+           }
+         }
+       ]
+     }
+   }
    EOF
    
    # Create monitoring dashboard for ML governance
@@ -245,7 +281,7 @@ echo "✅ Storage bucket created: ml-training-data-${RANDOM_SUFFIX}"
      - notifyStakeholders:
          call: sendNotification
          args:
-           message: "Model governance validation completed"
+           message: "Model governance validation completed successfully"
    
    validateModelQuality:
      params: [modelId, region]
@@ -273,7 +309,7 @@ echo "✅ Storage bucket created: ml-training-data-${RANDOM_SUFFIX}"
      - logUpdate:
          call: sys.log
          args:
-           text: \${"Updating model registry: " + modelId}
+           text: \${"Updating model registry status: " + status + " for model: " + modelId}
      - return:
          return: {"updated": true}
    
@@ -311,7 +347,7 @@ echo "✅ Storage bucket created: ml-training-data-${RANDOM_SUFFIX}"
        --display-name=governance-demo-model-v2-${RANDOM_SUFFIX} \
        --description="Model version with enhanced governance features" \
        --version-aliases=development,governance-enabled \
-       --container-image-uri=gcr.io/cloud-aiplatform/prediction/sklearn-cpu.1-0:latest \
+       --container-image-uri=us-docker.pkg.dev/vertex-ai/prediction/sklearn-cpu.1-3:latest \
        --artifact-uri=gs://ml-training-data-${RANDOM_SUFFIX}/models/v2/ \
        --labels=governance=enabled,compliance=validated
    
@@ -444,17 +480,22 @@ echo "✅ Storage bucket created: ml-training-data-${RANDOM_SUFFIX}"
            return json.dumps(self.lineage_data, indent=2)
    
    # Initialize lineage tracker
-   tracker = ModelLineageTracker("${PROJECT_ID}", "${REGION}")
+   import os
+   project_id = os.getenv('PROJECT_ID', 'default-project')
+   region = os.getenv('REGION', 'us-central1')
+   tracker = ModelLineageTracker(project_id, region)
    
    # Track a sample training run
    training_config = {
        'algorithm': 'random_forest',
-       'data_sources': ['gs://ml-training-data-${RANDOM_SUFFIX}/dataset.csv'],
+       'data_sources': [f'gs://ml-training-data-{os.getenv("RANDOM_SUFFIX", "abc123")}/dataset.csv'],
        'hyperparameters': {'n_estimators': 100, 'max_depth': 10},
-       'storage_performance': '10000_mbps_throughput'
+       'storage_performance': '10000_mbps_throughput',
+       'governance_validated': True
    }
    
-   run_id = tracker.track_training_run("${MODEL_ID}", training_config)
+   model_id = os.getenv('MODEL_ID', 'sample-model-id')
+   run_id = tracker.track_training_run(model_id, training_config)
    print(f"Training run tracked with ID: {run_id}")
    
    # Export lineage for audit
@@ -535,10 +576,12 @@ echo "✅ Storage bucket created: ml-training-data-${RANDOM_SUFFIX}"
    # Run policy validation test
    python3 governance-policies.py
    
-   # Verify compliance results
+   # Verify compliance results and lineage tracking
    if [ -f "model-lineage-audit.json" ]; then
        echo "✅ Lineage tracking operational"
-       jq '.[] | .environment.storage_type' model-lineage-audit.json
+       cat model-lineage-audit.json | python3 -m json.tool
+   else
+       echo "⚠️  Lineage audit file not found - check policy execution"
    fi
    ```
 
@@ -607,21 +650,31 @@ echo "✅ Storage bucket created: ml-training-data-${RANDOM_SUFFIX}"
    rm -f governance-metrics.yaml ml-governance-workflow.yaml
    rm -f governance-policies.py model-lineage.py model-lineage-audit.json
    
+   # Verify all resources are deleted
+   echo "Verifying resource cleanup..."
+   gcloud compute instances list --filter="name~ml-training-instance-.*" --format="value(name)"
+   gcloud compute disks list --filter="name~ml-training-hyperdisk-.*" --format="value(name)"
+   gcloud ai models list --region=${REGION} --filter="displayName~governance-demo-model-.*" --format="value(displayName)"
+   
    echo "✅ Cleanup completed successfully"
    echo "Note: Consider deleting the project if created specifically for this recipe"
    ```
 
 ## Discussion
 
-This comprehensive ML governance solution demonstrates how Google Cloud's specialized services work together to create enterprise-grade MLOps infrastructure. Hyperdisk ML provides the high-performance storage foundation essential for efficient ML training, delivering up to 1,200,000 MiB/s throughput that eliminates data loading bottlenecks commonly experienced in traditional storage systems. This performance advantage becomes critical when training large models with massive datasets, where storage I/O often becomes the limiting factor in training efficiency.
+This comprehensive ML governance solution demonstrates how Google Cloud's specialized services work together to create enterprise-grade MLOps infrastructure. Hyperdisk ML provides the high-performance storage foundation essential for efficient ML training, delivering up to 1,200,000 MiB/s throughput that eliminates data loading bottlenecks commonly experienced in traditional storage systems. This performance advantage becomes critical when training large models with massive datasets, where storage I/O often becomes the limiting factor in training efficiency. Learn more about [Hyperdisk performance characteristics](https://cloud.google.com/compute/docs/disks/hyperdisks) in the official Google Cloud documentation.
 
-The Vertex AI Model Registry serves as the central governance hub, providing not just model storage but comprehensive lifecycle management including versioning, metadata tracking, and deployment control. This centralized approach ensures that all models follow consistent governance practices, from initial development through production deployment. The registry's integration with Google Cloud's security framework ensures that access controls and audit trails meet enterprise compliance requirements while supporting collaborative ML development workflows.
+The Vertex AI Model Registry serves as the central governance hub, providing not just model storage but comprehensive lifecycle management including versioning, metadata tracking, and deployment control. This centralized approach ensures that all models follow consistent governance practices, from initial development through production deployment. The registry's integration with Google Cloud's IAM and security framework ensures that access controls and audit trails meet enterprise compliance requirements while supporting collaborative ML development workflows. Detailed information about model registry capabilities is available in the [Vertex AI Model Registry documentation](https://cloud.google.com/vertex-ai/docs/model-registry/introduction).
 
-Cloud Workflows orchestrates the governance automation, enforcing compliance policies and validation rules without manual intervention. This serverless orchestration approach ensures that governance processes scale with ML workload demands while maintaining consistent enforcement of organizational policies. The workflow system's integration with Cloud Monitoring provides real-time visibility into governance processes, enabling proactive identification of compliance issues and performance bottlenecks.
+Cloud Workflows orchestrates the governance automation, enforcing compliance policies and validation rules without manual intervention. This serverless orchestration approach ensures that governance processes scale with ML workload demands while maintaining consistent enforcement of organizational policies. The workflow system's integration with Cloud Monitoring provides real-time visibility into governance processes, enabling proactive identification of compliance issues and performance bottlenecks. For advanced workflow patterns, refer to the [Cloud Workflows documentation](https://cloud.google.com/workflows/docs) and [MLOps best practices guide](https://cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning).
 
-The policy engine implementation demonstrates how organizations can codify their ML governance requirements into automated validation systems. By defining clear performance thresholds, security requirements, and compliance standards, teams can ensure that only models meeting organizational criteria progress to production environments. This automated approach reduces the risk of human error while providing consistent governance enforcement across diverse ML projects and teams.
+The policy engine implementation demonstrates how organizations can codify their ML governance requirements into automated validation systems. By defining clear performance thresholds, security requirements, and compliance standards, teams can ensure that only models meeting organizational criteria progress to production environments. This automated approach reduces the risk of human error while providing consistent governance enforcement across diverse ML projects and teams. Organizations should also consider integrating with Google Cloud's [AI Platform Model Monitoring](https://cloud.google.com/vertex-ai/docs/model-monitoring/overview) for production model governance.
 
 > **Tip**: Implement gradual rollout strategies using Vertex AI Model Registry aliases to safely promote models through environments while maintaining governance controls and rollback capabilities.
+
+> **Warning**: Ensure proper IAM permissions are configured for all service accounts before deploying governance workflows. Review the [Google Cloud Security Best Practices](https://cloud.google.com/security/best-practices) for current recommendations.
+
+> **Note**: This configuration follows Google Cloud MLOps best practices and integrates with Google Cloud's Well-Architected Framework. See the [Google Cloud Architecture Center](https://cloud.google.com/architecture) for additional guidance on scalable ML governance patterns.
 
 ## Challenge
 
@@ -639,4 +692,9 @@ Extend this ML governance solution by implementing these advanced enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

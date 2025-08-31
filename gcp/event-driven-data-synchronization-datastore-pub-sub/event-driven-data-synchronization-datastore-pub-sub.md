@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Datastore, Cloud Pub/Sub, Cloud Functions, Cloud Logging
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: event-driven, data-synchronization, pubsub, datastore, serverless, messaging
 recipe-generator-version: 1.3
@@ -76,7 +76,7 @@ graph TB
 
 1. Google Cloud Project with Datastore API and Pub/Sub API enabled
 2. Google Cloud CLI (gcloud) installed and configured
-3. Python 3.9+ for Cloud Functions development
+3. Python 3.11+ for Cloud Functions development
 4. Basic understanding of NoSQL databases and event-driven architecture
 5. Estimated cost: $10-25 per month for development workloads (includes Datastore operations, Pub/Sub messages, and Cloud Functions invocations)
 
@@ -103,6 +103,7 @@ gcloud services enable datastore.googleapis.com
 gcloud services enable pubsub.googleapis.com
 gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable logging.googleapis.com
+gcloud services enable monitoring.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 
@@ -112,7 +113,6 @@ export SYNC_SUBSCRIPTION="sync-processor-${RANDOM_SUFFIX}"
 export AUDIT_SUBSCRIPTION="audit-logger-${RANDOM_SUFFIX}"
 export SYNC_FUNCTION="data-sync-processor-${RANDOM_SUFFIX}"
 export AUDIT_FUNCTION="audit-logger-${RANDOM_SUFFIX}"
-export CONFLICT_FUNCTION="conflict-resolver-${RANDOM_SUFFIX}"
 
 echo "✅ Resource names configured with suffix: ${RANDOM_SUFFIX}"
 ```
@@ -165,7 +165,7 @@ echo "✅ Resource names configured with suffix: ${RANDOM_SUFFIX}"
    # Create a test entity to initialize Datastore
    cat > datastore_init.py << 'EOF'
 from google.cloud import datastore
-import json
+from datetime import datetime
 import sys
 
 def initialize_datastore():
@@ -177,7 +177,7 @@ def initialize_datastore():
     entity.update({
         'name': 'initialization',
         'status': 'active',
-        'created_at': datastore.helpers.utcnow(),
+        'created_at': datetime.utcnow(),
         'version': 1,
         'sync_status': 'pending'
     })
@@ -211,6 +211,7 @@ EOF
 import base64
 import json
 import logging
+from datetime import datetime
 from google.cloud import datastore
 from google.cloud import pubsub_v1
 import functions_framework
@@ -234,7 +235,8 @@ def sync_processor(cloud_event):
         entity_id = event_data.get('entity_id')
         operation = event_data.get('operation')  # create, update, delete
         data = event_data.get('data', {})
-        timestamp = event_data.get('timestamp')
+        timestamp_str = event_data.get('timestamp')
+        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
         
         # Implement conflict resolution logic
         if operation in ['create', 'update']:
@@ -344,14 +346,14 @@ EOF
    
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
-google-cloud-datastore==2.19.0
-google-cloud-pubsub==2.18.4
-functions-framework==3.5.0
+google-cloud-datastore==2.20.1
+google-cloud-pubsub==2.25.2
+functions-framework==3.8.1
 EOF
    
    # Deploy the synchronization function
    gcloud functions deploy ${SYNC_FUNCTION} \
-       --runtime python39 \
+       --runtime python311 \
        --trigger-topic ${TOPIC_NAME} \
        --source . \
        --entry-point sync_processor \
@@ -442,13 +444,13 @@ EOF
    
    # Create requirements.txt for audit function
    cat > requirements.txt << 'EOF'
-google-cloud-logging==3.8.0
-functions-framework==3.5.0
+google-cloud-logging==3.11.3
+functions-framework==3.8.1
 EOF
    
    # Deploy the audit logging function
    gcloud functions deploy ${AUDIT_FUNCTION} \
-       --runtime python39 \
+       --runtime python311 \
        --trigger-topic ${TOPIC_NAME} \
        --source . \
        --entry-point audit_logger_func \
@@ -836,4 +838,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

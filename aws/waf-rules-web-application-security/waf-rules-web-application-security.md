@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: waf,cloudfront,alb,cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: waf,cloudfront,alb,cloudwatch,security
 recipe-generator-version: 1.3
@@ -334,11 +334,126 @@ echo "✅ Created CloudWatch Log Group: $LOG_GROUP_NAME"
        --query "IPSets[?Name=='blocked-ips-${RANDOM_SUFFIX}'].ARN" \
        --output text)
    
-   echo "✅ Created IP Set for blocking malicious IPs"
+   # Update WAF to include IP blocking rule
+   aws wafv2 update-web-acl \
+       --scope CLOUDFRONT \
+       --id $(aws wafv2 list-web-acls \
+           --scope CLOUDFRONT \
+           --region "$AWS_REGION" \
+           --query "WebACLs[?Name=='$WAF_NAME'].Id" \
+           --output text) \
+       --name "$WAF_NAME" \
+       --default-action Allow={} \
+       --description "Comprehensive WAF for web application security" \
+       --rules '[
+           {
+               "Name": "AWSManagedRulesCommonRuleSet",
+               "Priority": 1,
+               "Statement": {
+                   "ManagedRuleGroupStatement": {
+                       "VendorName": "AWS",
+                       "Name": "AWSManagedRulesCommonRuleSet"
+                   }
+               },
+               "OverrideAction": {
+                   "None": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "CommonRuleSetMetric"
+               }
+           },
+           {
+               "Name": "AWSManagedRulesKnownBadInputsRuleSet",
+               "Priority": 2,
+               "Statement": {
+                   "ManagedRuleGroupStatement": {
+                       "VendorName": "AWS",
+                       "Name": "AWSManagedRulesKnownBadInputsRuleSet"
+                   }
+               },
+               "OverrideAction": {
+                   "None": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "KnownBadInputsMetric"
+               }
+           },
+           {
+               "Name": "AWSManagedRulesSQLiRuleSet",
+               "Priority": 3,
+               "Statement": {
+                   "ManagedRuleGroupStatement": {
+                       "VendorName": "AWS",
+                       "Name": "AWSManagedRulesSQLiRuleSet"
+                   }
+               },
+               "OverrideAction": {
+                   "None": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "SQLiRuleSetMetric"
+               }
+           },
+           {
+               "Name": "RateLimitRule",
+               "Priority": 4,
+               "Statement": {
+                   "RateBasedStatement": {
+                       "Limit": 10000,
+                       "AggregateKeyType": "IP"
+                   }
+               },
+               "Action": {
+                   "Block": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "RateLimitMetric"
+               }
+           },
+           {
+               "Name": "BlockMaliciousIPs",
+               "Priority": 5,
+               "Statement": {
+                   "IPSetReferenceStatement": {
+                       "ARN": "'"$IP_SET_ARN"'"
+                   }
+               },
+               "Action": {
+                   "Block": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "IPBlockMetric"
+               }
+           }
+       ]' \
+       --visibility-config SampledRequestsEnabled=true,CloudWatchMetricsEnabled=true,MetricName="${WAF_NAME}Metric" \
+       --lock-token $(aws wafv2 get-web-acl \
+           --scope CLOUDFRONT \
+           --id $(aws wafv2 list-web-acls \
+               --scope CLOUDFRONT \
+               --region "$AWS_REGION" \
+               --query "WebACLs[?Name=='$WAF_NAME'].Id" \
+               --output text) \
+           --region "$AWS_REGION" \
+           --query "LockToken" \
+           --output text) \
+       --region "$AWS_REGION"
+   
+   echo "✅ Created IP Set and added IP blocking rule to WAF"
    echo "IP Set ARN: $IP_SET_ARN"
    ```
 
-   The IP Set is now configured with example blocked addresses and ready for immediate threat response. You can dynamically update this list through the AWS CLI or console as new threats are identified, enabling rapid blocking of malicious sources. This foundation supports automated threat response workflows where security tools can programmatically add threatening IPs based on attack detection.
+   The IP Set is now configured with example blocked addresses and actively integrated with your WAF rules. The system will immediately block any requests from the specified IP addresses or CIDR ranges. You can dynamically update this list through the AWS CLI or console as new threats are identified, enabling rapid blocking of malicious sources. This foundation supports automated threat response workflows where security tools can programmatically add threatening IPs based on attack detection.
 
 4. **Add Geographic Restrictions**:
 
@@ -430,8 +545,25 @@ echo "✅ Created CloudWatch Log Group: $LOG_GROUP_NAME"
                }
            },
            {
-               "Name": "BlockHighRiskCountries",
+               "Name": "BlockMaliciousIPs",
                "Priority": 5,
+               "Statement": {
+                   "IPSetReferenceStatement": {
+                       "ARN": "'"$IP_SET_ARN"'"
+                   }
+               },
+               "Action": {
+                   "Block": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "IPBlockMetric"
+               }
+           },
+           {
+               "Name": "BlockHighRiskCountries",
+               "Priority": 6,
                "Statement": {
                    "GeoMatchStatement": {
                        "CountryCodes": ["CN", "RU", "KP"]
@@ -546,11 +678,173 @@ echo "✅ Created CloudWatch Log Group: $LOG_GROUP_NAME"
        --query "RegexPatternSets[?Name=='suspicious-patterns-${RANDOM_SUFFIX}'].ARN" \
        --output text)
    
-   echo "✅ Created regex pattern set for custom threat detection"
+   # Update WAF to include regex matching rule
+   aws wafv2 update-web-acl \
+       --scope CLOUDFRONT \
+       --id $(aws wafv2 list-web-acls \
+           --scope CLOUDFRONT \
+           --region "$AWS_REGION" \
+           --query "WebACLs[?Name=='$WAF_NAME'].Id" \
+           --output text) \
+       --name "$WAF_NAME" \
+       --default-action Allow={} \
+       --description "Comprehensive WAF for web application security" \
+       --rules '[
+           {
+               "Name": "AWSManagedRulesCommonRuleSet",
+               "Priority": 1,
+               "Statement": {
+                   "ManagedRuleGroupStatement": {
+                       "VendorName": "AWS",
+                       "Name": "AWSManagedRulesCommonRuleSet"
+                   }
+               },
+               "OverrideAction": {
+                   "None": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "CommonRuleSetMetric"
+               }
+           },
+           {
+               "Name": "AWSManagedRulesKnownBadInputsRuleSet",
+               "Priority": 2,
+               "Statement": {
+                   "ManagedRuleGroupStatement": {
+                       "VendorName": "AWS",
+                       "Name": "AWSManagedRulesKnownBadInputsRuleSet"
+                   }
+               },
+               "OverrideAction": {
+                   "None": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "KnownBadInputsMetric"
+               }
+           },
+           {
+               "Name": "AWSManagedRulesSQLiRuleSet",
+               "Priority": 3,
+               "Statement": {
+                   "ManagedRuleGroupStatement": {
+                       "VendorName": "AWS",
+                       "Name": "AWSManagedRulesSQLiRuleSet"
+                   }
+               },
+               "OverrideAction": {
+                   "None": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "SQLiRuleSetMetric"
+               }
+           },
+           {
+               "Name": "RateLimitRule",
+               "Priority": 4,
+               "Statement": {
+                   "RateBasedStatement": {
+                       "Limit": 10000,
+                       "AggregateKeyType": "IP"
+                   }
+               },
+               "Action": {
+                   "Block": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "RateLimitMetric"
+               }
+           },
+           {
+               "Name": "BlockMaliciousIPs",
+               "Priority": 5,
+               "Statement": {
+                   "IPSetReferenceStatement": {
+                       "ARN": "'"$IP_SET_ARN"'"
+                   }
+               },
+               "Action": {
+                   "Block": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "IPBlockMetric"
+               }
+           },
+           {
+               "Name": "BlockHighRiskCountries",
+               "Priority": 6,
+               "Statement": {
+                   "GeoMatchStatement": {
+                       "CountryCodes": ["CN", "RU", "KP"]
+                   }
+               },
+               "Action": {
+                   "Block": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "GeoBlockMetric"
+               }
+           },
+           {
+               "Name": "CustomPatternMatching",
+               "Priority": 7,
+               "Statement": {
+                   "RegexPatternSetReferenceStatement": {
+                       "ARN": "'"$REGEX_SET_ARN"'",
+                       "FieldToMatch": {
+                           "UriPath": {}
+                       },
+                       "TextTransformations": [
+                           {
+                               "Priority": 0,
+                               "Type": "URL_DECODE"
+                           },
+                           {
+                               "Priority": 1,
+                               "Type": "HTML_ENTITY_DECODE"
+                           }
+                       ]
+                   }
+               },
+               "Action": {
+                   "Block": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "CustomPatternMetric"
+               }
+           }
+       ]' \
+       --visibility-config SampledRequestsEnabled=true,CloudWatchMetricsEnabled=true,MetricName="${WAF_NAME}Metric" \
+       --lock-token $(aws wafv2 get-web-acl \
+           --scope CLOUDFRONT \
+           --id $(aws wafv2 list-web-acls \
+               --scope CLOUDFRONT \
+               --region "$AWS_REGION" \
+               --query "WebACLs[?Name=='$WAF_NAME'].Id" \
+               --output text) \
+           --region "$AWS_REGION" \
+           --query "LockToken" \
+           --output text) \
+       --region "$AWS_REGION"
+   
+   echo "✅ Created regex pattern set and added custom matching rule"
    echo "Regex Pattern Set ARN: $REGEX_SET_ARN"
    ```
 
-   The custom pattern set is now configured to detect sophisticated attack signatures including SQL injection patterns, XSS attempts, directory traversal exploits, and command injection techniques. These patterns complement the managed rules by providing targeted protection against attack vectors specific to your application environment. The regular expressions are optimized for performance while maintaining high detection accuracy.
+   The custom pattern set is now configured to detect sophisticated attack signatures including SQL injection patterns, XSS attempts, directory traversal exploits, and command injection techniques. These patterns complement the managed rules by providing targeted protection against attack vectors specific to your application environment. The regular expressions are optimized for performance while maintaining high detection accuracy, with URL decoding and HTML entity decoding applied to catch obfuscated attacks.
 
 8. **Associate WAF with CloudFront Distribution**:
 
@@ -566,33 +860,17 @@ echo "✅ Created CloudWatch Log Group: $LOG_GROUP_NAME"
    # Set your CloudFront distribution ID
    read -p "Enter your CloudFront Distribution ID: " DISTRIBUTION_ID
    
-   # Associate WAF with CloudFront distribution
-   aws cloudfront get-distribution-config \
-       --id "$DISTRIBUTION_ID" \
-       --query "DistributionConfig" > /tmp/distribution-config.json
-   
-   # Update distribution config to include WAF
-   jq '.WebACLId = "'"$WAF_ARN"'"' /tmp/distribution-config.json > /tmp/updated-config.json
-   
-   # Get ETag for the distribution
-   ETAG=$(aws cloudfront get-distribution-config \
-       --id "$DISTRIBUTION_ID" \
-       --query "ETag" \
-       --output text)
-   
-   # Update the distribution
-   aws cloudfront update-distribution \
-       --id "$DISTRIBUTION_ID" \
-       --distribution-config file:///tmp/updated-config.json \
-       --if-match "$ETAG" \
-       --region "$AWS_REGION"
+   # Associate WAF with CloudFront distribution using new command
+   aws cloudfront associate-distribution-web-acl \
+       --distribution-id "$DISTRIBUTION_ID" \
+       --web-acl-id "$WAF_ARN"
    
    echo "✅ Associated WAF with CloudFront distribution: $DISTRIBUTION_ID"
    ```
 
    The WAF is now protecting your CloudFront distribution, with security rules active across all global edge locations. This integration provides immediate threat blocking at the network edge, reducing latency for legitimate users while preventing malicious traffic from reaching your origin infrastructure. The configuration will propagate to all edge locations within 15-20 minutes, ensuring global protection coverage.
 
-9. **Create Custom Bot Protection Rule**:
+9. **Create Bot Protection Rule**:
 
    Bot protection addresses the growing threat from automated attacks, content scraping, and competitive intelligence gathering that can overwhelm application resources and compromise business data. AWS Managed Bot Control rules use machine learning and behavioral analysis to distinguish between legitimate automated tools (like search engine crawlers) and malicious bots. This intelligent filtering preserves legitimate automated traffic while blocking harmful bot activities that could impact application performance and data integrity.
 
@@ -700,8 +978,25 @@ echo "✅ Created CloudWatch Log Group: $LOG_GROUP_NAME"
                }
            },
            {
-               "Name": "BlockHighRiskCountries",
+               "Name": "BlockMaliciousIPs",
                "Priority": 6,
+               "Statement": {
+                   "IPSetReferenceStatement": {
+                       "ARN": "'"$IP_SET_ARN"'"
+                   }
+               },
+               "Action": {
+                   "Block": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "IPBlockMetric"
+               }
+           },
+           {
+               "Name": "BlockHighRiskCountries",
+               "Priority": 7,
                "Statement": {
                    "GeoMatchStatement": {
                        "CountryCodes": ["CN", "RU", "KP"]
@@ -714,6 +1009,36 @@ echo "✅ Created CloudWatch Log Group: $LOG_GROUP_NAME"
                    "SampledRequestsEnabled": true,
                    "CloudWatchMetricsEnabled": true,
                    "MetricName": "GeoBlockMetric"
+               }
+           },
+           {
+               "Name": "CustomPatternMatching",
+               "Priority": 8,
+               "Statement": {
+                   "RegexPatternSetReferenceStatement": {
+                       "ARN": "'"$REGEX_SET_ARN"'",
+                       "FieldToMatch": {
+                           "UriPath": {}
+                       },
+                       "TextTransformations": [
+                           {
+                               "Priority": 0,
+                               "Type": "URL_DECODE"
+                           },
+                           {
+                               "Priority": 1,
+                               "Type": "HTML_ENTITY_DECODE"
+                           }
+                       ]
+                   }
+               },
+               "Action": {
+                   "Block": {}
+               },
+               "VisibilityConfig": {
+                   "SampledRequestsEnabled": true,
+                   "CloudWatchMetricsEnabled": true,
+                   "MetricName": "CustomPatternMetric"
                }
            }
        ]' \
@@ -775,7 +1100,9 @@ echo "✅ Created CloudWatch Log Group: $LOG_GROUP_NAME"
                             ["...", "KnownBadInputsMetric"],
                             ["...", "SQLiRuleSetMetric"],
                             ["...", "RateLimitMetric"],
-                            ["...", "GeoBlockMetric"]
+                            ["...", "GeoBlockMetric"],
+                            ["...", "IPBlockMetric"],
+                            ["...", "CustomPatternMetric"]
                         ],
                         "view": "timeSeries",
                         "stacked": false,
@@ -793,7 +1120,7 @@ echo "✅ Created CloudWatch Log Group: $LOG_GROUP_NAME"
 
     The WAF monitoring dashboard is now operational, providing comprehensive visibility into security events and rule performance across multiple time periods. The dashboard displays overall request statistics and rule-specific metrics, enabling security teams to monitor protection effectiveness and identify trends. This visual monitoring capability supports both real-time incident response and long-term security analysis for continuous improvement of your WAF configuration.
 
-   > **Note**: WAF dashboards can be customized to include additional metrics such as request latency, geographical distribution of blocked requests, and cost analysis. Consider integrating with AWS Security Hub for centralized security monitoring across all AWS services.
+    > **Note**: WAF dashboards can be customized to include additional metrics such as request latency, geographical distribution of blocked requests, and cost analysis. Consider integrating with AWS Security Hub for centralized security monitoring across all AWS services.
 
 ## Validation & Testing
 
@@ -885,25 +1212,8 @@ echo "✅ Created CloudWatch Log Group: $LOG_GROUP_NAME"
 
    ```bash
    # Remove WAF association from CloudFront
-   aws cloudfront get-distribution-config \
-       --id "$DISTRIBUTION_ID" \
-       --query "DistributionConfig" > /tmp/cleanup-config.json
-   
-   # Remove WAF association
-   jq '.WebACLId = ""' /tmp/cleanup-config.json > /tmp/cleanup-updated.json
-   
-   # Get current ETag
-   CLEANUP_ETAG=$(aws cloudfront get-distribution-config \
-       --id "$DISTRIBUTION_ID" \
-       --query "ETag" \
-       --output text)
-   
-   # Update distribution
-   aws cloudfront update-distribution \
-       --id "$DISTRIBUTION_ID" \
-       --distribution-config file:///tmp/cleanup-updated.json \
-       --if-match "$CLEANUP_ETAG" \
-       --region "$AWS_REGION"
+   aws cloudfront disassociate-distribution-web-acl \
+       --distribution-id "$DISTRIBUTION_ID"
    
    echo "✅ Removed WAF association from CloudFront distribution"
    ```
@@ -1014,22 +1324,18 @@ echo "✅ Created CloudWatch Log Group: $LOG_GROUP_NAME"
        --log-group-name "$LOG_GROUP_NAME" \
        --region "$AWS_REGION"
    
-   # Clean up temporary files
-   rm -f /tmp/distribution-config.json /tmp/updated-config.json
-   rm -f /tmp/cleanup-config.json /tmp/cleanup-updated.json
-   
-   echo "✅ Deleted CloudWatch Log Group and temporary files"
+   echo "✅ Deleted CloudWatch Log Group"
    ```
 
 ## Discussion
 
-AWS WAF provides comprehensive protection against common web application attacks through a combination of managed rule groups, custom rules, and rate limiting capabilities. The managed rule groups offer protection against the OWASP Top 10 vulnerabilities, including SQL injection, cross-site scripting, and other common attack vectors, while custom rules allow for application-specific threat detection.
+AWS WAF provides comprehensive protection against common web application attacks through a combination of managed rule groups, custom rules, and rate limiting capabilities. The managed rule groups offer protection against the OWASP Top 10 vulnerabilities, including SQL injection, cross-site scripting, and other common attack vectors, while custom rules allow for application-specific threat detection. This layered security approach follows the AWS Well-Architected Framework's security pillar principles of defense in depth and automated security best practices.
 
-The rate limiting functionality protects against DDoS attacks and brute force attempts by limiting the number of requests from a single IP address within a specified time window. Geographic blocking adds another layer of protection by restricting access from high-risk countries, while IP-based blocking allows for immediate response to known malicious sources. The bot control managed rule set provides advanced protection against automated attacks and scraping attempts.
+The rate limiting functionality protects against DDoS attacks and brute force attempts by limiting the number of requests from a single IP address within a specified time window. Geographic blocking adds another layer of protection by restricting access from high-risk countries, while IP-based blocking allows for immediate response to known malicious sources. The bot control managed rule set provides advanced protection against automated attacks and scraping attempts using machine learning algorithms to distinguish legitimate bots from malicious ones.
 
-Integration with CloudWatch provides comprehensive monitoring and alerting capabilities, enabling security teams to respond quickly to threats and analyze attack patterns. The logging capability captures detailed information about blocked requests, which is essential for forensic analysis and compliance reporting. This solution scales automatically with your application traffic and provides consistent protection across multiple AWS services.
+Integration with CloudWatch provides comprehensive monitoring and alerting capabilities, enabling security teams to respond quickly to threats and analyze attack patterns. The logging capability captures detailed information about blocked requests, which is essential for forensic analysis and compliance reporting. This solution scales automatically with your application traffic and provides consistent protection across multiple AWS services. For more information on WAF best practices, see the [AWS WAF Developer Guide](https://docs.aws.amazon.com/waf/latest/developerguide/).
 
-> **Tip**: Regularly review WAF logs and metrics to identify new attack patterns and adjust rules accordingly. Consider implementing automated response mechanisms using Lambda functions triggered by CloudWatch alarms.
+> **Tip**: Regularly review WAF logs and metrics to identify new attack patterns and adjust rules accordingly. Consider implementing automated response mechanisms using Lambda functions triggered by CloudWatch alarms to dynamically update IP sets based on detected threats.
 
 ## Challenge
 
@@ -1043,8 +1349,15 @@ Extend this solution by implementing these advanced security enhancements:
 
 4. **Build Cross-Service Security Integration**: Integrate WAF with AWS Security Hub, GuardDuty, and Inspector to create a comprehensive security monitoring and response system with automated remediation workflows.
 
-5. **Create Multi-Region WAF Management**: Implement a centralized WAF management system that synchronizes rules and configurations across multiple AWS regions for global applications.
+5. **Create Multi-Region WAF Management**: Implement a centralized WAF management system that synchronizes rules and configurations across multiple AWS regions for global applications using AWS Config and Lambda.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

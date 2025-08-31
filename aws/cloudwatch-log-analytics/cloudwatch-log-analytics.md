@@ -4,12 +4,12 @@ id: e139dadb
 category: analytics
 difficulty: 200
 subject: aws
-services: cloudwatch, logs, lambda, sns
+services: CloudWatch Logs, Lambda, SNS, EventBridge
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cloudwatch, logs, analytics, monitoring, insights
 recipe-generator-version: 1.3
@@ -49,7 +49,7 @@ graph TB
     
     subgraph "Automation"
         LAMBDA2[Analysis Lambda]
-        CWE[CloudWatch Events]
+        EB[EventBridge]
     end
     
     subgraph "Alerting"
@@ -67,7 +67,7 @@ graph TB
     LG2-->INSIGHTS
     LG3-->INSIGHTS
     INSIGHTS-->QUERIES
-    CWE-->LAMBDA2
+    EB-->LAMBDA2
     LAMBDA2-->INSIGHTS
     LAMBDA2-->SNS
     SNS-->EMAIL
@@ -79,14 +79,14 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with CloudWatch Logs, Lambda, and SNS permissions
+1. AWS account with CloudWatch Logs, Lambda, EventBridge, and SNS permissions
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of log formats and SQL-like query syntax
 4. Existing applications generating logs or sample log data
 5. Email address for receiving alerts and notifications
 6. Estimated cost: $10-30/month for moderate log volumes (varies by data ingestion)
 
-> **Note**: CloudWatch Logs charges based on data ingestion, storage, and query execution. Monitor usage to control costs in production environments.
+> **Note**: CloudWatch Logs charges based on data ingestion, storage, and query execution. Monitor usage to control costs in production environments. See [CloudWatch Logs pricing](https://aws.amazon.com/cloudwatch/pricing/) for details.
 
 ## Preparation
 
@@ -143,15 +143,37 @@ echo "Lambda Function: ${LAMBDA_FUNCTION_NAME}"
 
    ```bash
    # Create sample log entries with various patterns
+   TIMESTAMP1=$(date +%s000)
+   TIMESTAMP2=$((TIMESTAMP1 + 1000))
+   TIMESTAMP3=$((TIMESTAMP2 + 1000))
+   TIMESTAMP4=$((TIMESTAMP3 + 1000))
+   TIMESTAMP5=$((TIMESTAMP4 + 1000))
+   
    aws logs put-log-events \
        --log-group-name ${LOG_GROUP_NAME} \
        --log-stream-name "api-server-001" \
-       --log-events \
-       timestamp=$(date +%s000),message='[INFO] API Request: GET /users/123 - 200 - 45ms' \
-       timestamp=$(date +%s000),message='[ERROR] Database connection failed - Connection timeout' \
-       timestamp=$(date +%s000),message='[INFO] API Request: POST /orders - 201 - 120ms' \
-       timestamp=$(date +%s000),message='[WARN] High memory usage detected: 85%' \
-       timestamp=$(date +%s000),message='[INFO] API Request: GET /products - 200 - 32ms'
+       --log-events '[
+         {
+           "timestamp": '$TIMESTAMP1',
+           "message": "[INFO] API Request: GET /users/123 - 200 - 45ms"
+         },
+         {
+           "timestamp": '$TIMESTAMP2',
+           "message": "[ERROR] Database connection failed - Connection timeout"
+         },
+         {
+           "timestamp": '$TIMESTAMP3',
+           "message": "[INFO] API Request: POST /orders - 201 - 120ms"
+         },
+         {
+           "timestamp": '$TIMESTAMP4',
+           "message": "[WARN] High memory usage detected: 85%"
+         },
+         {
+           "timestamp": '$TIMESTAMP5',
+           "message": "[INFO] API Request: GET /products - 200 - 32ms"
+         }
+       ]'
    
    echo "✅ Sample log data generated successfully"
    ```
@@ -222,13 +244,8 @@ EOF
        --role-name ${LAMBDA_FUNCTION_NAME}-role \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
-   # Attach SNS publishing permissions
-   aws iam attach-role-policy \
-       --role-name ${LAMBDA_FUNCTION_NAME}-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonSNSFullAccess
-   
-   # Create custom policy for CloudWatch Logs Insights
-   cat > logs-policy.json << EOF
+   # Create custom policy for CloudWatch Logs Insights and SNS
+   cat > logs-sns-policy.json << EOF
 {
     "Version": "2012-10-17",
     "Statement": [
@@ -240,6 +257,13 @@ EOF
                 "logs:DescribeLogGroups"
             ],
             "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "sns:Publish"
+            ],
+            "Resource": "${SNS_TOPIC_ARN}"
         }
     ]
 }
@@ -247,12 +271,15 @@ EOF
    
    # Create and attach custom policy
    aws iam create-policy \
-       --policy-name ${LAMBDA_FUNCTION_NAME}-logs-policy \
-       --policy-document file://logs-policy.json
+       --policy-name ${LAMBDA_FUNCTION_NAME}-logs-sns-policy \
+       --policy-document file://logs-sns-policy.json
    
    aws iam attach-role-policy \
        --role-name ${LAMBDA_FUNCTION_NAME}-role \
-       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${LAMBDA_FUNCTION_NAME}-logs-policy
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${LAMBDA_FUNCTION_NAME}-logs-sns-policy
+   
+   # Wait for IAM consistency
+   sleep 10
    
    echo "✅ IAM policies attached successfully"
    ```
@@ -269,11 +296,15 @@ EOF
 import json
 import boto3
 import time
+import os
 from datetime import datetime, timedelta
 
 def lambda_handler(event, context):
     logs_client = boto3.client('logs')
     sns_client = boto3.client('sns')
+    
+    log_group_name = '${LOG_GROUP_NAME}'
+    sns_topic_arn = '${SNS_TOPIC_ARN}'
     
     # Query for errors in the last hour
     end_time = int(time.time())
@@ -288,7 +319,7 @@ def lambda_handler(event, context):
     try:
         # Start CloudWatch Logs Insights query
         response = logs_client.start_query(
-            logGroupName='${LOG_GROUP_NAME}',
+            logGroupName=log_group_name,
             startTime=start_time,
             endTime=end_time,
             queryString=query
@@ -296,23 +327,34 @@ def lambda_handler(event, context):
         
         query_id = response['queryId']
         
-        # Wait for query completion
-        while True:
+        # Wait for query completion with timeout
+        max_wait = 30
+        wait_time = 0
+        while wait_time < max_wait:
             result = logs_client.get_query_results(queryId=query_id)
             if result['status'] == 'Complete':
                 break
             time.sleep(1)
+            wait_time += 1
         
         # Check results and send alert if errors found
-        if result['results']:
-            error_count = int(result['results'][0][0]['value'])
-            if error_count > 0:
-                message = f"Alert: {error_count} errors detected in the last hour"
-                sns_client.publish(
-                    TopicArn='${SNS_TOPIC_ARN}',
-                    Message=message,
-                    Subject='Log Analytics Alert'
-                )
+        if result['status'] == 'Complete' and result['results']:
+            if len(result['results']) > 0 and len(result['results'][0]) > 0:
+                error_count = int(result['results'][0][0]['value'])
+                if error_count > 0:
+                    message = f"Log Analytics Alert: {error_count} errors detected in the last hour\\n\\nTimestamp: {datetime.now().isoformat()}\\nLog Group: {log_group_name}"
+                    sns_client.publish(
+                        TopicArn=sns_topic_arn,
+                        Message=message,
+                        Subject='CloudWatch Log Analytics Alert'
+                    )
+                    print(f"Alert sent: {error_count} errors detected")
+                else:
+                    print("No errors detected in the last hour")
+            else:
+                print("No results returned from query")
+        else:
+            print(f"Query incomplete or failed. Status: {result.get('status', 'Unknown')}")
                 
         return {
             'statusCode': 200,
@@ -320,7 +362,7 @@ def lambda_handler(event, context):
         }
         
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Error during log analysis: {str(e)}")
         return {
             'statusCode': 500,
             'body': json.dumps(f"Error: {str(e)}")
@@ -330,37 +372,39 @@ EOF
    # Package the function
    zip lambda-function.zip lambda_function.py
    
-   # Create Lambda function
+   # Create Lambda function with latest Python runtime
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
-       --timeout 60
+       --timeout 60 \
+       --description "Automated CloudWatch Logs analysis and alerting"
    
    echo "✅ Lambda function created: ${LAMBDA_FUNCTION_NAME}"
    ```
 
    The Lambda function is now deployed with automated error detection capabilities. This serverless approach eliminates infrastructure management while providing reliable, cost-effective log analysis that scales automatically with your logging volume.
 
-7. **Create CloudWatch Events Rule for Scheduled Analysis**:
+7. **Create EventBridge Rule for Scheduled Analysis**:
 
-   CloudWatch Events (now EventBridge) provides reliable, cron-like scheduling for automated workflows. Scheduling our log analysis function ensures continuous monitoring without manual intervention, enabling proactive issue detection and maintaining system observability around the clock.
+   Amazon EventBridge (formerly CloudWatch Events) provides reliable, cron-like scheduling for automated workflows. Scheduling our log analysis function ensures continuous monitoring without manual intervention, enabling proactive issue detection and maintaining system observability around the clock.
 
    ```bash
-   # Create CloudWatch Events rule for every 5 minutes
+   # Create EventBridge rule for every 5 minutes
    aws events put-rule \
        --name ${LAMBDA_FUNCTION_NAME}-schedule \
        --schedule-expression "rate(5 minutes)" \
-       --description "Automated log analysis every 5 minutes"
+       --description "Automated log analysis every 5 minutes" \
+       --state ENABLED
    
    # Add Lambda function as target
    aws events put-targets \
        --rule ${LAMBDA_FUNCTION_NAME}-schedule \
        --targets "Id"="1","Arn"="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}"
    
-   # Grant permission for Events to invoke Lambda
+   # Grant permission for EventBridge to invoke Lambda
    aws lambda add-permission \
        --function-name ${LAMBDA_FUNCTION_NAME} \
        --statement-id allow-eventbridge \
@@ -383,7 +427,7 @@ EOF
        --log-group-name ${LOG_GROUP_NAME} \
        --start-time $(date -d '1 hour ago' +%s) \
        --end-time $(date +%s) \
-       --query-string 'fields @timestamp, @message | filter @message like /API Request/ | parse @message "* - *ms" as status, response_time | stats avg(response_time) as avg_response_time' \
+       --query-string 'fields @timestamp, @message | filter @message like /API Request/ | parse @message "- * -" as status | parse @message "- *ms" as response_time | stats avg(response_time) as avg_response_time' \
        --query 'queryId' --output text)
    
    # Wait for query completion and get results
@@ -451,7 +495,7 @@ EOF
 4. **Test automated scheduling and notifications**:
 
    ```bash
-   # Check CloudWatch Events rule status
+   # Check EventBridge rule status
    aws events describe-rule \
        --name ${LAMBDA_FUNCTION_NAME}-schedule
    
@@ -465,7 +509,7 @@ EOF
 
 ## Cleanup
 
-1. **Remove CloudWatch Events rule and targets**:
+1. **Remove EventBridge rule and targets**:
 
    ```bash
    # Remove targets from rule
@@ -477,7 +521,7 @@ EOF
    aws events delete-rule \
        --name ${LAMBDA_FUNCTION_NAME}-schedule
    
-   echo "✅ CloudWatch Events rule deleted"
+   echo "✅ EventBridge rule deleted"
    ```
 
 2. **Delete Lambda function and associated resources**:
@@ -488,7 +532,8 @@ EOF
        --function-name ${LAMBDA_FUNCTION_NAME}
    
    # Remove local files
-   rm -f lambda_function.py lambda-function.zip response.json trust-policy.json logs-policy.json
+   rm -f lambda_function.py lambda-function.zip response.json \
+         trust-policy.json logs-sns-policy.json
    
    echo "✅ Lambda function and files deleted"
    ```
@@ -503,15 +548,11 @@ EOF
    
    aws iam detach-role-policy \
        --role-name ${LAMBDA_FUNCTION_NAME}-role \
-       --policy-arn arn:aws:iam::aws:policy/AmazonSNSFullAccess
-   
-   aws iam detach-role-policy \
-       --role-name ${LAMBDA_FUNCTION_NAME}-role \
-       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${LAMBDA_FUNCTION_NAME}-logs-policy
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${LAMBDA_FUNCTION_NAME}-logs-sns-policy
    
    # Delete custom policy and role
    aws iam delete-policy \
-       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${LAMBDA_FUNCTION_NAME}-logs-policy
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${LAMBDA_FUNCTION_NAME}-logs-sns-policy
    
    aws iam delete-role \
        --role-name ${LAMBDA_FUNCTION_NAME}-role
@@ -535,30 +576,37 @@ EOF
 
 ## Discussion
 
-CloudWatch Logs Insights transforms log analysis from a complex, infrastructure-heavy process into a serverless, SQL-like querying experience that scales automatically with your data volume. This solution demonstrates how modern cloud services enable sophisticated analytics capabilities without traditional data warehouse overhead, making advanced log analysis accessible to teams of all sizes.
+CloudWatch Logs Insights transforms log analysis from a complex, infrastructure-heavy process into a serverless, SQL-like querying experience that scales automatically with your data volume. This solution demonstrates how modern cloud services enable sophisticated analytics capabilities without traditional data warehouse overhead, making advanced log analysis accessible to teams of all sizes. The service can process terabytes of log data in seconds, providing near real-time insights into application behavior and system performance.
 
-The architecture leverages several key AWS services working in concert: CloudWatch Logs provides centralized, durable log storage with automatic indexing, while Logs Insights delivers interactive querying capabilities that can process terabytes of data in seconds. Lambda functions enable automated analysis workflows that run without server management, and SNS provides reliable notification delivery across multiple channels. This serverless approach eliminates infrastructure maintenance while ensuring high availability and automatic scaling.
+The architecture leverages several key AWS services working in concert: CloudWatch Logs provides centralized, durable log storage with automatic indexing, while Logs Insights delivers interactive querying capabilities using a purpose-built query language. Lambda functions enable automated analysis workflows that run without server management, and SNS provides reliable notification delivery across multiple channels. EventBridge ensures precise scheduling of analysis tasks, creating a robust monitoring pipeline that operates continuously without manual intervention.
 
-The automated alerting system demonstrates proactive monitoring patterns that detect issues before they impact users. By scheduling regular analysis of error patterns, response times, and system metrics, organizations can shift from reactive troubleshooting to predictive maintenance. The solution's flexibility allows for custom query development that adapts to specific application architectures and business requirements, making it valuable across diverse operational environments.
+The automated alerting system demonstrates proactive monitoring patterns that detect issues before they impact users. By scheduling regular analysis of error patterns, response times, and system metrics, organizations can shift from reactive troubleshooting to predictive maintenance. The solution's flexibility allows for custom query development that adapts to specific application architectures and business requirements, making it valuable across diverse operational environments. The [CloudWatch Logs Insights query syntax](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html) supports advanced filtering, parsing, and statistical operations.
 
-Cost optimization is achieved through intelligent retention policies, efficient query execution, and serverless computing models that charge only for actual usage. Organizations can control expenses by adjusting log retention periods, optimizing query frequency, and leveraging CloudWatch Logs' built-in compression and lifecycle management capabilities.
+Cost optimization is achieved through intelligent retention policies, efficient query execution, and serverless computing models that charge only for actual usage. Organizations can control expenses by adjusting log retention periods, optimizing query frequency, and leveraging CloudWatch Logs' built-in compression and lifecycle management capabilities. The solution follows AWS Well-Architected Framework principles for operational excellence, security, reliability, and cost optimization.
 
-> **Tip**: Use CloudWatch Logs Insights' query optimization features like field selection and time range filtering to improve performance and reduce costs. Consider implementing custom metrics extraction for frequently accessed data patterns.
+> **Tip**: Use CloudWatch Logs Insights' query optimization features like field selection and time range filtering to improve performance and reduce costs. Consider implementing custom metrics extraction for frequently accessed data patterns using the [parse command](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html) to structure unstructured log data.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Application Dashboard**: Create a CloudWatch dashboard that visualizes log analytics results across multiple applications, showing error rates, performance trends, and custom business metrics extracted from logs.
+1. **Multi-Application Dashboard**: Create a CloudWatch dashboard that visualizes log analytics results across multiple applications, showing error rates, performance trends, and custom business metrics extracted from logs using CloudWatch custom metrics.
 
 2. **Intelligent Anomaly Detection**: Integrate Amazon CloudWatch Anomaly Detection to automatically identify unusual patterns in log metrics, reducing false positives while catching subtle issues that static thresholds might miss.
 
-3. **Log Correlation Engine**: Build a Lambda function that correlates events across multiple log sources using trace IDs or session identifiers, enabling end-to-end transaction analysis in distributed systems.
+3. **Log Correlation Engine**: Build a Lambda function that correlates events across multiple log sources using trace IDs or session identifiers, enabling end-to-end transaction analysis in distributed systems with AWS X-Ray integration.
 
 4. **Custom Metric Generation**: Develop automated processes that extract business metrics from log data and publish them as CloudWatch custom metrics, enabling integration with existing monitoring and alerting systems.
 
-5. **Advanced Query Templates**: Create a library of reusable Logs Insights query templates for common analysis patterns like security monitoring, performance optimization, and business intelligence, complete with parameterization for different environments.
+5. **Advanced Query Templates**: Create a library of reusable Logs Insights query templates for common analysis patterns like security monitoring, performance optimization, and business intelligence, complete with parameterization for different environments and stored in AWS Systems Manager Parameter Store.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

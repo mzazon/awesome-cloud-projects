@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Cloud TPU, Dataproc Serverless, Cloud Storage, Vertex AI
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: machine-learning, tpu, trillium, dataproc, training-pipelines, large-language-models, neural-networks
 recipe-generator-version: 1.3
@@ -227,7 +227,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    gcloud compute tpus tpu-vm create ${TPU_NAME} \
        --zone=${ZONE} \
        --accelerator-type=v6e-8 \
-       --version=tpu-vm-v4-base \
+       --version=v2-alpha-tpuv6e \
        --network=default \
        --subnetwork=default \
        --service-account=${PROJECT_ID}-compute@developer.gserviceaccount.com \
@@ -363,6 +363,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    from google.cloud import aiplatform
    from google.cloud.aiplatform import pipeline_jobs
    import json
+   import os
    
    def create_training_pipeline():
        aiplatform.init(
@@ -403,12 +404,6 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    export REGION=${REGION}
    export BUCKET_NAME=${BUCKET_NAME}
    
-   # Submit Vertex AI training job
-   gcloud ai custom-jobs create \
-       --region=${REGION} \
-       --display-name="tpu-v6e-training-$(date +%s)" \
-       --config=training_config.yaml
-   
    # Create training configuration
    cat > training_config.yaml << EOF
    workerPoolSpecs:
@@ -425,6 +420,12 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    baseOutputDirectory:
      outputUriPrefix: gs://${BUCKET_NAME}/models/
    EOF
+   
+   # Submit Vertex AI training job
+   gcloud ai custom-jobs create \
+       --region=${REGION} \
+       --display-name="tpu-v6e-training-$(date +%s)" \
+       --config=training_config.yaml
    
    echo "✅ Vertex AI training pipeline configured"
    ```
@@ -481,7 +482,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        --condition-filter='resource.type="tpu_worker"' \
        --comparison=COMPARISON_GREATER_THAN \
        --threshold-value=0.1 \
-       --duration=300s
+       --duration=300s || true
    
    # Create custom metrics for training progress
    gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -666,4 +667,9 @@ Extend this solution by implementing these advanced enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

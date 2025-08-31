@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Asset Inventory, Cloud Workflows, Cloud Functions, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: governance, compliance, automation, asset-management, workflows
 recipe-generator-version: 1.3
@@ -72,7 +72,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and Organization-level access
-2. gcloud CLI v400.0.0+ installed and configured
+2. gcloud CLI v531.0.0+ installed and configured
 3. Basic understanding of Cloud IAM, Pub/Sub, and serverless architectures
 4. Organization Admin or Security Admin roles for setting up asset feeds
 5. Estimated cost: $50-150/month for medium-scale deployments with moderate governance activity
@@ -188,8 +188,7 @@ echo "✅ Organization ID: ${ORGANIZATION_ID}"
    export ASSET_TOPIC="asset-changes-${GOVERNANCE_SUFFIX}"
    
    gcloud pubsub topics create ${ASSET_TOPIC} \
-       --message-retention-duration=7d \
-       --message-encoding=JSON
+       --message-retention-duration=7d
    
    # Create subscription for workflow processing
    export WORKFLOW_SUBSCRIPTION="workflow-processor-${GOVERNANCE_SUFFIX}"
@@ -202,7 +201,7 @@ echo "✅ Organization ID: ${ORGANIZATION_ID}"
    echo "✅ Pub/Sub infrastructure created: ${ASSET_TOPIC}"
    ```
 
-   The Pub/Sub topic is configured with appropriate message retention and encoding settings to ensure reliable delivery of asset change events to the governance workflow system.
+   The Pub/Sub topic is configured with appropriate message retention settings to ensure reliable delivery of asset change events to the governance workflow system.
 
 4. **Create Service Account for Governance Operations**:
 
@@ -255,6 +254,7 @@ from google.cloud import bigquery
 from google.cloud import storage
 from datetime import datetime
 import hashlib
+import os
 
 def evaluate_governance_policy(request):
     """Evaluate assets against governance policies."""
@@ -313,7 +313,8 @@ def evaluate_governance_policy(request):
     
     # Record violations in BigQuery
     if violations:
-        table_id = f"{bq_client.project}.asset_governance_{request.headers.get('X-Governance-Suffix', 'default')}.asset_violations"
+        governance_suffix = os.environ.get('GOVERNANCE_SUFFIX', 'default')
+        table_id = f"{bq_client.project}.asset_governance_{governance_suffix}.asset_violations"
         
         rows_to_insert = []
         for violation in violations:
@@ -341,17 +342,17 @@ def evaluate_governance_policy(request):
     }, 200
 EOF
 
-   # Create requirements file
+   # Create requirements file with latest versions
    cat > requirements.txt << 'EOF'
-google-cloud-bigquery==3.13.0
-google-cloud-storage==2.10.0
-functions-framework==3.4.0
+google-cloud-bigquery>=3.25.0
+google-cloud-storage>=2.18.0
+functions-framework>=3.8.0
 EOF
 
    # Deploy the governance function
    gcloud functions deploy governance-policy-evaluator \
        --gen2 \
-       --runtime=python311 \
+       --runtime=python312 \
        --region=${REGION} \
        --source=. \
        --entry-point=evaluate_governance_policy \
@@ -421,17 +422,6 @@ main:
               args:
                 text: \${"Found " + string(evaluation_result.body.violations_found) + " violations for " + evaluation_result.body.resource_name}
                 severity: "WARNING"
-          
-          - trigger_alerts:
-              call: http.post
-              args:
-                url: "https://monitoring.googleapis.com/v3/projects/${PROJECT_ID}/notificationChannels"
-                headers:
-                  Authorization: \${"Bearer " + sys.get_env("GOOGLE_CLOUD_PROJECT")}
-                body:
-                  displayName: "Governance Violation Alert"
-                  description: \${"Policy violation detected: " + evaluation_result.body.resource_name}
-              result: alert_result
     
     - complete_processing:
         call: sys.log
@@ -501,6 +491,7 @@ import base64
 from google.cloud import workflows_v1
 from google.oauth2 import service_account
 import logging
+import os
 
 def trigger_governance_workflow(event, context):
     """Trigger governance workflow from Pub/Sub message."""
@@ -513,8 +504,8 @@ def trigger_governance_workflow(event, context):
     message_data = json.loads(pubsub_message)
     
     # Prepare workflow execution
-    project_id = context.resource.split('/')[1]
-    location = 'us-central1'  # Use your configured region
+    project_id = os.environ.get('GCP_PROJECT', context.resource.split('/')[1])
+    location = os.environ.get('FUNCTION_REGION', 'us-central1')
     workflow_id = 'governance-orchestrator'
     
     workflow_path = f"projects/{project_id}/locations/{location}/workflows/{workflow_id}"
@@ -541,14 +532,14 @@ def trigger_governance_workflow(event, context):
 EOF
 
    cat > requirements.txt << 'EOF'
-google-cloud-workflows==1.12.0
-google-auth==2.23.0
+google-cloud-workflows>=1.14.0
+google-auth>=2.35.0
 EOF
 
    # Deploy the trigger function
    gcloud functions deploy governance-workflow-trigger \
        --gen2 \
-       --runtime=python311 \
+       --runtime=python312 \
        --region=${REGION} \
        --source=. \
        --entry-point=trigger_governance_workflow \
@@ -736,4 +727,9 @@ Extend this automated governance solution by implementing these advanced capabil
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

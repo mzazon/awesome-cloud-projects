@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: connect,s3,cloudwatch,iam
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: connect,contact-center,telephony,customer-service,call-routing
 recipe-generator-version: 1.3
@@ -98,7 +98,17 @@ export S3_BUCKET_NAME="connect-recordings-${AWS_ACCOUNT_ID}-${RANDOM_SUFFIX}"
 # Create S3 bucket for call recordings and data storage
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
 
-echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
+# Enable S3 bucket versioning and encryption
+aws s3api put-bucket-versioning \
+    --bucket ${S3_BUCKET_NAME} \
+    --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+    --bucket ${S3_BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
+echo "✅ S3 bucket created and configured: ${S3_BUCKET_NAME}"
 ```
 
 ## Steps
@@ -121,6 +131,13 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    export INSTANCE_ID=$(echo $INSTANCE_RESULT | jq -r '.Id')
    export INSTANCE_ARN=$(echo $INSTANCE_RESULT | jq -r '.Arn')
    
+   # Wait for instance to be active
+   echo "Waiting for instance to become active..."
+   aws connect describe-instance \
+       --instance-id ${INSTANCE_ID} \
+       --query 'Instance.InstanceStatus' \
+       --output text
+   
    echo "✅ Connect instance created: ${INSTANCE_ID}"
    ```
 
@@ -137,15 +154,19 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    aws connect associate-instance-storage-config \
        --instance-id ${INSTANCE_ID} \
        --resource-type CALL_RECORDINGS \
-       --storage-config "S3Config={BucketName=${S3_BUCKET_NAME},BucketPrefix=call-recordings/}" \
-       --output table
+       --storage-config "S3Config={BucketName=${S3_BUCKET_NAME},BucketPrefix=call-recordings/}"
    
    # Associate S3 bucket for chat transcripts
    aws connect associate-instance-storage-config \
        --instance-id ${INSTANCE_ID} \
        --resource-type CHAT_TRANSCRIPTS \
-       --storage-config "S3Config={BucketName=${S3_BUCKET_NAME},BucketPrefix=chat-transcripts/}" \
-       --output table
+       --storage-config "S3Config={BucketName=${S3_BUCKET_NAME},BucketPrefix=chat-transcripts/}"
+   
+   # Associate S3 bucket for contact trace records
+   aws connect associate-instance-storage-config \
+       --instance-id ${INSTANCE_ID} \
+       --resource-type CONTACT_TRACE_RECORDS \
+       --storage-config "S3Config={BucketName=${S3_BUCKET_NAME},BucketPrefix=contact-trace-records/}"
    
    echo "✅ Storage configuration completed"
    ```
@@ -213,6 +234,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --output json)
    
    export QUEUE_ID=$(echo $QUEUE_RESULT | jq -r '.QueueId')
+   export QUEUE_ARN=$(echo $QUEUE_RESULT | jq -r '.QueueArn')
    
    echo "✅ Customer service queue created: ${QUEUE_ID}"
    ```
@@ -226,13 +248,6 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    Toll-free numbers eliminate customer calling costs and provide a professional image while supporting high-volume inbound traffic. The conditional logic in this step handles scenarios where toll-free numbers may not be immediately available, ensuring the setup process continues smoothly while providing alternative configuration options.
 
    ```bash
-   # List available phone numbers (this will show if any are available to claim)
-   aws connect list-phone-numbers \
-       --instance-id ${INSTANCE_ID} \
-       --phone-number-types TOLL_FREE DID \
-       --max-results 10 \
-       --output table
-   
    # Search for available phone numbers to claim (US numbers)
    AVAILABLE_NUMBERS=$(aws connect search-available-phone-numbers \
        --target-arn ${INSTANCE_ARN} \
@@ -245,17 +260,19 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    if [ "$(echo $AVAILABLE_NUMBERS | jq '.AvailableNumbersList | length')" -gt 0 ]; then
        PHONE_NUMBER=$(echo $AVAILABLE_NUMBERS | jq -r '.AvailableNumbersList[0]')
        
-       aws connect claim-phone-number \
+       CLAIM_RESULT=$(aws connect claim-phone-number \
            --target-arn ${INSTANCE_ARN} \
            --phone-number ${PHONE_NUMBER} \
            --phone-number-description "Main customer service line" \
            --tags "Purpose=CustomerService" \
-           --output json
+           --output json)
        
-       export CONTACT_NUMBER=$PHONE_NUMBER
+       export CONTACT_NUMBER=${PHONE_NUMBER}
+       export PHONE_NUMBER_ID=$(echo $CLAIM_RESULT | jq -r '.PhoneNumberId')
        echo "✅ Phone number claimed: ${PHONE_NUMBER}"
    else
        echo "ℹ️  No toll-free numbers available. Use Connect console to claim a number manually."
+       echo "ℹ️  You can continue with the setup and claim a number later."
    fi
    ```
 
@@ -316,7 +333,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
          "Identifier": "11111111-2222-3333-4444-555555555555",
          "Type": "TransferToQueue",
          "Parameters": {
-           "QueueId": "arn:aws:connect:REGION:ACCOUNT:instance/INSTANCE_ID/queue/QUEUE_ID"
+           "QueueId": "QUEUE_ARN_PLACEHOLDER"
          },
          "Transitions": {}
        }
@@ -324,11 +341,8 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    }
    EOF
    
-   # Update the contact flow with actual values
-   sed -i "s/REGION/${AWS_REGION}/g" contact-flow.json
-   sed -i "s/ACCOUNT/${AWS_ACCOUNT_ID}/g" contact-flow.json  
-   sed -i "s/INSTANCE_ID/${INSTANCE_ID}/g" contact-flow.json
-   sed -i "s/QUEUE_ID/${QUEUE_ID}/g" contact-flow.json
+   # Update the contact flow with actual queue ARN
+   sed -i "s/QUEUE_ARN_PLACEHOLDER/${QUEUE_ARN//\//\\/}/g" contact-flow.json
    
    # Create the contact flow
    FLOW_RESULT=$(aws connect create-contact-flow \
@@ -340,6 +354,16 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --output json)
    
    export FLOW_ID=$(echo $FLOW_RESULT | jq -r '.ContactFlowId')
+   export FLOW_ARN=$(echo $FLOW_RESULT | jq -r '.ContactFlowArn')
+   
+   # Associate phone number with contact flow (if phone number is available)
+   if [ ! -z "${PHONE_NUMBER_ID}" ]; then
+       aws connect associate-phone-number-contact-flow \
+           --phone-number-id ${PHONE_NUMBER_ID} \
+           --instance-id ${INSTANCE_ID} \
+           --contact-flow-id ${FLOW_ID}
+       echo "✅ Phone number associated with contact flow"
+   fi
    
    echo "✅ Contact flow created: ${FLOW_ID}"
    ```
@@ -406,7 +430,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    aws connect update-instance-attribute \
        --instance-id ${INSTANCE_ID} \
        --attribute-type CONTACT_LENS \
-       --value true
+       --value true 2>/dev/null || echo "ℹ️  Contact Lens not available in this region"
    
    # Create CloudWatch dashboard for monitoring
    cat > dashboard-config.json << EOF
@@ -414,6 +438,10 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
      "widgets": [
        {
          "type": "metric",
+         "x": 0,
+         "y": 0,
+         "width": 12,
+         "height": 6,
          "properties": {
            "metrics": [
              ["AWS/Connect", "ContactsReceived", "InstanceId", "${INSTANCE_ID}"],
@@ -483,6 +511,16 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --output table
    ```
 
+5. Verify phone number association (if claimed):
+
+   ```bash
+   # List phone numbers
+   aws connect list-phone-numbers \
+       --instance-id ${INSTANCE_ID} \
+       --phone-number-types TOLL_FREE DID \
+       --output table
+   ```
+
 ## Cleanup
 
 1. Remove users and profiles:
@@ -501,25 +539,18 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    echo "✅ Users deleted"
    ```
 
-2. Remove queues and contact flows:
+2. Release phone number (if claimed):
 
    ```bash
-   # Note: Contact flows and queues are automatically deleted with the instance
-   echo "ℹ️  Queues and flows will be deleted with instance"
-   ```
-
-3. Release phone number (if claimed):
-
-   ```bash
-   # List and release phone numbers
-   if [ ! -z "${CONTACT_NUMBER}" ]; then
+   # Release phone number if it was claimed
+   if [ ! -z "${PHONE_NUMBER_ID}" ]; then
        aws connect release-phone-number \
-           --phone-number-id ${CONTACT_NUMBER}
+           --phone-number-id ${PHONE_NUMBER_ID}
        echo "✅ Phone number released"
    fi
    ```
 
-4. Delete Connect instance:
+3. Delete Connect instance:
 
    ```bash
    # Delete the Connect instance (this removes all associated resources)
@@ -529,7 +560,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    echo "✅ Connect instance deletion initiated"
    ```
 
-5. Remove storage resources:
+4. Remove storage resources:
 
    ```bash
    # Empty and delete S3 bucket
@@ -540,32 +571,43 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    aws cloudwatch delete-dashboards \
        --dashboard-names "ConnectContactCenter-${RANDOM_SUFFIX}"
    
+   # Clean up local files
+   rm -f contact-flow.json dashboard-config.json
+   
    echo "✅ Storage and monitoring resources cleaned up"
    ```
 
 ## Discussion
 
-This implementation demonstrates building a production-ready contact center using Amazon Connect's cloud-native architecture. The solution eliminates traditional infrastructure concerns while providing enterprise-grade features like automatic call recording, intelligent routing, and real-time analytics.
+This implementation demonstrates building a production-ready contact center using Amazon Connect's cloud-native architecture. The solution eliminates traditional infrastructure concerns while providing enterprise-grade features like automatic call recording, intelligent routing, and real-time analytics. Amazon Connect follows the AWS Well-Architected Framework principles, ensuring operational excellence, security, reliability, performance efficiency, and cost optimization.
 
-Amazon Connect's pay-as-you-use pricing model significantly reduces costs compared to traditional contact center solutions. Organizations only pay for actual usage - per minute for calls and per agent-hour for staffing. This approach is particularly beneficial for businesses with variable call volumes or seasonal fluctuations.
+Amazon Connect's pay-as-you-use pricing model significantly reduces costs compared to traditional contact center solutions. Organizations only pay for actual usage - per minute for calls and per agent-hour for staffing. This approach is particularly beneficial for businesses with variable call volumes or seasonal fluctuations, providing cost optimization without sacrificing functionality.
 
-The service integrates seamlessly with other AWS services, enabling advanced capabilities like AI-powered chatbots (Amazon Lex), sentiment analysis (Amazon Comprehend), and machine learning insights (Contact Lens). Contact flows provide visual, drag-and-drop configuration for call routing logic, making it accessible to business users without requiring technical expertise.
+The service integrates seamlessly with other AWS services, enabling advanced capabilities like AI-powered chatbots (Amazon Lex), sentiment analysis (Amazon Comprehend), and machine learning insights (Contact Lens). Contact flows provide visual, drag-and-drop configuration for call routing logic, making it accessible to business users without requiring technical expertise. This integration ecosystem supports comprehensive omnichannel customer experience strategies.
 
-Real-time and historical analytics through CloudWatch and Connect's built-in reporting enable data-driven optimization of contact center operations. Managers can monitor key performance indicators like average handle time, abandonment rates, and agent utilization to improve customer experience and operational efficiency.
+Real-time and historical analytics through CloudWatch and Connect's built-in reporting enable data-driven optimization of contact center operations. Managers can monitor key performance indicators like average handle time, abandonment rates, and agent utilization to improve customer experience and operational efficiency. The solution supports compliance requirements through comprehensive audit trails and secure data storage in S3.
 
 > **Warning**: Contact Lens for Amazon Connect may not be available in all AWS regions. Check the [Amazon Connect service quotas and regional availability](https://docs.aws.amazon.com/connect/latest/adminguide/amazon-connect-service-limits.html) before enabling advanced analytics features.
 
-> **Tip**: Configure automatic call distribution (ACD) based on agent skills and availability to optimize customer wait times and ensure calls reach the most qualified agents.
+> **Tip**: Configure automatic call distribution (ACD) based on agent skills and availability to optimize customer wait times and ensure calls reach the most qualified agents. Use CloudWatch alarms to trigger notifications when queue wait times exceed business thresholds.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Add AI-powered chatbot integration**: Implement Amazon Lex chatbot for common inquiries with fallback to human agents for complex issues
-2. **Implement skills-based routing**: Create multiple agent skill sets (technical support, billing, sales) with intelligent routing based on customer input
-3. **Build real-time sentiment analysis**: Use Contact Lens to analyze customer sentiment during calls and trigger supervisor alerts for negative interactions
-4. **Create omnichannel experience**: Add web chat, SMS, and email channels with unified agent desktop and customer history across all touchpoints
+1. **Add AI-powered chatbot integration**: Implement Amazon Lex chatbot for common inquiries with fallback to human agents for complex issues, reducing agent workload and improving customer self-service capabilities
+2. **Implement skills-based routing**: Create multiple agent skill sets (technical support, billing, sales) with intelligent routing based on customer input or CRM integration
+3. **Build real-time sentiment analysis**: Use Contact Lens to analyze customer sentiment during calls and trigger supervisor alerts for negative interactions or escalation opportunities
+4. **Create omnichannel experience**: Add web chat, SMS, and email channels with unified agent desktop and customer history across all touchpoints using Amazon Connect APIs
+5. **Develop custom analytics dashboard**: Build advanced reporting using Amazon QuickSight with Connect data lake integration for executive-level insights and operational optimization
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,938 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Performance Monitoring AI Agents with AgentCore and CloudWatch
+  
+  This template creates a comprehensive monitoring system using AWS Bedrock AgentCore's 
+  built-in observability features, CloudWatch metrics and dashboards, and automated 
+  Lambda-based performance optimization alerts. Provides real-time visibility into 
+  agent execution paths, performance metrics, and automated remediation capabilities.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Agent Configuration"
+        Parameters:
+          - AgentName
+          - EnableDebugLogging
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - LatencyThresholdMs
+          - ErrorThreshold
+          - ThrottleThreshold
+          - LogRetentionDays
+      - Label:
+          default: "Performance Optimization"
+        Parameters:
+          - EnableAutomatedOptimization
+          - NotificationEmail
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - S3BucketName
+          - EnableS3Encryption
+    ParameterLabels:
+      AgentName:
+        default: "Agent Name"
+      LatencyThresholdMs:
+        default: "Latency Threshold (milliseconds)"
+      ErrorThreshold:
+        default: "Error Count Threshold"
+      ThrottleThreshold:
+        default: "Throttle Count Threshold"
+      LogRetentionDays:
+        default: "Log Retention Period (days)"
+      EnableAutomatedOptimization:
+        default: "Enable Automated Performance Optimization"
+      NotificationEmail:
+        default: "Notification Email Address"
+      S3BucketName:
+        default: "S3 Bucket Name for Performance Reports"
+      EnableS3Encryption:
+        default: "Enable S3 Bucket Encryption"
+      EnableDebugLogging:
+        default: "Enable Debug Logging"
+
+Parameters:
+  AgentName:
+    Type: String
+    Description: Name for the Bedrock AgentCore agent
+    Default: ai-performance-agent
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must be 3-63 characters, lowercase letters, numbers, and hyphens only
+
+  LatencyThresholdMs:
+    Type: Number
+    Description: Threshold for agent latency alarm in milliseconds
+    Default: 30000
+    MinValue: 1000
+    MaxValue: 300000
+    ConstraintDescription: Must be between 1,000ms (1 second) and 300,000ms (5 minutes)
+
+  ErrorThreshold:
+    Type: Number
+    Description: Threshold for system error count alarm
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  ThrottleThreshold:
+    Type: Number
+    Description: Threshold for throttle count alarm
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    ConstraintDescription: Must be between 1 and 1000
+
+  LogRetentionDays:
+    Type: Number
+    Description: Number of days to retain CloudWatch logs
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: Must be a valid CloudWatch Logs retention period
+
+  EnableAutomatedOptimization:
+    Type: String
+    Description: Enable automated performance optimization responses
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for performance alerts (optional)
+    Default: ''
+    AllowedPattern: ^$|^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+  S3BucketName:
+    Type: String
+    Description: Name for S3 bucket to store performance reports (leave empty for auto-generated)
+    Default: ''
+    AllowedPattern: ^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must be a valid S3 bucket name or empty for auto-generation
+
+  EnableS3Encryption:
+    Type: String
+    Description: Enable server-side encryption for S3 bucket
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableDebugLogging:
+    Type: String
+    Description: Enable debug-level logging for detailed troubleshooting
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  CreateSNSTopic: !Not [!Equals [!Ref NotificationEmail, '']]
+  AutoGenerateS3Bucket: !Equals [!Ref S3BucketName, '']
+  EnableS3EncryptionCondition: !Equals [!Ref EnableS3Encryption, 'true']
+  EnableOptimization: !Equals [!Ref EnableAutomatedOptimization, 'true']
+  EnableDebugLoggingCondition: !Equals [!Ref EnableDebugLogging, 'true']
+
+Resources:
+  # S3 Bucket for Performance Reports
+  PerformanceReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - AutoGenerateS3Bucket
+        - !Sub '${AWS::StackName}-agent-monitoring-${AWS::AccountId}-${AWS::Region}'
+        - !Ref S3BucketName
+      BucketEncryption: !If
+        - EnableS3EncryptionCondition
+        - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        - !Ref AWS::NoValue
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Purpose
+          Value: AgentCore Performance Monitoring
+        - Key: Environment
+          Value: !Ref AWS::StackName
+
+  # CloudWatch Log Groups
+  AgentCoreLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/bedrock/agentcore/${AgentName}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Purpose
+          Value: AgentCore Main Logs
+        - Key: Agent
+          Value: !Ref AgentName
+
+  AgentMemoryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/bedrock/agentcore/memory/${AgentName}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Purpose
+          Value: AgentCore Memory Operations
+        - Key: Agent
+          Value: !Ref AgentName
+
+  AgentGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/bedrock/agentcore/gateway/${AgentName}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Purpose
+          Value: AgentCore Gateway Operations
+        - Key: Agent
+          Value: !Ref AgentName
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PerformanceOptimizerFunction}'
+      RetentionInDays: 7
+      Tags:
+        - Key: Purpose
+          Value: Performance Optimizer Lambda Logs
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${PerformanceReportsBucket}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Purpose
+          Value: S3 Access Logs
+
+  # Custom Metric Filters
+  AgentResponseTimeMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroup
+      FilterPattern: '[timestamp, requestId, level=INFO, metric="response_time", value]'
+      MetricTransformations:
+        - MetricNamespace: CustomAgentMetrics
+          MetricName: AgentResponseTime
+          MetricValue: '$value'
+          DefaultValue: 0
+
+  ConversationQualityMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroup
+      FilterPattern: '[timestamp, requestId, level=INFO, metric="quality_score", score]'
+      MetricTransformations:
+        - MetricNamespace: CustomAgentMetrics
+          MetricName: ConversationQuality
+          MetricValue: '$score'
+          DefaultValue: 0
+
+  BusinessOutcomeMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref AgentCoreLogGroup
+      FilterPattern: '[timestamp, requestId, level=INFO, outcome="SUCCESS"]'
+      MetricTransformations:
+        - MetricNamespace: CustomAgentMetrics
+          MetricName: BusinessOutcomeSuccess
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # IAM Role for AgentCore with Observability Permissions
+  AgentCoreMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AgentCoreMonitoringRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonBedrockExecutionRoleForAgents_v20241118
+      Policies:
+        - PolicyName: AgentCoreObservabilityPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock/agentcore/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'AWS/BedrockAgentCore'
+      Tags:
+        - Key: Purpose
+          Value: AgentCore Observability
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  # IAM Role for Lambda Performance Optimizer
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'LambdaPerformanceMonitorRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
+      Policies:
+        - PolicyName: S3PerformanceReportsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                Resource: !Sub '${PerformanceReportsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref PerformanceReportsBucket
+        - PolicyName: SNSPublishAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [CreateSNSTopic, !Ref PerformanceAlertsTopic, !Ref AWS::NoValue]
+      Tags:
+        - Key: Purpose
+          Value: Performance Monitoring Lambda
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  # Lambda Function for Performance Optimization
+  PerformanceOptimizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'agent-performance-optimizer-${AWS::StackName}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          AGENT_NAME: !Ref AgentName
+          S3_BUCKET_NAME: !Ref PerformanceReportsBucket
+          SNS_TOPIC_ARN: !If [CreateSNSTopic, !Ref PerformanceAlertsTopic, '']
+          DEBUG_LOGGING: !Ref EnableDebugLogging
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime, timedelta
+          from typing import Dict, List, Any
+          
+          # Configure logging based on environment variable
+          log_level = logging.DEBUG if os.environ.get('DEBUG_LOGGING', 'false').lower() == 'true' else logging.INFO
+          logging.basicConfig(level=log_level)
+          logger = logging.getLogger(__name__)
+          
+          cloudwatch = boto3.client('cloudwatch')
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns') if os.environ.get('SNS_TOPIC_ARN') else None
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Monitor AgentCore performance metrics and trigger optimization actions
+              """
+              try:
+                  logger.debug(f"Received event: {json.dumps(event, default=str)}")
+                  
+                  # Handle different event sources
+                  alarm_data = parse_alarm_event(event)
+                  
+                  # Get performance metrics for analysis
+                  metrics_data = get_performance_metrics()
+                  
+                  # Analyze performance and create report
+                  performance_report = analyze_performance(alarm_data, metrics_data)
+                  
+                  # Store report in S3
+                  report_location = store_performance_report(performance_report, context.aws_request_id)
+                  
+                  # Send notification if configured
+                  if sns and os.environ.get('SNS_TOPIC_ARN'):
+                      send_notification(performance_report, report_location)
+                  
+                  logger.info(f"Performance analysis completed. Report stored at: {report_location}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Performance analysis completed successfully',
+                          'report_location': report_location,
+                          'optimization_actions': len(performance_report.get('optimization_actions', [])),
+                          'alarm_triggered': alarm_data.get('alarm_name', 'Unknown')
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing performance alert: {str(e)}", exc_info=True)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'request_id': context.aws_request_id
+                      })
+                  }
+          
+          def parse_alarm_event(event: Dict[str, Any]) -> Dict[str, str]:
+              """Parse alarm event from different sources"""
+              if 'Records' in event and event['Records']:
+                  # SNS message format
+                  message = json.loads(event['Records'][0]['Sns']['Message'])
+                  return {
+                      'alarm_name': message.get('AlarmName', 'Unknown'),
+                      'alarm_description': message.get('AlarmDescription', ''),
+                      'new_state': message.get('NewStateValue', 'UNKNOWN'),
+                      'reason': message.get('NewStateReason', '')
+                  }
+              else:
+                  # Direct invocation or test format
+                  return {
+                      'alarm_name': event.get('AlarmName', 'TestAlarm'),
+                      'alarm_description': event.get('AlarmDescription', 'Test alarm'),
+                      'new_state': event.get('NewStateValue', 'ALARM'),
+                      'reason': event.get('NewStateReason', 'Test trigger')
+                  }
+          
+          def get_performance_metrics() -> Dict[str, Any]:
+              """Retrieve AgentCore performance metrics"""
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(minutes=10)
+              
+              metrics = {}
+              
+              try:
+                  # Get AgentCore latency metrics
+                  latency_response = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/BedrockAgentCore',
+                      MetricName='Latency',
+                      Dimensions=[
+                          {'Name': 'AgentId', 'Value': os.environ['AGENT_NAME']}
+                      ],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Average', 'Maximum', 'Minimum']
+                  )
+                  metrics['latency'] = latency_response.get('Datapoints', [])
+                  
+                  # Get error metrics
+                  error_response = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/BedrockAgentCore',
+                      MetricName='SystemErrors',
+                      Dimensions=[
+                          {'Name': 'AgentId', 'Value': os.environ['AGENT_NAME']}
+                      ],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Sum']
+                  )
+                  metrics['errors'] = error_response.get('Datapoints', [])
+                  
+                  # Get throttle metrics
+                  throttle_response = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/BedrockAgentCore',
+                      MetricName='Throttles',
+                      Dimensions=[
+                          {'Name': 'AgentId', 'Value': os.environ['AGENT_NAME']}
+                      ],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Sum']
+                  )
+                  metrics['throttles'] = throttle_response.get('Datapoints', [])
+                  
+              except Exception as e:
+                  logger.warning(f"Could not retrieve all metrics: {str(e)}")
+              
+              return metrics
+          
+          def analyze_performance(alarm_data: Dict[str, str], metrics_data: Dict[str, Any]) -> Dict[str, Any]:
+              """Analyze performance metrics and generate optimization recommendations"""
+              report = {
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'alarm_data': alarm_data,
+                  'metrics_summary': {},
+                  'optimization_actions': [],
+                  'severity': 'INFO'
+              }
+              
+              # Analyze latency metrics
+              if 'latency' in metrics_data and metrics_data['latency']:
+                  latency_points = metrics_data['latency']
+                  avg_latency = sum(dp['Average'] for dp in latency_points) / len(latency_points)
+                  max_latency = max((dp['Maximum'] for dp in latency_points), default=0)
+                  
+                  report['metrics_summary']['average_latency_ms'] = round(avg_latency, 2)
+                  report['metrics_summary']['maximum_latency_ms'] = round(max_latency, 2)
+                  
+                  if avg_latency > 30000:  # 30 seconds
+                      report['optimization_actions'].append({
+                          'action': 'increase_memory_allocation',
+                          'reason': f'High average latency detected: {avg_latency:.2f}ms',
+                          'priority': 'HIGH'
+                      })
+                      report['severity'] = 'HIGH'
+                  
+                  if max_latency > 60000:  # 60 seconds
+                      report['optimization_actions'].append({
+                          'action': 'investigate_timeout_issues',
+                          'reason': f'Maximum latency threshold exceeded: {max_latency:.2f}ms',
+                          'priority': 'CRITICAL'
+                      })
+                      report['severity'] = 'CRITICAL'
+              
+              # Analyze error metrics
+              if 'errors' in metrics_data and metrics_data['errors']:
+                  total_errors = sum(dp['Sum'] for dp in metrics_data['errors'])
+                  report['metrics_summary']['total_errors'] = total_errors
+                  
+                  if total_errors > 0:
+                      report['optimization_actions'].append({
+                          'action': 'review_error_logs',
+                          'reason': f'System errors detected: {total_errors} errors in last 10 minutes',
+                          'priority': 'MEDIUM'
+                      })
+                      if report['severity'] == 'INFO':
+                          report['severity'] = 'MEDIUM'
+              
+              # Analyze throttle metrics
+              if 'throttles' in metrics_data and metrics_data['throttles']:
+                  total_throttles = sum(dp['Sum'] for dp in metrics_data['throttles'])
+                  report['metrics_summary']['total_throttles'] = total_throttles
+                  
+                  if total_throttles > 0:
+                      report['optimization_actions'].append({
+                          'action': 'implement_exponential_backoff',
+                          'reason': f'Throttling detected: {total_throttles} throttles in last 10 minutes',
+                          'priority': 'MEDIUM'
+                      })
+                      if report['severity'] == 'INFO':
+                          report['severity'] = 'MEDIUM'
+              
+              # Add general health check if no specific metrics available
+              if not report['optimization_actions']:
+                  report['optimization_actions'].append({
+                      'action': 'verify_agent_health',
+                      'reason': 'No performance issues detected in available metrics',
+                      'priority': 'LOW'
+                  })
+              
+              return report
+          
+          def store_performance_report(report: Dict[str, Any], request_id: str) -> str:
+              """Store performance report in S3"""
+              bucket_name = os.environ['S3_BUCKET_NAME']
+              timestamp = datetime.now()
+              report_key = f"performance-reports/{timestamp.strftime('%Y/%m/%d')}/{timestamp.strftime('%H%M%S')}-{request_id}.json"
+              
+              s3.put_object(
+                  Bucket=bucket_name,
+                  Key=report_key,
+                  Body=json.dumps(report, indent=2, default=str),
+                  ContentType='application/json',
+                  ServerSideEncryption='AES256'
+              )
+              
+              return f"s3://{bucket_name}/{report_key}"
+          
+          def send_notification(report: Dict[str, Any], report_location: str) -> None:
+              """Send SNS notification for high severity issues"""
+              if report.get('severity') in ['HIGH', 'CRITICAL']:
+                  message = {
+                      'default': f"AgentCore Performance Alert - {report['severity']} Severity",
+                      'email': format_email_notification(report, report_location)
+                  }
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"AgentCore Performance Alert - {report['alarm_data']['alarm_name']}",
+                      Message=json.dumps(message),
+                      MessageStructure='json'
+                  )
+          
+          def format_email_notification(report: Dict[str, Any], report_location: str) -> str:
+              """Format email notification content"""
+              actions = report.get('optimization_actions', [])
+              high_priority_actions = [a for a in actions if a.get('priority') in ['HIGH', 'CRITICAL']]
+              
+              email_body = f"""
+          AgentCore Performance Alert
+          
+          Severity: {report.get('severity', 'UNKNOWN')}
+          Alarm: {report['alarm_data']['alarm_name']}
+          Agent: {os.environ['AGENT_NAME']}
+          Timestamp: {report['timestamp']}
+          
+          Performance Summary:
+          {json.dumps(report.get('metrics_summary', {}), indent=2)}
+          
+          High Priority Actions Required:
+          """
+              
+              for action in high_priority_actions:
+                  email_body += f"- {action['action']}: {action['reason']}\n"
+              
+              email_body += f"\nFull Report: {report_location}"
+              
+              return email_body
+      Tags:
+        - Key: Purpose
+          Value: Performance Monitoring
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  # SNS Topic for Performance Alerts (conditional)
+  PerformanceAlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub 'agentcore-performance-alerts-${AWS::StackName}'
+      DisplayName: AgentCore Performance Alerts
+      Tags:
+        - Key: Purpose
+          Value: Performance Alerting
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  PerformanceAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSTopic
+    Properties:
+      TopicArn: !Ref PerformanceAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarms
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'AgentCore-HighLatency-${AWS::StackName}'
+      AlarmDescription: !Sub 'Alert when agent ${AgentName} latency exceeds ${LatencyThresholdMs}ms'
+      MetricName: Latency
+      Namespace: AWS/BedrockAgentCore
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LatencyThresholdMs
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AgentId
+          Value: !Ref AgentName
+      AlarmActions:
+        - !If
+          - EnableOptimization
+          - !GetAtt PerformanceOptimizerFunction.Arn
+          - !Ref AWS::NoValue
+        - !If
+          - CreateSNSTopic
+          - !Ref PerformanceAlertsTopic
+          - !Ref AWS::NoValue
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Purpose
+          Value: Latency Monitoring
+        - Key: Agent
+          Value: !Ref AgentName
+
+  HighSystemErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'AgentCore-HighSystemErrors-${AWS::StackName}'
+      AlarmDescription: !Sub 'Alert when agent ${AgentName} system errors exceed ${ErrorThreshold}'
+      MetricName: SystemErrors
+      Namespace: AWS/BedrockAgentCore
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AgentId
+          Value: !Ref AgentName
+      AlarmActions:
+        - !If
+          - EnableOptimization
+          - !GetAtt PerformanceOptimizerFunction.Arn
+          - !Ref AWS::NoValue
+        - !If
+          - CreateSNSTopic
+          - !Ref PerformanceAlertsTopic
+          - !Ref AWS::NoValue
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Purpose
+          Value: Error Rate Monitoring
+        - Key: Agent
+          Value: !Ref AgentName
+
+  HighThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'AgentCore-HighThrottles-${AWS::StackName}'
+      AlarmDescription: !Sub 'Alert when agent ${AgentName} throttles exceed ${ThrottleThreshold}'
+      MetricName: Throttles
+      Namespace: AWS/BedrockAgentCore
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ThrottleThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AgentId
+          Value: !Ref AgentName
+      AlarmActions:
+        - !If
+          - EnableOptimization
+          - !GetAtt PerformanceOptimizerFunction.Arn
+          - !Ref AWS::NoValue
+        - !If
+          - CreateSNSTopic
+          - !Ref PerformanceAlertsTopic
+          - !Ref AWS::NoValue
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Purpose
+          Value: Throttle Monitoring
+        - Key: Agent
+          Value: !Ref AgentName
+
+  # Lambda Permission for CloudWatch Alarms
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableOptimization
+    Properties:
+      FunctionName: !Ref PerformanceOptimizerFunction
+      Action: lambda:InvokeFunction
+      Principal: cloudwatch.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # CloudWatch Dashboard
+  PerformanceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'AgentCore-Performance-${AWS::StackName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/BedrockAgentCore", "Latency", "AgentId", "${AgentName}" ],
+                  [ ".", "Invocations", ".", "." ],
+                  [ ".", "SessionCount", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Agent Performance Metrics",
+                "period": 300,
+                "stat": "Average",
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "Latency Threshold",
+                      "value": ${LatencyThresholdMs}
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/BedrockAgentCore", "UserErrors", "AgentId", "${AgentName}" ],
+                  [ ".", "SystemErrors", ".", "." ],
+                  [ ".", "Throttles", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Error and Throttle Rates",
+                "period": 300,
+                "stat": "Sum",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "Error Threshold",
+                      "value": ${ErrorThreshold}
+                    },
+                    {
+                      "label": "Throttle Threshold", 
+                      "value": ${ThrottleThreshold}
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "CustomAgentMetrics", "AgentResponseTime", { "stat": "Average" } ],
+                  [ ".", "ConversationQuality", { "stat": "Average" } ],
+                  [ ".", "BusinessOutcomeSuccess", { "stat": "Sum" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Custom Business Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/bedrock/agentcore/${AgentName}' | fields @timestamp, @message\\n| filter @message like /ERROR/\\n| sort @timestamp desc\\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Agent Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  AgentName:
+    Description: Name of the AgentCore agent
+    Value: !Ref AgentName
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentName'
+
+  PerformanceReportsBucket:
+    Description: S3 bucket for storing performance reports
+    Value: !Ref PerformanceReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceReportsBucket'
+
+  PerformanceOptimizerFunction:
+    Description: Lambda function for performance optimization
+    Value: !Ref PerformanceOptimizerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceOptimizerFunction'
+
+  AgentCoreMonitoringRoleArn:
+    Description: IAM role ARN for AgentCore with observability permissions
+    Value: !GetAtt AgentCoreMonitoringRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentCoreMonitoringRoleArn'
+
+  PerformanceDashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${PerformanceDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  SNSTopicArn:
+    Condition: CreateSNSTopic
+    Description: SNS topic ARN for performance alerts
+    Value: !Ref PerformanceAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  HighLatencyAlarmArn:
+    Description: ARN of the high latency CloudWatch alarm
+    Value: !GetAtt HighLatencyAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HighLatencyAlarmArn'
+
+  HighSystemErrorsAlarmArn:
+    Description: ARN of the high system errors CloudWatch alarm
+    Value: !GetAtt HighSystemErrorsAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HighSystemErrorsAlarmArn'
+
+  HighThrottlesAlarmArn:
+    Description: ARN of the high throttles CloudWatch alarm
+    Value: !GetAtt HighThrottlesAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HighThrottlesAlarmArn'
+
+  LogGroups:
+    Description: CloudWatch log groups created for monitoring
+    Value: !Sub |
+      Main: ${AgentCoreLogGroup}
+      Memory: ${AgentMemoryLogGroup}
+      Gateway: ${AgentGatewayLogGroup}
+      Lambda: ${LambdaLogGroup}
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroups'
+
+  CustomMetricNamespace:
+    Description: Namespace for custom agent metrics
+    Value: CustomAgentMetrics
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomMetricNamespace'

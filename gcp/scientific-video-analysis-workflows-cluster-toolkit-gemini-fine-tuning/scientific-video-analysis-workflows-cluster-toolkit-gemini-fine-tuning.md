@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Cluster Toolkit, Vertex AI, Cloud Dataflow, Cloud Storage
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: hpc, ai, video-analysis, scientific-computing, machine-learning, batch-processing
 recipe-generator-version: 1.3
@@ -128,9 +128,9 @@ gsutil mb -p ${PROJECT_ID} \
 gsutil versioning set on gs://${BUCKET_NAME}
 
 # Create directory structure for organized data management
-gsutil -m cp -r gs://empty-folder gs://${BUCKET_NAME}/raw-videos/
-gsutil -m cp -r gs://empty-folder gs://${BUCKET_NAME}/processed-results/
-gsutil -m cp -r gs://empty-folder gs://${BUCKET_NAME}/model-artifacts/
+echo "" | gsutil cp - gs://${BUCKET_NAME}/raw-videos/.keep
+echo "" | gsutil cp - gs://${BUCKET_NAME}/processed-results/.keep
+echo "" | gsutil cp - gs://${BUCKET_NAME}/model-artifacts/.keep
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Storage bucket created: ${BUCKET_NAME}"
@@ -144,8 +144,11 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 
    ```bash
    # Clone the Cluster Toolkit repository
-   git clone https://github.com/GoogleCloudPlatform/hpc-toolkit.git
-   cd hpc-toolkit
+   git clone https://github.com/GoogleCloudPlatform/cluster-toolkit.git
+   cd cluster-toolkit
+   
+   # Build the gcluster binary
+   make
    
    # Create cluster configuration for video analysis
    cat > video-analysis-cluster.yaml << EOF
@@ -197,8 +200,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        use: [network, slurm_controller]
    EOF
    
-   # Build the deployment
-   ./ghpc create video-analysis-cluster.yaml
+   # Build the deployment using gcluster
+   ./gcluster create video-analysis-cluster.yaml
    cd video-analysis-cluster
    
    # Deploy the cluster infrastructure
@@ -216,18 +219,6 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    Vertex AI provides managed infrastructure for fine-tuning large language models like Gemini. Setting up the fine-tuning environment requires creating a custom dataset, configuring training parameters, and establishing model versioning for the specialized scientific video analysis use case.
 
    ```bash
-   # Create Vertex AI dataset for scientific video analysis
-   gcloud ai datasets create \
-       --display-name="scientific-video-dataset" \
-       --metadata-schema-uri="gs://google-cloud-aiplatform/schema/dataset/metadata/text_1.0.0.yaml" \
-       --region=${REGION}
-   
-   # Store dataset ID for later use
-   DATASET_ID=$(gcloud ai datasets list \
-       --region=${REGION} \
-       --filter="displayName:scientific-video-dataset" \
-       --format="value(name)" | cut -d'/' -f6)
-   
    # Create training dataset in JSONL format for Gemini fine-tuning
    cat > scientific-video-training.jsonl << EOF
    {"input_text": "Analyze this microscopy video for cellular division patterns", "output_text": "This video shows metaphase alignment of chromosomes during mitosis. The spindle apparatus is clearly visible, indicating normal cell division progression. Key features include: 1) Chromosome condensation and alignment at the metaphase plate, 2) Spindle fiber attachment to kinetochores, 3) Cell cycle checkpoint activation prior to anaphase onset."}
@@ -239,16 +230,29 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    gsutil cp scientific-video-training.jsonl \
        gs://${BUCKET_NAME}/model-artifacts/training-data/
    
-   # Create Gemini fine-tuning job
-   gcloud ai model-garden deploy \
-       --region=${REGION} \
-       --display-name="scientific-video-gemini" \
-       --model-id="gemini-1.5-flash" \
-       --machine-type="n1-standard-4" \
-       --accelerator-type="NVIDIA_TESLA_T4" \
-       --accelerator-count=1
+   # Create Gemini fine-tuning job using REST API
+   curl -X POST \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       -H "Content-Type: application/json" \
+       "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/tuningJobs" \
+       -d '{
+         "baseModel": "gemini-2.5-flash",
+         "supervisedTuningSpec": {
+           "trainingDatasetUri": "gs://'${BUCKET_NAME}'/model-artifacts/training-data/scientific-video-training.jsonl",
+           "hyperParameters": {
+             "epochCount": "5",
+             "learningRateMultiplier": 1.0
+           }
+         },
+         "labels": {
+           "use_case": "scientific_video_analysis"
+         }
+       }'
    
-   echo "✅ Vertex AI fine-tuning environment configured"
+   # Wait for fine-tuning job completion (this may take 30-60 minutes)
+   echo "Fine-tuning job submitted. Monitor progress in Vertex AI console."
+   
+   echo "✅ Vertex AI fine-tuning job configured"
    ```
 
    The fine-tuning process is now configured to create a specialized Gemini model trained on scientific video analysis patterns. This model will provide domain-specific intelligence for automated video interpretation across various scientific disciplines.
@@ -267,6 +271,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    import json
    import subprocess
    import logging
+   import datetime
    
    class VideoAnalysisOptions(PipelineOptions):
        @classmethod
@@ -277,6 +282,10 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
            parser.add_argument('--model_endpoint', required=True)
    
    class ProcessVideoFile(beam.DoFn):
+       def __init__(self, output_bucket, model_endpoint):
+           self.output_bucket = output_bucket
+           self.model_endpoint = model_endpoint
+           
        def process(self, video_file):
            # Submit Slurm job for video processing
            slurm_script = f"""#!/bin/bash
@@ -290,9 +299,9 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    module load python/3.8
    
    # Process video file
-   python /shared/video-analysis-script.py \
-       --input={video_file} \
-       --output=gs://{self.output_bucket}/processed-results/ \
+   python /shared/video-analysis-script.py \\
+       --input={video_file} \\
+       --output=gs://{self.output_bucket}/processed-results/ \\
        --model-endpoint={self.model_endpoint}
    """
            
@@ -301,7 +310,11 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
                'sbatch', '--parsable'
            ], input=slurm_script, text=True, capture_output=True)
            
-           return [{'video_file': video_file, 'job_id': job_id.stdout.strip()}]
+           return [{
+               'video_file': video_file, 
+               'job_id': job_id.stdout.strip(),
+               'timestamp': datetime.datetime.now().isoformat()
+           }]
    
    def run_pipeline(argv=None):
        pipeline_options = PipelineOptions(argv)
@@ -311,10 +324,13 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
            video_files = (
                pipeline
                | 'List Video Files' >> beam.io.ReadFromText(
-                   f'gs://{video_options.input_bucket}/raw-videos/*.mp4')
-               | 'Process Videos' >> beam.ParDo(ProcessVideoFile())
+                   f'gs://{video_options.input_bucket}/raw-videos/file-list.txt')
+               | 'Process Videos' >> beam.ParDo(
+                   ProcessVideoFile(
+                       video_options.output_bucket,
+                       video_options.model_endpoint))
                | 'Write Results' >> WriteToBigQuery(
-                   table=f'{PROJECT_ID}:{DATASET_NAME}.video_analysis_results',
+                   table=f'{video_options.project}:{video_options.dataset}.video_analysis_results',
                    write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND)
            )
    
@@ -332,19 +348,10 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        ${PROJECT_ID}:${DATASET_NAME}.video_analysis_results \
        video_file:STRING,job_id:STRING,analysis_results:STRING,timestamp:TIMESTAMP
    
-   # Deploy Dataflow pipeline
-   python video-analysis-pipeline.py \
-       --project=${PROJECT_ID} \
-       --region=${REGION} \
-       --runner=DataflowRunner \
-       --temp_location=gs://${BUCKET_NAME}/temp \
-       --staging_location=gs://${BUCKET_NAME}/staging \
-       --input_bucket=${BUCKET_NAME} \
-       --output_bucket=${BUCKET_NAME} \
-       --cluster_endpoint=${CLUSTER_NAME} \
-       --model_endpoint="projects/${PROJECT_ID}/locations/${REGION}/endpoints/scientific-video-gemini"
+   # Install Apache Beam dependencies
+   pip install apache-beam[gcp]
    
-   echo "✅ Cloud Dataflow pipeline configured and deployed"
+   echo "✅ Cloud Dataflow pipeline configured"
    ```
 
    The pipeline now coordinates video processing workflows by automatically distributing analysis tasks across the HPC cluster, leveraging both CPU and GPU resources for optimal performance while maintaining data lineage and processing status.
@@ -366,6 +373,9 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    from google.cloud import storage
    import tempfile
    import logging
+   import datetime
+   import base64
+   import os
    
    def extract_frames(video_path, output_dir, frame_interval=30):
        """Extract frames from video at specified intervals"""
@@ -390,23 +400,34 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    
    def analyze_frame_with_gemini(frame_path, model_endpoint, prompt):
        """Analyze individual frame using fine-tuned Gemini model"""
-       aiplatform.init(project=PROJECT_ID, location=REGION)
-       
-       endpoint = aiplatform.Endpoint(model_endpoint)
-       
-       # Prepare image for analysis
-       with open(frame_path, 'rb') as f:
-           image_bytes = f.read()
-       
-       # Submit to Gemini model
-       response = endpoint.predict(
-           instances=[{
-               "image": {"bytesBase64Encoded": image_bytes.decode('base64')},
-               "prompt": prompt
+       try:
+           # Initialize Vertex AI
+           project_id = os.environ.get('PROJECT_ID')
+           region = os.environ.get('REGION')
+           aiplatform.init(project=project_id, location=region)
+           
+           # Read and encode image
+           with open(frame_path, 'rb') as f:
+               image_bytes = f.read()
+               image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+           
+           # Create request payload
+           instances = [{
+               "prompt": prompt,
+               "image": {
+                   "bytesBase64Encoded": image_base64
+               }
            }]
-       )
-       
-       return response.predictions[0]['content']
+           
+           # Get endpoint and make prediction
+           endpoint = aiplatform.Endpoint(model_endpoint)
+           response = endpoint.predict(instances=instances)
+           
+           return response.predictions[0].get('content', 'No analysis available')
+           
+       except Exception as e:
+           logging.error(f"Error analyzing frame {frame_path}: {str(e)}")
+           return f"Analysis failed: {str(e)}"
    
    def process_video_file(video_path, output_bucket, model_endpoint):
        """Main video processing function"""
@@ -426,7 +447,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
                    "Analyze this scientific video frame for key research findings, measurements, and observable phenomena. Provide detailed technical analysis."
                )
                analysis_results.append({
-                   'frame': frame_path,
+                   'frame': os.path.basename(frame_path),
                    'analysis': analysis,
                    'timestamp': frame_path.split('_')[1].split('.')[0]
                })
@@ -437,13 +458,13 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
                'total_frames_analyzed': len(frames),
                'analysis_results': analysis_results,
                'summary': generate_video_summary(analysis_results),
-               'processing_timestamp': datetime.now().isoformat()
+               'processing_timestamp': datetime.datetime.now().isoformat()
            }
            
            # Upload results to Cloud Storage
            storage_client = storage.Client()
            bucket = storage_client.bucket(output_bucket)
-           blob = bucket.blob(f"processed-results/{video_path.split('/')[-1]}_analysis.json")
+           blob = bucket.blob(f"processed-results/{os.path.basename(video_path)}_analysis.json")
            blob.upload_from_string(json.dumps(report, indent=2))
            
            logging.info(f"Analysis completed for {video_path}")
@@ -451,17 +472,17 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    
    def generate_video_summary(analysis_results):
        """Generate summary using aggregated frame analyses"""
-       # Implement summary logic based on frame analysis patterns
        key_findings = []
        temporal_patterns = []
        
        for result in analysis_results:
+           analysis_text = result.get('analysis', '').lower()
            # Extract key scientific findings
-           if 'protein' in result['analysis'].lower():
+           if 'protein' in analysis_text:
                key_findings.append('Protein-related observations detected')
-           if 'cell' in result['analysis'].lower():
+           if 'cell' in analysis_text:
                key_findings.append('Cellular processes identified')
-           if 'movement' in result['analysis'].lower():
+           if 'movement' in analysis_text:
                temporal_patterns.append('Dynamic behavior patterns observed')
        
        return {
@@ -472,16 +493,18 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    
    def calculate_confidence_score(analysis_results):
        """Calculate confidence score based on analysis consistency"""
-       # Implement confidence scoring logic
        return min(len(analysis_results) / 100.0, 1.0)
    
    if __name__ == '__main__':
        parser = argparse.ArgumentParser(description='Scientific Video Analysis')
        parser.add_argument('--input', required=True, help='Input video file path')
-       parser.add_argument('--output', required=True, help='Output bucket path')
+       parser.add_argument('--output', required=True, help='Output bucket name')
        parser.add_argument('--model-endpoint', required=True, help='Gemini model endpoint')
        
        args = parser.parse_args()
+       
+       # Set up logging
+       logging.basicConfig(level=logging.INFO)
        
        # Process the video file
        result = process_video_file(args.input, args.output, args.model_endpoint)
@@ -490,11 +513,11 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    
    # Copy analysis script to cluster shared filesystem
    gcloud compute scp video-analysis-script.py \
-       ${CLUSTER_NAME}-login-0:/shared/video-analysis-script.py \
+       ${CLUSTER_NAME}-login-001:/shared/video-analysis-script.py \
        --zone=${ZONE}
    
    # Make script executable on cluster
-   gcloud compute ssh ${CLUSTER_NAME}-login-0 \
+   gcloud compute ssh ${CLUSTER_NAME}-login-001 \
        --zone=${ZONE} \
        --command="chmod +x /shared/video-analysis-script.py"
    
@@ -509,18 +532,18 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 
    ```bash
    # Create Slurm job submission script for automated processing
-   cat > submit-video-analysis.sh << EOF
+   cat > submit-video-analysis.sh << 'EOF'
    #!/bin/bash
    
    # Video analysis job submission script
-   VIDEO_INPUT_PATH=\$1
-   OUTPUT_BUCKET=\$2
-   MODEL_ENDPOINT=\$3
+   VIDEO_INPUT_PATH=$1
+   OUTPUT_BUCKET=$2
+   MODEL_ENDPOINT=$3
    
    # Submit job to appropriate partition based on video size
-   VIDEO_SIZE=\$(gsutil du \$VIDEO_INPUT_PATH | cut -f1)
+   VIDEO_SIZE=$(gsutil du $VIDEO_INPUT_PATH | cut -f1)
    
-   if [ \$VIDEO_SIZE -gt 1000000000 ]; then
+   if [ $VIDEO_SIZE -gt 1000000000 ]; then
        PARTITION="gpu"
        TIME_LIMIT="04:00:00"
        MEMORY="32GB"
@@ -531,14 +554,14 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    fi
    
    # Create Slurm job script
-   cat > video-job-\$\$.sh << SLURM_EOF
+   cat > video-job-$$.sh << SLURM_EOF
    #!/bin/bash
-   #SBATCH --partition=\$PARTITION
-   #SBATCH --time=\$TIME_LIMIT
-   #SBATCH --mem=\$MEMORY
-   #SBATCH --job-name=video-analysis-\$\$
-   #SBATCH --output=/shared/logs/video-analysis-\$\$.out
-   #SBATCH --error=/shared/logs/video-analysis-\$\$.err
+   #SBATCH --partition=$PARTITION
+   #SBATCH --time=$TIME_LIMIT
+   #SBATCH --mem=$MEMORY
+   #SBATCH --job-name=video-analysis-$$
+   #SBATCH --output=/shared/logs/video-analysis-$$.out
+   #SBATCH --error=/shared/logs/video-analysis-$$.err
    
    # Load required modules
    module load python/3.8
@@ -547,22 +570,24 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    
    # Set up Google Cloud authentication
    export GOOGLE_APPLICATION_CREDENTIALS=/shared/credentials/service-account.json
+   export PROJECT_ID=${PROJECT_ID}
+   export REGION=${REGION}
    
    # Execute video analysis
    python /shared/video-analysis-script.py \
-       --input=\$VIDEO_INPUT_PATH \
-       --output=\$OUTPUT_BUCKET \
-       --model-endpoint=\$MODEL_ENDPOINT
+       --input=$VIDEO_INPUT_PATH \
+       --output=$OUTPUT_BUCKET \
+       --model-endpoint=$MODEL_ENDPOINT
    
    # Log completion
-   echo "Video analysis completed: \$VIDEO_INPUT_PATH" >> /shared/logs/completed-jobs.log
+   echo "Video analysis completed: $VIDEO_INPUT_PATH" >> /shared/logs/completed-jobs.log
    SLURM_EOF
    
    # Submit the job
-   sbatch video-job-\$\$.sh
+   sbatch video-job-$$.sh
    
    # Clean up temporary script
-   rm video-job-\$\$.sh
+   rm video-job-$$.sh
    EOF
    
    # Create monitoring script for job status
@@ -571,47 +596,60 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    import subprocess
    import json
    import time
+   import os
    from google.cloud import monitoring_v3
    from google.cloud import logging
    
    def get_slurm_job_status():
        """Get current Slurm job status"""
-       result = subprocess.run(['squeue', '-o', '%i,%j,%t,%M'], 
-                              capture_output=True, text=True)
-       
-       jobs = []
-       for line in result.stdout.strip().split('\n')[1:]:
-           job_id, job_name, status, time_used = line.split(',')
-           if 'video-analysis' in job_name:
-               jobs.append({
-                   'job_id': job_id,
-                   'job_name': job_name,
-                   'status': status,
-                   'time_used': time_used
-               })
-       
-       return jobs
+       try:
+           result = subprocess.run(['squeue', '-o', '%i,%j,%t,%M'], 
+                                  capture_output=True, text=True)
+           
+           jobs = []
+           for line in result.stdout.strip().split('\n')[1:]:
+               if line.strip():
+                   parts = line.split(',')
+                   if len(parts) >= 4:
+                       job_id, job_name, status, time_used = parts[:4]
+                       if 'video-analysis' in job_name:
+                           jobs.append({
+                               'job_id': job_id,
+                               'job_name': job_name,
+                               'status': status,
+                               'time_used': time_used
+                           })
+           
+           return jobs
+       except Exception as e:
+           print(f"Error getting job status: {e}")
+           return []
    
    def send_metrics_to_monitoring(jobs):
        """Send job metrics to Cloud Monitoring"""
-       client = monitoring_v3.MetricServiceClient()
-       project_name = f"projects/{PROJECT_ID}"
-       
-       series = monitoring_v3.TimeSeries()
-       series.metric.type = "custom.googleapis.com/video_analysis/active_jobs"
-       series.resource.type = "gce_instance"
-       series.resource.labels["instance_id"] = "video-analysis-cluster"
-       series.resource.labels["zone"] = ZONE
-       
-       point = monitoring_v3.Point()
-       point.value.int64_value = len(jobs)
-       point.interval.end_time.seconds = int(time.time())
-       series.points = [point]
-       
-       client.create_time_series(
-           name=project_name,
-           time_series=[series]
-       )
+       try:
+           client = monitoring_v3.MetricServiceClient()
+           project_id = os.environ.get('PROJECT_ID')
+           zone = os.environ.get('ZONE')
+           project_name = f"projects/{project_id}"
+           
+           series = monitoring_v3.TimeSeries()
+           series.metric.type = "custom.googleapis.com/video_analysis/active_jobs"
+           series.resource.type = "gce_instance"
+           series.resource.labels["instance_id"] = "video-analysis-cluster"
+           series.resource.labels["zone"] = zone
+           
+           point = monitoring_v3.Point()
+           point.value.int64_value = len(jobs)
+           point.interval.end_time.seconds = int(time.time())
+           series.points = [point]
+           
+           client.create_time_series(
+               name=project_name,
+               time_series=[series]
+           )
+       except Exception as e:
+           print(f"Error sending metrics: {e}")
    
    def main():
        """Main monitoring loop"""
@@ -629,19 +667,24 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        main()
    EOF
    
+   # Create necessary directories on cluster
+   gcloud compute ssh ${CLUSTER_NAME}-login-001 \
+       --zone=${ZONE} \
+       --command="mkdir -p /shared/scripts /shared/logs"
+   
    # Deploy monitoring scripts to cluster
    gcloud compute scp submit-video-analysis.sh \
-       ${CLUSTER_NAME}-login-0:/shared/scripts/ \
+       ${CLUSTER_NAME}-login-001:/shared/scripts/ \
        --zone=${ZONE}
    
    gcloud compute scp monitor-video-jobs.py \
-       ${CLUSTER_NAME}-login-0:/shared/scripts/ \
+       ${CLUSTER_NAME}-login-001:/shared/scripts/ \
        --zone=${ZONE}
    
-   # Start monitoring daemon on cluster
-   gcloud compute ssh ${CLUSTER_NAME}-login-0 \
+   # Make scripts executable
+   gcloud compute ssh ${CLUSTER_NAME}-login-001 \
        --zone=${ZONE} \
-       --command="nohup python /shared/scripts/monitor-video-jobs.py > /shared/logs/monitoring.log 2>&1 &"
+       --command="chmod +x /shared/scripts/submit-video-analysis.sh /shared/scripts/monitor-video-jobs.py"
    
    echo "✅ Automated job scheduling and monitoring configured"
    ```
@@ -653,8 +696,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    Validating the complete video analysis pipeline ensures that all components work together seamlessly. Testing with sample scientific videos verifies that the HPC cluster, fine-tuned AI models, and orchestration systems can handle real-world scientific video analysis requirements.
 
    ```bash
-   # Upload sample scientific video for testing
-   # Create sample video metadata
+   # Create sample video metadata for testing
    cat > sample-video-metadata.json << EOF
    {
      "video_id": "test-microscopy-001",
@@ -672,40 +714,32 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    }
    EOF
    
-   # Upload test video and metadata
+   # Upload test video metadata
    gsutil cp sample-video-metadata.json \
        gs://${BUCKET_NAME}/raw-videos/metadata/
    
-   # Simulate video upload (replace with actual scientific video)
-   echo "Upload your scientific video file to gs://${BUCKET_NAME}/raw-videos/"
-   echo "For testing purposes, creating a placeholder video entry..."
+   # Create a simple test video list for Dataflow
+   echo "gs://${BUCKET_NAME}/raw-videos/test-video.mp4" > file-list.txt
+   gsutil cp file-list.txt gs://${BUCKET_NAME}/raw-videos/
    
-   # Submit test video for processing
-   TEST_VIDEO_PATH="gs://${BUCKET_NAME}/raw-videos/test-video.mp4"
+   # Note: Upload your actual scientific video file to the bucket
+   echo "Upload your scientific video file to: gs://${BUCKET_NAME}/raw-videos/"
+   echo "For testing purposes, you can use any MP4 video file named test-video.mp4"
    
-   gcloud compute ssh ${CLUSTER_NAME}-login-0 \
+   # Test HPC cluster connectivity
+   gcloud compute ssh ${CLUSTER_NAME}-login-001 \
        --zone=${ZONE} \
-       --command="/shared/scripts/submit-video-analysis.sh \
-           ${TEST_VIDEO_PATH} \
-           ${BUCKET_NAME} \
-           projects/${PROJECT_ID}/locations/${REGION}/endpoints/scientific-video-gemini"
+       --command="echo 'Cluster connection test successful'"
    
-   # Check job submission status
-   sleep 10
-   gcloud compute ssh ${CLUSTER_NAME}-login-0 \
+   # Check Slurm cluster status
+   gcloud compute ssh ${CLUSTER_NAME}-login-001 \
        --zone=${ZONE} \
-       --command="squeue -u \$USER"
+       --command="sinfo"
    
-   # Monitor processing logs
-   echo "Monitoring video processing logs..."
-   gcloud compute ssh ${CLUSTER_NAME}-login-0 \
-       --zone=${ZONE} \
-       --command="tail -f /shared/logs/completed-jobs.log"
-   
-   echo "✅ Video processing pipeline test initiated"
+   echo "✅ Video processing pipeline test environment prepared"
    ```
 
-   The test pipeline now processes sample scientific videos through the complete workflow, from initial upload through HPC processing to final analysis results, validating the integration between all system components.
+   The test pipeline environment is now prepared for processing sample scientific videos through the complete workflow, from initial upload through HPC processing to final analysis results, validating the integration between all system components.
 
 ## Validation & Testing
 
@@ -713,7 +747,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 
    ```bash
    # Check cluster node status
-   gcloud compute ssh ${CLUSTER_NAME}-login-0 \
+   gcloud compute ssh ${CLUSTER_NAME}-login-001 \
        --zone=${ZONE} \
        --command="sinfo"
    
@@ -721,21 +755,20 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    # with nodes in idle or allocated state
    
    # Verify Slurm controller health
-   gcloud compute ssh ${CLUSTER_NAME}-login-0 \
+   gcloud compute ssh ${CLUSTER_NAME}-login-001 \
        --zone=${ZONE} \
        --command="scontrol show config | grep ClusterName"
    ```
 
-2. **Test Vertex AI Model Endpoint**:
+2. **Test Vertex AI Model Status**:
 
    ```bash
-   # Test Gemini model endpoint responsiveness
-   gcloud ai endpoints predict \
-       --endpoint=scientific-video-gemini \
+   # List tuning jobs to check status
+   gcloud ai tuning-jobs list \
        --region=${REGION} \
-       --json-request='{"instances": [{"prompt": "Analyze this test frame"}]}'
+       --format="table(name,state,createTime)"
    
-   # Expected output should return model predictions
+   # Expected output should show completed tuning job
    ```
 
 3. **Validate Cloud Storage Integration**:
@@ -759,9 +792,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        --region=${REGION} \
        --filter="state:JOB_STATE_RUNNING"
    
-   # View job details and metrics
-   gcloud dataflow jobs describe JOB_ID \
-       --region=${REGION}
+   # View job details and metrics if jobs are running
+   # gcloud dataflow jobs describe JOB_ID --region=${REGION}
    ```
 
 5. **Verify BigQuery Results Storage**:
@@ -786,16 +818,17 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 
    ```bash
    # Drain all running jobs before cluster shutdown
-   gcloud compute ssh ${CLUSTER_NAME}-login-0 \
+   gcloud compute ssh ${CLUSTER_NAME}-login-001 \
        --zone=${ZONE} \
-       --command="scontrol update NodeName=ALL State=DRAIN Reason='Cluster shutdown'"
+       --command="scontrol update NodeName=ALL State=DRAIN Reason='Cluster shutdown'" \
+       --quiet || echo "Cluster may already be down"
    
    # Wait for jobs to complete
    echo "Waiting for jobs to complete..."
    sleep 60
    
    # Delete Cluster Toolkit infrastructure
-   cd hpc-toolkit/video-analysis-cluster
+   cd cluster-toolkit/video-analysis-cluster
    terraform destroy -auto-approve
    
    echo "✅ HPC cluster deleted"
@@ -804,17 +837,18 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 2. **Remove Vertex AI Resources**:
 
    ```bash
-   # Delete model endpoints
-   gcloud ai endpoints delete scientific-video-gemini \
+   # List and delete tuning jobs
+   TUNING_JOBS=$(gcloud ai tuning-jobs list \
        --region=${REGION} \
-       --quiet
+       --format="value(name)")
    
-   # Delete datasets
-   gcloud ai datasets delete ${DATASET_ID} \
-       --region=${REGION} \
-       --quiet
+   for job in $TUNING_JOBS; do
+       gcloud ai tuning-jobs cancel $job \
+           --region=${REGION} \
+           --quiet
+   done
    
-   echo "✅ Vertex AI resources deleted"
+   echo "✅ Vertex AI resources cleaned up"
    ```
 
 3. **Clean Up Storage and Data**:
@@ -832,10 +866,17 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 4. **Stop Dataflow Jobs**:
 
    ```bash
-   # Cancel running Dataflow jobs
-   gcloud dataflow jobs cancel JOB_ID \
+   # List and cancel running Dataflow jobs
+   DATAFLOW_JOBS=$(gcloud dataflow jobs list \
        --region=${REGION} \
-       --quiet
+       --filter="state:JOB_STATE_RUNNING" \
+       --format="value(id)")
+   
+   for job_id in $DATAFLOW_JOBS; do
+       gcloud dataflow jobs cancel $job_id \
+           --region=${REGION} \
+           --quiet
+   done
    
    echo "✅ Dataflow jobs stopped"
    ```
@@ -845,12 +886,14 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    ```bash
    # Clean up local repository and scripts
    cd ..
-   rm -rf hpc-toolkit/
+   rm -rf cluster-toolkit/
    rm -f video-analysis-pipeline.py
    rm -f video-analysis-script.py
    rm -f submit-video-analysis.sh
    rm -f monitor-video-jobs.py
    rm -f sample-video-metadata.json
+   rm -f scientific-video-training.jsonl
+   rm -f file-list.txt
    
    echo "✅ Local files cleaned up"
    ```
@@ -863,7 +906,7 @@ The integration of [Vertex AI's Gemini fine-tuning capabilities](https://cloud.g
 
 [Cloud Dataflow's orchestration capabilities](https://cloud.google.com/dataflow/docs) ensure that complex multi-step video processing workflows execute reliably at scale. The service handles task distribution, dependency management, and error recovery, allowing researchers to focus on analysis rather than infrastructure management. The seamless integration with [Cloud Storage](https://cloud.google.com/storage/docs) provides a unified data lake architecture that supports both raw video ingestion and processed result storage with appropriate lifecycle management policies.
 
-The architectural pattern demonstrated here establishes a foundation for reproducible scientific computing that can be adapted across disciplines. Whether analyzing microscopy videos for cellular behavior, processing astronomical observations for celestial phenomena, or examining behavioral studies for pattern recognition, the same infrastructure components can be reconfigured to meet specific research requirements while maintaining cost efficiency and scalability.
+The architectural pattern demonstrated here establishes a foundation for reproducible scientific computing that can be adapted across disciplines. Whether analyzing microscopy videos for cellular behavior, processing astronomical observations for celestial phenomena, or examining behavioral studies for pattern recognition, the same infrastructure components can be reconfigured to meet specific research requirements while maintaining cost efficiency and scalability. The use of modern containerization and Infrastructure as Code practices ensures that scientific workflows are portable and reproducible across different research environments.
 
 > **Tip**: Monitor your cluster utilization closely and configure auto-scaling policies to optimize costs. The [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) provides additional guidance for optimizing HPC workloads in cloud environments.
 
@@ -883,4 +926,9 @@ Extend this solution by implementing these advanced enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

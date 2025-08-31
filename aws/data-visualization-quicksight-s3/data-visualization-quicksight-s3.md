@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: QuickSight, S3, Athena, Glue
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: analytics, quicksight, s3, glue, athena, visualization
 recipe-generator-version: 1.3
@@ -92,7 +92,7 @@ graph TB
 5. Sample datasets for testing (CSV, JSON, or Parquet files)
 6. Estimated cost: $50-100/month for moderate usage (10GB data, 100 queries/day)
 
-> **Note**: QuickSight pricing varies by edition and user count. Standard edition starts at $9/user/month.
+> **Note**: QuickSight pricing varies by edition and user count. Standard edition starts at $9/user/month. Follow [QuickSight security best practices](https://docs.aws.amazon.com/quicksight/latest/user/security-best-practices.html) when configuring user access and data permissions.
 
 ## Preparation
 
@@ -113,12 +113,12 @@ export RAW_BUCKET="${PROJECT_NAME}-raw-data"
 export PROCESSED_BUCKET="${PROJECT_NAME}-processed-data"
 export ATHENA_RESULTS_BUCKET="${PROJECT_NAME}-athena-results"
 
-# Create S3 buckets
-aws s3 mb s3://${RAW_BUCKET}
-aws s3 mb s3://${PROCESSED_BUCKET}
-aws s3 mb s3://${ATHENA_RESULTS_BUCKET}
+# Create S3 buckets with security features
+aws s3 mb s3://${RAW_BUCKET} --region ${AWS_REGION}
+aws s3 mb s3://${PROCESSED_BUCKET} --region ${AWS_REGION}
+aws s3 mb s3://${ATHENA_RESULTS_BUCKET} --region ${AWS_REGION}
 
-# Enable versioning on buckets
+# Enable versioning on buckets for data protection
 aws s3api put-bucket-versioning \
     --bucket ${RAW_BUCKET} \
     --versioning-configuration Status=Enabled
@@ -126,6 +126,22 @@ aws s3api put-bucket-versioning \
 aws s3api put-bucket-versioning \
     --bucket ${PROCESSED_BUCKET} \
     --versioning-configuration Status=Enabled
+
+# Enable default encryption for security
+aws s3api put-bucket-encryption \
+    --bucket ${RAW_BUCKET} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
+aws s3api put-bucket-encryption \
+    --bucket ${PROCESSED_BUCKET} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
+aws s3api put-bucket-encryption \
+    --bucket ${ATHENA_RESULTS_BUCKET} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
 
 echo "✅ Created S3 buckets for data pipeline"
 ```
@@ -191,7 +207,7 @@ echo "✅ Created S3 buckets for data pipeline"
 
 2. **Create IAM roles for Glue and Lambda**:
 
-   This step establishes the security foundation for your pipeline by creating IAM roles with least-privilege access. The Glue service role needs permissions to read from your raw data bucket, write to your processed data bucket, and access the Glue Data Catalog for schema management.
+   This step establishes the security foundation for your pipeline by creating IAM roles with least-privilege access. The Glue service role needs permissions to read from your raw data bucket, write to your processed data bucket, and access the Glue Data Catalog for schema management. Following the AWS Well-Architected Security pillar, we implement proper IAM roles with minimal required permissions.
 
    ```bash
    # Create Glue service role
@@ -248,9 +264,59 @@ echo "✅ Created S3 buckets for data pipeline"
        --policy-name S3AccessPolicy \
        --policy-document file://glue-s3-policy.json
    
-   export GLUE_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/GlueDataVizRole-${RANDOM_SUFFIX}"
+   # Create Lambda execution role
+   cat > lambda-trust-policy.json << 'EOF'
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Principal": {
+                   "Service": "lambda.amazonaws.com"
+               },
+               "Action": "sts:AssumeRole"
+           }
+       ]
+   }
+   EOF
    
-   echo "✅ Created IAM roles for Glue"
+   aws iam create-role \
+       --role-name LambdaDataVizRole-${RANDOM_SUFFIX} \
+       --assume-role-policy-document file://lambda-trust-policy.json
+   
+   # Attach managed policy for basic Lambda execution
+   aws iam attach-role-policy \
+       --role-name LambdaDataVizRole-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   # Create custom policy for Glue access from Lambda
+   cat > lambda-glue-policy.json << EOF
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "glue:StartCrawler",
+                   "glue:StartJobRun",
+                   "glue:GetCrawler",
+                   "glue:GetJobRun"
+               ],
+               "Resource": "*"
+           }
+       ]
+   }
+   EOF
+   
+   aws iam put-role-policy \
+       --role-name LambdaDataVizRole-${RANDOM_SUFFIX} \
+       --policy-name GlueAccessPolicy \
+       --policy-document file://lambda-glue-policy.json
+   
+   export GLUE_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/GlueDataVizRole-${RANDOM_SUFFIX}"
+   export LAMBDA_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/LambdaDataVizRole-${RANDOM_SUFFIX}"
+   
+   echo "✅ Created IAM roles for Glue and Lambda"
    ```
 
 3. **Create Glue database and crawler**:
@@ -394,7 +460,7 @@ echo "✅ Created S3 buckets for data pipeline"
    aws glue create-job \
        --name ${PROJECT_NAME}-etl-job \
        --role ${GLUE_ROLE_ARN} \
-       --command Name=glueetl,ScriptLocation=s3://${PROCESSED_BUCKET}/scripts/sales-etl.py,PythonVersion=3 \
+       --command '{"Name":"glueetl","ScriptLocation":"s3://'${PROCESSED_BUCKET}'/scripts/sales-etl.py","PythonVersion":"3"}' \
        --default-arguments '{
            "--SOURCE_DATABASE":"'${PROJECT_NAME}'-database",
            "--TARGET_BUCKET":"'${PROCESSED_BUCKET}'",
@@ -461,14 +527,14 @@ echo "✅ Created S3 buckets for data pipeline"
 
 6. **Set up Athena workgroup and query results location**:
 
-   Athena workgroups help manage query execution, control costs, and organize queries by team or project. By creating dedicated workgroups, you can set query result locations, enforce data usage controls, and track query costs more effectively. Learn more about [using workgroups to control query access and costs](https://docs.aws.amazon.com/athena/latest/ug/workgroups-manage-queries-control-costs.html).
+   Athena workgroups help manage query execution, control costs, and organize queries by team or project. By creating dedicated workgroups, you can set query result locations, enforce data usage controls, and track query costs more effectively. Workgroups provide administrative control over query execution, including the ability to set per-query data scan limits and enforce encryption of query results. Learn more about [using workgroups to control query access and costs](https://docs.aws.amazon.com/athena/latest/ug/workgroups-manage-queries-control-costs.html).
 
    ```bash
    # Create Athena workgroup
    aws athena create-work-group \
        --name ${PROJECT_NAME}-workgroup \
        --description "Workgroup for data visualization pipeline" \
-       --configuration ResultConfiguration="{OutputLocation=s3://${ATHENA_RESULTS_BUCKET}/}"
+       --configuration '{"ResultConfiguration":{"OutputLocation":"s3://'${ATHENA_RESULTS_BUCKET}'/"}}'
    
    # Create sample queries for testing
    mkdir -p athena-queries
@@ -546,14 +612,14 @@ echo "✅ Created S3 buckets for data pipeline"
 
 8. **Create automation Lambda function for pipeline triggers**:
 
-   This automation layer ensures your pipeline stays current with new data uploads. When new files are added to S3, the Lambda function automatically triggers the crawler to update table schemas and then runs the ETL job to process the new data, maintaining data freshness without manual intervention.
+   This automation layer ensures your pipeline stays current with new data uploads using event-driven architecture patterns. When new files are added to S3, S3 event notifications trigger the Lambda function, which orchestrates the data pipeline by starting the crawler to update table schemas and then running the ETL job to process the new data. This serverless automation approach eliminates manual intervention while maintaining data freshness. The Lambda function uses the latest AWS SDK v3 for improved performance and tree-shaking capabilities.
 
    ```bash
    # Create Lambda function for automation
    mkdir -p lambda-automation
    cat > lambda-automation/index.js << 'EOF'
-   const AWS = require('aws-sdk');
-   const glue = new AWS.Glue();
+   const { GlueClient, StartCrawlerCommand, StartJobRunCommand } = require('@aws-sdk/client-glue');
+   const glue = new GlueClient({ region: process.env.AWS_REGION });
    
    const PROJECT_NAME = process.env.PROJECT_NAME;
    
@@ -592,11 +658,11 @@ echo "✅ Created S3 buckets for data pipeline"
    
    async function triggerCrawler(crawlerName) {
        try {
-           const params = { Name: crawlerName };
-           await glue.startCrawler(params).promise();
+           const command = new StartCrawlerCommand({ Name: crawlerName });
+           await glue.send(command);
            console.log(`Started crawler: ${crawlerName}`);
        } catch (error) {
-           if (error.code === 'CrawlerRunningException') {
+           if (error.name === 'CrawlerRunningException') {
                console.log(`Crawler ${crawlerName} is already running`);
            } else {
                throw error;
@@ -606,8 +672,8 @@ echo "✅ Created S3 buckets for data pipeline"
    
    async function triggerETLJob(jobName) {
        try {
-           const params = { JobName: jobName };
-           const result = await glue.startJobRun(params).promise();
+           const command = new StartJobRunCommand({ JobName: jobName });
+           const result = await glue.send(command);
            console.log(`Started ETL job: ${jobName}, Run ID: ${result.JobRunId}`);
        } catch (error) {
            console.error(`Error starting ETL job ${jobName}:`, error);
@@ -619,19 +685,19 @@ echo "✅ Created S3 buckets for data pipeline"
    # Create Lambda deployment package
    cd lambda-automation
    npm init -y
-   npm install aws-sdk
+   npm install @aws-sdk/client-glue
    zip -r ../automation-function.zip .
    cd ..
    
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-automation \
-       --runtime nodejs18.x \
-       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/GlueDataVizRole-${RANDOM_SUFFIX} \
+       --runtime nodejs20.x \
+       --role ${LAMBDA_ROLE_ARN} \
        --handler index.handler \
        --zip-file fileb://automation-function.zip \
        --timeout 300 \
-       --environment Variables="{PROJECT_NAME=${PROJECT_NAME}}"
+       --environment Variables="{PROJECT_NAME=${PROJECT_NAME},AWS_REGION=${AWS_REGION}}"
    
    # Add S3 trigger permission
    aws lambda add-permission \
@@ -774,13 +840,14 @@ echo "✅ Created S3 buckets for data pipeline"
    aws s3 rm s3://${RAW_BUCKET} --recursive
    aws s3 rb s3://${RAW_BUCKET}
    
-   aws s3rm s3://${PROCESSED_BUCKET} --recursive
+   aws s3 rm s3://${PROCESSED_BUCKET} --recursive
    aws s3 rb s3://${PROCESSED_BUCKET}
    
    aws s3 rm s3://${ATHENA_RESULTS_BUCKET} --recursive
    aws s3 rb s3://${ATHENA_RESULTS_BUCKET}
    
-   # Delete IAM role and policies
+   # Delete IAM roles and policies
+   # Delete Glue role policies
    aws iam delete-role-policy \
        --role-name GlueDataVizRole-${RANDOM_SUFFIX} \
        --policy-name S3AccessPolicy
@@ -791,8 +858,20 @@ echo "✅ Created S3 buckets for data pipeline"
    
    aws iam delete-role --role-name GlueDataVizRole-${RANDOM_SUFFIX}
    
+   # Delete Lambda role policies
+   aws iam delete-role-policy \
+       --role-name LambdaDataVizRole-${RANDOM_SUFFIX} \
+       --policy-name GlueAccessPolicy
+   
+   aws iam detach-role-policy \
+       --role-name LambdaDataVizRole-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   aws iam delete-role --role-name LambdaDataVizRole-${RANDOM_SUFFIX}
+   
    # Clean up local files
-   rm -rf sample-data glue-scripts lambda-automation athena-queries *.json *.zip
+   rm -rf sample-data glue-scripts lambda-automation athena-queries
+   rm -f *.json *.zip
    
    echo "✅ Cleanup completed"
    ```
@@ -805,9 +884,11 @@ The solution addresses several key challenges in modern data analytics. First, i
 
 The ETL pipeline design follows best practices for data lake architectures by separating raw and processed data, using columnar storage formats like Parquet for better query performance, and creating multiple aggregated views optimized for different analytical use cases. The automation layer ensures that new data is automatically processed and made available for analysis, reducing manual intervention and ensuring data freshness.
 
-QuickSight's integration with Athena provides a powerful combination for ad-hoc analysis and scheduled reporting. The serverless query engine scales automatically based on demand, while QuickSight's SPICE (Super-fast, Parallel, In-memory Calculation Engine) can cache frequently accessed data for improved dashboard performance. This architecture supports both real-time operational dashboards and historical trend analysis.
+QuickSight's integration with Athena provides a powerful combination for ad-hoc analysis and scheduled reporting. The serverless query engine scales automatically based on demand, while QuickSight's SPICE (Super-fast, Parallel, In-memory Calculation Engine) can cache frequently accessed data for improved dashboard performance. This architecture supports both real-time operational dashboards and historical trend analysis. The solution follows AWS Well-Architected Framework principles for analytics workloads, providing reliability through managed services, performance efficiency through serverless scaling, and cost optimization through pay-per-use pricing models. Learn more about [building analytics applications on AWS](https://docs.aws.amazon.com/wellarchitected/latest/analytics-lens/building-analytics-applications.html).
 
-> **Tip**: Use QuickSight's ML Insights feature to automatically detect anomalies and trends in your data, providing additional analytical value without manual configuration. Learn more about [making data-driven decisions with ML in QuickSight](https://docs.aws.amazon.com/quicksight/latest/user/making-data-driven-decisions-with-ml-in-quicksight.html).
+> **Tip**: Use QuickSight's ML Insights feature to automatically detect anomalies and trends in your data, providing additional analytical value without manual configuration. For cost optimization, consider using Athena partition projection to reduce query scan costs on large time-series datasets. Learn more about [making data-driven decisions with ML in QuickSight](https://docs.aws.amazon.com/quicksight/latest/user/making-data-driven-decisions-with-ml-in-quicksight.html) and [partition projection in Athena](https://docs.aws.amazon.com/athena/latest/ug/partition-projection.html).
+
+> **Warning**: Monitor your Athena query costs regularly as they are based on the amount of data scanned. Use columnar formats like Parquet and implement data partitioning strategies to minimize scan costs. Set up CloudWatch billing alarms to track spending across all services used in this pipeline.
 
 ## Challenge
 
@@ -825,4 +906,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

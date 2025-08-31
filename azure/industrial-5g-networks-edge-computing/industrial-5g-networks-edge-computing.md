@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Operator Nexus, Azure Private 5G Core, Azure Arc
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: 5g, private-networks, edge-computing, iot, manufacturing
 recipe-generator-version: 1.3
@@ -91,26 +91,26 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Enterprise Agreement and appropriate permissions for Azure Operator Nexus
-2. Azure CLI v2 installed and configured (version 2.40.0 or later)
+2. Azure CLI v2.40.0 or later installed and configured
 3. Azure Stack Edge Pro GPU device(s) deployed and configured
 4. 5G radio equipment (gNodeB) from certified partners
 5. Private spectrum license or CBRS access (3.5 GHz band in US)
 6. Understanding of 5G network architecture and Azure Arc-enabled services
 7. Estimated cost: $5,000-$10,000/month for core infrastructure plus spectrum costs
 
-> **Note**: Azure Private 5G Core requires specific hardware and radio equipment. Contact Microsoft or certified partners for detailed hardware requirements and compatibility matrix.
+> **Warning**: Azure Private 5G Core service will retire on September 30, 2025. Microsoft recommends migrating to partner solutions like [Nokia 4G & 5G private wireless](https://azuremarketplace.microsoft.com/en-US/marketplace/apps/nokiaofamericacorporation1591716055441.ndac_5g-ready_private_wireless?tab=Overview) or [Ericsson Private 5G](https://azuremarketplace.microsoft.com/en-US/marketplace/apps/ericssonab1605633442837.ericsson_private_five_g?tab=Overview) available in Azure Marketplace.
 
 ## Preparation
 
 ```bash
-# Set environment variables
-export RESOURCE_GROUP="rg-private5g-$(date +%s)"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-private5g-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 export MOBILE_NETWORK_NAME="mn-manufacturing"
 export SITE_NAME="site-factory01"
 
-# Generate unique identifiers
+# Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 export ASE_DEVICE_NAME="ase-${RANDOM_SUFFIX}"
 export CUSTOM_LOCATION_NAME="cl-${SITE_NAME}"
@@ -141,17 +141,17 @@ echo "✅ Resource providers registered"
    ```bash
    # Create the mobile network resource
    az mobile-network create \
-       --name ${MOBILE_NETWORK_NAME} \
+       --mobile-network-name ${MOBILE_NETWORK_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --public-land-mobile-network-identifier "{mcc:310,mnc:950}"
-   
+       --identifier "{mcc:310,mnc:950}"
+
    # Store the mobile network ID
    MOBILE_NETWORK_ID=$(az mobile-network show \
-       --name ${MOBILE_NETWORK_NAME} \
+       --mobile-network-name ${MOBILE_NETWORK_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query id --output tsv)
-   
+
    echo "✅ Mobile network created with ID: ${MOBILE_NETWORK_ID}"
    ```
 
@@ -169,7 +169,7 @@ echo "✅ Resource providers registered"
        --slice-name "slice-critical-iot" \
        --location ${LOCATION} \
        --snssai "{sst:1,sd:000001}"
-   
+
    # Create network slice for massive IoT
    az mobile-network slice create \
        --mobile-network-name ${MOBILE_NETWORK_NAME} \
@@ -177,7 +177,7 @@ echo "✅ Resource providers registered"
        --slice-name "slice-massive-iot" \
        --location ${LOCATION} \
        --snssai "{sst:2,sd:000002}"
-   
+
    # Create network slice for video surveillance
    az mobile-network slice create \
        --mobile-network-name ${MOBILE_NETWORK_NAME} \
@@ -185,7 +185,7 @@ echo "✅ Resource providers registered"
        --slice-name "slice-video" \
        --location ${LOCATION} \
        --snssai "{sst:3,sd:000003}"
-   
+
    echo "✅ Network slices configured for different use cases"
    ```
 
@@ -197,23 +197,21 @@ echo "✅ Resource providers registered"
 
    ```bash
    # Create data network for OT systems
-   az mobile-network attached-data-network create \
+   az mobile-network data-network create \
        --mobile-network-name ${MOBILE_NETWORK_NAME} \
        --data-network-name "dn-ot-systems" \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --dns-addresses "['10.1.0.10','10.1.0.11']" \
-       --user-plane-data-interface "{name:N6,ipv4Address:10.1.0.100}"
-   
+       --description "Operational Technology systems data network"
+
    # Create data network for IT systems
-   az mobile-network attached-data-network create \
+   az mobile-network data-network create \
        --mobile-network-name ${MOBILE_NETWORK_NAME} \
        --data-network-name "dn-it-systems" \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --dns-addresses "['10.2.0.10','10.2.0.11']" \
-       --user-plane-data-interface "{name:N6,ipv4Address:10.2.0.100}"
-   
+       --description "Information Technology systems data network"
+
    echo "✅ Data networks created for traffic segmentation"
    ```
 
@@ -232,13 +230,13 @@ echo "✅ Resource providers registered"
        --namespace "Microsoft.ExtendedLocation" \
        --host-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Kubernetes/connectedClusters/${ASE_DEVICE_NAME}" \
        --cluster-extension-ids "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Kubernetes/connectedClusters/${ASE_DEVICE_NAME}/providers/Microsoft.KubernetesConfiguration/extensions/azure-private-5g-core"
-   
+
    # Get custom location ID
    CUSTOM_LOCATION_ID=$(az customlocation show \
        --name ${CUSTOM_LOCATION_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query id --output tsv)
-   
+
    echo "✅ Custom location created for edge deployment"
    ```
 
@@ -250,22 +248,22 @@ echo "✅ Resource providers registered"
    # Create site resource
    az mobile-network site create \
        --mobile-network-name ${MOBILE_NETWORK_NAME} \
-       --name ${SITE_NAME} \
+       --site-name ${SITE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION}
-   
+
    # Deploy packet core control plane
    az mobile-network pccp create \
-       --name ${SITE_NAME} \
+       --packet-core-control-plane-name ${SITE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --access-interface "{name:N2,ipv4Address:192.168.1.10,ipv4Subnet:192.168.1.0/24,ipv4Gateway:192.168.1.1}" \
-       --local-diagnostics "{authentication-type:AAD}" \
-       --platform "{type:AKS-HCI,custom-location:${CUSTOM_LOCATION_ID}}" \
+       --local-diagnostics "{authenticationType:AAD}" \
+       --platform "{type:AKS-HCI,customLocationId:${CUSTOM_LOCATION_ID}}" \
        --sku "G0" \
-       --mobile-network "{id:${MOBILE_NETWORK_ID}}" \
-       --control-plane-access-interface "{name:N2}"
-   
+       --mobile-networks "[{id:${MOBILE_NETWORK_ID}}]" \
+       --control-plane-access-interface "{name:N2,ipv4Address:192.168.1.10,ipv4Subnet:192.168.1.0/24,ipv4Gateway:192.168.1.1}"
+
    echo "✅ Packet core control plane deployed"
    ```
 
@@ -282,18 +280,18 @@ echo "✅ Resource providers registered"
        --resource-group ${RESOURCE_GROUP} \
        --service-name "svc-realtime-control" \
        --location ${LOCATION} \
-       --service-qos "{5qi:82,arp:{priority-level:1,preemption-capability:MayPreempt,preemption-vulnerability:NotPreemptable}}" \
-       --pcc-rules "[{rule-name:rule-control,rule-precedence:100,service-data-flow-templates:[{template-name:control-traffic,direction:Bidirectional,protocol:[TCP],remote-ip-list:[10.1.0.0/16]}]}]"
-   
+       --service-precedence 10 \
+       --pcc-rules "[{ruleName:rule-control,rulePrecedence:100,serviceDataFlowTemplates:[{templateName:control-traffic,direction:Bidirectional,protocol:[tcp],remoteIpList:[10.1.0.0/16]}]}]"
+
    # Create service for video surveillance
    az mobile-network service create \
        --mobile-network-name ${MOBILE_NETWORK_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --service-name "svc-video-surveillance" \
        --location ${LOCATION} \
-       --service-qos "{5qi:4,arp:{priority-level:5,preemption-capability:MayPreempt,preemption-vulnerability:Preemptable}}" \
-       --pcc-rules "[{rule-name:rule-video,rule-precedence:200,service-data-flow-templates:[{template-name:video-streams,direction:Uplink,protocol:[UDP],remote-ip-list:[10.2.0.0/16],port-list:[{port:554,protocol:TCP}]}]}]"
-   
+       --service-precedence 20 \
+       --pcc-rules "[{ruleName:rule-video,rulePrecedence:200,serviceDataFlowTemplates:[{templateName:video-streams,direction:Uplink,protocol:[udp],remoteIpList:[10.2.0.0/16]}]}]"
+
    echo "✅ Service policies configured for different traffic types"
    ```
 
@@ -302,16 +300,30 @@ echo "✅ Resource providers registered"
    SIM policies control device access to your network and assign appropriate service levels. In a private 5G deployment, you maintain complete control over which devices can connect, what resources they can access, and their quality of service parameters.
 
    ```bash
+   # Get slice ID for SIM policy
+   SLICE_ID=$(az mobile-network slice show \
+       --mobile-network-name ${MOBILE_NETWORK_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --slice-name "slice-critical-iot" \
+       --query id --output tsv)
+
+   # Get data network ID for SIM policy
+   DATA_NETWORK_ID=$(az mobile-network data-network show \
+       --mobile-network-name ${MOBILE_NETWORK_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --data-network-name "dn-ot-systems" \
+       --query id --output tsv)
+
    # Create SIM policy for industrial IoT devices
-   az mobile-network sim-policy create \
+   az mobile-network sim policy create \
        --mobile-network-name ${MOBILE_NETWORK_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --sim-policy-name "policy-industrial-iot" \
        --location ${LOCATION} \
-       --default-slice "{id:/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.MobileNetwork/mobileNetworks/${MOBILE_NETWORK_NAME}/slices/slice-critical-iot}" \
+       --default-slice "{id:${SLICE_ID}}" \
        --ue-ambr "{uplink:10 Mbps,downlink:10 Mbps}" \
-       --slice-configurations "[{slice:{id:/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.MobileNetwork/mobileNetworks/${MOBILE_NETWORK_NAME}/slices/slice-critical-iot},default-data-network:{id:/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.MobileNetwork/mobileNetworks/${MOBILE_NETWORK_NAME}/dataNetworks/dn-ot-systems},data-network-configurations:[{data-network:{id:/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.MobileNetwork/mobileNetworks/${MOBILE_NETWORK_NAME}/dataNetworks/dn-ot-systems},session-ambr:{uplink:10 Mbps,downlink:10 Mbps},5qi:82,arp:{priority-level:1}}]}]"
-   
+       --slice-configurations "[{slice:{id:${SLICE_ID}},defaultDataNetwork:{id:${DATA_NETWORK_ID}},dataNetworkConfigurations:[{dataNetwork:{id:${DATA_NETWORK_ID}},sessionAmbr:{uplink:10 Mbps,downlink:10 Mbps}}]}]"
+
    echo "✅ SIM policies created for device provisioning"
    ```
 
@@ -322,23 +334,23 @@ echo "✅ Resource providers registered"
    ```bash
    # Create Log Analytics workspace
    az monitor log-analytics workspace create \
-       --name "law-private5g-${RANDOM_SUFFIX}" \
+       --workspace-name "law-private5g-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION}
-   
+
    # Configure diagnostic settings for packet core
    LAW_ID=$(az monitor log-analytics workspace show \
-       --name "law-private5g-${RANDOM_SUFFIX}" \
+       --workspace-name "law-private5g-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
        --query id --output tsv)
-   
+
    az monitor diagnostic-settings create \
        --name "diag-packet-core" \
        --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.MobileNetwork/packetCoreControlPlanes/${SITE_NAME}" \
        --logs '[{"category":"DeviceEvents","enabled":true},{"category":"SMFEvents","enabled":true}]' \
        --metrics '[{"category":"AllMetrics","enabled":true}]' \
        --workspace ${LAW_ID}
-   
+
    echo "✅ Monitoring and analytics configured"
    ```
 
@@ -355,24 +367,24 @@ echo "✅ Resource providers registered"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --sku S1
-   
+
    # Create device provisioning service
    az iot dps create \
        --name "dps-5g-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION}
-   
+
    # Link DPS to IoT Hub
    IOT_HUB_CONNECTION=$(az iot hub connection-string show \
        --hub-name "iothub-5g-${RANDOM_SUFFIX}" \
        --key primary --query connectionString --output tsv)
-   
+
    az iot dps linked-hub create \
        --dps-name "dps-5g-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
        --connection-string "${IOT_HUB_CONNECTION}" \
        --location ${LOCATION}
-   
+
    echo "✅ IoT services integrated with 5G network"
    ```
 
@@ -387,7 +399,7 @@ echo "✅ Resource providers registered"
         --resource-group ${RESOURCE_GROUP} \
         --location ${LOCATION} \
         --sku Standard
-    
+
     # Deploy sample edge analytics workload
     cat > edge-workload.yaml << EOF
     apiVersion: apps/v1
@@ -418,11 +430,11 @@ echo "✅ Resource providers registered"
                 memory: "1Gi"
                 cpu: "1000m"
     EOF
-    
+
     # Apply workload to edge cluster
     kubectl apply -f edge-workload.yaml \
         --kubeconfig ${CUSTOM_LOCATION_NAME}-kubeconfig
-    
+
     echo "✅ Edge computing workloads deployed"
     ```
 
@@ -435,7 +447,7 @@ echo "✅ Resource providers registered"
    ```bash
    # Check packet core control plane status
    az mobile-network pccp show \
-       --name ${SITE_NAME} \
+       --packet-core-control-plane-name ${SITE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query "{State:provisioningState,Version:version}" \
        --output table
@@ -443,12 +455,11 @@ echo "✅ Resource providers registered"
 
    Expected output: State should show "Succeeded" and Version should display the deployed packet core version.
 
-2. Test device connectivity:
+2. Test data network connectivity:
 
    ```bash
-   # Simulate UE attach (requires test device with provisioned SIM)
-   # Check connected devices
-   az mobile-network attached-data-network list \
+   # Check data networks
+   az mobile-network data-network list \
        --resource-group ${RESOURCE_GROUP} \
        --mobile-network-name ${MOBILE_NETWORK_NAME} \
        --query "[].{Name:name,State:provisioningState}" \
@@ -488,7 +499,7 @@ echo "✅ Resource providers registered"
    kubectl delete deployment realtime-analytics \
        --namespace edge-workloads \
        --kubeconfig ${CUSTOM_LOCATION_NAME}-kubeconfig
-   
+
    echo "✅ Edge workloads removed"
    ```
 
@@ -497,17 +508,17 @@ echo "✅ Resource providers registered"
    ```bash
    # Delete packet core control plane
    az mobile-network pccp delete \
-       --name ${SITE_NAME} \
+       --packet-core-control-plane-name ${SITE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --yes --no-wait
-   
+
    # Delete site
    az mobile-network site delete \
        --mobile-network-name ${MOBILE_NETWORK_NAME} \
-       --name ${SITE_NAME} \
+       --site-name ${SITE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --yes --no-wait
-   
+
    echo "✅ Packet core and site deletion initiated"
    ```
 
@@ -518,12 +529,12 @@ echo "✅ Resource providers registered"
    az iot hub delete \
        --name "iothub-5g-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP}
-   
+
    # Delete DPS
    az iot dps delete \
        --name "dps-5g-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP}
-   
+
    echo "✅ IoT services removed"
    ```
 
@@ -534,7 +545,7 @@ echo "✅ Resource providers registered"
    az group delete \
        --name ${RESOURCE_GROUP} \
        --yes --no-wait
-   
+
    echo "✅ Resource group deletion initiated: ${RESOURCE_GROUP}"
    echo "Note: Complete deletion may take 10-15 minutes"
    ```
@@ -549,22 +560,27 @@ Network slicing capabilities allow organizations to create multiple virtual netw
 
 From a security perspective, private 5G networks provide inherent advantages over Wi-Fi, including SIM-based authentication, encrypted air interfaces, and complete network isolation. Integration with Azure security services adds defense-in-depth through [Azure Private 5G Core security best practices](https://learn.microsoft.com/en-us/azure/private-5g-core/security), while the [reliability guide](https://learn.microsoft.com/en-us/azure/private-5g-core/reliability-private-5g-core) details high availability configurations for mission-critical deployments.
 
-> **Warning**: Azure Private 5G Core service will retire on September 30, 2025. Microsoft recommends migrating to partner solutions like Nokia or Ericsson private wireless offerings available in Azure Marketplace. Plan your migration strategy early to avoid service disruption.
+> **Warning**: Given the upcoming retirement of Azure Private 5G Core on September 30, 2025, organizations should evaluate migration paths to partner solutions early in the planning process. This allows sufficient time to test alternative solutions and ensure continuity of operations.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Site Federation**: Deploy private 5G cores across multiple manufacturing sites and implement inter-site communication through Azure Virtual WAN, enabling seamless roaming for mobile assets between facilities.
+1. **Migration to Partner Solutions**: Evaluate and implement migration to Nokia or Ericsson private 5G solutions available in Azure Marketplace before the September 2025 retirement deadline.
 
-2. **AI-Powered Network Optimization**: Integrate Azure Machine Learning to analyze network telemetry and automatically adjust QoS policies based on application performance, implementing self-optimizing network capabilities.
+2. **Multi-Site Federation**: Deploy private 5G cores across multiple manufacturing sites and implement inter-site communication through Azure Virtual WAN, enabling seamless roaming for mobile assets between facilities.
 
-3. **Digital Twin Integration**: Connect the 5G network to Azure Digital Twins to create real-time digital representations of manufacturing equipment, enabling predictive maintenance and process optimization.
+3. **AI-Powered Network Optimization**: Integrate Azure Machine Learning to analyze network telemetry and automatically adjust QoS policies based on application performance, implementing self-optimizing network capabilities.
 
-4. **Zero Trust Security**: Implement Azure Private Endpoint connections for all management traffic and integrate with Microsoft Defender for IoT to detect anomalous device behavior on the 5G network.
+4. **Digital Twin Integration**: Connect the 5G network to Azure Digital Twins to create real-time digital representations of manufacturing equipment, enabling predictive maintenance and process optimization.
 
-5. **Hybrid RAN Deployment**: Extend the solution to support both indoor small cells and outdoor macro cells, implementing carrier aggregation for increased throughput in high-density areas.
+5. **Zero Trust Security**: Implement Azure Private Endpoint connections for all management traffic and integrate with Microsoft Defender for IoT to detect anomalous device behavior on the 5G network.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

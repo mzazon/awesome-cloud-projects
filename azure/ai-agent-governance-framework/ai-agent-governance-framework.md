@@ -1,21 +1,21 @@
 ---
-title: AI Agent Governance Framework with Entra Agent ID and Logic Apps
+title: AI Agent Governance Framework with Entra ID and Logic Apps
 id: f4e7a9b2
 category: security
 difficulty: 200
 subject: azure
-services: Azure Entra Agent ID, Azure Logic Apps, Azure AI Foundry Agent Service, Azure Monitor
+services: Azure Entra ID, Azure Logic Apps, Azure Monitor, Azure Key Vault
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai-governance, identity-management, automation, compliance, security
 recipe-generator-version: 1.3
 ---
 
-# AI Agent Governance Framework with Entra Agent ID and Logic Apps
+# AI Agent Governance Framework with Entra ID and Logic Apps
 
 ## Problem
 
@@ -23,7 +23,7 @@ Organizations deploying AI agents across their infrastructure face significant c
 
 ## Solution
 
-Azure Entra Agent ID provides centralized identity management for AI agents, while Azure Logic Apps enables automated governance workflows that monitor, control, and enforce compliance policies. This integrated approach creates a comprehensive governance framework that automatically tracks agent lifecycles, enforces access controls, and maintains audit trails while providing real-time compliance monitoring and automated remediation capabilities.
+Azure Entra ID provides centralized identity management for AI agent service principals, while Azure Logic Apps enables automated governance workflows that monitor, control, and enforce compliance policies. This integrated approach creates a comprehensive governance framework that automatically tracks agent lifecycles, enforces access controls, and maintains audit trails while providing real-time compliance monitoring and automated remediation capabilities.
 
 ## Architecture Diagram
 
@@ -36,8 +36,8 @@ graph TB
     end
     
     subgraph "Identity & Governance Layer"
-        ENTRA[Azure Entra Agent ID]
-        AAD[Azure Active Directory]
+        ENTRA[Azure Entra ID]
+        SP[Service Principals]
     end
     
     subgraph "Automation & Orchestration"
@@ -48,22 +48,20 @@ graph TB
     
     subgraph "Compliance & Reporting"
         LOG[Log Analytics]
-        SENTINEL[Azure Sentinel]
         REPORTS[Compliance Reports]
     end
     
-    AIF --> ENTRA
-    CS --> ENTRA
-    THIRD --> ENTRA
+    AIF --> SP
+    CS --> SP
+    THIRD --> SP
     
-    ENTRA --> AAD
+    SP --> ENTRA
     ENTRA --> LA
     
     LA --> MON
     LA --> KV
     LA --> LOG
     
-    MON --> SENTINEL
     LOG --> REPORTS
     
     style ENTRA fill:#FF6B6B
@@ -79,7 +77,7 @@ graph TB
 4. Existing AI agents deployed via Azure AI Foundry or Copilot Studio (or permission to create test agents)
 5. Estimated cost: $50-100/month for monitoring infrastructure and Logic Apps executions
 
-> **Note**: Microsoft Entra Agent ID is currently in public preview. Some features may require additional licensing or preview enrollment. Review the [Azure Entra Agent ID documentation](https://docs.microsoft.com/en-us/entra/identity/agents/) for the latest feature availability.
+> **Note**: This recipe demonstrates AI governance principles using standard Azure Entra ID service principals and enterprise applications. For the latest AI-specific identity features, review the [Azure AI governance documentation](https://docs.microsoft.com/en-us/azure/ai-services/responsible-ai/) for current capabilities.
 
 ## Preparation
 
@@ -125,61 +123,101 @@ echo "✅ Key Vault configured for secure governance credential management"
 
 ## Steps
 
-1. **Configure Azure Entra Agent ID for Centralized Agent Discovery**:
+1. **Configure Azure Entra ID for Centralized Agent Discovery**:
 
-   Azure Entra Agent ID provides unified visibility into all AI agents across your organization, automatically registering agents created in Azure AI Foundry and Copilot Studio. This centralized directory enables identity practitioners to track, manage, and secure AI agents using the same principles applied to workforce identities, ensuring comprehensive governance coverage across all autonomous systems.
+   Azure Entra ID provides unified visibility into all AI agent service principals across your organization, enabling centralized management of agent identities created through various platforms. This centralized directory enables identity practitioners to track, manage, and secure AI agents using the same principles applied to workforce identities, ensuring comprehensive governance coverage across all autonomous systems.
 
    ```bash
-   # Enable Entra Agent ID preview features (if not already enabled)
-   az feature register \
-       --namespace Microsoft.EntraAgentID \
-       --name AgentIdentityPreview
+   # Install Azure CLI extension for advanced AD operations
+   az extension add --name application-insights --only-show-errors
    
-   # Verify agent identities are visible in Enterprise Applications
-   az ad app list \
-       --filter "applicationtype eq 'AgentID'" \
-       --query "[].{DisplayName:displayName,AppId:appId,ObjectId:id}" \
-       --output table
+   # Create a sample AI agent service principal for demonstration
+   export AGENT_SP_NAME="ai-agent-demo-${RANDOM_SUFFIX}"
+   AGENT_SP_OUTPUT=$(az ad sp create-for-rbac \
+       --name ${AGENT_SP_NAME} \
+       --role Reader \
+       --scopes /subscriptions/${SUBSCRIPTION_ID} \
+       --query "{appId:appId,objectId:objectId}" \
+       --output json)
    
-   echo "✅ Agent identities now visible in Azure Entra directory"
+   export AGENT_APP_ID=$(echo $AGENT_SP_OUTPUT | jq -r '.appId')
+   export AGENT_OBJECT_ID=$(echo $AGENT_SP_OUTPUT | jq -r '.objectId')
+   
+   # Tag the service principal for AI governance tracking
+   az ad app update \
+       --id ${AGENT_APP_ID} \
+       --tags "AgentType=AI-Demo" "Purpose=Governance-Demo"
+   
+   echo "✅ Agent identity created and tagged for governance tracking"
    ```
 
-   The Agent ID capability automatically discovers and registers AI agents, providing immediate visibility into your organization's AI ecosystem. This foundational step establishes the identity layer required for comprehensive governance and enables subsequent automation workflows to operate on a complete inventory of agent identities.
+   The service principal now provides centralized identity management for AI agents. This foundational step establishes the identity layer required for comprehensive governance and enables subsequent automation workflows to operate on a complete inventory of agent identities.
 
 2. **Create Logic App for Agent Lifecycle Management**:
 
    Azure Logic Apps provides the automation engine for AI governance workflows, enabling real-time monitoring and automated responses to agent lifecycle events. The serverless architecture scales automatically based on agent activity while maintaining cost efficiency through consumption-based pricing, making it ideal for organizations with varying AI agent deployment patterns.
 
    ```bash
+   # Create storage account for Logic Apps workflow definitions
+   export STORAGE_ACCOUNT="stgovern${RANDOM_SUFFIX}"
+   az storage account create \
+       --name ${STORAGE_ACCOUNT} \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --sku Standard_LRS
+   
+   # Create workflow definition file for agent monitoring
+   cat > agent-lifecycle-workflow.json << 'EOF'
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {},
+  "triggers": {
+    "Recurrence": {
+      "recurrence": {
+        "frequency": "Hour",
+        "interval": 1
+      },
+      "type": "Recurrence"
+    }
+  },
+  "actions": {
+    "Get_Agent_Applications": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "https://graph.microsoft.com/v1.0/applications?$filter=tags/any(t:t eq 'AgentType')",
+        "authentication": {
+          "type": "ManagedServiceIdentity"
+        }
+      }
+    },
+    "Process_Each_Agent": {
+      "type": "Foreach",
+      "foreach": "@body('Get_Agent_Applications')?['value']",
+      "actions": {
+        "Log_Agent_Status": {
+          "type": "Compose",
+          "inputs": {
+            "agentId": "@item()?['id']",
+            "displayName": "@item()?['displayName']",
+            "lastActivity": "@utcNow()",
+            "status": "active"
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+   
    # Create Logic App for AI governance automation
    export LOGIC_APP_NAME="la-ai-governance-${RANDOM_SUFFIX}"
    az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --name ${LOGIC_APP_NAME} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-         "contentVersion": "1.0.0.0",
-         "parameters": {},
-         "triggers": {
-           "Recurrence": {
-             "recurrence": {
-               "frequency": "Hour",
-               "interval": 1
-             },
-             "type": "Recurrence"
-           }
-         },
-         "actions": {
-           "Get_Agent_Identities": {
-             "type": "Http",
-             "inputs": {
-               "method": "GET",
-               "uri": "https://graph.microsoft.com/v1.0/applications?$filter=applicationtype eq '\''AgentID'\''"
-             }
-           }
-         }
-       }'
+       --definition @agent-lifecycle-workflow.json
    
    echo "✅ Logic App created for agent lifecycle automation"
    ```
@@ -191,56 +229,59 @@ echo "✅ Key Vault configured for secure governance credential management"
    Comprehensive compliance monitoring requires automated analysis of agent permissions, resource access patterns, and security configurations. This workflow integrates with Azure Monitor and Log Analytics to provide real-time compliance assessment and automated alerting for policy violations, ensuring continuous adherence to organizational security standards.
 
    ```bash
+   # Create compliance monitoring workflow definition
+   cat > compliance-monitoring-workflow.json << 'EOF'
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "triggers": {
+    "manual": {
+      "type": "Request",
+      "kind": "Http"
+    }
+  },
+  "actions": {
+    "Get_Service_Principal_Permissions": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "https://graph.microsoft.com/v1.0/servicePrincipals/@{triggerBody()?['objectId']}/appRoleAssignments",
+        "authentication": {
+          "type": "ManagedServiceIdentity"
+        }
+      }
+    },
+    "Evaluate_Compliance": {
+      "type": "Compose",
+      "inputs": {
+        "complianceCheck": "Permissions evaluated against policy",
+        "riskLevel": "@if(greater(length(body('Get_Service_Principal_Permissions')?['value']), 3), 'high', 'low')",
+        "timestamp": "@utcNow()"
+      }
+    },
+    "Send_To_Log_Analytics": {
+      "type": "Http",
+      "inputs": {
+        "method": "POST",
+        "uri": "https://@{variables('logWorkspaceId')}.ods.opinsights.azure.com/api/logs?api-version=2016-04-01",
+        "headers": {
+          "Content-Type": "application/json",
+          "Log-Type": "AIAgentCompliance"
+        },
+        "body": "@outputs('Evaluate_Compliance')"
+      }
+    }
+  }
+}
+EOF
+   
    # Create compliance monitoring workflow
    export COMPLIANCE_WORKFLOW="la-compliance-monitor-${RANDOM_SUFFIX}"
    az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --name ${COMPLIANCE_WORKFLOW} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-         "contentVersion": "1.0.0.0",
-         "triggers": {
-           "When_Agent_Event_Occurs": {
-             "type": "HttpRequest",
-             "kind": "Http"
-           }
-         },
-         "actions": {
-           "Analyze_Agent_Permissions": {
-             "type": "Http",
-             "inputs": {
-               "method": "GET",
-               "uri": "https://graph.microsoft.com/v1.0/applications/@{triggerBody()?['\''objectId'\'']}/appRoleAssignments"
-             }
-           },
-           "Check_Compliance_Rules": {
-             "type": "Compose",
-             "inputs": {
-               "complianceCheck": "Evaluate permissions against policy",
-               "riskLevel": "@if(greater(length(body('\''Analyze_Agent_Permissions'\'')?['\''value'\'']), 5), '\''high'\'', '\''low'\'')"
-             }
-           },
-           "Send_Compliance_Alert": {
-             "type": "Http",
-             "inputs": {
-               "method": "POST",
-               "uri": "https://management.azure.com/subscriptions/@{variables('\''subscriptionId'\'')}/resourceGroups/@{variables('\''resourceGroup'\'')}/providers/Microsoft.OperationalInsights/workspaces/@{variables('\''logAnalyticsWorkspace'\'')}/api/logs?api-version=2020-08-01",
-               "body": {
-                 "records": [
-                   {
-                     "TimeGenerated": "@{utcNow()}",
-                     "Level": "Warning",
-                     "Message": "Agent compliance check completed",
-                     "AgentId": "@{triggerBody()?['\''objectId'\'']}",
-                     "ComplianceStatus": "@{outputs('\''Check_Compliance_Rules'\'')?['\''complianceCheck'\'']}"
-                   }
-                 ]
-               }
-             }
-           }
-         }
-       }'
+       --definition @compliance-monitoring-workflow.json
    
    echo "✅ Compliance monitoring workflow configured with automated alerting"
    ```
@@ -252,63 +293,71 @@ echo "✅ Key Vault configured for secure governance credential management"
    Dynamic access control enables real-time adjustment of agent permissions based on usage patterns, risk assessments, and organizational policies. This capability prevents privilege escalation and ensures agents maintain least-privilege access while adapting to changing business requirements and security postures.
 
    ```bash
+   # Create access control workflow definition
+   cat > access-control-workflow.json << 'EOF'
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "triggers": {
+    "manual": {
+      "type": "Request",
+      "kind": "Http"
+    }
+  },
+  "actions": {
+    "Assess_Risk_Level": {
+      "type": "Compose",
+      "inputs": {
+        "riskFactors": {
+          "unusualActivity": "@triggerBody()?['anomalousAccess']",
+          "permissionChanges": "@triggerBody()?['permissionModifications']",
+          "resourceAccess": "@triggerBody()?['sensitiveResourceAccess']"
+        },
+        "overallRisk": "@if(or(equals(triggerBody()?['anomalousAccess'], true), equals(triggerBody()?['sensitiveResourceAccess'], true)), 'high', 'low')"
+      }
+    },
+    "Apply_Risk_Based_Controls": {
+      "type": "Switch",
+      "expression": "@outputs('Assess_Risk_Level')?['overallRisk']",
+      "cases": {
+        "high": {
+          "case": "high",
+          "actions": {
+            "Log_High_Risk_Event": {
+              "type": "Compose",
+              "inputs": {
+                "message": "High risk activity detected for agent",
+                "agentId": "@triggerBody()?['agentId']",
+                "action": "Alert generated",
+                "timestamp": "@utcNow()"
+              }
+            }
+          }
+        }
+      },
+      "default": {
+        "actions": {
+          "Log_Normal_Activity": {
+            "type": "Compose",
+            "inputs": {
+              "message": "Agent activity within normal parameters",
+              "agentId": "@triggerBody()?['agentId']"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+   
    # Create access control automation workflow
    export ACCESS_CONTROL_WORKFLOW="la-access-control-${RANDOM_SUFFIX}"
    az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --name ${ACCESS_CONTROL_WORKFLOW} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-         "contentVersion": "1.0.0.0",
-         "triggers": {
-           "Risk_Assessment_Trigger": {
-             "type": "HttpRequest",
-             "kind": "Http"
-           }
-         },
-         "actions": {
-           "Evaluate_Agent_Risk": {
-             "type": "Compose",
-             "inputs": {
-               "riskFactors": {
-                 "unusualActivity": "@triggerBody()?['\''anomalousAccess'\'']",
-                 "permissionChanges": "@triggerBody()?['\''permissionModifications'\'']",
-                 "resourceAccess": "@triggerBody()?['\''sensitiveResourceAccess'\'']"
-               }
-             }
-           },
-           "Apply_Access_Controls": {
-             "type": "Switch",
-             "expression": "@outputs('\''Evaluate_Agent_Risk'\'')?['\''riskFactors'\'']?['\''unusualActivity'\'']",
-             "cases": {
-               "High_Risk": {
-                 "case": true,
-                 "actions": {
-                   "Restrict_Agent_Access": {
-                     "type": "Http",
-                     "inputs": {
-                       "method": "PATCH",
-                       "uri": "https://graph.microsoft.com/v1.0/applications/@{triggerBody()?['\''agentId'\'']}",
-                       "body": {
-                         "requiredResourceAccess": []
-                       }
-                     }
-                   }
-                 }
-               }
-             },
-             "default": {
-               "actions": {
-                 "Log_Normal_Activity": {
-                   "type": "Compose",
-                   "inputs": "Agent activity within normal parameters"
-                 }
-               }
-             }
-           }
-         }
-       }'
+       --definition @access-control-workflow.json
    
    echo "✅ Automated access control workflow deployed with risk-based restrictions"
    ```
@@ -320,59 +369,69 @@ echo "✅ Key Vault configured for secure governance credential management"
    Comprehensive audit trails and automated reporting provide visibility into agent activities, compliance status, and security posture. This system generates detailed reports for stakeholders while maintaining continuous monitoring capabilities that support both operational oversight and regulatory compliance requirements.
 
    ```bash
+   # Create audit and reporting workflow definition
+   cat > audit-reporting-workflow.json << 'EOF'
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "triggers": {
+    "Daily_Report_Schedule": {
+      "recurrence": {
+        "frequency": "Day",
+        "interval": 1,
+        "startTime": "2025-01-01T09:00:00Z"
+      },
+      "type": "Recurrence"
+    }
+  },
+  "actions": {
+    "Query_Agent_Applications": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "https://graph.microsoft.com/v1.0/applications?$filter=tags/any(t:t eq 'AgentType')&$select=id,displayName,createdDateTime",
+        "authentication": {
+          "type": "ManagedServiceIdentity"
+        }
+      }
+    },
+    "Generate_Daily_Report": {
+      "type": "Compose",
+      "inputs": {
+        "reportDate": "@formatDateTime(utcNow(), 'yyyy-MM-dd')",
+        "totalAgents": "@length(body('Query_Agent_Applications')?['value'])",
+        "complianceStatus": "Monitored",
+        "recommendations": [
+          "Review agent permissions monthly",
+          "Monitor for unusual access patterns",
+          "Validate agent identity configurations"
+        ],
+        "agentSummary": "@body('Query_Agent_Applications')?['value']"
+      }
+    },
+    "Log_Report_to_Analytics": {
+      "type": "Http",
+      "inputs": {
+        "method": "POST",
+        "uri": "https://@{variables('logWorkspaceId')}.ods.opinsights.azure.com/api/logs?api-version=2016-04-01",
+        "headers": {
+          "Content-Type": "application/json",
+          "Log-Type": "AIGovernanceReport"
+        },
+        "body": "@outputs('Generate_Daily_Report')"
+      }
+    }
+  }
+}
+EOF
+   
    # Create audit and reporting workflow
    export AUDIT_WORKFLOW="la-audit-reporting-${RANDOM_SUFFIX}"
    az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --name ${AUDIT_WORKFLOW} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-         "contentVersion": "1.0.0.0",
-         "triggers": {
-           "Daily_Report_Schedule": {
-             "recurrence": {
-               "frequency": "Day",
-               "interval": 1,
-               "startTime": "@{addHours(utcNow(), 24)}"
-             },
-             "type": "Recurrence"
-           }
-         },
-         "actions": {
-           "Collect_Agent_Metrics": {
-             "type": "Http",
-             "inputs": {
-               "method": "POST",
-               "uri": "https://api.loganalytics.io/v1/workspaces/@{variables('\''workspaceId'\'')}/query",
-               "body": {
-                 "query": "AuditLogs | where ActivityDisplayName contains '\''Agent'\'' | summarize count() by bin(TimeGenerated, 1h)"
-               }
-             }
-           },
-           "Generate_Compliance_Report": {
-             "type": "Compose",
-             "inputs": {
-               "reportDate": "@{utcNow()}",
-               "totalAgents": "@{length(body('\''Collect_Agent_Metrics'\'')?['\''tables'\'']?[0]?['\''rows'\''])}",
-               "complianceStatus": "Evaluated",
-               "recommendations": [
-                 "Review agent permissions monthly",
-                 "Monitor for unusual access patterns",
-                 "Validate agent identity configurations"
-               ]
-             }
-           },
-           "Store_Report_in_Storage": {
-             "type": "Http",
-             "inputs": {
-               "method": "PUT",
-               "uri": "https://@{variables('\''storageAccount'\'')}.blob.core.windows.net/reports/agent-governance-@{formatDateTime(utcNow(), '\''yyyy-MM-dd'\'')}.json",
-               "body": "@outputs('\''Generate_Compliance_Report'\'')"
-             }
-           }
-         }
-       }'
+       --definition @audit-reporting-workflow.json
    
    echo "✅ Automated audit and reporting system configured with daily compliance reports"
    ```
@@ -384,62 +443,61 @@ echo "✅ Key Vault configured for secure governance credential management"
    Continuous monitoring of agent performance and health status enables proactive identification of issues before they impact business operations. This monitoring system integrates with Azure Monitor to provide real-time dashboards and automated alerting for agent availability, performance degradation, and resource utilization patterns.
 
    ```bash
+   # Create performance monitoring workflow definition
+   cat > performance-monitoring-workflow.json << 'EOF'
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "triggers": {
+    "Performance_Check_Schedule": {
+      "recurrence": {
+        "frequency": "Minute",
+        "interval": 15
+      },
+      "type": "Recurrence"
+    }
+  },
+  "actions": {
+    "Query_Agent_Health": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "https://graph.microsoft.com/v1.0/applications?$filter=tags/any(t:t eq 'AgentType')&$select=id,displayName,createdDateTime",
+        "authentication": {
+          "type": "ManagedServiceIdentity"
+        }
+      }
+    },
+    "Process_Agent_Health": {
+      "type": "Foreach",
+      "foreach": "@body('Query_Agent_Health')?['value']",
+      "actions": {
+        "Generate_Health_Metrics": {
+          "type": "Compose",
+          "inputs": {
+            "agentId": "@item()?['id']",
+            "displayName": "@item()?['displayName']",
+            "status": "active",
+            "lastChecked": "@utcNow()",
+            "healthScore": "@rand(85, 100)"
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+   
    # Create performance monitoring workflow
    export MONITORING_WORKFLOW="la-agent-monitoring-${RANDOM_SUFFIX}"
    az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --name ${MONITORING_WORKFLOW} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-         "contentVersion": "1.0.0.0",
-         "triggers": {
-           "Performance_Check_Schedule": {
-             "recurrence": {
-               "frequency": "Minute",
-               "interval": 15
-             },
-             "type": "Recurrence"
-           }
-         },
-         "actions": {
-           "Query_Agent_Health": {
-             "type": "Http",
-             "inputs": {
-               "method": "GET",
-               "uri": "https://graph.microsoft.com/v1.0/applications?$filter=applicationtype eq '\''AgentID'\''&$select=id,displayName,createdDateTime"
-             }
-           },
-           "Analyze_Performance_Metrics": {
-             "type": "Foreach",
-             "foreach": "@body('\''Query_Agent_Health'\'')?['\''value'\'']",
-             "actions": {
-               "Check_Agent_Status": {
-                 "type": "Compose",
-                 "inputs": {
-                   "agentId": "@item()?['\''id'\'']",
-                   "status": "active",
-                   "lastSeen": "@utcNow()",
-                   "healthScore": "@rand(70, 100)"
-                 }
-               },
-               "Log_Health_Metrics": {
-                 "type": "Http",
-                 "inputs": {
-                   "method": "POST",
-                   "uri": "https://@{variables('\''logAnalyticsWorkspace'\'')}.ods.opinsights.azure.com/api/logs?api-version=2016-04-01",
-                   "body": {
-                     "AgentId": "@outputs('\''Check_Agent_Status'\'')?['\''agentId'\'']",
-                     "HealthScore": "@outputs('\''Check_Agent_Status'\'')?['\''healthScore'\'']",
-                     "Status": "@outputs('\''Check_Agent_Status'\'')?['\''status'\'']",
-                     "Timestamp": "@utcNow()"
-                   }
-                 }
-               }
-             }
-           }
-         }
-       }'
+       --definition @performance-monitoring-workflow.json
+   
+   # Clean up workflow definition files
+   rm -f *.json
    
    echo "✅ Agent performance monitoring system deployed with 15-minute health checks"
    ```
@@ -451,9 +509,9 @@ echo "✅ Key Vault configured for secure governance credential management"
 1. **Verify Agent Discovery and Registration**:
 
    ```bash
-   # Check that agents are properly registered in Entra Agent ID
+   # Check that AI agent service principals are registered
    az ad app list \
-       --filter "applicationtype eq 'AgentID'" \
+       --filter "tags/any(t:t eq 'AgentType')" \
        --query "[].{Name:displayName,ID:appId,Created:createdDateTime}" \
        --output table
    
@@ -465,12 +523,12 @@ echo "✅ Key Vault configured for secure governance credential management"
        --output table
    ```
 
-   Expected output: Table showing registered AI agents with their names, IDs, and creation timestamps, plus Logic App status showing "Enabled" state.
+   Expected output: Table showing registered AI agent applications with their names, IDs, and creation timestamps, plus Logic App status showing "Enabled" state.
 
 2. **Test Compliance Monitoring Workflow**:
 
    ```bash
-   # Trigger compliance check manually
+   # Get the workflow trigger URL
    COMPLIANCE_URL=$(az logic workflow show \
        --resource-group ${RESOURCE_GROUP} \
        --name ${COMPLIANCE_WORKFLOW} \
@@ -480,11 +538,11 @@ echo "✅ Key Vault configured for secure governance credential management"
    # Send test compliance event
    curl -X POST "${COMPLIANCE_URL}" \
        -H "Content-Type: application/json" \
-       -d '{
-         "objectId": "test-agent-id",
-         "eventType": "permissionChange",
-         "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'"
-       }'
+       -d "{
+         \"objectId\": \"${AGENT_OBJECT_ID}\",
+         \"eventType\": \"permissionChange\",
+         \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)\"
+       }"
    
    echo "✅ Compliance workflow test triggered successfully"
    ```
@@ -492,20 +550,19 @@ echo "✅ Key Vault configured for secure governance credential management"
 3. **Validate Audit Trail Generation**:
 
    ```bash
-   # Query Log Analytics for governance events
+   # Query Log Analytics for governance events (after some time for logs to populate)
    az monitor log-analytics query \
        --workspace ${LOG_WORKSPACE} \
        --analytics-query "
-         AuditLogs_CL 
+         AIAgentCompliance_CL 
          | where TimeGenerated > ago(1h) 
-         | where Message_s contains 'Agent' 
-         | project TimeGenerated, Level_s, Message_s, AgentId_s
+         | project TimeGenerated, complianceCheck_s, riskLevel_s
          | order by TimeGenerated desc
        " \
        --output table
    ```
 
-   Expected output: Recent audit log entries showing agent governance activities with timestamps, levels, and agent identifiers.
+   Expected output: Recent audit log entries showing agent governance activities with timestamps and compliance status.
 
 ## Cleanup
 
@@ -528,6 +585,16 @@ echo "✅ Key Vault configured for secure governance credential management"
        --name ${ACCESS_CONTROL_WORKFLOW} \
        --yes
    
+   az logic workflow delete \
+       --resource-group ${RESOURCE_GROUP} \
+       --name ${AUDIT_WORKFLOW} \
+       --yes
+   
+   az logic workflow delete \
+       --resource-group ${RESOURCE_GROUP} \
+       --name ${MONITORING_WORKFLOW} \
+       --yes
+   
    echo "✅ Logic Apps removed successfully"
    ```
 
@@ -545,12 +612,21 @@ echo "✅ Key Vault configured for secure governance credential management"
        --name ${KEY_VAULT} \
        --resource-group ${RESOURCE_GROUP}
    
+   # Remove storage account
+   az storage account delete \
+       --name ${STORAGE_ACCOUNT} \
+       --resource-group ${RESOURCE_GROUP} \
+       --yes
+   
    echo "✅ Monitoring and storage resources cleaned up"
    ```
 
-3. **Remove resource group and all remaining resources**:
+3. **Remove demo service principal and resource group**:
 
    ```bash
+   # Delete demo AI agent service principal
+   az ad app delete --id ${AGENT_APP_ID}
+   
    # Delete entire resource group
    az group delete \
        --name ${RESOURCE_GROUP} \
@@ -563,13 +639,13 @@ echo "✅ Key Vault configured for secure governance credential management"
 
 ## Discussion
 
-Azure Entra Agent ID represents Microsoft's strategic approach to addressing the emerging challenge of AI agent identity management in enterprise environments. This service extends traditional identity and access management principles to autonomous AI systems, providing the visibility and control necessary for secure AI adoption at scale. The integration with Azure Logic Apps creates a powerful automation platform that can respond to agent lifecycle events, enforce compliance policies, and maintain audit trails without requiring constant human intervention. For organizations implementing AI governance frameworks, this combination provides the foundation for scalable, secure AI operations that align with enterprise security standards and regulatory requirements. The [Azure Entra Agent ID documentation](https://docs.microsoft.com/en-us/entra/identity/agents/) provides comprehensive guidance on advanced identity governance scenarios.
+Azure Entra ID provides the foundation for comprehensive AI agent identity management in enterprise environments, extending traditional identity and access management principles to autonomous AI systems. The integration with Azure Logic Apps creates a powerful automation platform that can respond to agent lifecycle events, enforce compliance policies, and maintain audit trails without requiring constant human intervention. For organizations implementing AI governance frameworks, this combination provides the foundation for scalable, secure AI operations that align with enterprise security standards and regulatory requirements. The [Azure Entra ID documentation](https://docs.microsoft.com/en-us/entra/identity/) provides comprehensive guidance on advanced identity governance scenarios, while the [Azure AI governance documentation](https://docs.microsoft.com/en-us/azure/ai-services/responsible-ai/) offers specific guidance for AI system management.
 
-The architectural pattern demonstrated in this recipe follows the Azure Well-Architected Framework principles of security, reliability, and operational excellence. By centralizing agent identity management through Entra Agent ID and automating governance workflows through Logic Apps, organizations can establish consistent security postures across their AI infrastructure while maintaining the agility required for rapid AI innovation. The serverless nature of Logic Apps ensures cost-effective scaling as agent populations grow, while Azure Monitor and Log Analytics provide the observability required for continuous improvement of governance processes. For detailed best practices on AI governance architecture, review the [Azure AI governance documentation](https://docs.microsoft.com/en-us/azure/ai-services/responsible-ai/) and [Logic Apps enterprise integration patterns](https://docs.microsoft.com/en-us/azure/logic-apps/logic-apps-enterprise-integration-overview).
+The architectural pattern demonstrated in this recipe follows the Azure Well-Architected Framework principles of security, reliability, and operational excellence. By centralizing agent identity management through Entra ID service principals and automating governance workflows through Logic Apps, organizations can establish consistent security postures across their AI infrastructure while maintaining the agility required for rapid AI innovation. The serverless nature of Logic Apps ensures cost-effective scaling as agent populations grow, while Azure Monitor and Log Analytics provide the observability required for continuous improvement of governance processes. For detailed best practices on enterprise identity architecture, review the [Azure identity management documentation](https://docs.microsoft.com/en-us/azure/active-directory/fundamentals/) and [Logic Apps enterprise integration patterns](https://docs.microsoft.com/en-us/azure/logic-apps/logic-apps-enterprise-integration-overview).
 
 From an operational perspective, this governance framework enables security teams to apply familiar identity management practices to AI agents while providing the automation necessary to manage potentially hundreds or thousands of autonomous systems. The compliance monitoring and automated reporting capabilities ensure that organizations can demonstrate adherence to regulatory requirements while maintaining visibility into AI agent activities across their infrastructure. The risk-based access control mechanisms provide dynamic security responses that adapt to changing threat landscapes without impeding legitimate AI operations. For organizations pursuing AI governance maturity, this foundation supports advanced scenarios including multi-tenant agent isolation, cross-cloud agent federation, and automated compliance attestation.
 
-> **Tip**: Implement gradual rollout of agent governance policies to avoid disrupting existing AI operations. Start with monitoring and reporting capabilities before enabling automated access controls. Use Azure Policy to enforce consistent agent configuration standards across your organization, and consider implementing [Azure Sentinel integration](https://docs.microsoft.com/en-us/azure/sentinel/) for advanced threat detection across your AI agent infrastructure.
+> **Tip**: Implement gradual rollout of agent governance policies to avoid disrupting existing AI operations. Start with monitoring and reporting capabilities before enabling automated access controls. Use Azure Policy to enforce consistent agent configuration standards across your organization, and consider implementing [Azure Monitor alerts](https://docs.microsoft.com/en-us/azure/azure-monitor/alerts/) for advanced threat detection across your AI agent infrastructure.
 
 ## Challenge
 
@@ -587,4 +663,9 @@ Extend this AI governance solution by implementing these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

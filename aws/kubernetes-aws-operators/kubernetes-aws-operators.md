@@ -6,12 +6,12 @@ difficulty: 400
 subject: aws
 services: eks,iam,s3,lambda
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: eks,iam,s3,lambda
+tags: operator-sdk,ack,kubernetes,gitops
 recipe-generator-version: 1.3
 ---
 
@@ -92,11 +92,11 @@ graph TB
 ## Prerequisites
 
 1. AWS account with EKS cluster admin permissions and IAM role creation rights
-2. AWS CLI v2 installed and configured (or AWS CloudShell)
+2. AWS CLI v2 installed and configured (or AWS CloudShell)  
 3. kubectl configured for EKS cluster access
 4. Helm 3.8+ installed for ACK controller deployment
-5. Go 1.21+ and Docker installed for custom operator development
-6. Operator SDK v1.32+ for scaffolding custom operators
+5. Go 1.23+ and Docker installed for custom operator development
+6. Operator SDK v1.41+ for scaffolding custom operators
 7. Estimated cost: $50-100 for EKS cluster, Lambda functions, and S3 storage during development
 
 > **Note**: This advanced recipe assumes familiarity with Kubernetes operators, Go programming, and AWS service integration patterns.
@@ -118,13 +118,13 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --output text --query RandomPassword)
 export RESOURCE_SUFFIX="ack-${RANDOM_SUFFIX}"
 
-# Create EKS cluster if not exists
+# Create EKS cluster with latest supported version if not exists
 if ! aws eks describe-cluster --name $CLUSTER_NAME \
     --region $AWS_REGION &>/dev/null; then
     echo "Creating EKS cluster..."
     aws eks create-cluster \
         --name $CLUSTER_NAME \
-        --version 1.28 \
+        --version 1.31 \
         --role-arn arn:aws:iam::$AWS_ACCOUNT_ID:role/eks-service-role \
         --resources-vpc-config subnetIds=subnet-12345,subnet-67890 \
         --region $AWS_REGION
@@ -139,9 +139,8 @@ aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION
 # Create OIDC identity provider for service accounts
 OIDC_ISSUER=$(aws eks describe-cluster --name $CLUSTER_NAME \
     --query "cluster.identity.oidc.issuer" --output text)
-OIDC_ID=$(echo $OIDC_ISSUER | cut -d '/' -f 5)
 
-# Create IAM role for ACK controllers
+# Create IAM role for ACK controllers with required policies
 cat > trust-policy.json << EOF
 {
   "Version": "2012-10-17",
@@ -154,7 +153,8 @@ cat > trust-policy.json << EOF
       "Action": "sts:AssumeRoleWithWebIdentity",
       "Condition": {
         "StringEquals": {
-          "${OIDC_ISSUER#https://}:sub": "system:serviceaccount:${ACK_SYSTEM_NAMESPACE}:ack-controller"
+          "${OIDC_ISSUER#https://}:sub": "system:serviceaccount:${ACK_SYSTEM_NAMESPACE}:ack-s3-controller",
+          "${OIDC_ISSUER#https://}:aud": "sts.amazonaws.com"
         }
       }
     }
@@ -166,8 +166,23 @@ aws iam create-role \
     --role-name ACK-Controller-Role-${RESOURCE_SUFFIX} \
     --assume-role-policy-document file://trust-policy.json
 
+# Attach required policies for ACK controllers
+aws iam attach-role-policy \
+    --role-name ACK-Controller-Role-${RESOURCE_SUFFIX} \
+    --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+aws iam attach-role-policy \
+    --role-name ACK-Controller-Role-${RESOURCE_SUFFIX} \
+    --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
+
+aws iam attach-role-policy \
+    --role-name ACK-Controller-Role-${RESOURCE_SUFFIX} \
+    --policy-arn arn:aws:iam::aws:policy/AWSLambda_FullAccess
+
 # Create namespace for ACK controllers
 kubectl create namespace $ACK_SYSTEM_NAMESPACE
+
+echo "✅ AWS environment and EKS cluster prepared"
 ```
 
 ## Steps
@@ -199,7 +214,8 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
 
    ```bash
    # Get latest S3 controller version
-   S3_VERSION=$(curl -sL https://api.github.com/repos/aws-controllers-k8s/s3-controller/releases/latest | jq -r '.tag_name | ltrimstr("v")')
+   S3_VERSION=$(curl -sL https://api.github.com/repos/aws-controllers-k8s/s3-controller/releases/latest | \
+       jq -r '.tag_name | ltrimstr("v")')
    
    # Install S3 controller
    aws ecr-public get-login-password --region us-east-1 | \
@@ -209,7 +225,6 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
        oci://public.ecr.aws/aws-controllers-k8s/s3-chart \
        --version=$S3_VERSION \
        --namespace $ACK_SYSTEM_NAMESPACE \
-       --create-namespace \
        --set aws.region=$AWS_REGION \
        --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="arn:aws:iam::${AWS_ACCOUNT_ID}:role/ACK-Controller-Role-${RESOURCE_SUFFIX}"
    
@@ -229,7 +244,8 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
 
    ```bash
    # Get latest IAM controller version
-   IAM_VERSION=$(curl -sL https://api.github.com/repos/aws-controllers-k8s/iam-controller/releases/latest | jq -r '.tag_name | ltrimstr("v")')
+   IAM_VERSION=$(curl -sL https://api.github.com/repos/aws-controllers-k8s/iam-controller/releases/latest | \
+       jq -r '.tag_name | ltrimstr("v")')
    
    # Install IAM controller
    helm install ack-iam-controller \
@@ -253,7 +269,8 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
 
    ```bash
    # Get latest Lambda controller version
-   LAMBDA_VERSION=$(curl -sL https://api.github.com/repos/aws-controllers-k8s/lambda-controller/releases/latest | jq -r '.tag_name | ltrimstr("v")')
+   LAMBDA_VERSION=$(curl -sL https://api.github.com/repos/aws-controllers-k8s/lambda-controller/releases/latest | \
+       jq -r '.tag_name | ltrimstr("v")')
    
    # Install Lambda controller
    helm install ack-lambda-controller \
@@ -305,7 +322,7 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
                    default: "STANDARD"
                  lambdaRuntime:
                    type: string
-                   default: "python3.9"
+                   default: "python3.12"
                  enableLogging:
                    type: boolean
                    default: true
@@ -345,10 +362,12 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
    mkdir -p platform-operator && cd platform-operator
    
    # Initialize Go module and operator project
-   operator-sdk init --domain=platform.example.com --repo=github.com/example/platform-operator
+   operator-sdk init --domain=platform.example.com \
+       --repo=github.com/example/platform-operator
    
    # Create API and controller for Application resource
-   operator-sdk create api --group=platform --version=v1 --kind=Application --resource --controller
+   operator-sdk create api --group=platform --version=v1 \
+       --kind=Application --resource --controller
    
    # Update the Application spec in api/v1/application_types.go
    cat > api/v1/application_types.go << 'EOF'
@@ -409,18 +428,19 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
 
    ```bash
    # Update controller implementation
-   cat > controllers/application_controller.go << 'EOF'
-   package controllers
+   cat > internal/controller/application_controller.go << 'EOF'
+   package controller
    
    import (
        "context"
        "fmt"
+       "os"
        "time"
        
-       "github.com/go-logr/logr"
        "k8s.io/apimachinery/pkg/api/errors"
        "k8s.io/apimachinery/pkg/runtime"
        "k8s.io/apimachinery/pkg/types"
+       metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
        ctrl "sigs.k8s.io/controller-runtime"
        "sigs.k8s.io/controller-runtime/pkg/client"
        "sigs.k8s.io/controller-runtime/pkg/log"
@@ -450,21 +470,21 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
            return ctrl.Result{}, err
        }
        
+       // Create IAM role first (Lambda function depends on it)
+       if err := r.ensureIAMRole(ctx, app); err != nil {
+           log.Error(err, "Failed to ensure IAM role")
+           return ctrl.Result{RequeueAfter: time.Minute}, err
+       }
+       
        // Create S3 bucket
        if err := r.ensureS3Bucket(ctx, app); err != nil {
-           log.Error(err, "Failed to create S3 bucket")
+           log.Error(err, "Failed to ensure S3 bucket")
            return ctrl.Result{RequeueAfter: time.Minute}, err
        }
        
-       // Create IAM role
-       if err := r.ensureIAMRole(ctx, app); err != nil {
-           log.Error(err, "Failed to create IAM role")
-           return ctrl.Result{RequeueAfter: time.Minute}, err
-       }
-       
-       // Create Lambda function
+       // Create Lambda function (after IAM role is ready)
        if err := r.ensureLambdaFunction(ctx, app); err != nil {
-           log.Error(err, "Failed to create Lambda function")
+           log.Error(err, "Failed to ensure Lambda function")
            return ctrl.Result{RequeueAfter: time.Minute}, err
        }
        
@@ -546,7 +566,8 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
        function := &lambdav1alpha1.Function{}
        err := r.Get(ctx, types.NamespacedName{Name: functionName, Namespace: app.Namespace}, function)
        if err != nil && errors.IsNotFound(err) {
-           code := "def lambda_handler(event, context): return {'statusCode': 200, 'body': 'Hello World'}"
+           code := "def lambda_handler(event, context):\n    return {'statusCode': 200, 'body': 'Hello from Kubernetes Operator!'}"
+           handlerValue := "index.lambda_handler"
            
            function = &lambdav1alpha1.Function{
                ObjectMeta: metav1.ObjectMeta{
@@ -560,7 +581,7 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
                    Code: &lambdav1alpha1.FunctionCode{
                        ZipFile: &code,
                    },
-                   Handler: aws.String("index.lambda_handler"),
+                   Handler: &handlerValue,
                },
            }
            
@@ -587,12 +608,14 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
    echo "✅ Custom operator controller implemented"
    ```
 
+   The controller logic ensures proper resource creation order and handles dependencies between AWS resources. The IAM role must be created before the Lambda function, and the reconciliation logic includes proper error handling and requeue strategies for eventual consistency.
+
 8. **Build and Deploy Custom Operator**:
 
    Building and deploying the operator transforms our code into a running controller that actively manages AWS resources. The `make generate` command creates deep-copy functions and CRD manifests, while `make manifests` generates RBAC rules and deployment configurations. This automated toolchain ensures consistent deployments and reduces human error in production environments.
 
    ```bash
-   # Generate CRD manifests
+   # Generate CRD manifests and code
    make generate
    make manifests
    
@@ -600,9 +623,18 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
    OPERATOR_IMAGE="platform-operator:latest"
    make docker-build IMG=$OPERATOR_IMAGE
    
-   # Load image into kind cluster or push to registry
-   kind load docker-image $OPERATOR_IMAGE --name $CLUSTER_NAME || \
-   docker tag $OPERATOR_IMAGE $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$OPERATOR_IMAGE
+   # Load image into kind cluster or push to ECR
+   if kind get clusters | grep -q $CLUSTER_NAME; then
+       kind load docker-image $OPERATOR_IMAGE --name $CLUSTER_NAME
+   else
+       # Push to ECR for EKS clusters
+       aws ecr get-login-password --region $AWS_REGION | \
+           docker login --username AWS --password-stdin \
+           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+       docker tag $OPERATOR_IMAGE \
+           $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$OPERATOR_IMAGE
+       docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$OPERATOR_IMAGE
+   fi
    
    # Deploy operator to cluster
    make deploy IMG=$OPERATOR_IMAGE
@@ -631,7 +663,7 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
      name: sample-app
      environment: dev
      storageClass: STANDARD
-     lambdaRuntime: python3.9
+     lambdaRuntime: python3.12
      enableLogging: true
    EOF
    
@@ -639,7 +671,10 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
    kubectl apply -f test-application.yaml
    
    # Monitor application status
-   kubectl get applications -w
+   kubectl get applications sample-app -w &
+   WATCH_PID=$!
+   sleep 30
+   kill $WATCH_PID
    
    echo "✅ Application instance created"
    ```
@@ -673,32 +708,35 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
       sideEffects: None
     EOF
     
-    # Create webhook handler
+    # Create basic webhook validation logic
     cat > webhook-handler.go << 'EOF'
-    func (r *ApplicationReconciler) ValidateApplication(ctx context.Context, req admission.Request) admission.Response {
-        app := &platformv1.Application{}
-        if err := r.Decoder.Decode(req, app); err != nil {
-            return admission.Errored(http.StatusBadRequest, err)
-        }
-        
+    package main
+    
+    import (
+        "regexp"
+        "slices"
+    )
+    
+    // ValidateApplication validates application resource
+    func ValidateApplication(app *Application) error {
         // Validate environment
         validEnvs := []string{"dev", "staging", "prod"}
-        if !contains(validEnvs, app.Spec.Environment) {
-            return admission.Denied("Invalid environment. Must be one of: dev, staging, prod")
+        if !slices.Contains(validEnvs, app.Spec.Environment) {
+            return fmt.Errorf("invalid environment. Must be one of: %v", validEnvs)
         }
         
         // Validate naming convention
         if !regexp.MustCompile(`^[a-z0-9-]+$`).MatchString(app.Spec.Name) {
-            return admission.Denied("Application name must contain only lowercase letters, numbers, and hyphens")
+            return fmt.Errorf("application name must contain only lowercase letters, numbers, and hyphens")
         }
         
-        return admission.Allowed("")
+        return nil
     }
     EOF
     
     kubectl apply -f webhook-configuration.yaml
     
-    echo "✅ Advanced operator features implemented"
+    echo "✅ Advanced operator features configured"
     ```
 
 11. **Configure RBAC and Security Policies**:
@@ -752,7 +790,7 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
     spec:
       podSelector:
         matchLabels:
-          app: platform-operator
+          control-plane: controller-manager
       policyTypes:
       - Ingress
       - Egress
@@ -761,11 +799,16 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
         - namespaceSelector:
             matchLabels:
               name: kube-system
+        ports:
+        - protocol: TCP
+          port: 9443
       egress:
       - to: []
         ports:
         - protocol: TCP
           port: 443
+        - protocol: TCP
+          port: 6443
     EOF
     
     kubectl apply -f network-policy.yaml
@@ -786,14 +829,14 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
       name: platform-operator-metrics
       namespace: platform-operator-system
       labels:
-        app: platform-operator
+        control-plane: controller-manager
     spec:
       ports:
       - name: metrics
         port: 8080
         targetPort: 8080
       selector:
-        app: platform-operator
+        control-plane: controller-manager
     ---
     apiVersion: monitoring.coreos.com/v1
     kind: ServiceMonitor
@@ -803,7 +846,7 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
     spec:
       selector:
         matchLabels:
-          app: platform-operator
+          control-plane: controller-manager
       endpoints:
       - port: metrics
         interval: 30s
@@ -812,7 +855,7 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
     
     kubectl apply -f metrics-config.yaml
     
-    # Create dashboard for operator metrics
+    # Create dashboard configuration for operator metrics
     cat > operator-dashboard.json << 'EOF'
     {
       "dashboard": {
@@ -820,6 +863,7 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
         "panels": [
           {
             "title": "Application Resources",
+            "type": "stat",
             "targets": [
               {
                 "expr": "controller_runtime_reconcile_total{controller=\"application\"}"
@@ -828,9 +872,19 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
           },
           {
             "title": "Reconciliation Errors",
+            "type": "stat",
             "targets": [
               {
                 "expr": "controller_runtime_reconcile_errors_total{controller=\"application\"}"
+              }
+            ]
+          },
+          {
+            "title": "Reconciliation Duration",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.95, controller_runtime_reconcile_time_seconds_bucket{controller=\"application\"})"
               }
             ]
           }
@@ -860,9 +914,9 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
    kubectl get applications sample-app -o yaml
    
    # Verify AWS resources were created
-   aws s3 ls | grep sample-app-dev-bucket
-   aws iam list-roles | grep sample-app-dev-role
-   aws lambda list-functions | grep sample-app-dev-function
+   aws s3api head-bucket --bucket sample-app-dev-bucket
+   aws iam get-role --role-name sample-app-dev-role
+   aws lambda get-function --function-name sample-app-dev-function
    ```
 
 3. Test operator webhook validation:
@@ -873,7 +927,7 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
    apiVersion: platform.example.com/v1
    kind: Application
    metadata:
-     name: Invalid_App
+     name: Invalid-App
    spec:
      name: Invalid_App
      environment: production
@@ -889,10 +943,16 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
    ```bash
    # Delete underlying S3 bucket directly
    aws s3 rm s3://sample-app-dev-bucket --recursive
-   aws s3 rb s3://sample-app-dev-bucket
+   aws s3api delete-bucket --bucket sample-app-dev-bucket
    
    # Verify operator recreates the bucket
-   kubectl get applications sample-app -w
+   kubectl get applications sample-app -w &
+   WATCH_PID=$!
+   sleep 60
+   kill $WATCH_PID
+   
+   # Check if bucket was recreated
+   aws s3api head-bucket --bucket sample-app-dev-bucket
    ```
 
 5. Test operator metrics and monitoring:
@@ -901,8 +961,12 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
    # Check operator metrics endpoint
    kubectl port-forward -n platform-operator-system \
        svc/platform-operator-metrics 8080:8080 &
+   PORT_FORWARD_PID=$!
    
+   sleep 5
    curl http://localhost:8080/metrics | grep controller_runtime
+   
+   kill $PORT_FORWARD_PID
    ```
 
 ## Cleanup
@@ -911,8 +975,8 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
 
    ```bash
    # Delete test applications
-   kubectl delete -f test-application.yaml
-   kubectl delete -f invalid-app.yaml
+   kubectl delete -f test-application.yaml --ignore-not-found
+   kubectl delete -f invalid-app.yaml --ignore-not-found
    
    echo "✅ Deleted Application resources"
    ```
@@ -922,13 +986,14 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
    ```bash
    # Remove operator deployment
    cd platform-operator
-   make undeploy
+   make undeploy IMG=platform-operator:latest
    
-   # Remove CRDs
-   kubectl delete -f application-crd.yaml
-   kubectl delete -f rbac-config.yaml
-   kubectl delete -f network-policy.yaml
-   kubectl delete -f metrics-config.yaml
+   # Remove CRDs and configurations
+   kubectl delete -f ../application-crd.yaml --ignore-not-found
+   kubectl delete -f ../rbac-config.yaml --ignore-not-found
+   kubectl delete -f ../network-policy.yaml --ignore-not-found
+   kubectl delete -f ../metrics-config.yaml --ignore-not-found
+   kubectl delete -f ../webhook-configuration.yaml --ignore-not-found
    
    echo "✅ Removed custom operator"
    ```
@@ -937,13 +1002,16 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
 
    ```bash
    # Uninstall ACK controllers
-   helm uninstall ack-s3-controller -n $ACK_SYSTEM_NAMESPACE
-   helm uninstall ack-iam-controller -n $ACK_SYSTEM_NAMESPACE
-   helm uninstall ack-lambda-controller -n $ACK_SYSTEM_NAMESPACE
+   helm uninstall ack-s3-controller -n $ACK_SYSTEM_NAMESPACE --ignore-not-found
+   helm uninstall ack-iam-controller -n $ACK_SYSTEM_NAMESPACE --ignore-not-found
+   helm uninstall ack-lambda-controller -n $ACK_SYSTEM_NAMESPACE --ignore-not-found
    
    # Remove ACK runtime CRDs
-   kubectl delete -f https://raw.githubusercontent.com/aws-controllers-k8s/runtime/main/config/crd/bases/services.k8s.aws_adoptedresources.yaml
-   kubectl delete -f https://raw.githubusercontent.com/aws-controllers-k8s/runtime/main/config/crd/bases/services.k8s.aws_fieldexports.yaml
+   kubectl delete -f https://raw.githubusercontent.com/aws-controllers-k8s/runtime/main/config/crd/bases/services.k8s.aws_adoptedresources.yaml --ignore-not-found
+   kubectl delete -f https://raw.githubusercontent.com/aws-controllers-k8s/runtime/main/config/crd/bases/services.k8s.aws_fieldexports.yaml --ignore-not-found
+   
+   # Remove ACK namespace
+   kubectl delete namespace $ACK_SYSTEM_NAMESPACE --ignore-not-found
    
    echo "✅ Removed ACK controllers"
    ```
@@ -951,13 +1019,33 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
 4. Remove IAM roles and policies:
 
    ```bash
+   # Detach policies from IAM role
+   aws iam detach-role-policy \
+       --role-name ACK-Controller-Role-${RESOURCE_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess \
+       --ignore-not-found
+   
+   aws iam detach-role-policy \
+       --role-name ACK-Controller-Role-${RESOURCE_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/IAMFullAccess \
+       --ignore-not-found
+   
+   aws iam detach-role-policy \
+       --role-name ACK-Controller-Role-${RESOURCE_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/AWSLambda_FullAccess \
+       --ignore-not-found
+   
    # Delete IAM role
-   aws iam delete-role --role-name ACK-Controller-Role-${RESOURCE_SUFFIX}
+   aws iam delete-role \
+       --role-name ACK-Controller-Role-${RESOURCE_SUFFIX} \
+       --ignore-not-found
    
    # Clean up local files
    rm -f trust-policy.json application-crd.yaml test-application.yaml
    rm -f webhook-configuration.yaml rbac-config.yaml network-policy.yaml
    rm -f metrics-config.yaml operator-dashboard.json invalid-app.yaml
+   rm -f webhook-handler.go
+   rm -rf platform-operator
    
    echo "✅ Cleaned up IAM resources and files"
    ```
@@ -975,28 +1063,35 @@ kubectl create namespace $ACK_SYSTEM_NAMESPACE
 
 AWS Controllers for Kubernetes (ACK) represents a paradigm shift in cloud-native infrastructure management by bringing AWS service lifecycle management directly into the Kubernetes API. This approach eliminates the traditional boundary between application workloads and supporting infrastructure, enabling true infrastructure-as-code practices within GitOps workflows. The custom operator pattern demonstrated here extends ACK's capabilities by providing higher-level abstractions that encapsulate organization-specific resource provisioning and compliance patterns.
 
-The architecture leverages Kubernetes' controller pattern to provide declarative, reconciliation-based management of AWS resources. Each ACK controller watches for changes to specific Custom Resource Definitions and translates Kubernetes API operations into corresponding AWS API calls. This design ensures eventual consistency between desired state (declared in Kubernetes manifests) and actual state (AWS resources), with automatic drift detection and remediation capabilities.
+The architecture leverages Kubernetes' controller pattern to provide declarative, reconciliation-based management of AWS resources. Each ACK controller watches for changes to specific Custom Resource Definitions and translates Kubernetes API operations into corresponding AWS API calls. This design ensures eventual consistency between desired state (declared in Kubernetes manifests) and actual state (AWS resources), with automatic drift detection and remediation capabilities following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
-Custom operators built on top of ACK controllers provide several architectural advantages. They enable composition of multiple AWS resources into logical application units, implement organization-specific validation and security policies, and provide simplified interfaces for development teams. The webhook admission controllers ensure policy compliance at resource creation time, while the reconciliation loop provides ongoing governance and automated remediation of configuration drift.
+Custom operators built on top of ACK controllers provide several architectural advantages. They enable composition of multiple AWS resources into logical application units, implement organization-specific validation and security policies, and provide simplified interfaces for development teams. The webhook admission controllers ensure policy compliance at resource creation time, while the reconciliation loop provides ongoing governance and automated remediation of configuration drift. This pattern aligns with [AWS security best practices](https://docs.aws.amazon.com/security/latest/userguide/security-best-practices.html) by implementing defense-in-depth strategies.
 
-The monitoring and observability integration through Prometheus metrics provides operational visibility into operator performance and resource management effectiveness. This is crucial for production deployments where understanding reconciliation patterns, error rates, and resource creation times directly impacts application deployment velocity and reliability.
+The monitoring and observability integration through Prometheus metrics provides operational visibility into operator performance and resource management effectiveness. This is crucial for production deployments where understanding reconciliation patterns, error rates, and resource creation times directly impacts application deployment velocity and reliability. The [AWS X-Ray integration](https://docs.aws.amazon.com/xray/latest/devguide/) can further enhance distributed tracing capabilities across your operator ecosystem.
 
-> **Tip**: Use field selectors and label selectors extensively in your custom operators to optimize Kubernetes API queries and reduce controller overhead in large-scale deployments.
+> **Tip**: Use field selectors and label selectors extensively in your custom operators to optimize Kubernetes API queries and reduce controller overhead in large-scale deployments. Consider implementing resource quotas and rate limiting for production environments.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Environment Resource Management**: Implement environment-specific resource configurations with automatic promotion workflows that validate resource configurations across development, staging, and production environments using ACK field exports and cross-references.
+1. **Multi-Environment Resource Management**: Implement environment-specific resource configurations with automatic promotion workflows that validate resource configurations across development, staging, and production environments using ACK field exports and cross-references with proper RBAC boundaries.
 
-2. **Cost Optimization Integration**: Add AWS Cost Explorer integration to the custom operator that automatically applies cost-optimization policies like S3 Intelligent Tiering, Lambda Provisioned Concurrency management, and resource right-sizing based on CloudWatch metrics analysis.
+2. **Cost Optimization Integration**: Add AWS Cost Explorer and [AWS Cost Anomaly Detection](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/getting-started-ad.html) integration to the custom operator that automatically applies cost-optimization policies like S3 Intelligent Tiering, Lambda Provisioned Concurrency management, and resource right-sizing based on CloudWatch metrics analysis.
 
-3. **Advanced Security Compliance**: Implement automated security policy enforcement using AWS Config rules integration, enabling the operator to automatically remediate security misconfigurations and maintain compliance with organizational security standards.
+3. **Advanced Security Compliance**: Implement automated security policy enforcement using [AWS Config rules](https://docs.aws.amazon.com/config/latest/developerguide/managed-rules-by-aws-config.html) integration, enabling the operator to automatically remediate security misconfigurations and maintain compliance with organizational security standards and industry frameworks.
 
-4. **Blue-Green Deployment Orchestration**: Extend the operator to support blue-green deployments of Lambda functions and associated resources, with automatic rollback capabilities based on CloudWatch alarms and application health metrics.
+4. **Blue-Green Deployment Orchestration**: Extend the operator to support blue-green deployments of Lambda functions and associated resources, with automatic rollback capabilities based on CloudWatch alarms, application health metrics, and canary analysis patterns.
 
-5. **Multi-Region Active-Active Architecture**: Implement cross-region resource replication and failover capabilities that automatically maintain resource consistency across multiple AWS regions using ACK controllers and custom reconciliation logic.
+5. **Multi-Region Active-Active Architecture**: Implement cross-region resource replication and failover capabilities that automatically maintain resource consistency across multiple AWS regions using ACK controllers, [AWS Global Tables](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GlobalTables.html), and custom reconciliation logic for disaster recovery scenarios.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

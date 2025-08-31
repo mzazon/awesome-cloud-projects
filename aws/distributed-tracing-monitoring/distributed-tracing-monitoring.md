@@ -5,10 +5,10 @@ category: compute
 subject: aws
 services: x-ray, lambda, api-gateway, dynamodb
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: aws,monitoring
 recipe-generator-version: 1.3
@@ -137,6 +137,11 @@ aws iam attach-role-policy \
 aws iam attach-role-policy \
     --role-name ${LAMBDA_ROLE_NAME} \
     --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+
+# Attach policies for CloudWatch and EventBridge
+aws iam attach-role-policy \
+    --role-name ${LAMBDA_ROLE_NAME} \
+    --policy-arn arn:aws:iam::aws:policy/CloudWatchFullAccess
 
 echo "✅ IAM role created and policies attached"
 ```
@@ -272,13 +277,13 @@ echo "✅ IAM role created and policies attached"
    
    # Create deployment package
    cd /tmp
-   pip install aws-xray-sdk -t .
-   zip -r order-processor.zip . -x "*.pyc" "__pycache__/*"
+   pip install aws-xray-sdk -t . --quiet
+   zip -r order-processor.zip . -x "*.pyc" "__pycache__/*" > /dev/null
    
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-order-processor \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler order-processor.lambda_handler \
        --zip-file fileb://order-processor.zip \
@@ -352,12 +357,12 @@ echo "✅ IAM role created and policies attached"
    
    # Create deployment package
    cd /tmp
-   zip -r inventory-manager.zip inventory-manager.py aws_xray_sdk/
+   zip -r inventory-manager.zip inventory-manager.py aws_xray_sdk/ > /dev/null
    
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-inventory-manager \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler inventory-manager.lambda_handler \
        --zip-file fileb://inventory-manager.zip \
@@ -623,8 +628,8 @@ echo "✅ IAM role created and policies attached"
     ```bash
     # Enable X-Ray insights (requires traces to be generated first)
     aws xray put-insight-selectors \
-        --insight-selectors InsightType=ResponseTimeRoot \
-        --insight-selectors InsightType=ResponseTimeUser
+        --insight-selectors 'InsightType=ResponseTimeRoot' \
+        'InsightType=ResponseTimeUser'
     
     # Create trace analysis queries
     cat > /tmp/trace-queries.txt << EOF
@@ -720,12 +725,12 @@ echo "✅ IAM role created and policies attached"
     
     # Create deployment package
     cd /tmp
-    zip -r trace-analyzer.zip trace-analyzer.py
+    zip -r trace-analyzer.zip trace-analyzer.py > /dev/null
     
     # Create Lambda function
     aws lambda create-function \
         --function-name ${PROJECT_NAME}-trace-analyzer \
-        --runtime python3.9 \
+        --runtime python3.12 \
         --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
         --handler trace-analyzer.lambda_handler \
         --zip-file fileb://trace-analyzer.zip \
@@ -947,6 +952,10 @@ echo "✅ IAM role created and policies attached"
        --role-name ${LAMBDA_ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
    
+   aws iam detach-role-policy \
+       --role-name ${LAMBDA_ROLE_NAME} \
+       --policy-arn arn:aws:iam::aws:policy/CloudWatchFullAccess
+   
    # Delete IAM role
    aws iam delete-role \
        --role-name ${LAMBDA_ROLE_NAME}
@@ -962,20 +971,27 @@ The sampling rules configuration allows precise control over which requests are 
 
 This architecture scales effectively as applications grow in complexity, providing consistent observability across microservices, API gateways, and data stores. The service map visualization helps teams understand dependencies and identify optimization opportunities, while trace timelines provide detailed request flow analysis for troubleshooting.
 
-For comprehensive monitoring implementations, consider integrating X-Ray with other AWS observability services like CloudWatch Application Insights, AWS CloudTrail for audit logging, and AWS Config for configuration monitoring. The combination provides end-to-end visibility into application behavior, infrastructure changes, and security events.
+For comprehensive monitoring implementations, consider integrating X-Ray with other AWS observability services like [CloudWatch Application Insights](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/appinsights-what-is.html), [AWS CloudTrail](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-user-guide.html) for audit logging, and [AWS Config](https://docs.aws.amazon.com/config/latest/developerguide/WhatIsConfig.html) for configuration monitoring. The combination provides end-to-end visibility into application behavior, infrastructure changes, and security events. Learn more about AWS observability best practices in the [AWS Well-Architected Observability Lens](https://docs.aws.amazon.com/wellarchitected/latest/observability-lens/observability-lens.html).
 
-> **Tip**: Use X-Ray trace annotations strategically to enable efficient filtering and analysis of specific request types or business operations.
+> **Tip**: Use X-Ray trace annotations strategically to enable efficient filtering and analysis of specific request types or business operations. See [AWS X-Ray Developer Guide](https://docs.aws.amazon.com/xray/latest/devguide/xray-concepts.html) for detailed annotation best practices.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Implement distributed tracing across multiple AWS accounts** using X-Ray cross-account tracing with IAM roles and resource sharing
-2. **Create custom X-Ray subsegments** for detailed timing analysis of specific code blocks and external service calls
-3. **Build automated performance regression detection** using historical trace data and machine learning models to identify anomalies
-4. **Integrate with third-party APM tools** using X-Ray trace export to Zipkin or Jaeger for hybrid monitoring strategies
-5. **Implement trace-based alerting** using X-Ray Insights to automatically detect and alert on performance degradation patterns
+1. **Implement distributed tracing across multiple AWS accounts** using [X-Ray cross-account tracing](https://docs.aws.amazon.com/xray/latest/devguide/xray-console-cross-account.html) with IAM roles and resource sharing
+2. **Create custom X-Ray subsegments** for detailed timing analysis using [X-Ray SDK subsegments](https://docs.aws.amazon.com/xray/latest/devguide/xray-sdk-python-subsegments.html)
+3. **Build automated performance regression detection** using [Amazon CloudWatch Anomaly Detection](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Anomaly_Detection.html) with X-Ray metrics
+4. **Integrate with third-party APM tools** using X-Ray trace export to [Zipkin](https://zipkin.io/) or [Jaeger](https://www.jaegertracing.io/) for hybrid monitoring strategies
+5. **Implement trace-based alerting** using [X-Ray Insights](https://docs.aws.amazon.com/xray/latest/devguide/xray-insights.html) to automatically detect and alert on performance degradation patterns
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

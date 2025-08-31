@@ -1,0 +1,302 @@
+# Infrastructure Manager Configuration for Weather API Gateway with Cloud Run
+# This configuration deploys a complete weather API gateway solution using:
+# - Cloud Run service for serverless container hosting
+# - Cloud Storage bucket for weather data caching
+# - IAM service account with least-privilege permissions
+# - Lifecycle policies for automatic cache expiration
+
+# Define input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    description: "Google Cloud Project ID where resources will be created"
+    type: string
+    required: true
+  
+  # Regional deployment settings
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+  
+  # Service naming and identification
+  service_name:
+    description: "Name of the Cloud Run service"
+    type: string
+    default: "weather-api-gateway"
+  
+  # Storage configuration
+  bucket_name:
+    description: "Name of the Cloud Storage bucket for caching (must be globally unique)"
+    type: string
+    required: true
+  
+  # Cache expiration settings
+  cache_expiration_days:
+    description: "Number of days before cached weather data expires"
+    type: number
+    default: 1
+    validation:
+      minimum: 1
+      maximum: 30
+  
+  # Container configuration
+  container_image:
+    description: "Container image for the weather API gateway"
+    type: string
+    default: "gcr.io/cloudrun/hello"  # Placeholder - will be replaced during deployment
+  
+  # Service scaling configuration
+  max_instances:
+    description: "Maximum number of Cloud Run instances"
+    type: number
+    default: 10
+    validation:
+      minimum: 1
+      maximum: 100
+  
+  # Resource allocation
+  memory_limit:
+    description: "Memory limit for Cloud Run service"
+    type: string
+    default: "512Mi"
+  
+  cpu_limit:
+    description: "CPU allocation for Cloud Run service"
+    type: string
+    default: "1"
+
+# Enable required Google Cloud APIs
+resources:
+  # Enable Cloud Run API for serverless container deployment
+  - name: enable-cloud-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/run.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Enable Cloud Storage API for caching functionality  
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Enable Cloud Build API for container image building
+  - name: enable-cloud-build-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Create dedicated service account for the weather API gateway
+  # This follows the principle of least privilege access
+  - name: weather-gateway-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: weather-gateway-sa
+      serviceAccount:
+        displayName: "Weather API Gateway Service Account"
+        description: "Service account for weather API gateway with storage access"
+    metadata:
+      dependsOn:
+        - enable-cloud-run-api
+
+  # Create Cloud Storage bucket for weather data caching
+  # Configured with appropriate settings for API caching use case
+  - name: weather-cache-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.bucket_name}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      # Enable uniform bucket-level access for better security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Configure lifecycle management for automatic cache expiration
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: ${var.cache_expiration_days}
+      # Enable versioning for data consistency
+      versioning:
+        enabled: false
+      # Configure CORS for web application access
+      cors:
+        - origin: ["*"]
+          method: ["GET", "POST", "PUT", "DELETE"]
+          responseHeader: ["Content-Type", "Access-Control-Allow-Origin"]
+          maxAgeSeconds: 3600
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Grant storage object admin permissions to the service account
+  # This allows the Cloud Run service to read and write cache data
+  - name: storage-bucket-iam-binding
+    type: gcp-types/storage-v1:buckets.setIamPolicy
+    properties:
+      bucket: ${var.bucket_name}
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.weather-gateway-service-account.email)
+          # Grant Cloud Run service agent access for deployment
+          - role: roles/storage.legacyBucketReader
+            members:
+              - serviceAccount:service-${var.project_id}@serverless-robot-prod.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - weather-cache-bucket
+        - weather-gateway-service-account
+
+  # Deploy Cloud Run service for the weather API gateway
+  # Configured with appropriate scaling, security, and environment settings
+  - name: weather-api-gateway-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/${var.project_id}
+      location: ${var.region}
+      service:
+        metadata:
+          name: ${var.service_name}
+          namespace: ${var.project_id}
+          annotations:
+            # Enable CPU allocation during request processing only
+            run.googleapis.com/cpu-throttling: "true"
+            # Set maximum request timeout
+            run.googleapis.com/timeout: "60s"
+            # Configure ingress for public access
+            run.googleapis.com/ingress: "all"
+        spec:
+          template:
+            metadata:
+              annotations:
+                # Configure autoscaling parameters
+                autoscaling.knative.dev/maxScale: "${var.max_instances}"
+                autoscaling.knative.dev/minScale: "0"
+                # Set concurrency target for optimal performance
+                run.googleapis.com/execution-environment: "gen2"
+            spec:
+              # Use custom service account with minimal permissions
+              serviceAccountName: $(ref.weather-gateway-service-account.email)
+              # Configure container timeout
+              timeoutSeconds: 60
+              containerConcurrency: 80
+              containers:
+                - image: ${var.container_image}
+                  # Configure resource limits
+                  resources:
+                    limits:
+                      memory: ${var.memory_limit}
+                      cpu: ${var.cpu_limit}
+                  # Set environment variables for application configuration
+                  env:
+                    - name: BUCKET_NAME
+                      value: ${var.bucket_name}
+                    - name: PROJECT_ID
+                      value: ${var.project_id}
+                    - name: REGION
+                      value: ${var.region}
+                  # Configure health check endpoint
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                  # Configure container port
+                  ports:
+                    - containerPort: 8080
+                      protocol: TCP
+          traffic:
+            - percent: 100
+              latestRevision: true
+    metadata:
+      dependsOn:
+        - enable-cloud-run-api
+        - weather-gateway-service-account
+        - weather-cache-bucket
+
+  # Configure IAM policy for public access to the Cloud Run service
+  # This allows unauthenticated access for public API functionality
+  - name: cloud-run-invoker-binding
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/${var.project_id}/locations/${var.region}/services/${var.service_name}
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - "allUsers"
+    metadata:
+      dependsOn:
+        - weather-api-gateway-service
+
+# Define outputs for verification and integration
+outputs:
+  # Service endpoint URL for API access
+  service_url:
+    description: "URL of the deployed weather API gateway service"
+    value: $(ref.weather-api-gateway-service.status.url)
+  
+  # Storage bucket information
+  bucket_name:
+    description: "Name of the Cloud Storage bucket used for caching"
+    value: ${var.bucket_name}
+  
+  # Service account details
+  service_account_email:
+    description: "Email of the service account used by the Cloud Run service"
+    value: $(ref.weather-gateway-service-account.email)
+  
+  # Regional deployment information
+  deployment_region:
+    description: "Google Cloud region where resources are deployed"
+    value: ${var.region}
+  
+  # Project context
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+  
+  # Cache configuration
+  cache_expiration_days:
+    description: "Number of days before cached data expires"
+    value: ${var.cache_expiration_days}
+
+# Metadata for deployment tracking and management
+metadata:
+  version: "1.0"
+  description: "Weather API Gateway with Cloud Run and Cloud Storage caching"
+  author: "Google Cloud Infrastructure Manager"
+  created: "2025-01-12"
+  
+  # Tags for resource organization and cost allocation
+  labels:
+    application: "weather-api-gateway"
+    environment: "production"
+    managed-by: "infrastructure-manager"
+    cost-center: "api-services"
+    
+  # Dependencies and requirements
+  requirements:
+    - "Google Cloud Project with billing enabled"
+    - "Appropriate IAM permissions for resource creation"
+    - "Container image built and available in registry"
+    
+  # Deployment notes and considerations
+  notes:
+    - "Ensure bucket name is globally unique before deployment"
+    - "Container image should be built and pushed to registry before deployment"
+    - "Monitor Cloud Run service metrics for optimal scaling configuration"
+    - "Review IAM permissions regularly for security compliance"
+    - "Consider implementing monitoring and alerting for production use"

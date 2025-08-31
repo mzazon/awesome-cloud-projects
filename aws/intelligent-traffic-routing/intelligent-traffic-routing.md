@@ -1,21 +1,21 @@
 ---
-title: Intelligent Global Traffic Routing
+title: Intelligent Global Traffic Routing with Route53 and CloudFront
 id: f10ad07f
 category: networking
 difficulty: 300
 subject: aws
 services: route53,cloudfront,alb,s3
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: networking,route53,cloudfront,alb,s3
 recipe-generator-version: 1.3
 ---
 
-# Intelligent Global Traffic Routing
+# Intelligent Global Traffic Routing with Route53 and CloudFront
 
 ## Problem
 
@@ -341,7 +341,7 @@ echo "✅ Environment prepared with fallback bucket: ${S3_FALLBACK_BUCKET}"
            --load-balancer-arns ${ALB_ARN} \
            --query 'LoadBalancers[0].DNSName' --output text)
        
-       # Create target group
+       # Create target group with optimized health check settings
        TG_ARN=$(aws elbv2 create-target-group \
            --region ${region} \
            --name ${PROJECT_NAME}-tg-${region_code} \
@@ -354,6 +354,7 @@ echo "✅ Environment prepared with fallback bucket: ${S3_FALLBACK_BUCKET}"
            --health-check-timeout-seconds 5 \
            --healthy-threshold-count 2 \
            --unhealthy-threshold-count 3 \
+           --matcher HttpCode=200 \
            --query 'TargetGroups[0].TargetGroupArn' --output text)
        
        # Create listener
@@ -398,11 +399,11 @@ echo "✅ Environment prepared with fallback bucket: ${S3_FALLBACK_BUCKET}"
        local region_code=$2
        local sg_var="SG_ID_${region_code}"
        
-       # Get latest Amazon Linux 2 AMI
+       # Get latest Amazon Linux 2023 AMI (updated)
        AMI_ID=$(aws ec2 describe-images \
            --region ${region} \
            --owners amazon \
-           --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" \
+           --filters "Name=name,Values=al2023-ami-*-x86_64" \
            "Name=state,Values=available" \
            --query 'Images|sort_by(@, &CreationDate)[-1].ImageId' \
            --output text)
@@ -421,6 +422,8 @@ echo "✅ Environment prepared with fallback bucket: ${S3_FALLBACK_BUCKET}"
    <html>
    <head>
        <title>Global Load Balancer Demo</title>
+       <meta charset="UTF-8">
+       <meta name="viewport" content="width=device-width, initial-scale=1.0">
        <style>
            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
            .region { background: #e3f2fd; padding: 20px; border-radius: 5px; margin: 20px auto; max-width: 600px; }
@@ -451,8 +454,8 @@ echo "✅ Environment prepared with fallback bucket: ${S3_FALLBACK_BUCKET}"
    }
    HEALTH
    
-   # Make health endpoint executable
-   chmod +x /var/www/html/health
+   # Make health endpoint accessible
+   chmod 644 /var/www/html/health
    EOF
        
        # Create launch template
@@ -489,7 +492,7 @@ echo "✅ Environment prepared with fallback bucket: ${S3_FALLBACK_BUCKET}"
    echo "✅ Launch templates created in all regions"
    ```
 
-   Launch templates are now configured with the latest Amazon Linux 2 AMIs and user data scripts that automatically install and configure the sample web application. Each template includes security group associations and tagging specifications that ensure instances are properly configured for load balancer integration. The user data script creates both a visual web interface for testing and a machine-readable health endpoint that supports automated monitoring and failover decisions.
+   Launch templates are now configured with the latest Amazon Linux 2023 AMIs and user data scripts that automatically install and configure the sample web application. Each template includes security group associations and tagging specifications that ensure instances are properly configured for load balancer integration. The user data script creates both a visual web interface for testing and a machine-readable health endpoint that supports automated monitoring and failover decisions.
 
 4. **Create Auto Scaling Groups**:
 
@@ -1330,9 +1333,10 @@ echo "✅ Environment prepared with fallback bucket: ${S3_FALLBACK_BUCKET}"
        sleep 60
        
        # Delete Launch Template
+       local lt_var="LT_ID_${region_code}"
        aws ec2 delete-launch-template \
            --region ${region} \
-           --launch-template-id ${!LT_ID_VAR}
+           --launch-template-id ${!lt_var}
        
        echo "✅ ASG and Launch Template deleted in ${region}"
    }
@@ -1483,11 +1487,11 @@ echo "✅ Environment prepared with fallback bucket: ${S3_FALLBACK_BUCKET}"
 
 ## Discussion
 
-This global load balancing solution demonstrates how to build enterprise-grade resilience and performance optimization using AWS's DNS and content delivery services. The architecture combines Route53's intelligent routing capabilities with CloudFront's global edge network to create a comprehensive failover and load distribution system that automatically adapts to changing conditions and geographical requirements.
+This global load balancing solution demonstrates how to build enterprise-grade resilience and performance optimization using AWS's DNS and content delivery services. The architecture follows AWS Well-Architected Framework principles, combining Route53's intelligent routing capabilities with CloudFront's global edge network to create a comprehensive failover and load distribution system that automatically adapts to changing conditions and geographical requirements.
 
-The Route53 implementation provides multiple routing strategies including weighted routing for gradual traffic shifting and geolocation-based routing for optimal user experience. Health checks continuously monitor endpoint availability across all regions, enabling automatic failover when issues are detected. This multi-layered approach ensures that users are always routed to the best available endpoint based on their location and current system health, minimizing latency and maximizing availability.
+The Route53 implementation provides multiple routing strategies including weighted routing for gradual traffic shifting and geolocation-based routing for optimal user experience. Health checks continuously monitor endpoint availability across all regions, enabling automatic failover when issues are detected. This multi-layered approach ensures that users are always routed to the best available endpoint based on their location and current system health, minimizing latency and maximizing availability according to [AWS Route53 failover documentation](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-failover-configuring.html).
 
-CloudFront's origin groups feature provides an additional layer of resilience by implementing automatic failover at the edge level. When primary origins become unavailable, CloudFront seamlessly switches to secondary origins or fallback content without requiring DNS propagation delays. This edge-level failover typically occurs within seconds, compared to DNS-based failover which can take minutes due to TTL constraints. The combination of both mechanisms provides comprehensive protection against various failure scenarios.
+CloudFront's origin groups feature provides an additional layer of resilience by implementing automatic failover at the edge level as described in [AWS CloudFront origin failover documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/high_availability_origin_failover.html). When primary origins become unavailable, CloudFront seamlessly switches to secondary origins or fallback content without requiring DNS propagation delays. This edge-level failover typically occurs within seconds, compared to DNS-based failover which can take minutes due to TTL constraints. The combination of both mechanisms provides comprehensive protection against various failure scenarios.
 
 The monitoring and alerting system provides real-time visibility into system health and performance across all regions. CloudWatch alarms trigger notifications when health checks fail or performance degrades, enabling rapid response to issues. The comprehensive dashboard provides operational teams with unified visibility into global system status, helping identify patterns and optimize routing policies based on actual usage data. This monitoring foundation is essential for maintaining high availability and performance standards in global deployments.
 
@@ -1511,4 +1515,11 @@ Extend this solution by implementing these advanced enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

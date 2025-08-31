@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: iot, lambda, s3, signer
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, firmware, device-management, ota, jobs, security, automation
 recipe-generator-version: 1.3
@@ -194,7 +194,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
    echo "✅ IoT Jobs role created: ${JOB_ROLE_ARN}"
    ```
 
-   The IAM role is now configured with the minimal permissions needed for IoT Jobs to retrieve firmware from S3. This establishes the security boundary for job execution and ensures that devices can only access signed firmware packages from your designated bucket.
+   The IAM role is now configured with the minimal permissions needed for IoT Jobs to retrieve firmware from S3. This establishes the security boundary for job execution and ensures that devices can only access signed firmware packages from your designated bucket, following the AWS Well-Architected Framework's security pillar principles.
 
 2. **Set up AWS Signer for Code Signing**:
 
@@ -208,17 +208,17 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
        --signature-validity-period "value=365,type=Days"
    
    # Wait for the profile to be created
-   aws signer describe-signing-job \
-       --job-id $(aws signer list-signing-jobs \
-           --platform-id "AmazonFreeRTOS-TI-CC3220SF" \
-           --max-results 1 \
-           --query 'jobs[0].jobId' --output text) \
+   sleep 5
+   
+   # Verify profile creation
+   aws signer get-signing-profile \
+       --profile-name ${SIGNING_PROFILE_NAME} \
        --query 'status' --output text || echo "Profile ready"
    
    echo "✅ Signing profile created: ${SIGNING_PROFILE_NAME}"
    ```
 
-   The signing profile is now ready to create cryptographic signatures for your firmware packages. This establishes the trust chain that devices will use to verify firmware authenticity, ensuring that only authorized updates can be installed on your IoT devices.
+   The signing profile is now ready to create cryptographic signatures for your firmware packages. This establishes the trust chain that devices will use to verify firmware authenticity, ensuring that only authorized updates can be installed on your IoT devices. The AmazonFreeRTOS-TI-CC3220SF platform provides SHA1-RSA signatures compatible with many IoT devices.
 
 3. **Create Lambda Function for Job Management**:
 
@@ -308,7 +308,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
    echo "✅ Lambda role created: ${LAMBDA_ROLE_ARN}"
    ```
 
-   The Lambda execution role is now configured with comprehensive permissions for managing IoT Jobs, accessing firmware in S3, and interacting with the signing service. This enables the Lambda function to orchestrate the entire firmware update lifecycle while maintaining security boundaries between different AWS services.
+   The Lambda execution role is now configured with comprehensive permissions for managing IoT Jobs, accessing firmware in S3, and interacting with the signing service. This enables the Lambda function to orchestrate the entire firmware update lifecycle while maintaining security boundaries between different AWS services, adhering to the principle of least privilege.
 
 4. **Create Lambda Function Code**:
 
@@ -489,7 +489,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
    # Create Lambda function
    aws lambda create-function \
        --function-name firmware-update-manager \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler firmware_update_manager.lambda_handler \
        --zip-file fileb://firmware_update_manager.zip \
@@ -500,7 +500,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
    echo "✅ Lambda function created: firmware-update-manager"
    ```
 
-   The firmware update manager is now deployed and ready to orchestrate update campaigns. This function provides a programmatic interface for creating jobs with advanced configuration options like rollout rates, abort conditions, and timeout policies, enabling sophisticated update strategies for different device types and deployment scenarios.
+   The firmware update manager is now deployed and ready to orchestrate update campaigns. This function provides a programmatic interface for creating jobs with advanced configuration options like rollout rates, abort conditions, and timeout policies, enabling sophisticated update strategies for different device types and deployment scenarios. The exponential rollout configuration ensures gradual deployment while monitoring for failures.
 
 5. **Create Sample Firmware and Upload to S3**:
 
@@ -514,7 +514,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
    # In production, this would be your actual firmware image
    
    FIRMWARE_VERSION=1.0.0
-   FIRMWARE_BUILD=20241211
+   FIRMWARE_BUILD=20250723
    FIRMWARE_FEATURES=["ota_support", "security_patch", "bug_fixes"]
    
    # Simulated binary data
@@ -533,7 +533,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
    cat > firmware_metadata.json << EOF
    {
      "version": "1.0.0",
-     "build": "20241211",
+     "build": "20250723",
      "description": "Sample firmware with OTA support and security patches",
      "features": ["ota_support", "security_patch", "bug_fixes"],
      "size": $(wc -c < sample_firmware_v1.0.0.bin),
@@ -548,7 +548,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
    echo "✅ Sample firmware uploaded to S3"
    ```
 
-   The firmware package and its metadata are now stored in S3, providing the foundation for secure distribution to your device fleet. The metadata file enables automated version management and compatibility checking, while S3's global infrastructure ensures fast download speeds regardless of device location.
+   The firmware package and its metadata are now stored in S3, providing the foundation for secure distribution to your device fleet. The metadata file enables automated version management and compatibility checking, while S3's global infrastructure ensures fast download speeds regardless of device location. This follows the AWS Well-Architected Framework's performance efficiency pillar.
 
 6. **Sign the Firmware**:
 
@@ -592,7 +592,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
    echo "✅ Signed firmware available at: s3://${FIRMWARE_BUCKET}/${SIGNED_FIRMWARE_KEY}"
    ```
 
-   The firmware package is now cryptographically signed and ready for secure distribution. Devices will verify this signature before installation, ensuring that the firmware has not been tampered with and originates from a trusted source. This establishes the security foundation for your OTA update pipeline.
+   The firmware package is now cryptographically signed and ready for secure distribution. Devices will verify this signature before installation, ensuring that the firmware has not been tampered with and originates from a trusted source. This establishes the security foundation for your OTA update pipeline, implementing defense-in-depth security practices.
 
 7. **Create Firmware Update Job**:
 
@@ -622,7 +622,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
    echo "✅ Firmware update job created: ${JOB_ID}"
    ```
 
-   The firmware update job is now active and devices in the target group will begin receiving update notifications. The job includes rollout controls and abort conditions to ensure safe deployment, while providing real-time visibility into update progress across your device fleet.
+   The firmware update job is now active and devices in the target group will begin receiving update notifications. The job includes rollout controls and abort conditions to ensure safe deployment, while providing real-time visibility into update progress across your device fleet. The exponential rollout strategy minimizes risk by gradually increasing deployment rate based on success metrics.
 
 8. **Monitor Job Progress**:
 
@@ -657,7 +657,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
    echo "✅ Job status retrieved"
    ```
 
-   The job monitoring system now provides comprehensive visibility into update progress, including individual device status and overall campaign metrics. This enables proactive management of firmware deployments and rapid response to any issues that arise during the update process.
+   The job monitoring system now provides comprehensive visibility into update progress, including individual device status and overall campaign metrics. This enables proactive management of firmware deployments and rapid response to any issues that arise during the update process, supporting the operational excellence pillar of the AWS Well-Architected Framework.
 
 9. **Set up CloudWatch Monitoring**:
 
@@ -710,7 +710,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
    echo "✅ CloudWatch dashboard created: IoT-Firmware-Updates"
    ```
 
-   The monitoring dashboard is now configured to provide real-time visibility into firmware update operations. This enables operations teams to track job success rates, identify problematic devices, and maintain comprehensive audit trails for compliance and troubleshooting purposes.
+   The monitoring dashboard is now configured to provide real-time visibility into firmware update operations. This enables operations teams to track job success rates, identify problematic devices, and maintain comprehensive audit trails for compliance and troubleshooting purposes. The dashboard supports both reactive monitoring and proactive operational insights.
 
 10. **Create Device Simulator for Testing**:
 
@@ -839,7 +839,7 @@ echo "✅ Thing Group created and device added: ${THING_GROUP}"
     echo "✅ Device simulator completed firmware update"
     ```
 
-    The device simulator has successfully completed the firmware update process, demonstrating the end-to-end functionality of your OTA update pipeline. This validates that devices can properly receive job notifications, download signed firmware, and report status back to the IoT Jobs service.
+    The device simulator has successfully completed the firmware update process, demonstrating the end-to-end functionality of your OTA update pipeline. This validates that devices can properly receive job notifications, download signed firmware, and report status back to the IoT Jobs service, confirming the reliability of your update system.
 
 ## Validation & Testing
 
@@ -1033,24 +1033,33 @@ This IoT firmware update solution demonstrates the power of AWS IoT Device Manag
 
 The implementation showcases advanced IoT device lifecycle management patterns, including graduated rollout strategies that limit the number of simultaneous updates to prevent overwhelming network resources or creating widespread failures. The job execution model provides granular control over update timing and allows devices to participate in updates based on their availability and operational status. Integration with CloudWatch enables comprehensive monitoring and alerting, while the Lambda-based orchestration layer provides flexibility for custom update logic and business rules.
 
-Key architectural decisions include using S3 for firmware distribution to leverage AWS's global content delivery network, implementing signed firmware packages to prevent unauthorized code execution, and utilizing IoT Jobs' built-in retry and timeout mechanisms for resilient update delivery. The solution also demonstrates proper IAM role separation between job management and device execution permissions, following security best practices for IoT deployments.
+Key architectural decisions include using S3 for firmware distribution to leverage AWS's global content delivery network, implementing signed firmware packages to prevent unauthorized code execution, and utilizing IoT Jobs' built-in retry and timeout mechanisms for resilient update delivery. The solution also demonstrates proper IAM role separation between job management and device execution permissions, following security best practices for IoT deployments as outlined in the [AWS IoT security best practices guide](https://docs.aws.amazon.com/iot/latest/developerguide/security-best-practices.html).
 
-> **Tip**: For production deployments, consider implementing staged rollouts with canary deployments to a small subset of devices first, followed by gradual expansion based on success metrics. This approach minimizes risk when deploying firmware updates to critical infrastructure.
+The architecture aligns with all five pillars of the AWS Well-Architected Framework. Security is ensured through encrypted firmware signing and least-privilege IAM policies. Reliability is provided through rollout controls and automatic abort mechanisms. Performance efficiency is achieved through S3's global distribution and CloudWatch monitoring. Cost optimization comes from Lambda's pay-per-execution model and graduated rollout strategies. Operational excellence is supported through comprehensive monitoring and automated job management capabilities.
+
+> **Tip**: For production deployments, consider implementing staged rollouts with canary deployments to a small subset of devices first, followed by gradual expansion based on success metrics. This approach minimizes risk when deploying firmware updates to critical infrastructure. See the [AWS IoT Jobs documentation](https://docs.aws.amazon.com/iot/latest/developerguide/iot-jobs.html) for advanced deployment strategies.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Stage Rollout Strategy**: Implement canary deployments with automatic progression based on success metrics, including device health checks and rollback triggers for failed updates.
+1. **Multi-Stage Rollout Strategy**: Implement canary deployments with automatic progression based on success metrics, including device health checks and rollback triggers for failed updates using AWS IoT Device Defender.
 
-2. **Firmware Version Management**: Create a comprehensive firmware versioning system with dependency tracking, compatibility matrices, and automated update path determination for devices running different firmware versions.
+2. **Firmware Version Management**: Create a comprehensive firmware versioning system with dependency tracking, compatibility matrices, and automated update path determination for devices running different firmware versions using DynamoDB.
 
-3. **Device Fleet Segmentation**: Implement advanced device grouping based on hardware types, geographic regions, or operational criticality, with different update policies and schedules for each segment.
+3. **Device Fleet Segmentation**: Implement advanced device grouping based on hardware types, geographic regions, or operational criticality, with different update policies and schedules for each segment using AWS IoT Thing Groups.
 
-4. **Real-Time Update Monitoring**: Build a comprehensive monitoring dashboard with real-time device status, update progress visualization, network bandwidth utilization, and automated alerting for update anomalies.
+4. **Real-Time Update Monitoring**: Build a comprehensive monitoring dashboard with real-time device status, update progress visualization, network bandwidth utilization, and automated alerting for update anomalies using Amazon Kinesis and AWS IoT Analytics.
 
-5. **Integration with CI/CD Pipeline**: Connect the firmware update system to a continuous integration pipeline that automatically builds, tests, signs, and deploys firmware updates triggered by code commits or scheduled releases.
+5. **Integration with CI/CD Pipeline**: Connect the firmware update system to a continuous integration pipeline using AWS CodePipeline that automatically builds, tests, signs, and deploys firmware updates triggered by code commits or scheduled releases.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

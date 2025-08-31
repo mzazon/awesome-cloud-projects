@@ -4,12 +4,12 @@ id: f3a7b2c9
 category: productivity
 difficulty: 300
 subject: gcp
-services: Cloud Calendar API, Cloud Run Worker Pools, Vertex AI, Cloud Tasks
+services: Google Calendar API, Cloud Run, Vertex AI, Cloud Tasks
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: calendar intelligence, AI scheduling, productivity automation, worker pools, serverless
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Organizations struggle with inefficient meeting scheduling patterns, double book
 
 ## Solution
 
-Build an intelligent calendar management system using Google Cloud Calendar API for calendar data access, Cloud Run Worker Pools for background AI processing, Vertex AI for pattern analysis and optimization recommendations, and Cloud Tasks for reliable job scheduling. This solution automatically analyzes meeting patterns, provides scheduling optimization suggestions, and delivers productivity insights through AI-powered calendar intelligence.
+Build an intelligent calendar management system using Google Calendar API for calendar data access, Cloud Run Worker Pools for background AI processing, Vertex AI for pattern analysis and optimization recommendations, and Cloud Tasks for reliable job scheduling. This solution automatically analyzes meeting patterns, provides scheduling optimization suggestions, and delivers productivity insights through AI-powered calendar intelligence.
 
 ## Architecture Diagram
 
@@ -88,7 +88,7 @@ graph TB
 2. Google Cloud CLI installed and configured or access to Cloud Shell
 3. Basic understanding of REST APIs, serverless computing, and machine learning concepts
 4. Google Workspace account for Calendar API testing and development
-5. Estimated cost: $15-25 USD for resources created during this recipe (primarily Vertex AI model training and BigQuery analysis)
+5. Estimated cost: $15-25 USD for resources created during this recipe (primarily Vertex AI model usage and BigQuery storage)
 
 > **Note**: Ensure you have domain-wide delegation configured for accessing Google Calendar API across your organization if building an enterprise solution.
 
@@ -188,7 +188,7 @@ echo "✅ Storage and analytics foundations created"
    from googleapiclient.discovery import build
    import vertexai
    from vertexai.generative_models import GenerativeModel
-
+   
    class CalendarIntelligenceWorker:
        def __init__(self):
            self.project_id = os.environ['GOOGLE_CLOUD_PROJECT']
@@ -202,7 +202,7 @@ echo "✅ Storage and analytics foundations created"
            
            # Initialize Vertex AI
            vertexai.init(project=self.project_id, location=self.region)
-           self.ai_model = GenerativeModel("gemini-1.5-flash")
+           self.ai_model = GenerativeModel("gemini-2.5-flash")
            
            # Calendar API setup (requires service account with domain delegation)
            credentials = service_account.Credentials.from_service_account_file(
@@ -303,7 +303,7 @@ echo "✅ Storage and analytics foundations created"
                logging.error(f"BigQuery insert errors: {errors}")
            else:
                logging.info("Analysis results stored successfully")
-
+   
    def main():
        """Main worker function"""
        worker = CalendarIntelligenceWorker()
@@ -315,28 +315,28 @@ echo "✅ Storage and analytics foundations created"
        logging.info(f"Starting calendar analysis for: {calendar_id}")
        results = worker.analyze_calendar_patterns(calendar_id)
        logging.info("Calendar intelligence processing completed")
-
+   
    if __name__ == "__main__":
        logging.basicConfig(level=logging.INFO)
        main()
    EOF
    
-   # Create requirements file
+   # Create requirements file with updated versions
    cat > requirements.txt << 'EOF'
    google-cloud-tasks==2.16.4
-   google-cloud-aiplatform==1.38.1
-   google-cloud-bigquery==3.13.0
-   google-api-python-client==2.108.0
-   google-auth==2.23.4
-   google-auth-oauthlib==1.1.0
-   google-auth-httplib2==0.1.1
-   google-cloud-storage==2.10.0
+   google-cloud-aiplatform==1.60.0
+   google-cloud-bigquery==3.25.0
+   google-api-python-client==2.147.0
+   google-auth==2.34.0
+   google-auth-oauthlib==1.2.1
+   google-auth-httplib2==0.2.0
+   google-cloud-storage==2.18.0
    EOF
    
    echo "✅ Calendar intelligence worker application created"
    ```
 
-   The worker application now implements sophisticated calendar analysis using Vertex AI's Gemini models, providing intelligent insights about meeting patterns, optimal scheduling times, and productivity recommendations through advanced machine learning capabilities.
+   The worker application now implements sophisticated calendar analysis using Vertex AI's latest Gemini 2.5 Flash model, providing intelligent insights about meeting patterns, optimal scheduling times, and productivity recommendations through advanced machine learning capabilities.
 
 3. **Create Cloud Run Worker Pool Configuration**:
 
@@ -346,26 +346,26 @@ echo "✅ Storage and analytics foundations created"
    # Create Dockerfile for the worker application
    cat > Dockerfile << 'EOF'
    FROM python:3.11-slim
-
+   
    WORKDIR /app
-
+   
    # Install system dependencies
    RUN apt-get update && apt-get install -y \
        gcc \
        && rm -rf /var/lib/apt/lists/*
-
+   
    # Copy requirements and install Python dependencies
    COPY requirements.txt .
    RUN pip install --no-cache-dir -r requirements.txt
-
+   
    # Copy application code
    COPY src/ ./src/
    COPY config/ ./config/
-
+   
    # Set environment variables
    ENV PYTHONPATH=/app
    ENV GOOGLE_CLOUD_REGION=us-central1
-
+   
    # Run the worker application
    CMD ["python", "src/calendar_worker.py"]
    EOF
@@ -403,7 +403,7 @@ echo "✅ Storage and analytics foundations created"
        --member="serviceAccount:calendar-intelligence-worker@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/storage.objectAdmin"
    
-   # Deploy worker pool
+   # Deploy worker pool using correct syntax
    gcloud beta run worker-pools deploy ${WORKER_POOL_NAME} \
        --image=${IMAGE_URL} \
        --service-account=calendar-intelligence-worker@${PROJECT_ID}.iam.gserviceaccount.com \
@@ -482,9 +482,9 @@ echo "✅ Storage and analytics foundations created"
    from flask import Flask, request, jsonify
    from google.cloud import tasks_v2
    from google.protobuf import timestamp_pb2
-
+   
    app = Flask(__name__)
-
+   
    class CalendarTaskCreator:
        def __init__(self):
            self.project_id = os.environ['GOOGLE_CLOUD_PROJECT']
@@ -498,9 +498,10 @@ echo "✅ Storage and analytics foundations created"
        def create_calendar_analysis_task(self, calendar_id, priority=0):
            """Create a calendar analysis task"""
            task = {
-               'app_engine_http_request': {
+               'http_request': {
                    'http_method': tasks_v2.HttpMethod.POST,
-                   'relative_uri': '/process-calendar',
+                   'url': 'https://example.com/process-calendar',
+                   'headers': {'Content-Type': 'application/json'},
                    'body': json.dumps({
                        'calendar_id': calendar_id,
                        'analysis_type': 'intelligence'
@@ -512,9 +513,9 @@ echo "✅ Storage and analytics foundations created"
                request={"parent": self.parent, "task": task}
            )
            return response.name
-
+   
    task_creator = CalendarTaskCreator()
-
+   
    @app.route('/trigger-analysis', methods=['POST'])
    def trigger_calendar_analysis():
        """API endpoint to trigger calendar analysis"""
@@ -533,33 +534,33 @@ echo "✅ Storage and analytics foundations created"
            'status': 'success',
            'created_tasks': created_tasks
        })
-
+   
    @app.route('/health', methods=['GET'])
    def health_check():
        return jsonify({'status': 'healthy'})
-
+   
    if __name__ == '__main__':
        app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
    EOF
    
    # Create API requirements
    cat > api/requirements.txt << 'EOF'
-   Flask==3.0.0
+   Flask==3.0.3
    google-cloud-tasks==2.16.4
-   gunicorn==21.2.0
+   gunicorn==23.0.0
    EOF
    
    # Create API Dockerfile
    cat > api/Dockerfile << 'EOF'
    FROM python:3.11-slim
-
+   
    WORKDIR /app
-
+   
    COPY requirements.txt .
    RUN pip install --no-cache-dir -r requirements.txt
-
+   
    COPY task_creator.py .
-
+   
    ENV PORT=8080
    CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 task_creator:app
    EOF
@@ -615,7 +616,7 @@ echo "✅ Storage and analytics foundations created"
 
 8. **Configure Vertex AI Model for Advanced Analytics**:
 
-   Vertex AI Model Garden provides pre-trained models and custom training capabilities for advanced calendar analytics. Configuring specialized models enables sophisticated pattern recognition, meeting optimization algorithms, and predictive scheduling recommendations based on historical calendar data and user behavior patterns.
+   Vertex AI provides access to Google's latest generative AI models for advanced calendar analytics. Configuring specialized models enables sophisticated pattern recognition, meeting optimization algorithms, and predictive scheduling recommendations based on historical calendar data and user behavior patterns.
 
    ```bash
    # Create Vertex AI model configuration
@@ -623,14 +624,14 @@ echo "✅ Storage and analytics foundations created"
    import vertexai
    from vertexai.generative_models import GenerativeModel, Part
    import json
-
+   
    def setup_calendar_intelligence_model(project_id, region):
        """Configure Vertex AI for calendar intelligence"""
        vertexai.init(project=project_id, location=region)
        
        # Initialize the Gemini model with specific instructions
        model = GenerativeModel(
-           "gemini-1.5-flash",
+           "gemini-2.5-flash",
            system_instruction="""
            You are a calendar intelligence assistant specialized in:
            1. Analyzing meeting patterns and productivity trends
@@ -644,7 +645,7 @@ echo "✅ Storage and analytics foundations created"
        )
        
        return model
-
+   
    def create_analysis_prompt(calendar_data):
        """Create structured prompt for calendar analysis"""
        prompt = f"""
@@ -688,7 +689,7 @@ echo "✅ Storage and analytics foundations created"
    echo "✅ Vertex AI model configuration created for advanced analytics"
    ```
 
-   The Vertex AI configuration now provides specialized calendar intelligence capabilities with structured analysis prompts, enabling sophisticated pattern recognition and actionable productivity recommendations through Google's advanced language models.
+   The Vertex AI configuration now provides specialized calendar intelligence capabilities with structured analysis prompts, enabling sophisticated pattern recognition and actionable productivity recommendations through Google's latest Gemini 2.5 Flash model.
 
 ## Validation & Testing
 
@@ -820,16 +821,18 @@ echo "✅ Storage and analytics foundations created"
 
 This calendar intelligence solution demonstrates the power of combining Google Cloud's serverless computing platform with advanced AI capabilities to solve real-world productivity challenges. Cloud Run Worker Pools provide the ideal serverless foundation for background processing tasks like calendar analysis, offering automatic scaling without the complexity of managing HTTP endpoints or ingress configurations. The worker pool architecture automatically scales based on Cloud Tasks queue depth, ensuring responsive processing during peak analysis periods while maintaining cost efficiency through pay-per-use pricing.
 
-The integration of Vertex AI's Gemini models enables sophisticated pattern recognition and natural language generation for actionable productivity insights. By analyzing meeting frequency, duration patterns, and scheduling conflicts, the system provides intelligent recommendations that go beyond simple calendar management to deliver strategic productivity optimization. The use of BigQuery for analytics storage creates a foundation for long-term trend analysis and organizational productivity metrics, enabling data-driven decisions about meeting culture and time allocation strategies.
+The integration of Vertex AI's latest Gemini 2.5 Flash model enables sophisticated pattern recognition and natural language generation for actionable productivity insights. With improved pricing at $0.30 per million input tokens and $2.50 per million output tokens, this solution provides cost-effective AI analysis that scales with usage. By analyzing meeting frequency, duration patterns, and scheduling conflicts, the system provides intelligent recommendations that go beyond simple calendar management to deliver strategic productivity optimization.
 
 The architectural pattern of combining Cloud Tasks for reliable job distribution with Cloud Scheduler for automated triggers creates a robust, enterprise-ready system that handles task failures gracefully and ensures consistent processing. This approach is particularly valuable for organizations managing multiple calendars across teams, where coordinated analysis and optimization can deliver significant productivity improvements. The system's ability to process calendar data asynchronously while maintaining strong consistency guarantees makes it suitable for both real-time insights and batch analytics workloads.
+
+The use of BigQuery for analytics storage creates a foundation for long-term trend analysis and organizational productivity metrics, enabling data-driven decisions about meeting culture and time allocation strategies. Combined with Cloud Run's automatic scaling and built-in monitoring, this architecture provides a production-ready solution that can handle enterprise-scale calendar analysis workloads.
 
 > **Tip**: Monitor Cloud Run Worker Pool metrics through Cloud Monitoring to optimize instance allocation and identify processing bottlenecks. The combination of custom metrics and Vertex AI model performance data provides valuable insights for system optimization.
 
 **References:**
 - [Cloud Run Worker Pools Documentation](https://cloud.google.com/run/docs/deploy-worker-pools)
-- [Google Calendar API Best Practices](https://developers.google.com/calendar/api/guides/best-practices)
-- [Vertex AI Generative Models Guide](https://cloud.google.com/vertex-ai/docs/generative-ai/learn/overview)
+- [Google Calendar API Best Practices](https://developers.google.com/workspace/calendar/api/guides/best-practices)
+- [Vertex AI Generative AI Pricing](https://cloud.google.com/vertex-ai/generative-ai/pricing)
 - [Cloud Tasks Queue Management](https://cloud.google.com/tasks/docs/creating-queues)
 - [BigQuery Analytics Patterns](https://cloud.google.com/bigquery/docs/best-practices-performance-patterns)
 
@@ -849,4 +852,9 @@ Extend this calendar intelligence solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

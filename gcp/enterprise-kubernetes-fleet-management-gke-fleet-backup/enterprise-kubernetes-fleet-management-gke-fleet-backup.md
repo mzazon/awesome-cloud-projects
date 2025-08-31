@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: GKE Fleet, Backup for GKE, Config Connector, Cloud Build
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: kubernetes, fleet-management, backup, gitops, config-connector, multi-cluster
 recipe-generator-version: 1.3
@@ -282,27 +282,29 @@ echo "Staging Project: ${WORKLOAD_PROJECT_2}"
    gcloud config set project ${FLEET_HOST_PROJECT_ID}
    
    # Create backup plan for production cluster
-   gcloud backup-dr backup-plans create ${BACKUP_PLAN_NAME}-prod \
+   gcloud beta container backup-restore backup-plans create ${BACKUP_PLAN_NAME}-prod \
        --location=${REGION} \
        --cluster=projects/${WORKLOAD_PROJECT_1}/locations/${REGION}/clusters/prod-cluster-${RANDOM_SUFFIX} \
+       --all-namespaces \
        --include-volume-data \
        --include-secrets \
-       --backup-schedule="0 2 * * *" \
+       --cron-schedule="0 2 * * *" \
        --backup-retain-days=30 \
-       --description="Daily backup for production workloads"
+       --backup-delete-lock-days=7
    
    # Create backup plan for staging cluster
-   gcloud backup-dr backup-plans create ${BACKUP_PLAN_NAME}-staging \
+   gcloud beta container backup-restore backup-plans create ${BACKUP_PLAN_NAME}-staging \
        --location=${REGION} \
        --cluster=projects/${WORKLOAD_PROJECT_2}/locations/${REGION}/clusters/staging-cluster-${RANDOM_SUFFIX} \
+       --all-namespaces \
        --include-volume-data \
        --include-secrets \
-       --backup-schedule="0 3 * * 0" \
+       --cron-schedule="0 3 * * 0" \
        --backup-retain-days=14 \
-       --description="Weekly backup for staging workloads"
+       --backup-delete-lock-days=3
    
    # List backup plans to verify creation
-   gcloud backup-dr backup-plans list --location=${REGION}
+   gcloud beta container backup-restore backup-plans list --location=${REGION}
    
    echo "✅ Backup plans configured with automated scheduling"
    ```
@@ -444,7 +446,7 @@ echo "Staging Project: ${WORKLOAD_PROJECT_2}"
 
    ```bash
    # Create service account for fleet operations
-   gcloud config set project ${FLEET_HOST_PROJECT_1}
+   gcloud config set project ${FLEET_HOST_PROJECT_ID}
    
    gcloud iam service-accounts create fleet-manager \
        --display-name="Fleet Manager Service Account" \
@@ -495,13 +497,13 @@ echo "Staging Project: ${WORKLOAD_PROJECT_2}"
 
    ```bash
    # Trigger manual backup for testing
-   gcloud backup-dr backups create test-backup-${RANDOM_SUFFIX} \
+   gcloud beta container backup-restore backups create test-backup-${RANDOM_SUFFIX} \
        --location=${REGION} \
        --backup-plan=${BACKUP_PLAN_NAME}-prod \
        --description="Manual test backup"
    
    # Monitor backup progress
-   gcloud backup-dr backups list --location=${REGION}
+   gcloud beta container backup-restore backups list --location=${REGION}
    ```
 
    Expected output: Backup should initiate and show "CREATING" status, progressing to "SUCCEEDED".
@@ -578,11 +580,11 @@ echo "Staging Project: ${WORKLOAD_PROJECT_2}"
    ```bash
    # Delete backup plans
    gcloud config set project ${FLEET_HOST_PROJECT_ID}
-   gcloud backup-dr backup-plans delete ${BACKUP_PLAN_NAME}-prod \
+   gcloud beta container backup-restore backup-plans delete ${BACKUP_PLAN_NAME}-prod \
        --location=${REGION} \
        --quiet
    
-   gcloud backup-dr backup-plans delete ${BACKUP_PLAN_NAME}-staging \
+   gcloud beta container backup-restore backup-plans delete ${BACKUP_PLAN_NAME}-staging \
        --location=${REGION} \
        --quiet
    
@@ -665,4 +667,9 @@ Extend this fleet management solution by implementing these enterprise enhanceme
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

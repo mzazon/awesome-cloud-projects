@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Cloud Healthcare API, Vision AI, Cloud Functions, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: healthcare, medical-imaging, dicom, ai-analysis, automation, vision-ai
 recipe-generator-version: 1.3
@@ -44,6 +44,7 @@ graph TB
         VISION[Vision AI]
         FUNCTION[Cloud Functions]
         ANALYSIS[Image Analysis]
+        PUBSUB[Pub/Sub Topic]
     end
     
     subgraph "Output"
@@ -55,7 +56,8 @@ graph TB
     DICOM --> STORAGE
     STORAGE --> DICOM_STORE
     DICOM_STORE --> DATASET
-    DATASET --> FUNCTION
+    DATASET --> PUBSUB
+    PUBSUB --> FUNCTION
     FUNCTION --> VISION
     VISION --> ANALYSIS
     ANALYSIS --> FHIR
@@ -82,7 +84,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for the project
+# Set environment variables for GCP resources
 export PROJECT_ID="medical-imaging-$(date +%s)"
 export REGION="us-central1"
 export ZONE="us-central1-a"
@@ -102,7 +104,8 @@ gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
 
 # Create the project if it doesn't exist
-gcloud projects create ${PROJECT_ID} --name="Medical Imaging Analysis"
+gcloud projects create ${PROJECT_ID} \
+    --name="Medical Imaging Analysis"
 gcloud config set project ${PROJECT_ID}
 
 # Enable required APIs
@@ -156,19 +159,18 @@ echo "✅ APIs enabled for medical imaging pipeline"
    gsutil mb -p ${PROJECT_ID} \
        -c STANDARD \
        -l ${REGION} \
-       -b on \
        gs://${BUCKET_NAME}
    
-   # Enable versioning and lifecycle management
+   # Enable versioning for data protection
    gsutil versioning set on gs://${BUCKET_NAME}
    
-   # Set bucket-level IAM for healthcare compliance
-   gsutil iam ch allUsers:objectViewer gs://${BUCKET_NAME} -d
+   # Remove public access for security compliance
+   gsutil iam ch -d allUsers:objectViewer gs://${BUCKET_NAME}
    
    # Create folder structure for organized processing
-   gsutil -m cp /dev/null gs://${BUCKET_NAME}/incoming/
-   gsutil -m cp /dev/null gs://${BUCKET_NAME}/processed/
-   gsutil -m cp /dev/null gs://${BUCKET_NAME}/failed/
+   echo "" | gsutil cp - gs://${BUCKET_NAME}/incoming/.gitkeep
+   echo "" | gsutil cp - gs://${BUCKET_NAME}/processed/.gitkeep
+   echo "" | gsutil cp - gs://${BUCKET_NAME}/failed/.gitkeep
    
    echo "✅ Cloud Storage bucket configured for medical imaging workflow"
    ```
@@ -193,7 +195,7 @@ echo "✅ APIs enabled for medical imaging pipeline"
    # Grant Vision AI permissions
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
-       --role="roles/ml.developer"
+       --role="roles/aiplatform.user"
    
    # Grant Cloud Storage permissions
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
@@ -203,7 +205,7 @@ echo "✅ APIs enabled for medical imaging pipeline"
    # Grant Cloud Functions permissions
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
-       --role="roles/cloudfunctions.developer"
+       --role="roles/cloudfunctions.invoker"
    
    echo "✅ Service account created with healthcare-appropriate permissions"
    ```
@@ -245,13 +247,14 @@ echo "✅ APIs enabled for medical imaging pipeline"
    
    # Create requirements.txt for Python dependencies
    cat > requirements.txt << 'EOF'
-   google-cloud-healthcare==1.11.0
-   google-cloud-vision==3.4.0
-   google-cloud-storage==2.10.0
-   google-cloud-pubsub==2.18.0
-   pydicom==2.4.0
-   Pillow==10.0.0
-   functions-framework==3.4.0
+   google-cloud-healthcare==2.28.0
+   google-cloud-vision==3.8.0
+   google-cloud-storage==2.19.0
+   google-cloud-pubsub==2.26.1
+   pydicom==3.0.1
+   Pillow==11.0.0
+   functions-framework==3.8.0
+   numpy==2.1.3
    EOF
    
    # Create main.py with image analysis logic
@@ -265,6 +268,7 @@ echo "✅ APIs enabled for medical imaging pipeline"
    from google.cloud import pubsub_v1
    import pydicom
    from PIL import Image
+   import numpy as np
    import io
    
    def process_medical_image(cloud_event):
@@ -280,7 +284,7 @@ echo "✅ APIs enabled for medical imaging pipeline"
        
        # Process DICOM image
        try:
-           # Retrieve DICOM instance
+           # Retrieve DICOM instance from Healthcare API
            dicom_instance = healthcare_client.get_instance(
                name=event_data['name']
            )
@@ -289,12 +293,19 @@ echo "✅ APIs enabled for medical imaging pipeline"
            dicom_data = pydicom.dcmread(io.BytesIO(dicom_instance.data))
            pixel_array = dicom_data.pixel_array
            
-           # Normalize pixel values for Vision AI
-           normalized_pixels = ((pixel_array - pixel_array.min()) / 
-                               (pixel_array.max() - pixel_array.min()) * 255).astype('uint8')
+           # Normalize pixel values for Vision AI processing
+           if pixel_array.max() > pixel_array.min():
+               normalized_pixels = ((pixel_array - pixel_array.min()) / 
+                                   (pixel_array.max() - pixel_array.min()) * 255).astype(np.uint8)
+           else:
+               normalized_pixels = pixel_array.astype(np.uint8)
            
            # Convert to PIL Image
            pil_image = Image.fromarray(normalized_pixels)
+           
+           # Handle grayscale to RGB conversion for Vision AI
+           if pil_image.mode != 'RGB':
+               pil_image = pil_image.convert('RGB')
            
            # Convert to bytes for Vision AI
            img_byte_arr = io.BytesIO()
@@ -307,20 +318,25 @@ echo "✅ APIs enabled for medical imaging pipeline"
            # Detect objects and anomalies
            objects = vision_client.object_localization(image=image)
            labels = vision_client.label_detection(image=image)
+           text_detection = vision_client.text_detection(image=image)
            
            # Analyze for medical anomalies
            analysis_results = {
                'patient_id': dicom_data.get('PatientID', 'Unknown'),
                'study_date': dicom_data.get('StudyDate', 'Unknown'),
                'modality': dicom_data.get('Modality', 'Unknown'),
+               'study_description': dicom_data.get('StudyDescription', 'Unknown'),
                'detected_objects': [obj.name for obj in objects.localized_object_annotations],
                'confidence_scores': [obj.score for obj in objects.localized_object_annotations],
-               'image_labels': [label.description for label in labels.label_annotations],
+               'image_labels': [label.description for label in labels.label_annotations][:10],
+               'label_scores': [label.score for label in labels.label_annotations][:10],
+               'detected_text': [text.description for text in text_detection.text_annotations][:5],
                'anomaly_detected': any(score > 0.8 for score in 
-                                     [obj.score for obj in objects.localized_object_annotations])
+                                     [obj.score for obj in objects.localized_object_annotations]),
+               'processing_timestamp': dicom_data.get('AcquisitionDateTime', 'Unknown')
            }
            
-           # Store results in FHIR
+           # Store results in FHIR store
            store_analysis_results(analysis_results, event_data['name'])
            
            print(f"Successfully processed image: {event_data['name']}")
@@ -328,27 +344,44 @@ echo "✅ APIs enabled for medical imaging pipeline"
            
        except Exception as e:
            print(f"Error processing image: {str(e)}")
+           # Store failed processing information
+           error_info = {
+               'error': str(e),
+               'image_name': event_data.get('name', 'Unknown'),
+               'timestamp': str(event_data.get('eventTime', 'Unknown'))
+           }
+           print(f"Error details: {json.dumps(error_info, indent=2)}")
            raise
    
    def store_analysis_results(results, image_name):
        """Store analysis results in FHIR store"""
        
-       # This would typically create a FHIR DiagnosticReport resource
-       # For demo purposes, we'll print the results
+       # In a production environment, this would create FHIR DiagnosticReport resource
+       # For demonstration purposes, we'll log the structured results
        print(f"Analysis results for {image_name}:")
        print(json.dumps(results, indent=2))
+       
+       # Log summary for monitoring
+       summary = {
+           'patient_id': results.get('patient_id'),
+           'modality': results.get('modality'),
+           'anomaly_detected': results.get('anomaly_detected'),
+           'objects_detected': len(results.get('detected_objects', [])),
+           'labels_detected': len(results.get('image_labels', []))
+       }
+       print(f"Processing summary: {json.dumps(summary)}")
    EOF
    
    # Deploy the Cloud Function
    gcloud functions deploy ${FUNCTION_NAME} \
        --gen2 \
-       --runtime=python311 \
+       --runtime=python312 \
        --region=${REGION} \
        --source=. \
        --entry-point=process_medical_image \
        --trigger-topic=medical-image-processing \
        --service-account=${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com \
-       --memory=512MB \
+       --memory=1GB \
        --timeout=540s \
        --set-env-vars="PROJECT_ID=${PROJECT_ID},DATASET_ID=${DATASET_ID},DICOM_STORE_ID=${DICOM_STORE_ID},FHIR_STORE_ID=${FHIR_STORE_ID}"
    
@@ -371,18 +404,19 @@ echo "✅ APIs enabled for medical imaging pipeline"
    cat > sample-dicom/sample_study.json << 'EOF'
    {
      "PatientID": "TEST001",
-     "StudyDate": "20250112",
+     "StudyDate": "20250123",
      "Modality": "CT",
      "StudyDescription": "Chest CT for routine screening",
-     "SeriesDescription": "Axial chest images"
+     "SeriesDescription": "Axial chest images",
+     "AcquisitionDateTime": "20250123143000"
    }
    EOF
    
-   # Upload sample data to Cloud Storage
+   # Upload sample data to Cloud Storage for reference
    gsutil cp sample-dicom/* gs://${BUCKET_NAME}/incoming/
    
-   # Create a simple test trigger
-   echo "Test medical image uploaded to: gs://${BUCKET_NAME}/incoming/"
+   # Note: In production, DICOM files would be uploaded directly to the DICOM store
+   echo "Sample DICOM metadata uploaded to: gs://${BUCKET_NAME}/incoming/"
    
    echo "✅ Sample DICOM data prepared for testing"
    ```
@@ -401,29 +435,19 @@ echo "✅ APIs enabled for medical imaging pipeline"
                      resource.labels.function_name="'${FUNCTION_NAME}'" 
                      "Successfully processed image"'
    
-   # Create alerting policy for processing failures
-   gcloud alpha monitoring policies create \
-       --policy-from-file=<(cat << 'EOF'
-   {
-     "displayName": "Medical Image Processing Failures",
-     "conditions": [
-       {
-         "displayName": "Function execution failures",
-         "conditionThreshold": {
-           "filter": "resource.type=\"cloud_function\" resource.label.function_name=\"medical-image-processor\"",
-           "comparison": "COMPARISON_GT",
-           "thresholdValue": 0,
-           "duration": "300s"
-         }
-       }
-     ],
-     "alertStrategy": {
-       "autoClose": "1800s"
-     },
-     "enabled": true
-   }
-   EOF
-   )
+   # Create log-based metric for processing failures
+   gcloud logging metrics create medical_image_processing_errors \
+       --description="Failed medical image processing events" \
+       --log-filter='resource.type="cloud_function" 
+                     resource.labels.function_name="'${FUNCTION_NAME}'" 
+                     "Error processing image"'
+   
+   # Create notification channel (replace with actual email)
+   gcloud alpha monitoring channels create \
+       --display-name="Healthcare Alert Channel" \
+       --type=email \
+       --channel-labels=email_address=admin@example.com \
+       --description="Email notifications for healthcare pipeline alerts"
    
    echo "✅ Monitoring and alerting configured for medical imaging pipeline"
    ```
@@ -549,10 +573,17 @@ echo "✅ APIs enabled for medical imaging pipeline"
        ${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com \
        --quiet
    
+   # Delete log-based metrics
+   gcloud logging metrics delete medical_image_processing_success \
+       --quiet
+   gcloud logging metrics delete medical_image_processing_errors \
+       --quiet
+   
    # Delete project (optional - removes all resources)
    gcloud projects delete ${PROJECT_ID} --quiet
    
    echo "✅ All resources cleaned up successfully"
+   echo "Note: Project deletion may take several minutes to complete"
    ```
 
 ## Discussion
@@ -561,9 +592,9 @@ The automated medical imaging analysis solution demonstrates how Google Cloud's 
 
 The architecture leverages Google Cloud's serverless computing model through Cloud Functions, which automatically scales based on image processing demand while maintaining cost efficiency. This approach is particularly valuable in healthcare environments where image volumes can vary significantly based on patient flow and clinical schedules. The event-driven architecture using Pub/Sub ensures reliable processing and enables future expansion to include additional AI services or integration with Electronic Health Record (EHR) systems.
 
-Security and compliance are paramount in healthcare applications, and this solution addresses these requirements through multiple layers of protection. The Healthcare API provides HIPAA-compliant data storage and handling, while IAM roles and service accounts implement the principle of least privilege. The solution also includes comprehensive monitoring and alerting capabilities essential for maintaining the high availability and reliability standards required in healthcare environments.
+Security and compliance are paramount in healthcare applications, and this solution addresses these requirements through multiple layers of protection. The Healthcare API provides HIPAA-compliant data storage and handling, while IAM roles and service accounts implement the principle of least privilege. The solution includes comprehensive monitoring and alerting capabilities essential for maintaining the high availability and reliability standards required in healthcare environments, following the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) principles.
 
-The integration of Vision AI with medical imaging opens possibilities for advanced diagnostic assistance, though it's important to note that AI-generated insights should always be reviewed by qualified healthcare professionals before clinical decisions are made. The system is designed to augment human expertise rather than replace clinical judgment, following established best practices for AI in healthcare as outlined in the [Google Cloud Healthcare AI documentation](https://cloud.google.com/healthcare-ai).
+The integration of Vision AI with medical imaging opens possibilities for advanced diagnostic assistance, though it's important to note that AI-generated insights should always be reviewed by qualified healthcare professionals before clinical decisions are made. The system is designed to augment human expertise rather than replace clinical judgment, following established best practices for AI in healthcare as outlined in the [Google Cloud Healthcare AI documentation](https://cloud.google.com/healthcare-api/docs/concepts/healthcare-ai).
 
 > **Warning**: This solution processes medical imaging data and must comply with HIPAA regulations and local healthcare data protection laws. Ensure proper BAAs (Business Associate Agreements) are in place with Google Cloud before processing actual patient data.
 
@@ -583,4 +614,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

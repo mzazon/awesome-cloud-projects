@@ -1,0 +1,868 @@
+# Infrastructure Manager Configuration for Background Task Processing with Cloud Run Worker Pools
+# This configuration deploys a complete serverless background task processing system
+# using Cloud Run Jobs, Pub/Sub, and Cloud Storage for scalable, cost-effective processing
+
+# =============================================================================
+# METADATA AND DESCRIPTION
+# =============================================================================
+metadata:
+  name: background-task-processing-system
+  description: |
+    Complete Infrastructure Manager configuration for deploying a serverless 
+    background task processing system using Cloud Run Jobs triggered by Pub/Sub 
+    messages with Cloud Storage for file processing and results storage.
+  
+    This system provides:
+    - Scalable task submission API via Cloud Run Service
+    - Reliable message queuing with Pub/Sub
+    - Background job processing with Cloud Run Jobs
+    - Persistent storage for files and results
+    - Automatic scaling based on message volume
+    - Built-in retry mechanisms and error handling
+  version: "1.0"
+  labels:
+    environment: production
+    solution: background-processing
+    pattern: serverless-workers
+
+# =============================================================================
+# INPUT VARIABLES
+# =============================================================================
+variables:
+  # Project Configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID where resources will be created"
+    required: true
+  
+  region:
+    type: string
+    description: "GCP region for deploying regional resources"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "GCP zone for zonal resources"
+    default: "us-central1-a"
+  
+  # Naming and Identification
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod) for resource naming"
+    default: "dev"
+    validation:
+      pattern: "^(dev|staging|prod)$"
+  
+  resource_suffix:
+    type: string
+    description: "Random suffix for unique resource names (6 character hex string)"
+    default: "a1b2c3"
+    validation:
+      pattern: "^[a-f0-9]{6}$"
+  
+  # Pub/Sub Configuration
+  pubsub_topic_name:
+    type: string
+    description: "Name for the Pub/Sub topic for task coordination"
+    default: "task-queue"
+  
+  pubsub_subscription_name:
+    type: string
+    description: "Name for the Pub/Sub subscription for worker processing"
+    default: "worker-subscription"
+  
+  message_retention_duration:
+    type: string
+    description: "Duration to retain messages in subscription (e.g., '7d', '168h')"
+    default: "7d"
+  
+  ack_deadline_seconds:
+    type: number
+    description: "Message acknowledgment deadline in seconds"
+    default: 600
+    validation:
+      minimum: 10
+      maximum: 600
+  
+  max_delivery_attempts:
+    type: number
+    description: "Maximum delivery attempts for failed messages"
+    default: 5
+    validation:
+      minimum: 1
+      maximum: 100
+  
+  # Cloud Storage Configuration
+  storage_bucket_name:
+    type: string
+    description: "Name for the Cloud Storage bucket (will be prefixed with project ID)"
+    default: "task-files"
+  
+  storage_class:
+    type: string
+    description: "Storage class for the bucket"
+    default: "STANDARD"
+    validation:
+      enum: ["STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"]
+  
+  bucket_location:
+    type: string
+    description: "Location for the storage bucket"
+    default: "US"
+  
+  # Cloud Run Job Configuration
+  worker_job_name:
+    type: string
+    description: "Name for the Cloud Run worker job"
+    default: "background-worker"
+  
+  worker_memory:
+    type: string
+    description: "Memory allocation for worker job tasks"
+    default: "1Gi"
+    validation:
+      pattern: "^[1-9][0-9]*[GM]i$"
+  
+  worker_cpu:
+    type: string
+    description: "CPU allocation for worker job tasks"
+    default: "1"
+    validation:
+      pattern: "^[1-4]$"
+  
+  max_retries:
+    type: number
+    description: "Maximum retries for failed job executions"
+    default: 3
+    validation:
+      minimum: 0
+      maximum: 10
+  
+  task_count:
+    type: number
+    description: "Number of parallel tasks to run per job execution"
+    default: 1
+    validation:
+      minimum: 1
+      maximum: 10000
+  
+  parallelism:
+    type: number
+    description: "Maximum number of tasks running simultaneously"
+    default: 1
+    validation:
+      minimum: 1
+      maximum: 1000
+  
+  # Cloud Run API Service Configuration
+  api_service_name:
+    type: string
+    description: "Name for the task submission API service"
+    default: "task-api"
+  
+  api_memory:
+    type: string
+    description: "Memory allocation for API service"
+    default: "512Mi"
+    validation:
+      pattern: "^[1-9][0-9]*[GM]i$"
+  
+  api_cpu:
+    type: string
+    description: "CPU allocation for API service"
+    default: "1"
+    validation:
+      pattern: "^[1-4]$"
+  
+  min_instances:
+    type: number
+    description: "Minimum number of API service instances"
+    default: 0
+    validation:
+      minimum: 0
+      maximum: 100
+  
+  max_instances:
+    type: number
+    description: "Maximum number of API service instances"
+    default: 10
+    validation:
+      minimum: 1
+      maximum: 1000
+  
+  # Container Registry Configuration
+  artifact_registry_name:
+    type: string
+    description: "Name for the Artifact Registry repository"
+    default: "background-tasks"
+  
+  # Security and IAM Configuration
+  allow_unauthenticated:
+    type: boolean
+    description: "Allow unauthenticated access to API service (for testing)"
+    default: false
+  
+  # Monitoring and Logging
+  enable_logging:
+    type: boolean
+    description: "Enable enhanced logging for all services"
+    default: true
+  
+  log_level:
+    type: string
+    description: "Logging level for applications"
+    default: "INFO"
+    validation:
+      enum: ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+
+# =============================================================================
+# REQUIRED GOOGLE CLOUD APIS
+# =============================================================================
+apis:
+  - run.googleapis.com
+  - pubsub.googleapis.com
+  - storage.googleapis.com
+  - cloudbuild.googleapis.com
+  - artifactregistry.googleapis.com
+  - iam.googleapis.com
+  - cloudresourcemanager.googleapis.com
+  - logging.googleapis.com
+  - monitoring.googleapis.com
+
+# =============================================================================
+# INFRASTRUCTURE RESOURCES
+# =============================================================================
+resources:
+  # -----------------------------------------------------------------------------
+  # GOOGLE CLOUD APIS ENABLEMENT
+  # -----------------------------------------------------------------------------
+  - name: enable-required-apis
+    type: google-cloud-apis
+    properties:
+      project: ${project_id}
+      services:
+        - run.googleapis.com
+        - pubsub.googleapis.com
+        - storage.googleapis.com
+        - cloudbuild.googleapis.com
+        - artifactregistry.googleapis.com
+        - iam.googleapis.com
+        - logging.googleapis.com
+        - monitoring.googleapis.com
+    metadata:
+      description: "Enable all required Google Cloud APIs for the background processing system"
+
+  # -----------------------------------------------------------------------------
+  # ARTIFACT REGISTRY REPOSITORY
+  # -----------------------------------------------------------------------------
+  - name: artifact-registry-repo
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      repositoryId: ${artifact_registry_name}-${resource_suffix}
+      repository:
+        format: DOCKER
+        description: "Container registry for background task processing applications"
+        labels:
+          environment: ${environment}
+          purpose: background-processing
+          managed-by: infrastructure-manager
+    depends_on:
+      - enable-required-apis
+    metadata:
+      description: "Artifact Registry repository for storing container images"
+
+  # -----------------------------------------------------------------------------
+  # CLOUD STORAGE BUCKET FOR FILE PROCESSING
+  # -----------------------------------------------------------------------------
+  - name: task-files-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      project: ${project_id}
+      name: ${storage_bucket_name}-${project_id}-${resource_suffix}
+      location: ${bucket_location}
+      storageClass: ${storage_class}
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              isLive: false
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              isLive: true
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        environment: ${environment}
+        purpose: task-file-storage
+        managed-by: infrastructure-manager
+    depends_on:
+      - enable-required-apis
+    metadata:
+      description: "Cloud Storage bucket for task files and processing results"
+
+  # -----------------------------------------------------------------------------
+  # PUB/SUB TOPIC FOR TASK COORDINATION
+  # -----------------------------------------------------------------------------
+  - name: task-queue-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${project_id}/topics/${pubsub_topic_name}-${resource_suffix}
+      labels:
+        environment: ${environment}
+        purpose: task-coordination
+        managed-by: infrastructure-manager
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - ${region}
+      # Enable message ordering for better task processing control
+      messageRetentionDuration: "604800s"  # 7 days in seconds
+    depends_on:
+      - enable-required-apis
+    metadata:
+      description: "Pub/Sub topic for background task message coordination"
+
+  # -----------------------------------------------------------------------------
+  # PUB/SUB SUBSCRIPTION FOR WORKER PROCESSING
+  # -----------------------------------------------------------------------------
+  - name: worker-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/${project_id}/subscriptions/${pubsub_subscription_name}-${resource_suffix}
+      topic: $(ref.task-queue-topic.name)
+      labels:
+        environment: ${environment}
+        purpose: worker-processing
+        managed-by: infrastructure-manager
+      # Configure subscription for reliable background processing
+      ackDeadlineSeconds: ${ack_deadline_seconds}
+      messageRetentionDuration: ${message_retention_duration}
+      retainAckedMessages: false
+      enableMessageOrdering: false
+      # Configure delivery retry policy
+      deadLetterPolicy:
+        maxDeliveryAttempts: ${max_delivery_attempts}
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      # Configure expiration to prevent indefinite retention
+      expirationPolicy:
+        ttl: "2678400s"  # 31 days
+    depends_on:
+      - task-queue-topic
+    metadata:
+      description: "Pub/Sub subscription for reliable message delivery to workers"
+
+  # -----------------------------------------------------------------------------
+  # IAM SERVICE ACCOUNT FOR CLOUD RUN JOBS
+  # -----------------------------------------------------------------------------
+  - name: worker-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: background-worker-sa-${resource_suffix}
+      serviceAccount:
+        displayName: "Background Worker Service Account"
+        description: "Service account for Cloud Run Jobs processing background tasks"
+        labels:
+          environment: ${environment}
+          purpose: worker-execution
+          managed-by: infrastructure-manager
+    depends_on:
+      - enable-required-apis
+    metadata:
+      description: "Service account with minimal permissions for worker job execution"
+
+  # -----------------------------------------------------------------------------
+  # IAM BINDINGS FOR WORKER SERVICE ACCOUNT
+  # -----------------------------------------------------------------------------
+  # Grant Pub/Sub Subscriber role for message consumption
+  - name: worker-pubsub-subscriber-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/pubsub.subscriber
+      member: serviceAccount:$(ref.worker-service-account.email)
+    depends_on:
+      - worker-service-account
+    metadata:
+      description: "Grant Pub/Sub Subscriber access to worker service account"
+
+  # Grant Cloud Storage Object Admin role for file processing
+  - name: worker-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.worker-service-account.email)
+    depends_on:
+      - worker-service-account
+    metadata:
+      description: "Grant Cloud Storage Object Admin access to worker service account"
+
+  # Grant Logging Writer role for application logs
+  - name: worker-logging-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.worker-service-account.email)
+    depends_on:
+      - worker-service-account
+    metadata:
+      description: "Grant Logging Writer access to worker service account"
+
+  # Grant Monitoring Metric Writer role for custom metrics
+  - name: worker-monitoring-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.worker-service-account.email)
+    depends_on:
+      - worker-service-account
+    metadata:
+      description: "Grant Monitoring Metric Writer access to worker service account"
+
+  # -----------------------------------------------------------------------------
+  # IAM SERVICE ACCOUNT FOR API SERVICE
+  # -----------------------------------------------------------------------------
+  - name: api-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: task-api-sa-${resource_suffix}
+      serviceAccount:
+        displayName: "Task API Service Account"
+        description: "Service account for Cloud Run API service submitting tasks"
+        labels:
+          environment: ${environment}
+          purpose: api-execution
+          managed-by: infrastructure-manager
+    depends_on:
+      - enable-required-apis
+    metadata:
+      description: "Service account with minimal permissions for API service execution"
+
+  # Grant Pub/Sub Publisher role for task submission
+  - name: api-pubsub-publisher-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.api-service-account.email)
+    depends_on:
+      - api-service-account
+    metadata:
+      description: "Grant Pub/Sub Publisher access to API service account"
+
+  # Grant Logging Writer role for API logs
+  - name: api-logging-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.api-service-account.email)
+    depends_on:
+      - api-service-account
+    metadata:
+      description: "Grant Logging Writer access to API service account"
+
+  # -----------------------------------------------------------------------------
+  # CLOUD RUN JOB FOR BACKGROUND PROCESSING
+  # -----------------------------------------------------------------------------
+  - name: background-worker-job
+    type: gcp-types/run-v1:namespaces.jobs
+    properties:
+      parent: namespaces/${project_id}
+      location: ${region}
+      job:
+        metadata:
+          name: ${worker_job_name}-${resource_suffix}
+          namespace: ${project_id}
+          labels:
+            environment: ${environment}
+            purpose: background-processing
+            managed-by: infrastructure-manager
+          annotations:
+            # Enable CPU allocation only during request processing
+            run.googleapis.com/cpu-throttling: "true"
+            # Enable execution environment v2 for better performance
+            run.googleapis.com/execution-environment: gen2
+        spec:
+          template:
+            metadata:
+              labels:
+                environment: ${environment}
+                version: "1.0"
+              annotations:
+                # Configure job-specific annotations
+                run.googleapis.com/execution-environment: gen2
+                autoscaling.knative.dev/maxScale: "${task_count}"
+            spec:
+              # Configure job execution parameters
+              taskCount: ${task_count}
+              parallelism: ${parallelism}
+              taskTimeoutSeconds: "3600"  # 1 hour timeout
+              backoffLimit: ${max_retries}
+              # Configure container template
+              template:
+                spec:
+                  restartPolicy: Never
+                  serviceAccountName: $(ref.worker-service-account.email)
+                  containers:
+                    - name: worker
+                      # Placeholder image - will be updated during deployment
+                      image: gcr.io/cloudrun/hello:latest
+                      resources:
+                        requests:
+                          memory: ${worker_memory}
+                          cpu: ${worker_cpu}
+                        limits:
+                          memory: ${worker_memory}
+                          cpu: ${worker_cpu}
+                      env:
+                        - name: GOOGLE_CLOUD_PROJECT
+                          value: ${project_id}
+                        - name: SUBSCRIPTION_NAME
+                          value: ${pubsub_subscription_name}-${resource_suffix}
+                        - name: BUCKET_NAME
+                          value: ${storage_bucket_name}-${project_id}-${resource_suffix}
+                        - name: MAX_MESSAGES
+                          value: "10"
+                        - name: LOG_LEVEL
+                          value: ${log_level}
+                        - name: ENVIRONMENT
+                          value: ${environment}
+                        # Enable structured logging
+                        - name: PYTHONUNBUFFERED
+                          value: "1"
+                      # Configure health checks for better reliability
+                      startupProbe:
+                        httpGet:
+                          path: /health
+                          port: 8080
+                        initialDelaySeconds: 10
+                        periodSeconds: 10
+                        timeoutSeconds: 5
+                        failureThreshold: 3
+                      # Configure resource monitoring
+                      securityContext:
+                        runAsNonRoot: true
+                        runAsUser: 1000
+                        allowPrivilegeEscalation: false
+                        readOnlyRootFilesystem: false
+                        capabilities:
+                          drop:
+                            - ALL
+    depends_on:
+      - worker-service-account
+      - worker-pubsub-subscriber-binding
+      - worker-storage-admin-binding
+      - worker-logging-writer-binding
+      - task-files-bucket
+      - worker-subscription
+    metadata:
+      description: "Cloud Run Job for processing background tasks from Pub/Sub"
+
+  # -----------------------------------------------------------------------------
+  # CLOUD RUN SERVICE FOR TASK SUBMISSION API
+  # -----------------------------------------------------------------------------
+  - name: task-api-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/${project_id}
+      location: ${region}
+      service:
+        metadata:
+          name: ${api_service_name}-${resource_suffix}
+          namespace: ${project_id}
+          labels:
+            environment: ${environment}
+            purpose: task-submission
+            managed-by: infrastructure-manager
+          annotations:
+            # Enable HTTP/2 for better performance
+            run.googleapis.com/ingress: all
+            # Enable execution environment v2
+            run.googleapis.com/execution-environment: gen2
+            # Configure custom domain mapping if needed
+            run.googleapis.com/custom-audiences: ${project_id}
+        spec:
+          template:
+            metadata:
+              labels:
+                environment: ${environment}
+                version: "1.0"
+              annotations:
+                # Configure autoscaling parameters
+                autoscaling.knative.dev/minScale: "${min_instances}"
+                autoscaling.knative.dev/maxScale: "${max_instances}"
+                # Enable CPU allocation only during request processing
+                run.googleapis.com/cpu-throttling: "true"
+                # Configure execution environment
+                run.googleapis.com/execution-environment: gen2
+            spec:
+              serviceAccountName: $(ref.api-service-account.email)
+              containers:
+                - name: api
+                  # Placeholder image - will be updated during deployment
+                  image: gcr.io/cloudrun/hello:latest
+                  ports:
+                    - name: http1
+                      containerPort: 8080
+                      protocol: TCP
+                  resources:
+                    requests:
+                      memory: ${api_memory}
+                      cpu: ${api_cpu}
+                    limits:
+                      memory: ${api_memory}
+                      cpu: ${api_cpu}
+                  env:
+                    - name: GOOGLE_CLOUD_PROJECT
+                      value: ${project_id}
+                    - name: TOPIC_NAME
+                      value: ${pubsub_topic_name}-${resource_suffix}
+                    - name: PORT
+                      value: "8080"
+                    - name: LOG_LEVEL
+                      value: ${log_level}
+                    - name: ENVIRONMENT
+                      value: ${environment}
+                    # Flask configuration
+                    - name: FLASK_ENV
+                      value: production
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                  # Configure health and readiness probes
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                    timeoutSeconds: 10
+                    failureThreshold: 3
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  # Configure startup probe for better cold start handling
+                  startupProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 10
+                  # Configure security context
+                  securityContext:
+                    runAsNonRoot: true
+                    runAsUser: 1000
+                    allowPrivilegeEscalation: false
+                    readOnlyRootFilesystem: false
+                    capabilities:
+                      drop:
+                        - ALL
+          # Configure traffic allocation for gradual rollouts
+          traffic:
+            - percent: 100
+              latestRevision: true
+    depends_on:
+      - api-service-account
+      - api-pubsub-publisher-binding
+      - api-logging-writer-binding
+      - task-queue-topic
+    metadata:
+      description: "Cloud Run Service providing REST API for task submission"
+
+  # -----------------------------------------------------------------------------
+  # IAM POLICY FOR PUBLIC ACCESS (IF ENABLED)
+  # -----------------------------------------------------------------------------
+  - name: api-service-public-access
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/run.invoker
+      member: allUsers
+    condition: ${allow_unauthenticated}
+    depends_on:
+      - task-api-service
+    metadata:
+      description: "Allow unauthenticated access to API service (conditional)"
+
+# =============================================================================
+# OUTPUT VALUES
+# =============================================================================
+outputs:
+  # Project and Environment Information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${project_id}
+  
+  region:
+    description: "Deployment region"
+    value: ${region}
+  
+  environment:
+    description: "Environment name"
+    value: ${environment}
+  
+  resource_suffix:
+    description: "Resource naming suffix"
+    value: ${resource_suffix}
+  
+  # Pub/Sub Resources
+  pubsub_topic_name:
+    description: "Name of the Pub/Sub topic for task coordination"
+    value: $(ref.task-queue-topic.name)
+  
+  pubsub_subscription_name:
+    description: "Name of the Pub/Sub subscription for worker processing"
+    value: $(ref.worker-subscription.name)
+  
+  # Cloud Storage Resources
+  storage_bucket_name:
+    description: "Name of the Cloud Storage bucket for file processing"
+    value: $(ref.task-files-bucket.name)
+  
+  storage_bucket_url:
+    description: "URL of the Cloud Storage bucket"
+    value: gs://$(ref.task-files-bucket.name)
+  
+  # Artifact Registry
+  artifact_registry_url:
+    description: "URL of the Artifact Registry repository"
+    value: ${region}-docker.pkg.dev/${project_id}/$(ref.artifact-registry-repo.name)
+  
+  # Cloud Run Resources
+  worker_job_name:
+    description: "Name of the Cloud Run worker job"
+    value: $(ref.background-worker-job.metadata.name)
+  
+  api_service_name:
+    description: "Name of the Cloud Run API service"
+    value: $(ref.task-api-service.metadata.name)
+  
+  api_service_url:
+    description: "URL of the task submission API service"
+    value: $(ref.task-api-service.status.url)
+  
+  # Service Accounts
+  worker_service_account_email:
+    description: "Email of the worker service account"
+    value: $(ref.worker-service-account.email)
+  
+  api_service_account_email:
+    description: "Email of the API service account"
+    value: $(ref.api-service-account.email)
+  
+  # Configuration Values
+  max_delivery_attempts:
+    description: "Maximum delivery attempts for failed messages"
+    value: ${max_delivery_attempts}
+  
+  message_retention_duration:
+    description: "Message retention duration in subscription"
+    value: ${message_retention_duration}
+  
+  # Deployment Instructions
+  deployment_notes:
+    description: "Important deployment and usage notes"
+    value: |
+      Background Task Processing System Successfully Deployed!
+      
+      Next Steps:
+      1. Build and push container images to Artifact Registry:
+         - Worker: ${region}-docker.pkg.dev/${project_id}/${artifact_registry_name}-${resource_suffix}/worker:latest
+         - API: ${region}-docker.pkg.dev/${project_id}/${artifact_registry_name}-${resource_suffix}/api:latest
+      
+      2. Update Cloud Run services with container images:
+         gcloud run jobs replace-image ${worker_job_name}-${resource_suffix} \
+           --image=${region}-docker.pkg.dev/${project_id}/${artifact_registry_name}-${resource_suffix}/worker:latest \
+           --region=${region}
+         
+         gcloud run services replace-image ${api_service_name}-${resource_suffix} \
+           --image=${region}-docker.pkg.dev/${project_id}/${artifact_registry_name}-${resource_suffix}/api:latest \
+           --region=${region}
+      
+      3. Test the system:
+         curl -X POST "$(ref.task-api-service.status.url)/submit-file-task" \
+           -H "Content-Type: application/json" \
+           -d '{"filename": "test.txt", "processing_time": 2}'
+      
+      4. Execute background job:
+         gcloud run jobs execute $(ref.background-worker-job.metadata.name) \
+           --region=${region} --wait
+      
+      5. Monitor processing:
+         - Check Pub/Sub metrics in Cloud Monitoring
+         - View Cloud Run logs for job execution details
+         - Check Cloud Storage bucket for processed files
+      
+      Security Notes:
+      - Service accounts follow principle of least privilege
+      - Container images run as non-root user
+      - API access ${allow_unauthenticated ? "allows unauthenticated requests" : "requires authentication"}
+      - All resources are labeled for easier management
+      
+      Cost Optimization:
+      - Cloud Run services scale to zero when idle
+      - Pub/Sub messages expire after 31 days
+      - Storage lifecycle rules automatically manage file retention
+      - CPU throttling enabled for cost-efficient execution
+
+# =============================================================================
+# VALIDATION AND CONSTRAINTS
+# =============================================================================
+validation:
+  # Ensure resource names follow GCP naming conventions
+  - condition: length(var.resource_suffix) == 6
+    error_message: "Resource suffix must be exactly 6 characters long"
+  
+  - condition: can(regex("^[a-f0-9]+$", var.resource_suffix))
+    error_message: "Resource suffix must contain only lowercase hexadecimal characters"
+  
+  # Validate CPU and memory configurations
+  - condition: tonumber(split("Gi", var.worker_memory)[0]) >= 1
+    error_message: "Worker memory must be at least 1Gi"
+  
+  - condition: tonumber(var.worker_cpu) >= 1
+    error_message: "Worker CPU must be at least 1"
+  
+  # Validate Pub/Sub configuration
+  - condition: var.ack_deadline_seconds >= 10 && var.ack_deadline_seconds <= 600
+    error_message: "ACK deadline must be between 10 and 600 seconds"
+  
+  - condition: var.max_delivery_attempts >= 1 && var.max_delivery_attempts <= 100
+    error_message: "Max delivery attempts must be between 1 and 100"
+  
+  # Validate scaling parameters
+  - condition: var.min_instances >= 0 && var.min_instances <= var.max_instances
+    error_message: "Min instances must be >= 0 and <= max instances"
+  
+  - condition: var.max_instances >= 1 && var.max_instances <= 1000
+    error_message: "Max instances must be between 1 and 1000"
+
+# =============================================================================
+# TAGS AND LABELS
+# =============================================================================
+default_labels:
+  project: background-task-processing
+  solution: serverless-workers
+  managed-by: infrastructure-manager
+  created-by: recipe-f7b9c2d8
+  environment: ${environment}
+  cost-center: engineering
+  auto-cleanup: enabled

@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: Security Hub, EventBridge, Lambda, SNS
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, incident-response, automation, security-hub, eventbridge, lambda
 recipe-generator-version: 1.3
@@ -175,11 +175,11 @@ echo "✅ IAM roles created successfully"
        --enable-default-standards \
        --tags '{"Project": "IncidentResponse", "Environment": "Production"}'
    
-   # Enable additional security standards
+   # Enable additional security standards (using current region-agnostic format)
    aws securityhub batch-enable-standards \
        --standards-subscription-requests '[
            {
-               "StandardsArn": "arn:aws:securityhub:us-east-1::standards/cis-aws-foundations-benchmark/v/1.4.0",
+               "StandardsArn": "arn:aws:securityhub:::ruleset/finding-format/aws-foundational-security-best-practices/v/1.0.0",
                "StandardsInput": {}
            }
        ]'
@@ -187,7 +187,7 @@ echo "✅ IAM roles created successfully"
    echo "✅ Security Hub enabled with security standards"
    ```
 
-   Security Hub is now active and will begin collecting findings from enabled security services. The CIS AWS Foundations Benchmark provides industry-standard security controls that help ensure your AWS environment follows security best practices. This creates the foundation for automated incident detection and response workflows.
+   Security Hub is now active and will begin collecting findings from enabled security services. The AWS Foundational Security Best Practices standard provides industry-standard security controls that help ensure your AWS environment follows security best practices. This creates the foundation for automated incident detection and response workflows.
 
 2. **Create SNS Topic for Incident Notifications**:
 
@@ -420,10 +420,10 @@ echo "✅ IAM roles created successfully"
    # Wait for IAM role propagation
    sleep 10
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    LAMBDA_ARN=$(aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler incident_processor.lambda_handler \
        --zip-file fileb:///tmp/incident_processor.zip \
@@ -533,7 +533,7 @@ echo "✅ IAM roles created successfully"
    ```bash
    # Create automation rule for suppressing low priority findings
    aws securityhub create-automation-rule \
-       --rule-name "Suppress Low Priority Findings" \
+       --automation-rule-name "Suppress Low Priority Findings" \
        --description "Automatically suppress informational findings from specific controls" \
        --rule-order 1 \
        --rule-status ENABLED \
@@ -541,7 +541,7 @@ echo "✅ IAM roles created successfully"
            "SeverityLabel": [{"Value": "INFORMATIONAL", "Comparison": "EQUALS"}],
            "GeneratorId": [{"Value": "aws-foundational-security-best-practices", "Comparison": "PREFIX"}]
        }' \
-       --actions '[{
+       --actions '{
            "Type": "FINDING_FIELDS_UPDATE",
            "FindingFieldsUpdate": {
                "Note": {
@@ -552,11 +552,11 @@ echo "✅ IAM roles created successfully"
                    "Status": "SUPPRESSED"
                }
            }
-       }]'
+       }'
    
    # Create automation rule for escalating critical findings
    aws securityhub create-automation-rule \
-       --rule-name "Escalate Critical Findings" \
+       --automation-rule-name "Escalate Critical Findings" \
        --description "Automatically escalate critical findings and add priority notes" \
        --rule-order 2 \
        --rule-status ENABLED \
@@ -566,7 +566,7 @@ echo "✅ IAM roles created successfully"
                "Status": [{"Value": "NEW", "Comparison": "EQUALS"}]
            }
        }' \
-       --actions '[{
+       --actions '{
            "Type": "FINDING_FIELDS_UPDATE",
            "FindingFieldsUpdate": {
                "Note": {
@@ -577,7 +577,7 @@ echo "✅ IAM roles created successfully"
                    "Status": "NOTIFIED"
                }
            }
-       }]'
+       }'
    
    echo "✅ Automation rules created for intelligent triage"
    ```
@@ -641,7 +641,6 @@ echo "✅ IAM roles created successfully"
    cat > /tmp/threat_intelligence.py << 'EOF'
    import json
    import boto3
-   import requests
    import os
    
    def lambda_handler(event, context):
@@ -726,7 +725,7 @@ echo "✅ IAM roles created successfully"
    
    THREAT_INTEL_ARN=$(aws lambda create-function \
        --function-name threat-intelligence-lookup-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler threat_intelligence.lambda_handler \
        --zip-file fileb:///tmp/threat_intelligence.zip \
@@ -944,14 +943,33 @@ echo "✅ IAM roles created successfully"
    aws securityhub delete-action-target \
        --action-target-arn ${CUSTOM_ACTION_ARN}
    
-   # Delete automation rules
-   aws securityhub batch-delete-automation-rules \
-       --automation-rules-arns '[]'
+   # List and delete automation rules individually
+   AUTOMATION_RULE_ARNS=$(aws securityhub list-automation-rules \
+       --query 'AutomationRules[?starts_with(RuleName, `Suppress`) || starts_with(RuleName, `Escalate`)].RuleArn' \
+       --output text)
+   
+   for rule_arn in $AUTOMATION_RULE_ARNS; do
+       aws securityhub delete-automation-rule --automation-rule-arn $rule_arn
+   done
    
    echo "✅ Security Hub configurations removed"
    ```
 
-6. **Clean up IAM roles and policies**:
+6. **Clean up CloudWatch resources**:
+
+   ```bash
+   # Delete CloudWatch dashboard
+   aws cloudwatch delete-dashboards \
+       --dashboard-names SecurityHubIncidentResponse
+   
+   # Delete CloudWatch alarm
+   aws cloudwatch delete-alarms \
+       --alarm-names SecurityHubIncidentProcessingFailures
+   
+   echo "✅ CloudWatch resources cleaned up"
+   ```
+
+7. **Clean up IAM roles and policies**:
 
    ```bash
    # Detach policies from roles
@@ -976,15 +994,15 @@ echo "✅ IAM roles created successfully"
 
 ## Discussion
 
-This comprehensive security incident response solution demonstrates how AWS Security Hub can serve as the central nervous system for enterprise security operations. The architecture leverages event-driven automation to ensure rapid response to security threats while maintaining the flexibility to integrate with existing security tools and workflows.
+This comprehensive security incident response solution demonstrates how AWS Security Hub can serve as the central nervous system for enterprise security operations. The architecture leverages event-driven automation to ensure rapid response to security threats while maintaining the flexibility to integrate with existing security tools and workflows. This follows the AWS Well-Architected Framework's Security Pillar by implementing defense in depth, automation, and proper monitoring.
 
-The solution addresses several critical aspects of modern security operations. First, it provides automated triage through Security Hub's automation rules, which can suppress low-priority findings while escalating critical ones. This reduces alert fatigue and allows security teams to focus on genuine threats. Second, the EventBridge integration enables real-time processing of security events, ensuring that incidents are detected and responded to within minutes rather than hours.
+The solution addresses several critical aspects of modern security operations. First, it provides automated triage through Security Hub's automation rules, which can suppress low-priority findings while escalating critical ones. This reduces alert fatigue and allows security teams to focus on genuine threats. Second, the EventBridge integration enables real-time processing of security events, ensuring that incidents are detected and responded to within minutes rather than hours. This aligns with the Operational Excellence pillar of the Well-Architected Framework by automating operational procedures.
 
-The Lambda-based incident processor serves as the intelligence layer, enriching security findings with contextual information such as threat intelligence scores, business impact assessments, and automated remediation recommendations. This enrichment process is crucial for effective incident response, as it provides security analysts with the information they need to make informed decisions quickly. The integration with external ticketing systems through SNS ensures that incidents are properly tracked and managed according to established processes.
+The Lambda-based incident processor serves as the intelligence layer, enriching security findings with contextual information such as threat intelligence scores, business impact assessments, and automated remediation recommendations. This enrichment process is crucial for effective incident response, as it provides security analysts with the information they need to make informed decisions quickly. The integration with external ticketing systems through SNS ensures that incidents are properly tracked and managed according to established processes. For additional guidance on Lambda best practices, see the [AWS Lambda Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/).
 
-The custom actions feature allows security teams to maintain control over the incident response process while benefiting from automation. When analysts encounter findings that require special attention, they can use custom actions to trigger additional workflows, such as deeper investigation, stakeholder notification, or emergency response procedures. This hybrid approach combines the efficiency of automation with the expertise of human analysts.
+The custom actions feature allows security teams to maintain control over the incident response process while benefiting from automation. When analysts encounter findings that require special attention, they can use custom actions to trigger additional workflows, such as deeper investigation, stakeholder notification, or emergency response procedures. This hybrid approach combines the efficiency of automation with the expertise of human analysts. For more information on Security Hub custom actions, consult the [AWS Security Hub User Guide](https://docs.aws.amazon.com/securityhub/latest/userguide/).
 
-> **Tip**: Consider implementing AWS Config rules alongside Security Hub to detect configuration drifts that might indicate security policy violations or unauthorized changes.
+> **Tip**: Consider implementing AWS Config rules alongside Security Hub to detect configuration drifts that might indicate security policy violations or unauthorized changes. This provides additional coverage for compliance monitoring and automated remediation.
 
 ## Challenge
 
@@ -1002,4 +1020,11 @@ Extend this security incident response solution by implementing these enhancemen
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

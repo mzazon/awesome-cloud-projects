@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: Kinesis Data Streams, Lambda, DynamoDB, CloudWatch
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: analytics, kinesis, lambda, real-time, clickstream
 recipe-generator-version: 1.3
@@ -105,7 +105,7 @@ export TABLE_PREFIX="clickstream-${RANDOM_SUFFIX}"
 
 # Create S3 bucket for raw data archiving
 export BUCKET_NAME="clickstream-archive-${RANDOM_SUFFIX}"
-aws s3 mb s3://${BUCKET_NAME}
+aws s3 mb s3://${BUCKET_NAME} --region ${AWS_REGION}
 
 echo "✅ Environment prepared with stream: ${STREAM_NAME}"
 ```
@@ -167,7 +167,7 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
            AttributeName=session_id,KeyType=HASH \
        --billing-mode PAY_PER_REQUEST
    
-   # Create table for real-time counters
+   # Create table for real-time counters with TTL
    # Metric name and time window for aggregated data
    aws dynamodb create-table \
        --table-name ${TABLE_PREFIX}-counters \
@@ -178,6 +178,12 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
            AttributeName=metric_name,KeyType=HASH \
            AttributeName=time_window,KeyType=RANGE \
        --billing-mode PAY_PER_REQUEST
+   
+   # Enable TTL on the counters table for automatic cleanup
+   aws dynamodb update-time-to-live \
+       --table-name ${TABLE_PREFIX}-counters \
+       --time-to-live-specification \
+           Enabled=true,AttributeName=ttl
    
    echo "✅ Created DynamoDB tables for metrics storage"
    ```
@@ -270,6 +276,9 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
    
    export LAMBDA_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/ClickstreamProcessorRole-${RANDOM_SUFFIX}"
    
+   # Wait for role to be available
+   sleep 10
+   
    echo "✅ Created IAM role for Lambda functions"
    ```
 
@@ -285,10 +294,15 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
    # Create the Lambda function code
    mkdir -p lambda-functions/event-processor
    cat > lambda-functions/event-processor/index.js << 'EOF'
-   const AWS = require('aws-sdk');
-   const dynamodb = new AWS.DynamoDB.DocumentClient();
-   const s3 = new AWS.S3();
-   const cloudwatch = new AWS.CloudWatch();
+   const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+   const { DynamoDBDocumentClient, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+   const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+   const { CloudWatchClient, PutMetricDataCommand } = require('@aws-sdk/client-cloudwatch');
+   
+   const dynamoClient = new DynamoDBClient({});
+   const dynamodb = DynamoDBDocumentClient.from(dynamoClient);
+   const s3 = new S3Client({});
+   const cloudwatch = new CloudWatchClient({});
    
    const TABLE_PREFIX = process.env.TABLE_PREFIX;
    const BUCKET_NAME = process.env.BUCKET_NAME;
@@ -318,7 +332,7 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
        });
        
        await Promise.all(promises);
-       return { statusCode:200, body: 'Successfully processed events' };
+       return { statusCode: 200, body: 'Successfully processed events' };
    };
    
    async function processPageView(event) {
@@ -326,7 +340,7 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
        
        const hour = new Date(event.timestamp).toISOString().slice(0, 13);
        
-       const params = {
+       const command = new UpdateCommand({
            TableName: `${TABLE_PREFIX}-page-metrics`,
            Key: {
                page_url: event.page_url,
@@ -337,13 +351,13 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
                ':inc': 1,
                ':now': Date.now()
            }
-       };
+       });
        
-       await dynamodb.update(params).promise();
+       await dynamodb.send(command);
    }
    
    async function updateSessionMetrics(event) {
-       const params = {
+       const command = new UpdateCommand({
            TableName: `${TABLE_PREFIX}-session-metrics`,
            Key: { session_id: event.session_id },
            UpdateExpression: 'SET last_activity = :now, user_agent = :ua ADD event_count :inc',
@@ -352,15 +366,15 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
                ':ua': event.user_agent || 'unknown',
                ':inc': 1
            }
-       };
+       });
        
-       await dynamodb.update(params).promise();
+       await dynamodb.send(command);
    }
    
    async function updateRealTimeCounters(event) {
        const minute = new Date(event.timestamp).toISOString().slice(0, 16);
        
-       const params = {
+       const command = new UpdateCommand({
            TableName: `${TABLE_PREFIX}-counters`,
            Key: {
                metric_name: `events_per_minute_${event.event_type}`,
@@ -371,27 +385,27 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
                ':inc': 1,
                ':ttl': Math.floor(Date.now() / 1000) + (24 * 60 * 60) // 24 hour TTL
            }
-       };
+       });
        
-       await dynamodb.update(params).promise();
+       await dynamodb.send(command);
    }
    
    async function archiveRawEvent(event) {
        const date = new Date(event.timestamp);
        const key = `year=${date.getFullYear()}/month=${date.getMonth() + 1}/day=${date.getDate()}/hour=${date.getHours()}/${event.session_id}-${Date.now()}.json`;
        
-       const params = {
+       const command = new PutObjectCommand({
            Bucket: BUCKET_NAME,
            Key: key,
            Body: JSON.stringify(event),
            ContentType: 'application/json'
-       };
+       });
        
-       await s3.putObject(params).promise();
+       await s3.send(command);
    }
    
    async function publishMetrics(event) {
-       const params = {
+       const command = new PutMetricDataCommand({
            Namespace: 'Clickstream/Events',
            MetricData: [
                {
@@ -406,26 +420,30 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
                    ]
                }
            ]
-       };
+       });
        
-       await cloudwatch.putMetricData(params).promise();
+       await cloudwatch.send(command);
    }
    EOF
    
-   # Create package.json
+   # Create package.json with AWS SDK v3
    cat > lambda-functions/event-processor/package.json << 'EOF'
    {
        "name": "clickstream-event-processor",
-       "version": "1.0",
+       "version": "1.0.0",
        "main": "index.js",
        "dependencies": {
-           "aws-sdk": "^2.1000.0"
+           "@aws-sdk/client-dynamodb": "^3.0.0",
+           "@aws-sdk/lib-dynamodb": "^3.0.0",
+           "@aws-sdk/client-s3": "^3.0.0",
+           "@aws-sdk/client-cloudwatch": "^3.0.0"
        }
    }
    EOF
    
    # Package the Lambda function
    cd lambda-functions/event-processor
+   npm install --omit=dev
    zip -r ../event-processor.zip .
    cd ../..
    
@@ -433,7 +451,7 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
    # Memory size affects performance for concurrent processing
    aws lambda create-function \
        --function-name clickstream-event-processor-${RANDOM_SUFFIX} \
-       --runtime nodejs18.x \
+       --runtime nodejs20.x \
        --role ${LAMBDA_ROLE_ARN} \
        --handler index.handler \
        --zip-file fileb://lambda-functions/event-processor.zip \
@@ -457,13 +475,14 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
    ```bash
    # Create event source mapping
    # Batch size determines how many records are processed together
-   # This balances latency vs throughput
+   # This balances latency vs throughput (max 10,000 for Kinesis)
    aws lambda create-event-source-mapping \
        --event-source-arn ${STREAM_ARN} \
        --function-name clickstream-event-processor-${RANDOM_SUFFIX} \
        --starting-position LATEST \
        --batch-size 100 \
-       --maximum-batching-window-in-seconds 5
+       --maximum-batching-window-in-seconds 5 \
+       --parallelization-factor 1
    
    echo "✅ Created event source mapping for real-time processing"
    ```
@@ -479,9 +498,13 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
    # This function demonstrates real-time pattern recognition
    mkdir -p lambda-functions/anomaly-detector
    cat > lambda-functions/anomaly-detector/index.js << 'EOF'
-   const AWS = require('aws-sdk');
-   const dynamodb = new AWS.DynamoDB.DocumentClient();
-   const sns = new AWS.SNS();
+   const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+   const { DynamoDBDocumentClient, GetCommand } = require('@aws-sdk/lib-dynamodb');
+   const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
+   
+   const dynamoClient = new DynamoDBClient({});
+   const dynamodb = DynamoDBDocumentClient.from(dynamoClient);
+   const sns = new SNSClient({});
    
    const TABLE_PREFIX = process.env.TABLE_PREFIX;
    const SNS_TOPIC_ARN = process.env.SNS_TOPIC_ARN;
@@ -522,15 +545,15 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
    async function checkHighFrequencyClicks(event) {
        const minute = new Date(event.timestamp).toISOString().slice(0, 16);
        
-       const params = {
+       const command = new GetCommand({
            TableName: `${TABLE_PREFIX}-counters`,
            Key: {
                metric_name: `session_events_${event.session_id}`,
                time_window: minute
            }
-       };
+       });
        
-       const result = await dynamodb.get(params).promise();
+       const result = await dynamodb.send(command);
        const eventCount = result.Item ? result.Item.event_count : 0;
        
        // Flag if more than 50 events per minute from same session
@@ -559,12 +582,12 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
    async function checkUnusualPageSequence(event) {
        // Simple check for direct access to checkout without viewing products
        if (event.page_url && event.page_url.includes('/checkout')) {
-           const params = {
+           const command = new GetCommand({
                TableName: `${TABLE_PREFIX}-session-metrics`,
                Key: { session_id: event.session_id }
-           };
+           });
            
-           const result = await dynamodb.get(params).promise();
+           const result = await dynamodb.send(command);
            const eventCount = result.Item ? result.Item.event_count : 0;
            
            // Flag if going to checkout with very few page views
@@ -588,30 +611,41 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
            event_details: event
        };
        
-       const params = {
+       const command = new PublishCommand({
            TopicArn: SNS_TOPIC_ARN,
            Message: JSON.stringify(message, null, 2),
            Subject: 'Clickstream Anomaly Detected'
-       };
+       });
        
-       await sns.publish(params).promise();
+       await sns.send(command);
        console.log('Alert sent for anomalies:', anomalies.map(a => a.type));
    }
    EOF
    
+   # Create package.json for anomaly detector
+   cat > lambda-functions/anomaly-detector/package.json << 'EOF'
+   {
+       "name": "anomaly-detector",
+       "version": "1.0.0",
+       "main": "index.js",
+       "dependencies": {
+           "@aws-sdk/client-dynamodb": "^3.0.0",
+           "@aws-sdk/lib-dynamodb": "^3.0.0",
+           "@aws-sdk/client-sns": "^3.0.0"
+       }
+   }
+   EOF
+   
    # Package the anomaly detection function
-   cd lambda-functions
-   mkdir -p anomaly-detector
-   cp anomaly-detector/index.js anomaly-detector/
-   echo '{"name": "anomaly-detector", "version": "1.0.0", "main": "index.js", "dependencies": {"aws-sdk": "^2.1000.0"}}' > anomaly-detector/package.json
-   cd anomaly-detector
+   cd lambda-functions/anomaly-detector
+   npm install --omit=dev
    zip -r ../anomaly-detector.zip .
    cd ../..
    
    # Create the anomaly detection Lambda function
    aws lambda create-function \
        --function-name clickstream-anomaly-detector-${RANDOM_SUFFIX} \
-       --runtime nodejs18.x \
+       --runtime nodejs20.x \
        --role ${LAMBDA_ROLE_ARN} \
        --handler index.handler \
        --zip-file fileb://lambda-functions/anomaly-detector.zip \
@@ -641,8 +675,9 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
    # Create test client
    mkdir -p test-client
    cat > test-client/generate-events.js << 'EOF'
-   const AWS = require('aws-sdk');
-   const kinesis = new AWS.Kinesis();
+   const { KinesisClient, PutRecordCommand } = require('@aws-sdk/client-kinesis');
+   
+   const kinesis = new KinesisClient({});
    
    const STREAM_NAME = process.env.STREAM_NAME;
    const USER_AGENTS = [
@@ -687,14 +722,14 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
        for (let i = 0; i < eventsPerSession; i++) {
            const event = generateEvent(sessionId);
            
-           const params = {
+           const command = new PutRecordCommand({
                StreamName: STREAM_NAME,
                Data: JSON.stringify(event),
                PartitionKey: sessionId
-           };
+           });
            
            try {
-               await kinesis.putRecord(params).promise();
+               await kinesis.send(command);
                console.log('Sent event:', event.event_type, event.page_url);
                
                // Small delay between events
@@ -711,7 +746,7 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
        
        while (true) {
            await sendEvents();
-           // Wait2-5 seconds between sessions
+           // Wait 2-5 seconds between sessions
            await new Promise(resolve => 
                setTimeout(resolve, 2000 + Math.random() * 3000)
            );
@@ -725,10 +760,10 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
    cat > test-client/package.json << 'EOF'
    {
        "name": "clickstream-test-client",
-       "version": "1.0",
+       "version": "1.0.0",
        "main": "generate-events.js",
        "dependencies": {
-           "aws-sdk": "^2.1000.0"
+           "@aws-sdk/client-kinesis": "^3.0.0"
        }
    }
    EOF
@@ -835,7 +870,7 @@ echo "✅ Environment prepared with stream: ${STREAM_NAME}"
    npm install
    
    # Run event generator for 30 seconds
-   timeout30s node generate-events.js
+   timeout 30s node generate-events.js
    cd ..
    ```
 
@@ -936,11 +971,11 @@ This real-time clickstream analytics solution demonstrates how to build a scalab
 
 The solution addresses several key challenges in clickstream analytics. First, it handles high-velocity data ingestion through Kinesis Data Streams' automatic scaling capabilities. Second, it provides real-time processing through Lambda's event-driven architecture, eliminating the need for always-running infrastructure. Third, it enables multiple analytical workloads to operate independently on the same data stream without interference.
 
-The DynamoDB storage layer is optimized for real-time queries with partition keys designed for efficient access patterns. Page metrics are partitioned by URL and time, session metrics by session ID, and counters by metric type and time window. This design enables fast lookups for dashboards and real-time alerting while maintaining cost efficiency through on-demand billing.
+The DynamoDB storage layer is optimized for real-time queries with partition keys designed for efficient access patterns. Page metrics are partitioned by URL and time, session metrics by session ID, and counters by metric type and time window. This design enables fast lookups for dashboards and real-time alerting while maintaining cost efficiency through on-demand billing. The implementation of TTL on the counters table automatically manages data retention and controls storage costs.
 
-The anomaly detection component showcases how to implement real-time fraud detection and bot identification. By analyzing patterns like click frequency, user agent strings, and navigation sequences, the system can identify suspicious behavior and trigger immediate alerts. This capability is crucial for e-commerce platforms and content sites that need to protect against automated attacks and ensure data quality.
+The anomaly detection component showcases how to implement real-time fraud detection and bot identification. By analyzing patterns like click frequency, user agent strings, and navigation sequences, the system can identify suspicious behavior and trigger immediate alerts. This capability is crucial for e-commerce platforms and content sites that need to protect against automated attacks and ensure data quality. For more information on AWS Lambda event source mappings, see the [AWS Lambda Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/services-kinesis.html).
 
-> **Tip**: Consider implementing data retention policies in DynamoDB using TTL attributes to automatically expire old metrics and control storage costs.
+> **Tip**: Consider implementing data retention policies in DynamoDB using TTL attributes to automatically expire old metrics and control storage costs. This recipe already includes TTL configuration for the counters table as a best practice.
 
 ## Challenge
 
@@ -958,4 +993,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

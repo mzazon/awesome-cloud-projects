@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Build, Cloud Monitoring, Cloud Source Repositories, Cloud Run
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ci-cd, performance-monitoring, automation, alerting, optimization
 recipe-generator-version: 1.3
@@ -112,7 +112,7 @@ gcloud services enable cloudbuild.googleapis.com \
     monitoring.googleapis.com \
     sourcerepo.googleapis.com \
     run.googleapis.com \
-    containerregistry.googleapis.com
+    artifactregistry.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Region set to: ${REGION}"
@@ -254,12 +254,12 @@ echo "✅ Required APIs enabled"
    steps:
    # Build optimized container image
    - name: 'gcr.io/cloud-builders/docker'
-     args: ['build', '-t', 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$BUILD_ID', '.']
+     args: ['build', '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/${_SERVICE_NAME}:$BUILD_ID', '.']
      id: 'build-image'
    
-   # Push image to Container Registry
+   # Push image to Artifact Registry
    - name: 'gcr.io/cloud-builders/docker'
-     args: ['push', 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$BUILD_ID']
+     args: ['push', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/${_SERVICE_NAME}:$BUILD_ID']
      id: 'push-image'
      waitFor: ['build-image']
    
@@ -269,7 +269,7 @@ echo "✅ Required APIs enabled"
      - 'run'
      - 'deploy'
      - '${_SERVICE_NAME}'
-     - '--image=gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$BUILD_ID'
+     - '--image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO_NAME}/${_SERVICE_NAME}:$BUILD_ID'
      - '--region=${_REGION}'
      - '--platform=managed'
      - '--allow-unauthenticated'
@@ -292,13 +292,14 @@ echo "✅ Required APIs enabled"
      - '/dev/null'
      - '-w'
      - 'Deploy verification: %{http_code} - Response time: %{time_total}s'
-     - 'https://${_SERVICE_NAME}-${_REGION}-$PROJECT_ID.a.run.app/health'
+     - 'https://${_SERVICE_NAME}-${_REGION}-run.app/health'
      id: 'verify-deployment'
      waitFor: ['deploy-service']
    
    substitutions:
      _SERVICE_NAME: 'performance-app-default'
      _REGION: 'us-central1'
+     _REPO_NAME: 'app-performance-repo'
    
    options:
      logging: CLOUD_LOGGING_ONLY
@@ -312,7 +313,26 @@ echo "✅ Required APIs enabled"
 
    The Cloud Build configuration implements production-ready deployment practices including resource limits, concurrency controls, and automated verification steps that ensure optimal performance characteristics.
 
-4. **Create Performance Monitoring Script**:
+4. **Create Artifact Registry Repository**:
+
+   Artifact Registry provides secure, fully managed container image storage with fine-grained access controls and vulnerability scanning capabilities. Creating a dedicated repository ensures organized image management and enables advanced security features for the CI/CD pipeline.
+
+   ```bash
+   # Create Artifact Registry repository
+   gcloud artifacts repositories create ${REPO_NAME} \
+       --repository-format=docker \
+       --location=${REGION} \
+       --description="Performance optimization container repository"
+   
+   # Configure Docker authentication for Artifact Registry
+   gcloud auth configure-docker ${REGION}-docker.pkg.dev
+   
+   echo "✅ Artifact Registry repository created and configured"
+   ```
+
+   The Artifact Registry repository provides centralized container image storage with integrated security scanning and access controls that integrate seamlessly with Cloud Build and Cloud Run.
+
+5. **Create Performance Monitoring Script**:
 
    Performance monitoring requires custom metrics collection to track application-specific performance indicators beyond standard infrastructure metrics. This script implements comprehensive performance testing and metrics collection that feeds into Cloud Monitoring for alerting and automated optimization triggers.
 
@@ -386,7 +406,7 @@ echo "✅ Required APIs enabled"
 
    The monitoring script implements real-time performance tracking with automated metrics collection, providing the data foundation for intelligent alerting and optimization triggers.
 
-5. **Commit and Push Initial Code**:
+6. **Commit and Push Initial Code**:
 
    Version control integration ensures that all performance optimization triggers are properly tracked and can be audited. The initial commit establishes the baseline configuration that will be automatically updated by performance optimization builds.
 
@@ -400,14 +420,14 @@ echo "✅ Required APIs enabled"
    
    # Create initial commit
    git commit -m "Initial performance monitoring application
-   
+
    - Added Express.js application with performance endpoints
    - Implemented optimized Dockerfile with security hardening
    - Created Cloud Build configuration with performance optimizations
    - Added comprehensive performance monitoring script
    - Configured baseline performance thresholds"
    
-   # Push to Cloud Source Repository
+   # Push to Cloud Source Repository (master is the default branch)
    git push origin master
    
    echo "✅ Code committed and pushed to Cloud Source Repository"
@@ -415,7 +435,7 @@ echo "✅ Required APIs enabled"
 
    The detailed commit message provides context for automated builds and helps track the evolution of performance optimizations over time.
 
-6. **Create Cloud Build Trigger for Performance Optimization**:
+7. **Create Cloud Build Trigger for Performance Optimization**:
 
    Cloud Build Triggers enable automated CI/CD workflows that respond to both code changes and external events like monitoring alerts. This trigger implements intelligent build logic that can differentiate between regular deployments and performance optimization builds, applying different strategies accordingly.
 
@@ -428,7 +448,7 @@ echo "✅ Required APIs enabled"
        --name=${BUILD_TRIGGER_NAME} \
        --description="Automated performance optimization trigger" \
        --include-logs-with-status \
-       --substitutions=_SERVICE_NAME=${SERVICE_NAME},_REGION=${REGION}
+       --substitutions=_SERVICE_NAME=${SERVICE_NAME},_REGION=${REGION},_REPO_NAME=${REPO_NAME}
    
    # Get trigger ID for later use
    TRIGGER_ID=$(gcloud builds triggers list \
@@ -442,7 +462,7 @@ echo "✅ Required APIs enabled"
 
    The build trigger is configured with flexible branch patterns and substitution variables, enabling dynamic configuration based on the source of the trigger (manual, scheduled, or alert-driven).
 
-7. **Deploy Initial Application Version**:
+8. **Deploy Initial Application Version**:
 
    The initial deployment establishes a performance baseline and verifies that all components are properly integrated. This deployment serves as the foundation for automated performance monitoring and provides the reference point for optimization improvements.
 
@@ -472,7 +492,7 @@ echo "✅ Required APIs enabled"
 
    The deployment verification includes health checks and service URL extraction, ensuring the application is ready for performance monitoring and optimization workflows.
 
-8. **Create Cloud Monitoring Alerting Policy**:
+9. **Create Cloud Monitoring Alerting Policy**:
 
    Cloud Monitoring alerting policies enable proactive performance management by automatically detecting performance degradation before it impacts users significantly. This policy implements intelligent thresholds that account for normal performance variations while detecting genuine performance issues that require optimization.
 
@@ -520,60 +540,7 @@ echo "✅ Required APIs enabled"
 
    The alerting policy implements multiple performance indicators with carefully tuned thresholds that balance sensitivity with false positive prevention, ensuring optimization builds are triggered only when necessary.
 
-9. **Create Notification Channel and Webhook Integration**:
-
-   Notification channels bridge the gap between monitoring alerts and automated responses, enabling the system to automatically trigger optimization builds when performance issues are detected. This webhook integration implements secure communication between Cloud Monitoring and Cloud Build.
-
-   ```bash
-   # Create webhook notification channel configuration
-   cat > notification-channel.yaml << EOF
-   type: "webhook_tokenauth"
-   displayName: "Performance Optimization Webhook"
-   description: "Webhook to trigger performance optimization builds"
-   labels:
-     url: "https://cloudbuild.googleapis.com/v1/projects/${PROJECT_ID}/triggers/${TRIGGER_ID}:webhook"
-   userLabels:
-     purpose: "performance-optimization"
-     component: "automated-builds"
-   EOF
-   
-   # Create notification channel
-   CHANNEL_ID=$(gcloud alpha monitoring channels create \
-       --channel-from-file=notification-channel.yaml \
-       --format="value(name.split('/').slice(-1)[0])")
-   
-   # Update alerting policy to use notification channel
-   cat > updated-alerting-policy.yaml << EOF
-   displayName: "Performance Optimization Alert Policy"
-   documentation:
-     content: "Triggers performance optimization builds when response time exceeds thresholds"
-     mimeType: "text/markdown"
-   conditions:
-   - displayName: "High Response Time"
-     conditionThreshold:
-       filter: 'resource.type="cloud_run_revision" AND metric.type="run.googleapis.com/request_latencies"'
-       comparison: COMPARISON_GREATER_THAN
-       thresholdValue: 1.0
-       duration: "300s"
-       aggregations:
-       - alignmentPeriod: "60s"
-         perSeriesAligner: ALIGN_MEAN
-         crossSeriesReducer: REDUCE_MEAN
-         groupByFields:
-         - "resource.label.service_name"
-   combiner: OR
-   enabled: true
-   notificationChannels:
-   - "projects/${PROJECT_ID}/notificationChannels/${CHANNEL_ID}"
-   EOF
-   
-   echo "✅ Notification channel created and integrated with alerting policy"
-   echo "   Channel ID: ${CHANNEL_ID}"
-   ```
-
-   The webhook integration provides secure, authenticated communication that enables Cloud Monitoring to automatically trigger optimization builds while maintaining proper access controls and audit trails.
-
-10. **Configure Performance Testing and Validation**:
+10. **Create Performance Testing and Validation Framework**:
 
     Automated performance testing validates that optimization builds actually improve application performance and don't introduce regressions. This testing framework implements comprehensive performance validation that measures multiple performance dimensions and provides feedback for continuous improvement.
 
@@ -649,7 +616,7 @@ echo "✅ Required APIs enabled"
     # Add performance validation to git
     git add validate-performance.sh
     git commit -m "Add performance validation framework
-    
+
     - Implemented comprehensive performance testing
     - Added baseline comparison capabilities
     - Created JSON-based results tracking
@@ -671,7 +638,8 @@ echo "✅ Required APIs enabled"
    gcloud builds triggers describe ${BUILD_TRIGGER_NAME}
    
    # List recent builds
-   gcloud builds list --limit=5 --format="table(id,status,createTime,source.repoSource.branchName)"
+   gcloud builds list --limit=5 \
+       --format="table(id,status,createTime,source.repoSource.branchName)"
    ```
 
    Expected output: Trigger should show as enabled with proper repository and branch configuration.
@@ -683,7 +651,8 @@ echo "✅ Required APIs enabled"
    ./monitor-performance.sh ${SERVICE_URL} 30
    
    # Check Cloud Logging for performance metrics
-   gcloud logging read "resource.type=global AND logName=projects/${PROJECT_ID}/logs/performance-metrics" \
+   gcloud logging read \
+       "resource.type=global AND logName=projects/${PROJECT_ID}/logs/performance-metrics" \
        --limit=10 \
        --format="table(timestamp,jsonPayload.responseTime,jsonPayload.httpCode)"
    ```
@@ -706,18 +675,21 @@ echo "✅ Required APIs enabled"
 
    Expected output: Alerting policy should be listed as enabled with proper condition names.
 
-4. Verify notification channel integration:
+4. Verify Artifact Registry repository and images:
 
    ```bash
-   # Check notification channels
-   gcloud alpha monitoring channels list \
-       --format="table(displayName,type,labels.url)"
+   # Check Artifact Registry repository
+   gcloud artifacts repositories list \
+       --location=${REGION} \
+       --format="table(name,format,createTime)"
    
-   # Monitor for triggered builds
-   gcloud builds list --ongoing --format="table(id,status,createTime,source.repoSource.branchName)"
+   # List container images
+   gcloud artifacts docker images list \
+       ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME} \
+       --format="table(IMAGE,TAGS,CREATE_TIME)"
    ```
 
-   Expected output: Notification channel should show webhook URL pointing to the build trigger.
+   Expected output: Repository should be listed with Docker format, and images should show build tags.
 
 ## Cleanup
 
@@ -745,12 +717,6 @@ echo "✅ Required APIs enabled"
      gcloud alpha monitoring policies delete $POLICY_ID --quiet
    fi
    
-   # Delete notification channel
-   if [ ! -z "$CHANNEL_ID" ]; then
-     gcloud alpha monitoring channels delete \
-         projects/${PROJECT_ID}/notificationChannels/${CHANNEL_ID} --quiet
-   fi
-   
    echo "✅ Monitoring resources cleaned up"
    ```
 
@@ -766,14 +732,15 @@ echo "✅ Required APIs enabled"
    echo "✅ Build trigger and source repository deleted"
    ```
 
-4. Remove container images:
+4. Remove Artifact Registry repository and images:
 
    ```bash
-   # Delete container images
-   gcloud container images delete gcr.io/${PROJECT_ID}/${SERVICE_NAME} \
-       --force-delete-tags --quiet
+   # Delete Artifact Registry repository (includes all images)
+   gcloud artifacts repositories delete ${REPO_NAME} \
+       --location=${REGION} \
+       --quiet
    
-   echo "✅ Container images cleaned up"
+   echo "✅ Artifact Registry repository and images cleaned up"
    ```
 
 5. Clean up local files and project:
@@ -794,28 +761,33 @@ echo "✅ Required APIs enabled"
 
 This continuous performance optimization solution represents a significant advancement in proactive application performance management. Traditional monitoring approaches are inherently reactive, detecting performance issues only after they begin impacting users. By contrast, this automated system creates a feedback loop between performance monitoring and deployment optimization, enabling applications to self-improve based on real-world performance data.
 
-The integration between Cloud Monitoring and Cloud Build Triggers creates an intelligent system that responds to performance degradation with automated optimization builds. This approach leverages Google Cloud's managed services to implement sophisticated DevOps patterns without requiring extensive infrastructure management. The use of Cloud Run provides automatic scaling and resource optimization, while Cloud Build enables reproducible, optimized deployments that can adapt to changing performance requirements.
+The integration between Cloud Monitoring and Cloud Build Triggers creates an intelligent system that responds to performance degradation with automated optimization builds. This approach leverages Google Cloud's managed services to implement sophisticated DevOps patterns without requiring extensive infrastructure management. The use of Cloud Run provides automatic scaling and resource optimization, while Cloud Build enables reproducible, optimized deployments that can adapt to changing performance requirements. The migration from Container Registry to Artifact Registry provides enhanced security features, vulnerability scanning, and fine-grained access controls as recommended by [Google Cloud best practices](https://cloud.google.com/container-registry/docs/transition-to-artifact-registry).
 
-The alerting policy implementation demonstrates advanced monitoring practices that balance sensitivity with operational stability. By using multiple performance indicators (response time, memory utilization) with carefully tuned thresholds and durations, the system avoids false positive alerts while ensuring genuine performance issues trigger appropriate responses. The notification channel integration with webhook authentication provides secure, automated communication between monitoring and deployment systems, maintaining proper access controls throughout the optimization workflow.
+The alerting policy implementation demonstrates advanced monitoring practices that balance sensitivity with operational stability. By using multiple performance indicators (response time, memory utilization) with carefully tuned thresholds and durations, the system avoids false positive alerts while ensuring genuine performance issues trigger appropriate responses. The Cloud Monitoring service provides comprehensive observability for Cloud Run applications, including built-in metrics for request latency, memory utilization, and error rates as detailed in the [Google Cloud Monitoring documentation](https://cloud.google.com/monitoring/support/cloud-run).
 
-Performance validation frameworks ensure that optimization builds actually improve application performance rather than introducing regressions. This systematic approach to performance testing provides quantitative feedback that enables continuous improvement of optimization strategies. The baseline comparison capabilities allow teams to track performance trends over time and validate the effectiveness of different optimization approaches.
+Performance validation frameworks ensure that optimization builds actually improve application performance rather than introducing regressions. This systematic approach to performance testing provides quantitative feedback that enables continuous improvement of optimization strategies. The baseline comparison capabilities allow teams to track performance trends over time and validate the effectiveness of different optimization approaches, following Google Cloud's [operational excellence principles](https://cloud.google.com/architecture/framework/operational-excellence).
 
-> **Tip**: Monitor your Cloud Build quota and implement intelligent throttling to prevent excessive optimization builds during sustained performance issues. Consider implementing exponential backoff for repeated alerts.
+> **Tip**: Monitor your Cloud Build quota and implement intelligent throttling to prevent excessive optimization builds during sustained performance issues. Consider implementing exponential backoff for repeated alerts and leverage Cloud Run's [concurrency controls](https://cloud.google.com/run/docs/configuring/concurrency) for optimal performance.
 
 ## Challenge
 
 Extend this continuous performance optimization solution by implementing these advanced enhancements:
 
-1. **Multi-Environment Performance Optimization**: Implement staging and production environment separation with environment-specific performance thresholds and optimization strategies, enabling safe testing of optimization builds before production deployment.
+1. **Multi-Environment Performance Optimization**: Implement staging and production environment separation with environment-specific performance thresholds and optimization strategies, enabling safe testing of optimization builds before production deployment using [Cloud Build's environment-specific triggers](https://cloud.google.com/build/docs/automating-builds/create-manage-triggers).
 
-2. **Machine Learning-Based Performance Prediction**: Integrate Vertex AI to analyze historical performance data and predict optimal resource configurations, enabling proactive optimization before performance degradation occurs.
+2. **Machine Learning-Based Performance Prediction**: Integrate [Vertex AI](https://cloud.google.com/vertex-ai) to analyze historical performance data and predict optimal resource configurations, enabling proactive optimization before performance degradation occurs through time-series forecasting models.
 
-3. **Advanced Performance Profiling Integration**: Add Cloud Profiler integration to automatically capture performance profiles during high-load periods and include profiling data in optimization build decisions for more targeted improvements.
+3. **Advanced Performance Profiling Integration**: Add [Cloud Profiler](https://cloud.google.com/profiler) integration to automatically capture performance profiles during high-load periods and include profiling data in optimization build decisions for more targeted improvements.
 
-4. **Cost-Aware Performance Optimization**: Implement Cloud Billing API integration to balance performance improvements with cost optimization, ensuring optimization builds consider both performance and cost metrics in their decision-making process.
+4. **Cost-Aware Performance Optimization**: Implement [Cloud Billing API](https://cloud.google.com/billing/docs) integration to balance performance improvements with cost optimization, ensuring optimization builds consider both performance and cost metrics in their decision-making process.
 
-5. **Multi-Cloud Performance Monitoring**: Extend the solution to monitor applications across multiple cloud providers using Prometheus and Grafana, providing unified performance optimization for hybrid cloud architectures.
+5. **Multi-Cloud Performance Monitoring**: Extend the solution to monitor applications across multiple cloud providers using [Prometheus](https://prometheus.io/) and [Grafana](https://grafana.com/), providing unified performance optimization for hybrid cloud architectures with Google Cloud's [managed service for Prometheus](https://cloud.google.com/stackdriver/docs/managed-prometheus).
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

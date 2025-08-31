@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: MemoryDB, Application Load Balancer, ECS, Systems Manager
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: session-management, distributed-systems, redis, load-balancing, stateless
 recipe-generator-version: 1.3
@@ -175,6 +175,20 @@ echo "✅ AWS environment and networking configured"
        --description "Subnet group for session management MemoryDB" \
        --subnet-ids "$(cat private-subnet-1.txt)" "$(cat private-subnet-2.txt)"
    
+   # Create default MemoryDB user for authentication
+   aws memorydb create-user \
+       --user-name session-user \
+       --access-string "~* &* +@all" \
+       --authentication-mode Type=password,Passwords="SessionPass123!"
+   
+   # Create MemoryDB ACL for access control
+   aws memorydb create-acl \
+       --acl-name session-acl \
+       --user-names session-user
+   
+   # Wait for ACL to become active
+   aws memorydb wait acl-active --acl-name session-acl
+   
    # Create MemoryDB cluster with optimized session storage configuration
    aws memorydb create-cluster \
        --cluster-name ${MEMORYDB_CLUSTER_NAME} \
@@ -182,6 +196,7 @@ echo "✅ AWS environment and networking configured"
        --node-type db.r6g.large \
        --parameter-group-name default.memorydb-redis7 \
        --subnet-group-name session-subnet-group \
+       --acl-name session-acl \
        --num-shards 2 \
        --num-replicas-per-shard 1 \
        --security-group-ids $(aws ec2 create-security-group \
@@ -232,12 +247,19 @@ echo "✅ AWS environment and networking configured"
        --vpc-id ${VPC_ID} \
        --output text --query 'GroupId')
    
-   # Allow ALB to communicate with ECS tasks on port 8080
+   # Allow ALB to communicate with ECS tasks on port 80
    aws ec2 authorize-security-group-ingress \
        --group-id ${ECS_SG} \
        --protocol tcp \
-       --port 8080 \
+       --port 80 \
        --source-group ${ALB_SG}
+   
+   # Allow ECS tasks outbound internet access for pulling images
+   aws ec2 authorize-security-group-egress \
+       --group-id ${ECS_SG} \
+       --protocol tcp \
+       --port 443 \
+       --cidr 0.0.0.0/0
    
    # Get MemoryDB security group ID
    MEMORYDB_SG=$(aws ec2 describe-security-groups \
@@ -282,6 +304,18 @@ echo "✅ AWS environment and networking configured"
        --description "MemoryDB port for Redis connections"
    
    aws ssm put-parameter \
+       --name "/session-app/memorydb/username" \
+       --value "session-user" \
+       --type "String" \
+       --description "MemoryDB username for authentication"
+   
+   aws ssm put-parameter \
+       --name "/session-app/memorydb/password" \
+       --value "SessionPass123!" \
+       --type "SecureString" \
+       --description "MemoryDB password for authentication"
+   
+   aws ssm put-parameter \
        --name "/session-app/config/session-timeout" \
        --value "1800" \
        --type "String" \
@@ -293,7 +327,7 @@ echo "✅ AWS environment and networking configured"
        --type "String" \
        --description "Redis database number for session storage"
    
-   echo "✅ Configuration stored in Parameter Store for centralized management"
+   echo "✅ Configuration stored securely in Parameter Store"
    ```
 
    Parameter Store now contains all necessary configuration for the session management system. This centralized approach allows applications to retrieve current configuration values at runtime, enabling dynamic updates without redeployment and supporting environment-specific configurations across development, staging, and production environments.
@@ -468,6 +502,37 @@ echo "✅ AWS environment and networking configured"
    ECS Services ensure that a specified number of task instances are running and healthy at all times. With auto scaling enabled, the service can automatically adjust the number of running tasks based on demand, providing cost-effective scaling for session management workloads while maintaining high availability.
 
    ```bash
+   # Create NAT gateway for private subnet internet access
+   NAT_GATEWAY_ID=$(aws ec2 create-nat-gateway \
+       --subnet-id $(cat public-subnet-1.txt) \
+       --allocation-id $(aws ec2 allocate-address \
+           --domain vpc \
+           --output text --query 'AllocationId') \
+       --output text --query 'NatGateway.NatGatewayId')
+   
+   # Wait for NAT gateway to be available
+   aws ec2 wait nat-gateway-available --nat-gateway-ids ${NAT_GATEWAY_ID}
+   
+   # Create route table for private subnets
+   PRIVATE_RT_ID=$(aws ec2 create-route-table \
+       --vpc-id ${VPC_ID} \
+       --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value=session-private-rt}]' \
+       --output text --query 'RouteTable.RouteTableId')
+   
+   aws ec2 create-route \
+       --route-table-id ${PRIVATE_RT_ID} \
+       --destination-cidr-block 0.0.0.0/0 \
+       --nat-gateway-id ${NAT_GATEWAY_ID}
+   
+   # Associate private subnets with route table
+   aws ec2 associate-route-table \
+       --route-table-id ${PRIVATE_RT_ID} \
+       --subnet-id $(cat private-subnet-1.txt)
+   
+   aws ec2 associate-route-table \
+       --route-table-id ${PRIVATE_RT_ID} \
+       --subnet-id $(cat private-subnet-2.txt)
+   
    # Create ECS service with ALB integration
    aws ecs create-service \
        --cluster ${CLUSTER_NAME} \
@@ -538,6 +603,17 @@ echo "✅ AWS environment and networking configured"
        --query 'Parameter.Value' \
        --output text)
    
+   REDIS_USERNAME=$(aws ssm get-parameter \
+       --name "/session-app/memorydb/username" \
+       --query 'Parameter.Value' \
+       --output text)
+   
+   REDIS_PASSWORD=$(aws ssm get-parameter \
+       --name "/session-app/memorydb/password" \
+       --with-decryption \
+       --query 'Parameter.Value' \
+       --output text)
+   
    SESSION_TIMEOUT=$(aws ssm get-parameter \
        --name "/session-app/config/session-timeout" \
        --query 'Parameter.Value' \
@@ -546,6 +622,8 @@ echo "✅ AWS environment and networking configured"
    # Export environment variables for application use
    export REDIS_ENDPOINT="${REDIS_ENDPOINT}"
    export REDIS_PORT="${REDIS_PORT}"
+   export REDIS_USERNAME="${REDIS_USERNAME}"
+   export REDIS_PASSWORD="${REDIS_PASSWORD}"
    export SESSION_TIMEOUT="${SESSION_TIMEOUT}"
    
    echo "Session configuration loaded from Parameter Store"
@@ -562,12 +640,16 @@ echo "✅ AWS environment and networking configured"
    import time
    import os
    
-   # Connect to MemoryDB
+   # Connect to MemoryDB with authentication
    redis_client = redis.Redis(
        host=os.getenv('REDIS_ENDPOINT', 'localhost'),
        port=int(os.getenv('REDIS_PORT', '6379')),
+       username=os.getenv('REDIS_USERNAME', ''),
+       password=os.getenv('REDIS_PASSWORD', ''),
        db=0,
-       decode_responses=True
+       decode_responses=True,
+       ssl=True,
+       ssl_cert_reqs=None
    )
    
    # Test session creation and retrieval
@@ -650,12 +732,14 @@ echo "✅ AWS environment and networking configured"
 4. **Test Session Storage and Retrieval**:
 
    ```bash
-   # Connect to MemoryDB and test session operations
+   # Test Redis connectivity with authentication
    redis-cli -h ${MEMORYDB_ENDPOINT} -p 6379 \
+       --tls --user session-user --askpass \
        SET "test:session:123" "user_data" EX 1800
    
    # Verify session retrieval
    redis-cli -h ${MEMORYDB_ENDPOINT} -p 6379 \
+       --tls --user session-user --askpass \
        GET "test:session:123"
    ```
 
@@ -672,11 +756,36 @@ echo "✅ AWS environment and networking configured"
 
    Expected output: Scalable target with min/max capacity settings
 
+6. **Verify Parameter Store Configuration**:
+
+   ```bash
+   # Test parameter retrieval
+   aws ssm get-parameter \
+       --name "/session-app/memorydb/endpoint" \
+       --query 'Parameter.Value' \
+       --output text
+   ```
+
+   Expected output: MemoryDB cluster endpoint address
+
 ## Cleanup
 
 1. **Delete ECS Service and Cluster**:
 
    ```bash
+   # Delete auto scaling policy
+   aws application-autoscaling delete-scaling-policy \
+       --policy-name session-app-cpu-scaling \
+       --service-namespace ecs \
+       --resource-id service/${CLUSTER_NAME}/session-app-service \
+       --scalable-dimension ecs:service:DesiredCount
+   
+   # Deregister auto scaling target
+   aws application-autoscaling deregister-scalable-target \
+       --service-namespace ecs \
+       --resource-id service/${CLUSTER_NAME}/session-app-service \
+       --scalable-dimension ecs:service:DesiredCount
+   
    # Delete ECS service
    aws ecs delete-service \
        --cluster ${CLUSTER_NAME} \
@@ -711,12 +820,20 @@ echo "✅ AWS environment and networking configured"
    echo "✅ Application Load Balancer deleted"
    ```
 
-3. **Delete MemoryDB Cluster**:
+3. **Delete MemoryDB Cluster and ACL**:
 
    ```bash
    # Delete MemoryDB cluster
    aws memorydb delete-cluster \
        --cluster-name ${MEMORYDB_CLUSTER_NAME}
+   
+   # Wait for cluster deletion
+   aws memorydb wait cluster-deleted \
+       --cluster-name ${MEMORYDB_CLUSTER_NAME}
+   
+   # Delete ACL and user
+   aws memorydb delete-acl --acl-name session-acl
+   aws memorydb delete-user --user-name session-user
    
    # Delete subnet group
    aws memorydb delete-subnet-group \
@@ -732,6 +849,8 @@ echo "✅ AWS environment and networking configured"
    aws ssm delete-parameters \
        --names "/session-app/memorydb/endpoint" \
               "/session-app/memorydb/port" \
+              "/session-app/memorydb/username" \
+              "/session-app/memorydb/password" \
               "/session-app/config/session-timeout" \
               "/session-app/config/redis-db"
    
@@ -756,25 +875,39 @@ echo "✅ AWS environment and networking configured"
 5. **Remove VPC and Networking Resources**:
 
    ```bash
+   # Delete NAT gateway
+   NAT_ALLOCATION_ID=$(aws ec2 describe-nat-gateways \
+       --nat-gateway-ids ${NAT_GATEWAY_ID} \
+       --query 'NatGateways[0].NatGatewayAddresses[0].AllocationId' \
+       --output text)
+   aws ec2 delete-nat-gateway --nat-gateway-id ${NAT_GATEWAY_ID}
+   aws ec2 wait nat-gateway-deleted --nat-gateway-ids ${NAT_GATEWAY_ID}
+   aws ec2 release-address --allocation-id ${NAT_ALLOCATION_ID}
+   
    # Delete security groups
    aws ec2 delete-security-group --group-id ${ALB_SG}
    aws ec2 delete-security-group --group-id ${ECS_SG}
    aws ec2 delete-security-group --group-id ${MEMORYDB_SG}
    
-   # Delete route table associations
+   # Delete route table associations and routes
    aws ec2 disassociate-route-table \
        --association-id $(aws ec2 describe-route-tables \
            --route-table-ids ${RT_ID} \
            --query 'RouteTables[0].Associations[0].RouteTableAssociationId' \
            --output text)
    
-   # Delete route
+   aws ec2 disassociate-route-table \
+       --association-id $(aws ec2 describe-route-tables \
+           --route-table-ids ${PRIVATE_RT_ID} \
+           --query 'RouteTables[0].Associations[0].RouteTableAssociationId' \
+           --output text)
+   
+   # Delete routes and route tables
    aws ec2 delete-route \
        --route-table-id ${RT_ID} \
        --destination-cidr-block 0.0.0.0/0
-   
-   # Delete route table
    aws ec2 delete-route-table --route-table-id ${RT_ID}
+   aws ec2 delete-route-table --route-table-id ${PRIVATE_RT_ID}
    
    # Detach and delete internet gateway
    aws ec2 detach-internet-gateway \
@@ -805,30 +938,37 @@ echo "✅ AWS environment and networking configured"
 
 This distributed session management architecture demonstrates how to build scalable, stateless web applications using AWS managed services. The combination of MemoryDB for Redis and Application Load Balancer provides a robust foundation for session management that can scale to support thousands of concurrent users while maintaining high availability and performance.
 
-**MemoryDB for Redis** serves as the cornerstone of this architecture, providing microsecond read latencies and single-digit millisecond write latencies with full Redis compatibility. Unlike traditional Redis deployments, MemoryDB offers durability by storing data both in-memory and on disk, ensuring that session data survives node failures and provides Multi-AZ redundancy. This durability is crucial for session management where data loss could result in user logout and poor user experience. The service automatically handles backups, patching, and scaling, reducing operational overhead while providing enterprise-grade reliability.
+**MemoryDB for Redis** serves as the cornerstone of this architecture, providing microsecond read latencies and single-digit millisecond write latencies with full Redis compatibility. Unlike traditional Redis deployments, MemoryDB offers durability by storing data both in-memory and on disk, ensuring that session data survives node failures and provides Multi-AZ redundancy. This durability is crucial for session management where data loss could result in user logout and poor user experience. The service automatically handles backups, patching, and scaling, reducing operational overhead while providing enterprise-grade reliability. The integration of Access Control Lists (ACLs) and user authentication provides fine-grained security controls that follow the AWS Well-Architected Framework's security best practices.
 
 **Application Load Balancer** integration enables sophisticated traffic routing and health checking capabilities. While traditional session management often relies on sticky sessions to maintain user affinity to specific servers, this architecture eliminates that dependency by storing session data externally. ALB can distribute traffic using various algorithms (round-robin, least connections) without concern for session continuity, enabling true horizontal scaling. The health check configuration ensures that only healthy application instances receive traffic, providing automatic failover capabilities when containers become unhealthy.
 
-**ECS with Fargate** provides the compute layer for running stateless application containers. The auto scaling configuration automatically adjusts capacity based on CPU utilization, ensuring that session management performance remains consistent during traffic spikes while optimizing costs during low-demand periods. The integration with Systems Manager Parameter Store enables dynamic configuration management, allowing applications to retrieve current settings without hardcoding values or requiring redeployment for configuration changes.
+**ECS with Fargate** provides the compute layer for running stateless application containers. The auto scaling configuration automatically adjusts capacity based on CPU utilization, ensuring that session management performance remains consistent during traffic spikes while optimizing costs during low-demand periods. The integration with Systems Manager Parameter Store enables dynamic configuration management, allowing applications to retrieve current settings without hardcoding values or requiring redeployment for configuration changes. The use of secure string parameters for sensitive information like passwords ensures that credentials are encrypted at rest and in transit.
 
-This architecture follows the AWS Well-Architected Framework principles across multiple pillars. The [security pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html) is addressed through VPC isolation, security groups with least privilege access, and encrypted data storage. The [reliability pillar](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) is implemented through Multi-AZ deployments, automatic failover, and health checks. The [performance efficiency pillar](https://docs.aws.amazon.com/wellarchitected/latest/framework/perf-bp.html) is achieved through in-memory session storage, efficient load balancing, and auto scaling capabilities.
+This architecture follows the AWS Well-Architected Framework principles across multiple pillars. The [security pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html) is addressed through VPC isolation, security groups with least privilege access, encrypted data storage, and secure parameter management. The [reliability pillar](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) is implemented through Multi-AZ deployments, automatic failover, and health checks. The [performance efficiency pillar](https://docs.aws.amazon.com/wellarchitected/latest/framework/perf-bp.html) is achieved through in-memory session storage, efficient load balancing, and auto scaling capabilities. The [cost optimization pillar](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html) is supported through the use of Fargate's pay-per-use model and auto scaling that adjusts capacity based on actual demand.
 
-> **Tip**: Monitor MemoryDB performance metrics in CloudWatch to optimize node types and scaling policies. Key metrics include CPU utilization, memory usage, and network throughput to ensure optimal performance for session management workloads.
+> **Tip**: Monitor MemoryDB performance metrics in CloudWatch to optimize node types and scaling policies. Key metrics include CPU utilization, memory usage, network throughput, and authentication failures to ensure optimal performance and security for session management workloads.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Implement Session Encryption and Security**: Add encryption at rest and in transit for session data using AWS KMS keys, implement Redis AUTH for connection security, and add session token validation middleware to prevent session hijacking attacks.
+1. **Implement Session Encryption and Security**: Add encryption at rest and in transit for session data using AWS KMS keys, implement Redis AUTH with more complex access control patterns, and add session token validation middleware to prevent session hijacking attacks and implement session rotation policies.
 
-2. **Add Session Analytics and Monitoring**: Create CloudWatch dashboards for session metrics, implement custom metrics for session duration and user activity patterns, and set up alarms for session storage capacity and performance thresholds.
+2. **Add Session Analytics and Monitoring**: Create CloudWatch dashboards for session metrics, implement custom metrics for session duration and user activity patterns, set up alarms for session storage capacity and performance thresholds, and integrate with AWS X-Ray for distributed tracing of session operations.
 
-3. **Implement Session Replication Across Regions**: Configure cross-region MemoryDB replication for disaster recovery, implement active-passive session failover, and add DNS-based routing for region-level failover scenarios.
+3. **Implement Session Replication Across Regions**: Configure cross-region MemoryDB replication using [Global Datastore](https://docs.aws.amazon.com/memorydb/latest/devguide/global-datastore.html) for disaster recovery, implement active-passive session failover with Route 53 health checks, and add DNS-based routing for region-level failover scenarios.
 
-4. **Add Advanced Session Management Features**: Implement session clustering by user type or geographic location, add session warming and pre-loading capabilities, and create session data compression and serialization optimizations for improved performance.
+4. **Add Advanced Session Management Features**: Implement session clustering by user type or geographic location using Redis data structures, add session warming and pre-loading capabilities for frequently accessed user data, and create session data compression and serialization optimizations for improved performance and reduced storage costs.
 
-5. **Integrate with Identity and Access Management**: Connect session management with AWS Cognito for user authentication, implement role-based session data access, and add session audit logging for compliance and security monitoring.
+5. **Integrate with Identity and Access Management**: Connect session management with [AWS Cognito](https://docs.aws.amazon.com/cognito/latest/developerguide/) for user authentication and authorization, implement role-based session data access with fine-grained permissions, and add comprehensive session audit logging for compliance and security monitoring using CloudTrail and CloudWatch Logs.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

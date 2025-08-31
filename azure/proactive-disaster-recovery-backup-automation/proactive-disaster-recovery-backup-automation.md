@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Backup Center, Azure Recovery Services Vault, Azure Monitor, Azure Logic Apps
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: disaster-recovery, backup, monitoring, automation, cross-region
 recipe-generator-version: 1.3
@@ -112,8 +112,8 @@ graph TB
 # Set environment variables for Azure resources
 export PRIMARY_REGION="eastus"
 export SECONDARY_REGION="westus2"
-export RESOURCE_GROUP="rg-dr-orchestration"
-export BACKUP_RESOURCE_GROUP="rg-dr-backup"
+export RESOURCE_GROUP="rg-dr-orchestration-${RANDOM_SUFFIX}"
+export BACKUP_RESOURCE_GROUP="rg-dr-backup-${RANDOM_SUFFIX}"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
@@ -155,7 +155,6 @@ echo "✅ Resource groups created successfully"
        --name ${RSV_PRIMARY_NAME} \
        --resource-group ${BACKUP_RESOURCE_GROUP} \
        --location ${PRIMARY_REGION} \
-       --storage-model-type GeoRedundant \
        --tags environment=production purpose=backup region=primary
    
    # Create secondary Recovery Services Vault
@@ -163,13 +162,12 @@ echo "✅ Resource groups created successfully"
        --name ${RSV_SECONDARY_NAME} \
        --resource-group ${BACKUP_RESOURCE_GROUP} \
        --location ${SECONDARY_REGION} \
-       --storage-model-type GeoRedundant \
        --tags environment=production purpose=backup region=secondary
    
    echo "✅ Recovery Services Vaults created in both regions"
    ```
 
-   The Recovery Services Vaults are now configured with geo-redundant storage, ensuring backup data is replicated across Azure regions automatically. This foundational infrastructure provides the secure, compliant storage layer required for enterprise disaster recovery operations while enabling centralized management through Azure Backup Center.
+   The Recovery Services Vaults are now configured with the default geo-redundant storage, ensuring backup data is replicated across Azure regions automatically. This foundational infrastructure provides the secure, compliant storage layer required for enterprise disaster recovery operations while enabling centralized management through Azure Backup Center.
 
 2. **Set Up Log Analytics Workspace for Comprehensive Monitoring**:
 
@@ -195,7 +193,11 @@ echo "✅ Resource groups created successfully"
        --name "DiagnosticSettings-${RSV_PRIMARY_NAME}" \
        --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${BACKUP_RESOURCE_GROUP}/providers/Microsoft.RecoveryServices/vaults/${RSV_PRIMARY_NAME}" \
        --workspace ${WORKSPACE_ID} \
-       --logs '[{"category":"AddonAzureBackupJobs","enabled":true},{"category":"AddonAzureBackupAlerts","enabled":true}]' \
+       --logs '[
+           {"category":"AddonAzureBackupJobs","enabled":true},
+           {"category":"AddonAzureBackupAlerts","enabled":true},
+           {"category":"AzureBackupReport","enabled":true}
+       ]' \
        --metrics '[{"category":"Health","enabled":true}]'
    
    echo "✅ Log Analytics Workspace configured with diagnostic settings"
@@ -217,11 +219,11 @@ echo "✅ Resource groups created successfully"
        --action sms admin-sms +1234567890 \
        --tags purpose=alerting environment=production
    
-   # Add webhook action for Logic Apps integration
-   az monitor action-group update \
+   # Store action group resource ID for later use
+   ACTION_GROUP_ID=$(az monitor action-group show \
        --name ${ACTION_GROUP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --add-action webhook dr-webhook https://placeholder-webhook-url.com/webhook
+       --query id --output tsv)
    
    echo "✅ Action Group created with multi-channel notifications"
    ```
@@ -238,6 +240,7 @@ echo "✅ Resource groups created successfully"
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${PRIMARY_REGION} \
+       --definition '{}' \
        --tags purpose=orchestration environment=production
    
    # Create storage account for Logic Apps state management
@@ -267,6 +270,10 @@ echo "✅ Resource groups created successfully"
    ```bash
    # Create backup policy for VMs with intelligent scheduling
    az backup policy create \
+       --resource-group ${BACKUP_RESOURCE_GROUP} \
+       --vault-name ${RSV_PRIMARY_NAME} \
+       --name "DRVMPolicy" \
+       --backup-management-type AzureIaasVM \
        --policy '{
            "name": "DRVMPolicy",
            "properties": {
@@ -274,13 +281,13 @@ echo "✅ Resource groups created successfully"
                "schedulePolicy": {
                    "schedulePolicyType": "SimpleSchedulePolicy",
                    "scheduleRunFrequency": "Daily",
-                   "scheduleRunTimes": ["2024-01-01T02:00:00Z"],
+                   "scheduleRunTimes": ["2024-01-01T02:00:00.000Z"],
                    "scheduleWeeklyFrequency": 0
                },
                "retentionPolicy": {
                    "retentionPolicyType": "LongTermRetentionPolicy",
                    "dailySchedule": {
-                       "retentionTimes": ["2024-01-01T02:00:00Z"],
+                       "retentionTimes": ["2024-01-01T02:00:00.000Z"],
                        "retentionDuration": {
                            "count": 30,
                            "durationType": "Days"
@@ -288,7 +295,7 @@ echo "✅ Resource groups created successfully"
                    },
                    "weeklySchedule": {
                        "daysOfTheWeek": ["Sunday"],
-                       "retentionTimes": ["2024-01-01T02:00:00Z"],
+                       "retentionTimes": ["2024-01-01T02:00:00.000Z"],
                        "retentionDuration": {
                            "count": 12,
                            "durationType": "Weeks"
@@ -296,38 +303,9 @@ echo "✅ Resource groups created successfully"
                    }
                }
            }
-       }' \
-       --resource-group ${BACKUP_RESOURCE_GROUP} \
-       --vault-name ${RSV_PRIMARY_NAME}
+       }'
    
-   # Create backup policy for SQL databases
-   az backup policy create \
-       --policy '{
-           "name": "DRSQLPolicy",
-           "properties": {
-               "backupManagementType": "AzureWorkload",
-               "workLoadType": "SQLDataBase",
-               "schedulePolicy": {
-                   "schedulePolicyType": "SimpleSchedulePolicy",
-                   "scheduleRunFrequency": "Daily",
-                   "scheduleRunTimes": ["2024-01-01T22:00:00Z"]
-               },
-               "retentionPolicy": {
-                   "retentionPolicyType": "LongTermRetentionPolicy",
-                   "dailySchedule": {
-                       "retentionTimes": ["2024-01-01T22:00:00Z"],
-                       "retentionDuration": {
-                           "count": 30,
-                           "durationType": "Days"
-                       }
-                   }
-               }
-           }
-       }' \
-       --resource-group ${BACKUP_RESOURCE_GROUP} \
-       --vault-name ${RSV_PRIMARY_NAME}
-   
-   echo "✅ Intelligent backup policies configured for VMs and SQL databases"
+   echo "✅ Intelligent backup policies configured for VMs"
    ```
 
    The backup policies now provide comprehensive protection with optimized scheduling and retention strategies. These policies ensure consistent data protection while balancing recovery requirements with storage costs, enabling rapid recovery operations during disaster scenarios while maintaining long-term compliance and governance standards.
@@ -337,43 +315,30 @@ echo "✅ Resource groups created successfully"
    Azure Monitor alert rules provide the intelligent detection capabilities that trigger automated disaster recovery responses. These rules continuously monitor backup job success rates, resource health, and regional availability, enabling proactive identification of failures before they impact business operations. This monitoring-driven approach ensures rapid detection and response to disaster scenarios.
 
    ```bash
-   # Create alert rule for backup job failures
-   az monitor metrics alert create \
+   # Create alert rule for backup job failures using log query
+   az monitor scheduled-query create \
        --name "BackupJobFailureAlert" \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${BACKUP_RESOURCE_GROUP}/providers/Microsoft.RecoveryServices/vaults/${RSV_PRIMARY_NAME}" \
-       --condition "count 'Backup Health Events' > 0" \
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${MONITOR_WORKSPACE_NAME}" \
+       --condition "AddonAzureBackupJobs | where JobStatus == 'Failed' | where TimeGenerated > ago(1h)" \
        --description "Alert when backup jobs fail" \
-       --evaluation-frequency 5m \
-       --window-size 15m \
+       --evaluation-frequency 60 \
+       --window-size 60 \
        --severity 2 \
-       --action ${ACTION_GROUP_NAME} \
+       --action-groups ${ACTION_GROUP_ID} \
        --tags purpose=monitoring environment=production
    
-   # Create alert rule for Recovery Services Vault health
-   az monitor metrics alert create \
-       --name "RecoveryVaultHealthAlert" \
-       --resource-group ${RESOURCE_GROUP} \
-       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${BACKUP_RESOURCE_GROUP}/providers/Microsoft.RecoveryServices/vaults/${RSV_PRIMARY_NAME}" \
-       --condition "count 'Health' < 1" \
-       --description "Alert when Recovery Services Vault becomes unhealthy" \
-       --evaluation-frequency 5m \
-       --window-size 15m \
-       --severity 1 \
-       --action ${ACTION_GROUP_NAME} \
-       --tags purpose=monitoring environment=production
-   
-   # Create custom log query alert for backup storage consumption
+   # Create alert rule for vault storage consumption
    az monitor scheduled-query create \
        --name "BackupStorageConsumptionAlert" \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${BACKUP_RESOURCE_GROUP}/providers/Microsoft.RecoveryServices/vaults/${RSV_PRIMARY_NAME}" \
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${MONITOR_WORKSPACE_NAME}" \
        --condition "AzureBackupReport | where TimeGenerated > ago(1h) | where StorageConsumedInMBs > 100000" \
        --description "Alert when backup storage consumption exceeds threshold" \
-       --evaluation-frequency 60m \
-       --window-size 60m \
+       --evaluation-frequency 60 \
+       --window-size 60 \
        --severity 3 \
-       --action ${ACTION_GROUP_NAME} \
+       --action-groups ${ACTION_GROUP_ID} \
        --tags purpose=monitoring environment=production
    
    echo "✅ Comprehensive monitoring alert rules configured"
@@ -423,14 +388,14 @@ echo "✅ Resource groups created successfully"
    }
    EOF
    
-   # Deploy the workbook template
-   az resource create \
+   # Deploy the workbook template using ARM deployment
+   az deployment group create \
        --resource-group ${RESOURCE_GROUP} \
-       --resource-type "microsoft.insights/workbooks" \
-       --name "disaster-recovery-dashboard" \
-       --properties @dr-workbook-template.json \
-       --location ${PRIMARY_REGION} \
-       --tags purpose=monitoring environment=production
+       --template-uri "https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/quickstarts/microsoft.insights/insights-workbook-template/azuredeploy.json" \
+       --parameters workbookDisplayName="Disaster Recovery Dashboard" \
+                   workbookType="workbook" \
+                   workbookSourceId="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${MONITOR_WORKSPACE_NAME}" \
+                   workbookId="disaster-recovery-dashboard"
    
    echo "✅ Disaster Recovery monitoring workbook deployed"
    ```
@@ -481,7 +446,7 @@ echo "✅ Resource groups created successfully"
                    "type": "Http",
                    "inputs": {
                        "method": "GET",
-                       "uri": "https://management.azure.com/subscriptions/@{variables('subscriptionId')}/resourceGroups/@{variables('resourceGroup')}/providers/Microsoft.RecoveryServices/vaults/@{variables('vaultName')}/backupJobs",
+                       "uri": "https://management.azure.com/subscriptions/@{variables('subscriptionId')}/resourceGroups/@{variables('resourceGroup')}/providers/Microsoft.RecoveryServices/vaults/@{variables('vaultName')}/backupJobs?api-version=2021-01-01",
                        "authentication": {
                            "type": "ManagedServiceIdentity"
                        }
@@ -525,25 +490,6 @@ echo "✅ Resource groups created successfully"
                    "runAfter": {
                        "Check_Backup_Status": ["Succeeded"]
                    }
-               },
-               "Trigger_Cross_Region_Restore": {
-                   "type": "Http",
-                   "inputs": {
-                       "method": "POST",
-                       "uri": "https://management.azure.com/subscriptions/@{variables('subscriptionId')}/resourceGroups/@{variables('resourceGroup')}/providers/Microsoft.RecoveryServices/vaults/@{variables('vaultName')}/backupFabrics/Azure/protectionContainers/IaasVMContainer/protectedItems/VM/restore",
-                       "authentication": {
-                           "type": "ManagedServiceIdentity"
-                       },
-                       "body": {
-                           "properties": {
-                               "restoreType": "AlternateLocation",
-                               "targetRegion": "westus2"
-                           }
-                       }
-                   },
-                   "runAfter": {
-                       "Send_Teams_Notification": ["Succeeded"]
-                   }
                }
            },
            "triggers": {
@@ -568,7 +514,7 @@ echo "✅ Resource groups created successfully"
    }
    EOF
    
-   # Deploy the Logic Apps workflow
+   # Update the Logic Apps workflow with proper definition
    az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
@@ -649,7 +595,7 @@ echo "✅ Resource groups created successfully"
        --query '{name:name,location:location,sku:sku.name}'
    
    # Check alert rule configuration
-   az monitor metrics alert list \
+   az monitor scheduled-query list \
        --resource-group ${RESOURCE_GROUP} \
        --output table
    ```
@@ -715,12 +661,12 @@ echo "✅ Resource groups created successfully"
 
    ```bash
    # Delete alert rules
-   az monitor metrics alert delete \
+   az monitor scheduled-query delete \
        --name "BackupJobFailureAlert" \
        --resource-group ${RESOURCE_GROUP}
    
-   az monitor metrics alert delete \
-       --name "RecoveryVaultHealthAlert" \
+   az monitor scheduled-query delete \
+       --name "BackupStorageConsumptionAlert" \
        --resource-group ${RESOURCE_GROUP}
    
    # Delete Action Group
@@ -802,4 +748,9 @@ Extend this disaster recovery orchestration solution by implementing these advan
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Deployment Environments, Azure Developer CLI, Azure DevCenter, Azure Resource Manager
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, self-service, infrastructure-as-code, developer-experience, governance
 recipe-generator-version: 1.3
@@ -44,7 +44,7 @@ graph TB
     
     subgraph "Infrastructure Management"
         CAT[Catalog Repository]
-        ARM[ARM Templates]
+        GIT[GitHub Repository]
         ENV[Deployed Environments]
     end
     
@@ -62,8 +62,8 @@ graph TB
     PROJ-->ET
     PROJ-->ED
     ED-->CAT
-    CAT-->ARM
-    ARM-->ENV
+    CAT-->GIT
+    GIT-->ENV
     DC-->RBAC
     DC-->POL
     DC-->COST
@@ -82,7 +82,7 @@ graph TB
 5. Understanding of Azure Resource Manager templates and infrastructure as code
 6. Estimated cost: $50-150/month depending on deployed environments
 
-> **Note**: Azure Deployment Environments requires specific Azure subscription features. Review the [Azure Deployment Environments documentation](https://docs.microsoft.com/en-us/azure/deployment-environments/) for detailed prerequisites and regional availability.
+> **Note**: Azure Deployment Environments requires specific Azure subscription features. Review the [Azure Deployment Environments documentation](https://learn.microsoft.com/en-us/azure/deployment-environments/) for detailed prerequisites and regional availability.
 
 ## Preparation
 
@@ -99,11 +99,14 @@ RANDOM_SUFFIX=$(openssl rand -hex 3)
 export DEVCENTER_NAME="dc-selfservice-${RANDOM_SUFFIX}"
 export PROJECT_NAME="proj-webapp-${RANDOM_SUFFIX}"
 export CATALOG_NAME="catalog-templates"
-export STORAGE_ACCOUNT="st${RANDOM_SUFFIX}templates"
+export KEYVAULT_NAME="kv-${RANDOM_SUFFIX}-ade"
 
 # Verify Azure CLI and azd installations
 az version
 azd version
+
+# Install Azure CLI DevCenter extension
+az extension add --name devcenter --upgrade
 
 # Create resource group for DevCenter resources
 az group create \
@@ -146,80 +149,95 @@ echo "✅ Azure providers registered for Deployment Environments"
 
    The DevCenter now provides the foundational platform for managing all development environments. The managed identity enables secure authentication to Azure resources without storing credentials, following Azure security best practices and Zero Trust principles.
 
-2. **Configure Storage Account for Infrastructure Templates**:
+2. **Create Key Vault for Secure Secret Management**:
 
-   Azure Deployment Environments requires a centralized location to store and version infrastructure templates. A storage account provides the secure, scalable repository for ARM templates, Bicep files, and other infrastructure as code artifacts that define your standardized environments.
+   Azure Key Vault provides secure storage for secrets, keys, and certificates required for Azure Deployment Environments. In this step, we create a Key Vault to store GitHub personal access tokens or other authentication credentials needed to access catalog repositories.
 
    ```bash
-   # Create storage account for template repository
-   az storage account create \
-       --name ${STORAGE_ACCOUNT} \
+   # Create Key Vault for storing secrets
+   az keyvault create \
+       --name ${KEYVAULT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --sku Standard_LRS \
-       --kind StorageV2 \
-       --allow-blob-public-access false \
-       --https-only true
+       --sku standard \
+       --enable-rbac-authorization true
    
-   # Create container for ARM templates
-   az storage container create \
-       --name templates \
-       --account-name ${STORAGE_ACCOUNT} \
-       --auth-mode login
-   
-   # Grant DevCenter managed identity access to storage
+   # Grant DevCenter managed identity access to Key Vault secrets
    az role assignment create \
        --assignee ${DEVCENTER_IDENTITY} \
-       --role "Storage Blob Data Reader" \
-       --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}"
+       --role "Key Vault Secrets User" \
+       --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.KeyVault/vaults/${KEYVAULT_NAME}"
    
-   echo "✅ Storage account configured with DevCenter access"
+   # Grant current user access to manage secrets
+   USER_ID=$(az ad signed-in-user show --query id --output tsv)
+   az role assignment create \
+       --assignee ${USER_ID} \
+       --role "Key Vault Administrator" \
+       --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.KeyVault/vaults/${KEYVAULT_NAME}"
+   
+   echo "✅ Key Vault configured with DevCenter access"
    ```
 
-   The storage account is now configured with enterprise-grade security and access controls. The DevCenter can securely access infrastructure templates while maintaining audit trails and compliance requirements through Azure's built-in monitoring and logging capabilities.
+   The Key Vault is now configured with enterprise-grade security and access controls. This enables secure storage of authentication credentials while maintaining audit trails and compliance requirements through Azure's built-in monitoring and logging capabilities.
 
-3. **Create Sample Infrastructure Templates**:
+3. **Create GitHub Repository and Store Access Token**:
 
-   Infrastructure templates define the standardized environments that developers can deploy. These templates encapsulate best practices, security configurations, and organizational standards while providing consistent, repeatable infrastructure deployments.
+   Infrastructure templates for Azure Deployment Environments are typically stored in Git repositories. This step creates a sample repository structure and securely stores access credentials in Key Vault for catalog integration.
 
    ```bash
-   # Create a simple web app ARM template
-   cat > webapp-template.json << 'EOF'
+   # Create a sample ARM template for web applications
+   mkdir -p catalog-templates/webapp-environment
+   
+   cat > catalog-templates/webapp-environment/azuredeploy.json << 'EOF'
    {
        "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
        "contentVersion": "1.0.0.0",
        "parameters": {
            "appName": {
                "type": "string",
-               "defaultValue": "[concat('webapp-', uniqueString(resourceGroup().id))]"
+               "defaultValue": "[concat('webapp-', uniqueString(resourceGroup().id))]",
+               "metadata": {
+                   "description": "Name of the web application"
+               }
            },
            "location": {
                "type": "string",
-               "defaultValue": "[resourceGroup().location]"
+               "defaultValue": "[resourceGroup().location]",
+               "metadata": {
+                   "description": "Location for all resources"
+               }
+           },
+           "sku": {
+               "type": "string",
+               "defaultValue": "F1",
+               "allowedValues": ["F1", "B1", "S1", "P1V2"],
+               "metadata": {
+                   "description": "App Service Plan SKU"
+               }
            }
        },
        "resources": [
            {
                "type": "Microsoft.Web/serverfarms",
-               "apiVersion": "2021-02-01",
+               "apiVersion": "2023-01-01",
                "name": "[concat(parameters('appName'), '-plan')]",
                "location": "[parameters('location')]",
                "sku": {
-                   "name": "F1",
-                   "tier": "Free"
+                   "name": "[parameters('sku')]"
                },
                "properties": {}
            },
            {
                "type": "Microsoft.Web/sites",
-               "apiVersion": "2021-02-01",
+               "apiVersion": "2023-01-01",
                "name": "[parameters('appName')]",
                "location": "[parameters('location')]",
                "dependsOn": [
                    "[resourceId('Microsoft.Web/serverfarms', concat(parameters('appName'), '-plan'))]"
                ],
                "properties": {
-                   "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', concat(parameters('appName'), '-plan'))]"
+                   "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', concat(parameters('appName'), '-plan'))]",
+                   "httpsOnly": true
                }
            }
        ],
@@ -227,57 +245,54 @@ echo "✅ Azure providers registered for Deployment Environments"
            "webAppUrl": {
                "type": "string",
                "value": "[concat('https://', reference(parameters('appName')).defaultHostName)]"
+           },
+           "webAppName": {
+               "type": "string",
+               "value": "[parameters('appName')]"
            }
        }
    }
    EOF
    
-   # Upload template to storage account
-   az storage blob upload \
-       --file webapp-template.json \
-       --name webapp-environment.json \
-       --container-name templates \
-       --account-name ${STORAGE_ACCOUNT} \
-       --auth-mode login
+   # Create environment definition manifest
+   cat > catalog-templates/webapp-environment/environment.yaml << 'EOF'
+   name: WebApp-Environment
+   version: 1.0.0
+   summary: Standard web application environment
+   description: Deploys a web application with App Service Plan following Azure best practices
+   runner: ARM
+   templatePath: azuredeploy.json
+   parameters:
+   - id: appName
+     name: appName
+     description: 'Name of the web application'
+     default: '[from-template]'
+     type: string
+     required: false
+   - id: sku
+     name: sku
+     description: 'App Service Plan SKU'
+     default: 'F1'
+     type: string
+     required: false
+   EOF
    
-   echo "✅ Infrastructure template uploaded to catalog"
+   echo "✅ Sample infrastructure templates created"
+   echo "Next: Push these templates to a GitHub repository and note the repository URL"
+   echo "Repository structure:"
+   echo "├── webapp-environment/"
+   echo "│   ├── azuredeploy.json"
+   echo "│   └── environment.yaml"
+   
+   # For demo purposes, create a placeholder for GitHub PAT
+   echo "Creating placeholder for GitHub Personal Access Token..."
+   echo "In production, create a GitHub PAT and store it with:"
+   echo "az keyvault secret set --vault-name ${KEYVAULT_NAME} --name github-pat --value '<your-github-pat>'"
    ```
 
-   This template provides a complete web application environment following Azure best practices for cost optimization and security. The template uses the free tier for development purposes while maintaining the flexibility to scale to production-grade resources.
+   This template provides a complete web application environment following Azure best practices for security and cost optimization. The template uses the latest ARM template API versions and includes proper metadata and parameter validation for production use.
 
-4. **Create Environment Catalog and Definitions**:
-
-   Environment catalogs provide a curated collection of infrastructure templates that development teams can deploy. Catalogs enable version control, approval workflows, and centralized management of available environment types while ensuring consistency across deployments.
-
-   ```bash
-   # Create catalog linked to storage account
-   az devcenter admin catalog create \
-       --name ${CATALOG_NAME} \
-       --devcenter-name ${DEVCENTER_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --git-hub-path "/" \
-       --git-hub-branch main \
-       --git-hub-secret-identifier "" \
-       --git-hub-uri "https://${STORAGE_ACCOUNT}.blob.core.windows.net/templates"
-   
-   # Wait for catalog sync to complete
-   sleep 30
-   
-   # Create environment definition for web application
-   az devcenter admin environment-definition create \
-       --name "webapp-env" \
-       --catalog-name ${CATALOG_NAME} \
-       --devcenter-name ${DEVCENTER_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --template-path "webapp-environment.json" \
-       --description "Standard web application environment with App Service"
-   
-   echo "✅ Environment catalog and definitions configured"
-   ```
-
-   The catalog now provides a centralized repository of approved infrastructure templates. Development teams can browse available environments through the developer portal or Azure CLI, ensuring consistent deployment patterns across the organization.
-
-5. **Configure Environment Types and Governance**:
+4. **Create Environment Types and Governance**:
 
    Environment types define deployment targets with specific governance policies, cost controls, and access permissions. This enables different policies for development, staging, and production environments while maintaining consistent security and compliance standards.
 
@@ -296,47 +311,48 @@ echo "✅ Azure providers registered for Deployment Environments"
        --resource-group ${RESOURCE_GROUP} \
        --tags tier=staging cost-center=engineering monitoring=enhanced
    
-   # Configure deployment subscription for environment types
-   az devcenter admin environment-type update \
-       --name "development" \
-       --devcenter-name ${DEVCENTER_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --deployment-target-id "/subscriptions/${SUBSCRIPTION_ID}"
-   
    echo "✅ Environment types configured with governance policies"
    ```
 
    Environment types now provide the governance framework that ensures appropriate policies are applied based on the deployment target. This enables automated compliance checking and cost management while providing developers with clear guidelines for environment usage.
 
-6. **Create Project and Assign Permissions**:
+5. **Create Project and Configure Environment Types**:
 
    Projects organize development teams and define which environment types and definitions are available to specific user groups. Projects enable granular access control and resource management while providing team-specific customization of available templates and policies.
 
    ```bash
+   # Get DevCenter resource ID for project creation
+   DEVCENTER_ID=$(az devcenter admin devcenter show \
+       --name ${DEVCENTER_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query id --output tsv)
+   
    # Create project for web application development
    az devcenter admin project create \
        --name ${PROJECT_NAME} \
-       --devcenter-name ${DEVCENTER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
+       --dev-center-id ${DEVCENTER_ID} \
        --description "Web application development project with self-service environments"
    
-   # Associate environment types with the project
+   # Configure project environment types with deployment permissions
    az devcenter admin project-environment-type create \
        --project-name ${PROJECT_NAME} \
        --environment-type-name "development" \
-       --devcenter-name ${DEVCENTER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --deployment-target-id "/subscriptions/${SUBSCRIPTION_ID}" \
-       --status Enabled
+       --identity-type SystemAssigned \
+       --status Enabled \
+       --roles '{"b24988ac-6180-42a0-ab88-20f7382dd24c":{}}'
    
    az devcenter admin project-environment-type create \
        --project-name ${PROJECT_NAME} \
        --environment-type-name "staging" \
-       --devcenter-name ${DEVCENTER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --deployment-target-id "/subscriptions/${SUBSCRIPTION_ID}" \
-       --status Enabled
+       --identity-type SystemAssigned \
+       --status Enabled \
+       --roles '{"b24988ac-6180-42a0-ab88-20f7382dd24c":{}}'
    
    # Get current user ID for RBAC assignment
    USER_ID=$(az ad signed-in-user show --query id --output tsv)
@@ -352,6 +368,42 @@ echo "✅ Azure providers registered for Deployment Environments"
 
    The project now provides a collaborative workspace where development teams can discover, deploy, and manage their infrastructure environments. The role assignments ensure appropriate access while maintaining security boundaries and audit capabilities.
 
+6. **Add Catalog with Infrastructure Templates**:
+
+   Environment catalogs provide a curated collection of infrastructure templates that development teams can deploy. Catalogs enable version control, approval workflows, and centralized management of available environment types while ensuring consistency across deployments.
+
+   ```bash
+   # For this demo, we'll use the Microsoft sample catalog
+   # In production, replace with your own GitHub repository URL
+   SAMPLE_REPO_URL="https://github.com/Azure/deployment-environments"
+   
+   # Get Key Vault secret identifier (using sample - replace with actual PAT)
+   # az keyvault secret set --vault-name ${KEYVAULT_NAME} --name github-pat --value '<your-github-pat>'
+   # SECRET_ID=$(az keyvault secret show --vault-name ${KEYVAULT_NAME} --name github-pat --query id --output tsv)
+   
+   # For demo purposes, create catalog without authentication (public repo)
+   az devcenter admin catalog create \
+       --name ${CATALOG_NAME} \
+       --devcenter-name ${DEVCENTER_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --git-hub path="/Environments" branch="main" uri="${SAMPLE_REPO_URL}.git"
+   
+   # Wait for catalog synchronization
+   echo "Waiting for catalog synchronization..."
+   sleep 60
+   
+   # Verify catalog sync status
+   az devcenter admin catalog show \
+       --name ${CATALOG_NAME} \
+       --devcenter-name ${DEVCENTER_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query "syncState" --output tsv
+   
+   echo "✅ Environment catalog configured and synchronized"
+   ```
+
+   The catalog now provides a centralized repository of approved infrastructure templates. Development teams can browse available environments through the developer portal or Azure CLI, ensuring consistent deployment patterns across the organization.
+
 7. **Configure Azure Developer CLI Integration**:
 
    Azure Developer CLI integration enables seamless command-line access to deployment environments, allowing developers to incorporate infrastructure provisioning into their development workflows. This integration provides both interactive and automated deployment capabilities.
@@ -360,63 +412,59 @@ echo "✅ Azure providers registered for Deployment Environments"
    # Configure azd to use Azure Deployment Environments
    azd config set platform.type devcenter
    
+   # Set default dev center and project
+   azd config set platform.config.default-subscription ${SUBSCRIPTION_ID}
+   azd config set platform.config.default-location ${LOCATION}
+   
    # Verify azd configuration
    azd config show
    
-   # Initialize sample application with environment integration
-   mkdir webapp-sample && cd webapp-sample
-   
-   # Create azure.yaml for azd integration
-   cat > azure.yaml << EOF
-   name: webapp-sample
-   metadata:
-     template: webapp-sample@1.0.0
-   platform:
-     type: devcenter
-   services:
-     web:
-       project: ./src
-       host: appservice
-   EOF
-   
-   # Create basic application structure
-   mkdir -p src
-   echo "<h1>Hello from Azure Deployment Environments!</h1>" > src/index.html
+   # List available environment types through azd
+   azd env list
    
    echo "✅ Azure Developer CLI configured for deployment environments"
    ```
 
    The Azure Developer CLI is now integrated with Azure Deployment Environments, providing developers with powerful command-line tools for infrastructure management. This integration enables GitOps workflows and automated deployment pipelines while maintaining enterprise governance controls.
 
-8. **Deploy Self-Service Environment Using azd**:
+8. **Deploy Self-Service Environment**:
 
-   Deploying environments through Azure Developer CLI demonstrates the complete self-service infrastructure lifecycle. Developers can provision environments on-demand without requiring infrastructure team involvement while maintaining compliance with organizational policies and standards.
+   Deploying environments through Azure CLI demonstrates the complete self-service infrastructure lifecycle. Developers can provision environments on-demand without requiring infrastructure team involvement while maintaining compliance with organizational policies and standards.
 
    ```bash
+   # Get DevCenter endpoint URL
+   DEVCENTER_ENDPOINT="https://${DEVCENTER_NAME}-${LOCATION}.devcenter.azure.com/"
+   
    # List available environment definitions
-   azd template list
-   
-   # Deploy environment using azd
-   azd auth login
-   azd init --template minimal
-   
-   # Configure environment variables for deployment
-   azd env set PROJECT_NAME ${PROJECT_NAME}
-   azd env set ENVIRONMENT_TYPE "development"
-   azd env set ENVIRONMENT_NAME "webapp-dev-${RANDOM_SUFFIX}"
-   
-   # Deploy the environment
-   azd provision --environment development
-   
-   # Verify deployment status
-   az devcenter dev environment list \
+   az devcenter dev environment-definition list \
+       --dev-center-name ${DEVCENTER_NAME} \
        --project-name ${PROJECT_NAME} \
-       --endpoint "https://${DEVCENTER_NAME}-${LOCATION}.devcenter.azure.com/"
+       --output table
    
-   echo "✅ Self-service environment deployed successfully"
+   # Create a development environment using CLI
+   ENVIRONMENT_NAME="webapp-dev-${RANDOM_SUFFIX}"
+   
+   az devcenter dev environment create \
+       --dev-center-name ${DEVCENTER_NAME} \
+       --project-name ${PROJECT_NAME} \
+       --environment-name ${ENVIRONMENT_NAME} \
+       --environment-type "development" \
+       --catalog-name ${CATALOG_NAME} \
+       --environment-definition-name "WebAppEnvironment" \
+       --parameters '{"name": "devapp", "location": "eastus"}'
+   
+   # Monitor deployment progress
+   echo "Monitoring environment deployment..."
+   az devcenter dev environment show \
+       --dev-center-name ${DEVCENTER_NAME} \
+       --project-name ${PROJECT_NAME} \
+       --environment-name ${ENVIRONMENT_NAME} \
+       --query "provisioningState" --output tsv
+   
+   echo "✅ Self-service environment deployment initiated"
    ```
 
-   The environment is now deployed and accessible to the development team. This demonstrates the complete self-service lifecycle where developers can independently provision infrastructure while adhering to enterprise governance policies and cost controls.
+   The environment deployment demonstrates the complete self-service lifecycle where developers can independently provision infrastructure while adhering to enterprise governance policies and cost controls. The deployment follows Azure best practices for security, monitoring, and resource management.
 
 ## Validation & Testing
 
@@ -442,19 +490,23 @@ echo "✅ Azure providers registered for Deployment Environments"
 
    ```bash
    # Test environment creation through CLI
+   TEST_ENV_NAME="test-env-${RANDOM_SUFFIX}"
+   
    az devcenter dev environment create \
+       --dev-center-name ${DEVCENTER_NAME} \
        --project-name ${PROJECT_NAME} \
-       --endpoint "https://${DEVCENTER_NAME}-${LOCATION}.devcenter.azure.com/" \
-       --environment-name "test-env-${RANDOM_SUFFIX}" \
+       --environment-name ${TEST_ENV_NAME} \
        --environment-type "development" \
        --catalog-name ${CATALOG_NAME} \
-       --environment-definition-name "webapp-env"
+       --environment-definition-name "WebAppEnvironment"
    
-   # Check environment status
+   # Check deployment status
    az devcenter dev environment show \
+       --dev-center-name ${DEVCENTER_NAME} \
        --project-name ${PROJECT_NAME} \
-       --endpoint "https://${DEVCENTER_NAME}-${LOCATION}.devcenter.azure.com/" \
-       --environment-name "test-env-${RANDOM_SUFFIX}"
+       --environment-name ${TEST_ENV_NAME} \
+       --query "{Name:name, State:provisioningState, Type:environmentType}" \
+       --output table
    ```
 
 3. **Validate Access Controls and Governance**:
@@ -468,6 +520,7 @@ echo "✅ Azure providers registered for Deployment Environments"
    # Check policy compliance on deployed resources
    az policy state list \
        --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}" \
+       --query "[?complianceState=='NonCompliant']" \
        --output table
    ```
 
@@ -476,14 +529,30 @@ echo "✅ Azure providers registered for Deployment Environments"
 1. **Remove Deployed Environments**:
 
    ```bash
-   # Delete test environment
-   az devcenter dev environment delete \
+   # List all environments for cleanup
+   az devcenter dev environment list \
+       --dev-center-name ${DEVCENTER_NAME} \
        --project-name ${PROJECT_NAME} \
-       --endpoint "https://${DEVCENTER_NAME}-${LOCATION}.devcenter.azure.com/" \
-       --environment-name "test-env-${RANDOM_SUFFIX}" \
-       --yes
+       --output table
    
-   echo "✅ Test environment deleted"
+   # Delete test environments
+   if [ ! -z "${TEST_ENV_NAME}" ]; then
+       az devcenter dev environment delete \
+           --dev-center-name ${DEVCENTER_NAME} \
+           --project-name ${PROJECT_NAME} \
+           --environment-name ${TEST_ENV_NAME} \
+           --yes
+   fi
+   
+   if [ ! -z "${ENVIRONMENT_NAME}" ]; then
+       az devcenter dev environment delete \
+           --dev-center-name ${DEVCENTER_NAME} \
+           --project-name ${PROJECT_NAME} \
+           --environment-name ${ENVIRONMENT_NAME} \
+           --yes
+   fi
+   
+   echo "✅ Test environments deleted"
    ```
 
 2. **Remove Azure Developer CLI Configuration**:
@@ -491,9 +560,11 @@ echo "✅ Azure providers registered for Deployment Environments"
    ```bash
    # Reset azd configuration
    azd config unset platform.type
+   azd config unset platform.config.default-subscription
+   azd config unset platform.config.default-location
    
-   # Clean up local azd environment
-   cd .. && rm -rf webapp-sample
+   # Clean up local template files
+   rm -rf catalog-templates/
    
    echo "✅ Azure Developer CLI configuration reset"
    ```
@@ -501,6 +572,13 @@ echo "✅ Azure providers registered for Deployment Environments"
 3. **Delete DevCenter Resources**:
 
    ```bash
+   # Delete catalog first
+   az devcenter admin catalog delete \
+       --name ${CATALOG_NAME} \
+       --devcenter-name ${DEVCENTER_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --yes
+   
    # Delete project (removes associated environment types)
    az devcenter admin project delete \
        --name ${PROJECT_NAME} \
@@ -519,11 +597,13 @@ echo "✅ Azure providers registered for Deployment Environments"
 4. **Remove Supporting Resources**:
 
    ```bash
-   # Delete storage account
-   az storage account delete \
-       --name ${STORAGE_ACCOUNT} \
-       --resource-group ${RESOURCE_GROUP} \
-       --yes
+   # Delete Key Vault
+   az keyvault delete \
+       --name ${KEYVAULT_NAME} \
+       --resource-group ${RESOURCE_GROUP}
+   
+   # Purge Key Vault (optional - removes from soft delete)
+   az keyvault purge --name ${KEYVAULT_NAME}
    
    # Delete resource group and all remaining resources
    az group delete \
@@ -541,11 +621,11 @@ echo "✅ Azure providers registered for Deployment Environments"
 
 Azure Deployment Environments represents a paradigm shift in enterprise infrastructure management, enabling true self-service capabilities while maintaining the governance and security controls that enterprises require. This solution addresses the fundamental tension between developer agility and operational control by providing a platform that scales from individual developer environments to enterprise-wide infrastructure management. The integration with Azure Developer CLI creates a seamless experience that fits naturally into existing development workflows while providing the automation and consistency that modern DevOps practices demand.
 
-The architectural approach demonstrated here follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles, particularly focusing on operational excellence and security. By centralizing template management and policy enforcement through DevCenter, organizations can ensure consistent application of security policies, cost controls, and compliance requirements across all deployed environments. The managed identity integration provides secure, credential-free access to Azure resources, following Zero Trust security principles and reducing the attack surface associated with traditional credential-based authentication.
+The architectural approach demonstrated here follows the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles, particularly focusing on operational excellence and security. By centralizing template management and policy enforcement through DevCenter, organizations can ensure consistent application of security policies, cost controls, and compliance requirements across all deployed environments. The managed identity integration provides secure, credential-free access to Azure resources, following Zero Trust security principles and reducing the attack surface associated with traditional credential-based authentication.
 
-From a cost optimization perspective, Azure Deployment Environments enables organizations to implement sophisticated cost management strategies through environment types and automated lifecycle policies. Development teams can provision environments on-demand without requiring pre-allocated capacity, while automated deletion policies ensure that unused resources don't accumulate costs. The integration with [Azure Cost Management](https://docs.microsoft.com/en-us/azure/cost-management/) provides detailed visibility into environment costs and usage patterns, enabling data-driven decisions about resource allocation and optimization.
+From a cost optimization perspective, Azure Deployment Environments enables organizations to implement sophisticated cost management strategies through environment types and automated lifecycle policies. Development teams can provision environments on-demand without requiring pre-allocated capacity, while automated deletion policies ensure that unused resources don't accumulate costs. The integration with [Azure Cost Management](https://learn.microsoft.com/en-us/azure/cost-management-billing/) provides detailed visibility into environment costs and usage patterns, enabling data-driven decisions about resource allocation and optimization.
 
-The developer experience created by this solution significantly reduces the time from idea to deployed infrastructure, eliminating traditional bottlenecks associated with manual provisioning processes. According to Microsoft's research, organizations implementing Azure Deployment Environments typically see 70-80% reduction in environment provisioning time and 60% improvement in developer productivity metrics. This acceleration enables more frequent testing, faster iteration cycles, and ultimately higher quality software delivery. For comprehensive guidance on developer experience optimization, see the [Azure Developer CLI documentation](https://docs.microsoft.com/en-us/azure/developer/azure-developer-cli/) and [Azure DevCenter best practices](https://docs.microsoft.com/en-us/azure/dev-center/).
+The developer experience created by this solution significantly reduces the time from idea to deployed infrastructure, eliminating traditional bottlenecks associated with manual provisioning processes. According to Microsoft's research, organizations implementing Azure Deployment Environments typically see 70-80% reduction in environment provisioning time and 60% improvement in developer productivity metrics. This acceleration enables more frequent testing, faster iteration cycles, and ultimately higher quality software delivery. For comprehensive guidance on developer experience optimization, see the [Azure Developer CLI documentation](https://learn.microsoft.com/en-us/azure/developer/azure-developer-cli/) and [Azure DevCenter best practices](https://learn.microsoft.com/en-us/azure/dev-center/).
 
 > **Tip**: Implement automated environment lifecycle policies to delete unused environments after specified periods. This practice significantly reduces costs while maintaining developer productivity. Use Azure Tags and Azure Policy to enforce consistent resource tagging for better cost tracking and governance.
 
@@ -565,4 +645,9 @@ Extend this self-service infrastructure platform by implementing these advanced 
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

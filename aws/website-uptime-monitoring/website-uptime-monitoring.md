@@ -6,10 +6,10 @@ difficulty: 100
 subject: aws
 services: Route 53, CloudWatch, SNS
 estimated-time: 60 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: monitoring, uptime, health-checks, alerting, availability
 recipe-generator-version: 1.3
@@ -240,7 +240,6 @@ echo "✅ Notifications will be sent to: ${MONITOR_EMAIL}"
                            "min": 0,
                            "max": 1
                        }
-                   }
                    }
                }
            },
@@ -496,4 +495,11 @@ Extend this monitoring solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

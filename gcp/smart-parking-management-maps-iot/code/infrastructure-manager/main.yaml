@@ -1,0 +1,426 @@
+# Infrastructure Manager Configuration for Smart Parking Management System
+# This configuration deploys a complete smart parking management solution using
+# Google Cloud Pub/Sub, Cloud Functions, Firestore, and Maps Platform
+
+# Configuration metadata
+metadata:
+  name: smart-parking-management
+  description: "Smart parking management system with IoT sensors, real-time processing, and Maps Platform integration"
+  version: "1.0.0"
+  labels:
+    category: iot
+    solution: smart-parking
+    complexity: intermediate
+
+# Input variables for customization
+inputs:
+  # Project configuration
+  - name: project_id
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+    
+  - name: region
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+    
+  - name: zone
+    description: "Google Cloud zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+    
+  # Resource naming
+  - name: resource_suffix
+    description: "Suffix for resource names to ensure uniqueness"
+    type: string
+    default: "001"
+    
+  - name: environment
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+    
+  # Pub/Sub configuration
+  - name: pubsub_topic_name
+    description: "Name for the Pub/Sub topic"
+    type: string
+    default: "parking-events"
+    
+  - name: message_retention_duration
+    description: "Message retention duration for Pub/Sub topic"
+    type: string
+    default: "604800s"  # 7 days
+    
+  # Cloud Functions configuration
+  - name: function_timeout
+    description: "Timeout for Cloud Functions in seconds"
+    type: number
+    default: 60
+    
+  - name: function_memory
+    description: "Memory allocation for Cloud Functions in MB"
+    type: number
+    default: 256
+    
+  # Firestore configuration
+  - name: firestore_location
+    description: "Firestore database location"
+    type: string
+    default: "us-central"
+    
+  # Maps Platform configuration
+  - name: enable_maps_apis
+    description: "Enable Maps Platform APIs"
+    type: boolean
+    default: true
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.get-project.projectId)/services/pubsub.googleapis.com
+      
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.get-project.projectId)/services/cloudfunctions.googleapis.com
+      
+  - name: enable-firestore-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.get-project.projectId)/services/firestore.googleapis.com
+      
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.get-project.projectId)/services/cloudbuild.googleapis.com
+      
+  - name: enable-maps-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.get-project.projectId)/services/maps-backend.googleapis.com
+    condition: $(inputs.enable_maps_apis)
+    
+  # Get project information
+  - name: get-project
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(inputs.project_id)
+      
+  # Service Account for MQTT broker integration
+  - name: mqtt-pubsub-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: mqtt-pubsub-publisher-$(inputs.resource_suffix)
+      displayName: "MQTT to Pub/Sub Publisher Service Account"
+      description: "Service account for MQTT broker to publish messages to Pub/Sub"
+      projectId: $(inputs.project_id)
+    depends_on:
+      - enable-apis
+      
+  # IAM binding for service account to publish to Pub/Sub
+  - name: mqtt-pubsub-iam-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(inputs.project_id)
+      policy:
+        bindings:
+          - role: roles/pubsub.publisher
+            members:
+              - serviceAccount:$(ref.mqtt-pubsub-service-account.email)
+    depends_on:
+      - mqtt-pubsub-service-account
+      
+  # Pub/Sub Topic for parking sensor data
+  - name: parking-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(inputs.project_id)/topics/$(inputs.pubsub_topic_name)-$(inputs.resource_suffix)
+      labels:
+        environment: $(inputs.environment)
+        component: messaging
+        solution: smart-parking
+      messageRetentionDuration: $(inputs.message_retention_duration)
+      schemaSettings:
+        encoding: JSON
+    depends_on:
+      - enable-apis
+      
+  # Pub/Sub Subscription for message processing
+  - name: parking-processing-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(inputs.project_id)/subscriptions/parking-processing-$(inputs.resource_suffix)
+      topic: $(ref.parking-events-topic.name)
+      labels:
+        environment: $(inputs.environment)
+        component: messaging
+        solution: smart-parking
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: $(inputs.message_retention_duration)
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+    depends_on:
+      - parking-events-topic
+      
+  # Firestore Database
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      name: projects/$(inputs.project_id)/databases/(default)
+      type: FIRESTORE_NATIVE
+      locationId: $(inputs.firestore_location)
+      concurrencyMode: OPTIMISTIC
+      appEngineIntegrationMode: DISABLED
+    depends_on:
+      - enable-firestore-api
+      
+  # Cloud Storage Bucket for function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: parking-functions-source-$(inputs.project_id)-$(inputs.resource_suffix)
+      location: $(inputs.region)
+      labels:
+        environment: $(inputs.environment)
+        component: storage
+        solution: smart-parking
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              
+  # Cloud Function for processing parking sensor data
+  - name: parking-data-processor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/$(inputs.project_id)/locations/$(inputs.region)/functions/process-parking-data-$(inputs.resource_suffix)
+      description: "Processes parking sensor data from IoT devices via Pub/Sub"
+      labels:
+        environment: $(inputs.environment)
+        component: processing
+        solution: smart-parking
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/parking-processor-source.zip
+      runtime: nodejs20
+      entryPoint: processParkingData
+      timeout: $(inputs.function_timeout)s
+      availableMemoryMb: $(inputs.function_memory)
+      environmentVariables:
+        FIRESTORE_COLLECTION: parking_spaces
+        PROJECT_ID: $(inputs.project_id)
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.parking-events-topic.name)
+        failurePolicy:
+          retry: {}
+      serviceAccountEmail: $(ref.mqtt-pubsub-service-account.email)
+    depends_on:
+      - function-source-bucket
+      - parking-events-topic
+      - firestore-database
+      - enable-functions-api
+      - enable-cloudbuild-api
+      
+  # Cloud Function for parking management API
+  - name: parking-api-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/$(inputs.project_id)/locations/$(inputs.region)/functions/parking-management-api-$(inputs.resource_suffix)
+      description: "REST API for parking space search and zone statistics"
+      labels:
+        environment: $(inputs.environment)
+        component: api
+        solution: smart-parking
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/parking-api-source.zip
+      runtime: nodejs20
+      entryPoint: parkingApi
+      timeout: $(inputs.function_timeout)s
+      availableMemoryMb: $(inputs.function_memory)
+      environmentVariables:
+        FIRESTORE_COLLECTION: parking_spaces
+        PROJECT_ID: $(inputs.project_id)
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      serviceAccountEmail: $(ref.mqtt-pubsub-service-account.email)
+    depends_on:
+      - function-source-bucket
+      - firestore-database
+      - enable-functions-api
+      - enable-cloudbuild-api
+      
+  # IAM binding to allow unauthenticated access to API function
+  - name: api-function-invoker
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.parking-api-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    depends_on:
+      - parking-api-function
+      
+  # Maps Platform API Key (if enabled)
+  - name: maps-api-key
+    type: gcp-types/apikeys-v2:projects.locations.keys
+    properties:
+      parent: projects/$(inputs.project_id)/locations/global
+      displayName: Smart Parking Maps API Key
+      restrictions:
+        apiTargets:
+          - service: maps-backend.googleapis.com
+        serverKeyRestrictions:
+          allowedIps:
+            - "0.0.0.0/0"  # Restrict this in production
+    condition: $(inputs.enable_maps_apis)
+    depends_on:
+      - enable-maps-api
+      
+  # Cloud Monitoring Alert Policy for function errors
+  - name: function-error-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Parking Function Error Rate Alert"
+      documentation:
+        content: "Alert when parking processing functions have high error rates"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "Function error rate"
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" AND resource.labels.function_name=~".*parking.*"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.1
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.labels.function_name
+      alertStrategy:
+        autoClose: 86400s
+      enabled: true
+      
+  # Cloud Monitoring Dashboard for parking system
+  - name: parking-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: "Smart Parking System Dashboard"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "Pub/Sub Message Rate"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="pubsub_topic" AND resource.labels.topic_id="$(inputs.pubsub_topic_name)-$(inputs.resource_suffix)"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                    plotType: LINE
+          - width: 6
+            height: 4
+            widget:
+              title: "Function Execution Count"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="cloud_function" AND resource.labels.function_name=~".*parking.*"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - resource.labels.function_name
+                    plotType: LINE
+
+# Output values for integration and verification
+outputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    value: $(inputs.project_id)
+    
+  - name: region
+    description: "Deployment region"
+    value: $(inputs.region)
+    
+  - name: pubsub_topic_name
+    description: "Pub/Sub topic name for sensor data"
+    value: $(ref.parking-events-topic.name)
+    
+  - name: subscription_name
+    description: "Pub/Sub subscription name for message processing"
+    value: $(ref.parking-processing-subscription.name)
+    
+  - name: processor_function_name
+    description: "Cloud Function name for data processing"
+    value: $(ref.parking-data-processor-function.name)
+    
+  - name: api_function_name
+    description: "Cloud Function name for API endpoints"
+    value: $(ref.parking-api-function.name)
+    
+  - name: api_function_url
+    description: "HTTP trigger URL for parking management API"
+    value: $(ref.parking-api-function.httpsTrigger.url)
+    
+  - name: service_account_email
+    description: "Service account email for MQTT broker integration"
+    value: $(ref.mqtt-pubsub-service-account.email)
+    
+  - name: storage_bucket_name
+    description: "Cloud Storage bucket for function source code"
+    value: $(ref.function-source-bucket.name)
+    
+  - name: firestore_database_name
+    description: "Firestore database name"
+    value: $(ref.firestore-database.name)
+    
+  - name: maps_api_key_name
+    description: "Maps Platform API key name"
+    value: $(ref.maps-api-key.name)
+    condition: $(inputs.enable_maps_apis)
+    
+  - name: monitoring_dashboard_name
+    description: "Cloud Monitoring dashboard name"
+    value: $(ref.parking-monitoring-dashboard.name)
+
+# Deployment configuration
+deployment:
+  # Preview before applying changes
+  preview: true
+  
+  # Deployment constraints
+  constraints:
+    - type: allowed-locations
+      locations:
+        - us-central1
+        - us-east1
+        - us-west1
+        - europe-west1
+        - asia-southeast1
+        
+  # Resource labeling policy
+  labels:
+    managed-by: infrastructure-manager
+    solution: smart-parking-management
+    version: "1.0.0"
+    
+  # Deletion policy for stateful resources
+  deletion_policy:
+    firestore-database: ABANDON  # Preserve data
+    function-source-bucket: DELETE  # Clean up code artifacts

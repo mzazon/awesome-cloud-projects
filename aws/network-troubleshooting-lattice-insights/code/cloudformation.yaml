@@ -1,0 +1,1285 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Network Troubleshooting with VPC Lattice and Network Insights - Complete infrastructure for automated network diagnostics and monitoring'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Environment name for resource tagging and naming'
+    
+  InstanceType:
+    Type: String
+    Default: 't3.micro'
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: 'EC2 instance type for test instances'
+    
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for SNS notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+    
+  ServiceNetworkName:
+    Type: String
+    Default: 'troubleshooting-network'
+    Description: 'Name for the VPC Lattice service network'
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable detailed CloudWatch monitoring and enhanced dashboards'
+    
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID for deploying test resources (use default VPC or existing VPC)'
+    
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: 'Subnet ID for test EC2 instance deployment (must be in selected VPC)'
+    
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch log retention period in days'
+    
+  AlarmThreshold5XX:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Threshold for 5XX error count alarm'
+    
+  AlarmThresholdLatency:
+    Type: Number
+    Default: 5000
+    MinValue: 100
+    MaxValue: 30000
+    Description: 'Threshold for response time alarm (in milliseconds)'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+
+Conditions:
+  CreateEmailSubscription: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# ==============================================================================
+# MAPPINGS
+# ==============================================================================
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      LatestAmiId: ami-0e2c8caa4b6378d8c
+    us-west-2:
+      LatestAmiId: ami-008fe2fc65df48dac
+    us-west-1:
+      LatestAmiId: ami-0827b3b7dcd394d2a
+    eu-west-1:
+      LatestAmiId: ami-01dd271720c1ba44f
+    eu-west-2:
+      LatestAmiId: ami-0b2ed2e3df8d8746c
+    eu-central-1:
+      LatestAmiId: ami-04e601abe3e1a910f
+    ap-southeast-1:
+      LatestAmiId: ami-0497a974f8d5dcef8
+    ap-southeast-2:
+      LatestAmiId: ami-0310483fb2b488153
+    ap-northeast-1:
+      LatestAmiId: ami-0bcc04cc82c5b5bf7
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+
+Resources:
+
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+  
+  # IAM Role for Systems Manager Automation
+  AutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'NetworkTroubleshootingRole-${Environment}-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: NetworkTroubleshootingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:CreateNetworkInsightsPath'
+                  - 'ec2:StartNetworkInsightsAnalysis'
+                  - 'ec2:DescribeNetworkInsightsAnalyses'
+                  - 'ec2:DescribeNetworkInsightsPaths'
+                  - 'ec2:DeleteNetworkInsightsPath'
+                  - 'ec2:DeleteNetworkInsightsAnalysis'
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DescribeSecurityGroups'
+                  - 'ec2:DescribeVpcs'
+                  - 'ec2:DescribeSubnets'
+                  - 'ec2:DescribeRouteTables'
+                  - 'ec2:DescribeNatGateways'
+                  - 'ec2:DescribeInternetGateways'
+                  - 'ec2:CreateTags'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'vpc-lattice:GetService'
+                  - 'vpc-lattice:GetServiceNetwork'
+                  - 'vpc-lattice:ListServices'
+                  - 'vpc-lattice:ListServiceNetworks'
+                  - 'vpc-lattice:ListTargetGroups'
+                  - 'vpc-lattice:GetTargetGroup'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:GetMetricStatistics'
+                  - 'cloudwatch:ListMetrics'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+          
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'NetworkTroubleshootingLambdaRole-${Environment}-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSMAutomationExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:StartAutomationExecution'
+                  - 'ssm:GetAutomationExecution'
+                  - 'ssm:DescribeAutomationExecutions'
+                  - 'ssm:DescribeAutomationStepExecutions'
+                Resource: 
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/*'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-execution/*'
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: !GetAtt AutomationRole.Arn
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'ssm.amazonaws.com'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # VPC LATTICE RESOURCES
+  # ============================================================================
+  
+  # VPC Lattice Service Network
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub '${ServiceNetworkName}-${Environment}'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: CostCenter
+          Value: !If [IsProduction, 'Production', 'Development']
+          
+  # VPC Association with Service Network
+  ServiceNetworkVpcAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      VpcIdentifier: !Ref VpcId
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # EC2 TEST INFRASTRUCTURE
+  # ============================================================================
+  
+  # Security Group for Test Instances
+  TestSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'lattice-test-sg-${Environment}-${AWS::StackName}'
+      GroupDescription: 'Security group for VPC Lattice network testing with comprehensive rules'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref TestSecurityGroup
+          Description: 'HTTP traffic from same security group'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref TestSecurityGroup
+          Description: 'HTTPS traffic from same security group'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/8
+          Description: 'SSH access from private networks'
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref TestSecurityGroup
+          Description: 'Alternative HTTP port for testing'
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.0.0/8
+          Description: 'ICMP for network diagnostics'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub 'lattice-test-sg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+          
+  # IAM Role for EC2 Instance with enhanced permissions
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: VPCLatticeTestPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'vpc-lattice:GetService'
+                  - 'vpc-lattice:GetServiceNetwork'
+                  - 'vpc-lattice:ListServices'
+                  - 'vpc-lattice:ListServiceNetworks'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DescribeInstances'
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+          
+  # Instance Profile for EC2
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+        
+  # Test EC2 Instance with enhanced configuration
+  TestInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', LatestAmiId]
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds:
+        - !Ref TestSecurityGroup
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      Monitoring: !If [EnableDetailedMonitoringCondition, true, false]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y amazon-cloudwatch-agent
+          yum install -y awscli
+          yum install -y curl wget telnet nc
+          
+          # Enhanced HTTP server for testing with health checks
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          
+          # Create comprehensive test pages
+          cat > /var/www/html/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>VPC Lattice Test Server</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 40px; }
+                  .header { background-color: #232f3e; color: white; padding: 20px; }
+                  .content { padding: 20px; }
+                  .status { background-color: #28a745; color: white; padding: 10px; border-radius: 5px; }
+              </style>
+          </head>
+          <body>
+              <div class="header">
+                  <h1>VPC Lattice Test Server - ${Environment}</h1>
+              </div>
+              <div class="content">
+                  <div class="status">✅ Server is running and accessible</div>
+                  <p><strong>Instance ID:</strong> $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>
+                  <p><strong>Availability Zone:</strong> $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</p>
+                  <p><strong>Private IP:</strong> $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)</p>
+                  <p><strong>Environment:</strong> ${Environment}</p>
+                  <p><strong>Timestamp:</strong> $(date)</p>
+              </div>
+          </body>
+          </html>
+          EOF
+          
+          # Health check endpoint
+          echo '{"status": "healthy", "timestamp": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"}' > /var/www/html/health
+          
+          # Network diagnostic tools endpoint
+          cat > /var/www/html/diagnostics.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>Network Diagnostics</title></head>
+          <body>
+              <h1>Network Diagnostic Tools</h1>
+              <p>Use this server for network connectivity testing</p>
+              <ul>
+                  <li><a href="/health">Health Check</a></li>
+                  <li>HTTP Port: 80</li>
+                  <li>HTTPS Port: 443 (if configured)</li>
+                  <li>Alternative Port: 8080</li>
+              </ul>
+          </body>
+          </html>
+          EOF
+          
+          # Configure CloudWatch agent with enhanced metrics
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+          {
+            "metrics": {
+              "namespace": "NetworkTroubleshooting/${Environment}",
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                  "metrics_collection_interval": 60,
+                  "totalcpu": true
+                },
+                "disk": {
+                  "measurement": ["used_percent", "inodes_free"],
+                  "metrics_collection_interval": 60,
+                  "resources": ["*"]
+                },
+                "diskio": {
+                  "measurement": ["io_time", "read_bytes", "write_bytes", "reads", "writes"],
+                  "metrics_collection_interval": 60,
+                  "resources": ["*"]
+                },
+                "mem": {
+                  "measurement": ["mem_used_percent", "mem_available_percent"],
+                  "metrics_collection_interval": 60
+                },
+                "netstat": {
+                  "measurement": ["tcp_established", "tcp_time_wait"],
+                  "metrics_collection_interval": 60
+                },
+                "net": {
+                  "measurement": ["bytes_sent", "bytes_recv", "packets_sent", "packets_recv"],
+                  "metrics_collection_interval": 60,
+                  "resources": ["*"]
+                }
+              }
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/httpd/access_log",
+                      "log_group_name": "/aws/ec2/httpd/access",
+                      "log_stream_name": "{instance_id}",
+                      "timezone": "UTC"
+                    },
+                    {
+                      "file_path": "/var/log/httpd/error_log",
+                      "log_group_name": "/aws/ec2/httpd/error",
+                      "log_stream_name": "{instance_id}",
+                      "timezone": "UTC"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+          
+          # Create simple network testing scripts
+          cat > /usr/local/bin/network-test.sh << 'EOF'
+          #!/bin/bash
+          echo "=== Network Connectivity Test ==="
+          echo "Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+          echo "Private IP: $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)"
+          echo "Default Gateway: $(ip route | grep default | awk '{print $3}')"
+          echo "DNS Servers: $(cat /etc/resolv.conf | grep nameserver | awk '{print $2}')"
+          echo "Active Connections: $(netstat -an | wc -l)"
+          echo "=== End Test ==="
+          EOF
+          chmod +x /usr/local/bin/network-test.sh
+          
+          # Signal completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource TestInstance --region ${AWS::Region}
+      CreationPolicy:
+        ResourceSignal:
+          Timeout: PT10M
+          Count: 1
+      Tags:
+        - Key: Name
+          Value: !Sub 'lattice-test-${Environment}-${AWS::StackName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # CLOUDWATCH MONITORING AND LOGGING
+  # ============================================================================
+  
+  # CloudWatch Log Group for VPC Lattice
+  VpcLatticeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpclattice/servicenetwork/${ServiceNetwork}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+          
+  # Additional log groups for EC2 monitoring
+  EC2HttpdAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/ec2/httpd/access'
+      RetentionInDays: !Ref LogRetentionDays
+      
+  EC2HttpdErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/ec2/httpd/error'
+      RetentionInDays: !Ref LogRetentionDays
+          
+  # SNS Topic for Network Alerts
+  NetworkAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'network-alerts-${Environment}-${AWS::StackName}'
+      DisplayName: 'Network Troubleshooting Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+          
+  # Email Subscription for SNS Topic (conditional)
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailSubscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NetworkAlertsTopic
+      Endpoint: !Ref NotificationEmail
+      
+  # CloudWatch Alarm - High Error Rate
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'VPCLattice-HighErrorRate-${Environment}-${AWS::StackName}'
+      AlarmDescription: 'Alarm for high VPC Lattice 5XX error rate indicating service issues'
+      MetricName: HTTPCode_Target_5XX_Count
+      Namespace: AWS/VpcLattice
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref AlarmThreshold5XX
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NetworkAlertsTopic
+      OKActions:
+        - !Ref NetworkAlertsTopic
+      Dimensions:
+        - Name: ServiceNetwork
+          Value: !Ref ServiceNetwork
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+          
+  # CloudWatch Alarm - High Latency
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'VPCLattice-HighLatency-${Environment}-${AWS::StackName}'
+      AlarmDescription: 'Alarm for high VPC Lattice response time indicating performance degradation'
+      MetricName: TargetResponseTime
+      Namespace: AWS/VpcLattice
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref AlarmThresholdLatency
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NetworkAlertsTopic
+      OKActions:
+        - !Ref NetworkAlertsTopic
+      Dimensions:
+        - Name: ServiceNetwork
+          Value: !Ref ServiceNetwork
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+          
+  # CloudWatch Alarm - Instance Health
+  InstanceCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub 'Instance-HighCPU-${Environment}-${AWS::StackName}'
+      AlarmDescription: 'Alarm for high CPU utilization on test instance'
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NetworkAlertsTopic
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TestInstance
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+          
+  # Enhanced CloudWatch Dashboard
+  NetworkMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'VPCLatticeNetworkTroubleshooting-${Environment}-${AWS::StackName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VpcLattice", "RequestCount", "ServiceNetwork", "${ServiceNetwork}" ],
+                  [ ".", "TargetResponseTime", ".", "." ],
+                  [ ".", "ActiveConnectionCount", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Performance Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VpcLattice", "HTTPCode_Target_2XX_Count", "ServiceNetwork", "${ServiceNetwork}" ],
+                  [ ".", "HTTPCode_Target_4XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_Target_5XX_Count", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Response Codes",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "NetworkTroubleshooting/${Environment}", "cpu_usage_idle", "InstanceId", "${TestInstance}" ],
+                  [ ".", "mem_used_percent", ".", "." ],
+                  [ "AWS/EC2", "CPUUtilization", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Test Instance Performance"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "NetworkTroubleshooting/${Environment}", "net_bytes_sent", "InstanceId", "${TestInstance}" ],
+                  [ ".", "net_bytes_recv", ".", "." ],
+                  [ ".", "tcp_established", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Network Activity"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/vpclattice/servicenetwork/${ServiceNetwork}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Access Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # ============================================================================
+  # SYSTEMS MANAGER AUTOMATION
+  # ============================================================================
+  
+  # Enhanced Systems Manager Automation Document for Network Analysis
+  NetworkReachabilityAnalysisDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: JSON
+      Name: !Sub 'NetworkReachabilityAnalysis-${Environment}-${AWS::StackName}'
+      Content:
+        schemaVersion: '0.3'
+        description: 'Comprehensive VPC Reachability Analysis for Network Troubleshooting with enhanced diagnostics'
+        assumeRole: !GetAtt AutomationRole.Arn
+        parameters:
+          SourceId:
+            type: String
+            description: 'Source instance ID or ENI ID for connectivity analysis'
+          DestinationId:
+            type: String
+            description: 'Destination instance ID or ENI ID for connectivity analysis'
+          AutomationAssumeRole:
+            type: String
+            description: 'IAM role for automation execution'
+            default: !GetAtt AutomationRole.Arn
+          Protocol:
+            type: String
+            description: 'Protocol for analysis (tcp, udp)'
+            default: 'tcp'
+            allowedValues: ['tcp', 'udp']
+          DestinationPort:
+            type: String
+            description: 'Destination port for analysis'
+            default: '80'
+        mainSteps:
+          - name: ValidateInputs
+            action: 'aws:executeAwsApi'
+            description: 'Validate source and destination resources exist'
+            inputs:
+              Service: ec2
+              Api: DescribeInstances
+              InstanceIds:
+                - '{{ SourceId }}'
+            outputs:
+              - Name: SourceInstanceInfo
+                Selector: '$.Reservations[0].Instances[0]'
+                Type: StringMap
+          - name: CreateNetworkInsightsPath
+            action: 'aws:executeAwsApi'
+            description: 'Create a network insights path for reachability analysis'
+            inputs:
+              Service: ec2
+              Api: CreateNetworkInsightsPath
+              Source: '{{ SourceId }}'
+              Destination: '{{ DestinationId }}'
+              Protocol: '{{ Protocol }}'
+              DestinationPort: !ToNumber '{{ DestinationPort }}'
+              TagSpecifications:
+                - ResourceType: network-insights-path
+                  Tags:
+                    - Key: Name
+                      Value: !Sub 'AutomatedTroubleshooting-${Environment}'
+                    - Key: Environment
+                      Value: !Ref Environment
+                    - Key: ManagedBy
+                      Value: SystemsManager
+                    - Key: AutomationExecution
+                      Value: '{{ automation:EXECUTION_ID }}'
+            outputs:
+              - Name: NetworkInsightsPathId
+                Selector: '$.NetworkInsightsPath.NetworkInsightsPathId'
+                Type: String
+          - name: StartNetworkInsightsAnalysis
+            action: 'aws:executeAwsApi'
+            description: 'Start the network insights analysis with comprehensive tagging'
+            inputs:
+              Service: ec2
+              Api: StartNetworkInsightsAnalysis
+              NetworkInsightsPathId: '{{ CreateNetworkInsightsPath.NetworkInsightsPathId }}'
+              TagSpecifications:
+                - ResourceType: network-insights-analysis
+                  Tags:
+                    - Key: Name
+                      Value: !Sub 'AutomatedAnalysis-${Environment}'
+                    - Key: Environment
+                      Value: !Ref Environment
+                    - Key: ManagedBy
+                      Value: SystemsManager
+                    - Key: AutomationExecution
+                      Value: '{{ automation:EXECUTION_ID }}'
+                    - Key: SourceResource
+                      Value: '{{ SourceId }}'
+                    - Key: DestinationResource
+                      Value: '{{ DestinationId }}'
+            outputs:
+              - Name: NetworkInsightsAnalysisId
+                Selector: '$.NetworkInsightsAnalysis.NetworkInsightsAnalysisId'
+                Type: String
+          - name: WaitForAnalysisCompletion
+            action: 'aws:waitForAwsResourceProperty'
+            description: 'Wait for the analysis to complete with timeout protection'
+            timeoutSeconds: 600
+            inputs:
+              Service: ec2
+              Api: DescribeNetworkInsightsAnalyses
+              NetworkInsightsAnalysisIds:
+                - '{{ StartNetworkInsightsAnalysis.NetworkInsightsAnalysisId }}'
+              PropertySelector: '$.NetworkInsightsAnalyses[0].Status'
+              DesiredValues:
+                - succeeded
+                - failed
+          - name: GetAnalysisResults
+            action: 'aws:executeAwsApi'
+            description: 'Retrieve detailed analysis results'
+            inputs:
+              Service: ec2
+              Api: DescribeNetworkInsightsAnalyses
+              NetworkInsightsAnalysisIds:
+                - '{{ StartNetworkInsightsAnalysis.NetworkInsightsAnalysisId }}'
+            outputs:
+              - Name: AnalysisResults
+                Selector: '$.NetworkInsightsAnalyses[0]'
+                Type: StringMap
+              - Name: NetworkPathFound
+                Selector: '$.NetworkInsightsAnalyses[0].NetworkPathFound'
+                Type: String
+              - Name: Status
+                Selector: '$.NetworkInsightsAnalyses[0].Status'
+                Type: String
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # LAMBDA FUNCTION
+  # ============================================================================
+  
+  # Enhanced Lambda Function for Network Troubleshooting
+  NetworkTroubleshootingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'network-troubleshooting-${Environment}-${AWS::StackName}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          AUTOMATION_ROLE_ARN: !GetAtt AutomationRole.Arn
+          DEFAULT_INSTANCE_ID: !Ref TestInstance
+          AUTOMATION_DOCUMENT_NAME: !Ref NetworkReachabilityAnalysisDocument
+          ENVIRONMENT: !Ref Environment
+          SNS_TOPIC_ARN: !Ref NetworkAlertsTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          import traceback
+          from datetime import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          ssm_client = boto3.client('ssm')
+          sns_client = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              """
+              Enhanced Lambda function to automatically trigger network troubleshooting
+              when CloudWatch alarms are triggered via SNS
+              """
+              
+              try:
+                  logger.info(f"Received event: {json.dumps(event, default=str)}")
+                  
+                  # Parse SNS message
+                  if 'Records' in event:
+                      for record in event['Records']:
+                          if record['EventSource'] == 'aws:sns':
+                              message = json.loads(record['Sns']['Message'])
+                              alarm_name = message.get('AlarmName', '')
+                              alarm_state = message.get('NewStateValue', '')
+                              alarm_reason = message.get('NewStateReason', '')
+                              
+                              logger.info(f"Processing alarm: {alarm_name}, State: {alarm_state}")
+                              
+                              # Only trigger automation for ALARM state
+                              if alarm_state != 'ALARM':
+                                  logger.info(f"Alarm state is {alarm_state}, skipping automation")
+                                  continue
+                              
+                              # Get environment variables with validation
+                              automation_role = os.environ.get('AUTOMATION_ROLE_ARN', '')
+                              default_instance = os.environ.get('DEFAULT_INSTANCE_ID', '')
+                              document_name = os.environ.get('AUTOMATION_DOCUMENT_NAME', '')
+                              environment = os.environ.get('ENVIRONMENT', 'dev')
+                              sns_topic = os.environ.get('SNS_TOPIC_ARN', '')
+                              
+                              if not all([automation_role, default_instance, document_name]):
+                                  error_msg = "Missing required environment variables"
+                                  logger.error(error_msg)
+                                  send_notification(sns_topic, f"Network Troubleshooting Error: {error_msg}")
+                                  return {
+                                      'statusCode': 400,
+                                      'body': json.dumps({'error': error_msg})
+                                  }
+                              
+                              # Trigger automated troubleshooting
+                              try:
+                                  response = ssm_client.start_automation_execution(
+                                      DocumentName=document_name,
+                                      Parameters={
+                                          'SourceId': [default_instance],
+                                          'DestinationId': [default_instance],
+                                          'AutomationAssumeRole': [automation_role],
+                                          'Protocol': ['tcp'],
+                                          'DestinationPort': ['80']
+                                      },
+                                      Tags=[
+                                          {
+                                              'Key': 'Environment',
+                                              'Value': environment
+                                          },
+                                          {
+                                              'Key': 'TriggerAlarm',
+                                              'Value': alarm_name
+                                          },
+                                          {
+                                              'Key': 'TriggerTime',
+                                              'Value': datetime.utcnow().isoformat()
+                                          }
+                                      ]
+                                  )
+                                  
+                                  execution_id = response['AutomationExecutionId']
+                                  logger.info(f"Started automation execution: {execution_id}")
+                                  
+                                  # Send success notification
+                                  success_message = f"""
+                                  Network Troubleshooting Automation Started
+                                  
+                                  Alarm: {alarm_name}
+                                  State: {alarm_state}
+                                  Reason: {alarm_reason}
+                                  
+                                  Automation Execution ID: {execution_id}
+                                  Environment: {environment}
+                                  
+                                  Monitor progress in Systems Manager Console.
+                                  """
+                                  
+                                  send_notification(sns_topic, success_message.strip())
+                                  
+                                  return {
+                                      'statusCode': 200,
+                                      'body': json.dumps({
+                                          'message': 'Network troubleshooting automation started',
+                                          'execution_id': execution_id,
+                                          'alarm_name': alarm_name,
+                                          'alarm_state': alarm_state
+                                      })
+                                  }
+                                  
+                              except Exception as automation_error:
+                                  error_msg = f"Failed to start automation: {str(automation_error)}"
+                                  logger.error(error_msg)
+                                  logger.error(traceback.format_exc())
+                                  
+                                  send_notification(sns_topic, f"Network Troubleshooting Automation Failed: {error_msg}")
+                                  
+                                  return {
+                                      'statusCode': 500,
+                                      'body': json.dumps({'error': error_msg})
+                                  }
+                      
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'No actionable SNS records to process'})
+                  }
+                      
+              except Exception as e:
+                  error_msg = f"Unexpected error processing event: {str(e)}"
+                  logger.error(error_msg)
+                  logger.error(traceback.format_exc())
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': error_msg})
+                  }
+          
+          def send_notification(topic_arn, message):
+              """Send notification to SNS topic"""
+              if not topic_arn:
+                  logger.warning("No SNS topic ARN provided for notifications")
+                  return
+                  
+              try:
+                  sns_client.publish(
+                      TopicArn=topic_arn,
+                      Message=message,
+                      Subject='Network Troubleshooting Alert'
+                  )
+                  logger.info("Notification sent successfully")
+              except Exception as e:
+                  logger.error(f"Failed to send notification: {str(e)}")
+      DeadLetterQueue:
+        TargetArn: !GetAtt NetworkTroubleshootingDLQ.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+          
+  # Dead Letter Queue for Lambda
+  NetworkTroubleshootingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'network-troubleshooting-dlq-${Environment}-${AWS::StackName}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: NetworkTroubleshooting
+        - Key: ManagedBy
+          Value: CloudFormation
+          
+  # Lambda Permission for SNS Invocation
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NetworkTroubleshootingFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref NetworkAlertsTopic
+      
+  # SNS Subscription for Lambda
+  LambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref NetworkAlertsTopic
+      Endpoint: !GetAtt NetworkTroubleshootingFunction.Arn
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+
+Outputs:
+  ServiceNetworkId:
+    Description: 'VPC Lattice Service Network ID'
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkId'
+      
+  ServiceNetworkArn:
+    Description: 'VPC Lattice Service Network ARN'
+    Value: !GetAtt ServiceNetwork.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkArn'
+      
+  ServiceNetworkDNS:
+    Description: 'VPC Lattice Service Network DNS name'
+    Value: !GetAtt ServiceNetwork.DnsName
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkDNS'
+      
+  TestInstanceId:
+    Description: 'Test EC2 Instance ID for network analysis'
+    Value: !Ref TestInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-TestInstanceId'
+      
+  TestInstancePrivateIP:
+    Description: 'Test EC2 Instance private IP address'
+    Value: !GetAtt TestInstance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-TestInstancePrivateIP'
+      
+  TestSecurityGroupId:
+    Description: 'Security Group ID for test instances'
+    Value: !Ref TestSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-TestSecurityGroupId'
+      
+  AutomationRoleArn:
+    Description: 'IAM Role ARN for Systems Manager Automation'
+    Value: !GetAtt AutomationRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AutomationRoleArn'
+      
+  LambdaFunctionArn:
+    Description: 'Lambda Function ARN for automated troubleshooting'
+    Value: !GetAtt NetworkTroubleshootingFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+      
+  SNSTopicArn:
+    Description: 'SNS Topic ARN for network alerts'
+    Value: !Ref NetworkAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+      
+  CloudWatchDashboardURL:
+    Description: 'CloudWatch Dashboard URL for network monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${NetworkMonitoringDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+      
+  AutomationDocumentName:
+    Description: 'Systems Manager Automation Document Name'
+    Value: !Ref NetworkReachabilityAnalysisDocument
+    Export:
+      Name: !Sub '${AWS::StackName}-AutomationDocumentName'
+      
+  VpcLatticeLogGroupName:
+    Description: 'CloudWatch Log Group for VPC Lattice access logs'
+    Value: !Ref VpcLatticeLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+      
+  TestInstanceURL:
+    Description: 'HTTP URL for testing the deployed instance'
+    Value: !Sub 'http://${TestInstance.PrivateIp}/'
+    Export:
+      Name: !Sub '${AWS::StackName}-TestInstanceURL'
+      
+  NetworkTestCommand:
+    Description: 'AWS CLI command to manually trigger network analysis'
+    Value: !Sub |
+      aws ssm start-automation-execution \
+        --document-name "${NetworkReachabilityAnalysisDocument}" \
+        --parameters "SourceId=${TestInstance},DestinationId=${TestInstance},AutomationAssumeRole=${AutomationRole.Arn}"
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ServiceNetworkName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetId
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceType
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableDetailedMonitoring
+          - LogRetentionDays
+          - AlarmThreshold5XX
+          - AlarmThresholdLatency
+          - NotificationEmail
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ServiceNetworkName:
+        default: "Service Network Name"
+      VpcId:
+        default: "VPC ID"
+      SubnetId:
+        default: "Subnet ID"
+      InstanceType:
+        default: "EC2 Instance Type"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed Monitoring"
+      LogRetentionDays:
+        default: "Log Retention Days"
+      AlarmThreshold5XX:
+        default: "5XX Error Threshold"
+      AlarmThresholdLatency:
+        default: "Latency Threshold (ms)"
+      NotificationEmail:
+        default: "Notification Email"
+  
+  AWS::CloudFormation::Designer:
+    version: "1.0"

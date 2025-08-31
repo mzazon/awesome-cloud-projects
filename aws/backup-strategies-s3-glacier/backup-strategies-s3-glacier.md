@@ -216,7 +216,7 @@ echo "✅ Environment prepared with unique identifiers"
            },
            "Tierings": [
                {
-                   "Days": 1,
+                   "Days": 90,
                    "AccessTier": "ARCHIVE_ACCESS"
                },
                {
@@ -456,7 +456,7 @@ echo "✅ Environment prepared with unique identifiers"
    # Create Lambda function
    aws lambda create-function \
        --function-name $BACKUP_FUNCTION_NAME \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${BACKUP_ROLE_NAME}" \
        --handler backup-function.lambda_handler \
        --zip-file fileb://backup-function.zip \
@@ -720,11 +720,17 @@ echo "✅ Environment prepared with unique identifiers"
     
     DR_BUCKET_NAME="backup-strategy-dr-${RANDOM_SUFFIX}"
     
-    # Create DR bucket
-    aws s3api create-bucket \
-        --bucket $DR_BUCKET_NAME \
-        --region $DR_REGION \
-        --create-bucket-configuration LocationConstraint=$DR_REGION
+    # Create DR bucket (us-east-1 doesn't need LocationConstraint)
+    if [ "$DR_REGION" = "us-east-1" ]; then
+        aws s3api create-bucket \
+            --bucket $DR_BUCKET_NAME \
+            --region $DR_REGION
+    else
+        aws s3api create-bucket \
+            --bucket $DR_BUCKET_NAME \
+            --region $DR_REGION \
+            --create-bucket-configuration LocationConstraint=$DR_REGION
+    fi
     
     # Create replication role
     cat > replication-trust-policy.json << EOF
@@ -963,11 +969,15 @@ echo "✅ Environment prepared with unique identifiers"
        jq -r '.[] | "--key \(.Key) --version-id \(.VersionId)"' | \
        xargs -I {} aws s3api delete-object --bucket $BACKUP_BUCKET_NAME {}
    
-   # Delete delete markers
-   aws s3api list-object-versions --bucket $BACKUP_BUCKET_NAME \
-       --output json --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' | \
-       jq -r '.[] | "--key \(.Key) --version-id \(.VersionId)"' | \
-       xargs -I {} aws s3api delete-object --bucket $BACKUP_BUCKET_NAME {}
+   # Delete delete markers (check if jq is available)
+   if command -v jq >/dev/null 2>&1; then
+       aws s3api list-object-versions --bucket $BACKUP_BUCKET_NAME \
+           --output json --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' | \
+           jq -r '.[] | "--key \(.Key) --version-id \(.VersionId)"' | \
+           xargs -I {} aws s3api delete-object --bucket $BACKUP_BUCKET_NAME {}
+   else
+       echo "jq not available - delete objects manually from AWS Console"
+   fi
    
    # Delete bucket
    aws s3api delete-bucket --bucket $BACKUP_BUCKET_NAME
@@ -1042,4 +1052,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

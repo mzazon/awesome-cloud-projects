@@ -1,0 +1,263 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: File Upload Notifications with Cloud Storage and Pub/Sub
+# This configuration deploys a complete event-driven file processing system
+# that automatically publishes notifications when files are uploaded to Cloud Storage
+
+# Import Google Cloud provider
+imports:
+- path: https://www.googleapis.com/storage/v1/types.yaml
+  name: storage-v1
+- path: https://www.googleapis.com/pubsub/v1/types.yaml
+  name: pubsub-v1
+
+# Configuration parameters
+parameters:
+  # Project configuration
+  project:
+    type: string
+    description: "Google Cloud Project ID"
+    default: "my-project-id"
+  
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+  
+  # Resource naming parameters
+  resourceSuffix:
+    type: string
+    description: "Unique suffix for resource names (e.g., generated random string)"
+    default: "demo"
+  
+  # Pub/Sub configuration
+  topicName:
+    type: string
+    description: "Name for the Pub/Sub topic"
+    default: "file-upload-notifications"
+  
+  subscriptionName:
+    type: string
+    description: "Name for the Pub/Sub subscription"
+    default: "file-processor"
+  
+  # Cloud Storage configuration
+  bucketName:
+    type: string
+    description: "Name for the Cloud Storage bucket"
+    default: "uploads-bucket"
+  
+  storageClass:
+    type: string
+    description: "Storage class for the bucket"
+    default: "STANDARD"
+    enum:
+    - "STANDARD"
+    - "NEARLINE"
+    - "COLDLINE"
+    - "ARCHIVE"
+  
+  # Notification configuration
+  notificationEventTypes:
+    type: array
+    description: "Event types to trigger notifications"
+    default:
+    - "OBJECT_FINALIZE"
+    - "OBJECT_DELETE"
+  
+  messageRetentionDuration:
+    type: string
+    description: "Message retention duration for the subscription"
+    default: "604800s"  # 7 days
+  
+  ackDeadlineSeconds:
+    type: integer
+    description: "Acknowledgment deadline in seconds"
+    default: 60
+    minimum: 10
+    maximum: 600
+
+# Resource definitions
+resources:
+  # Pub/Sub Topic for file upload notifications
+  # This topic receives messages from Cloud Storage when file events occur
+  file-upload-topic:
+    type: pubsub-v1:projects.topics
+    name: "$(ref.project.projectId)/topics/$(parameter.topicName)-$(parameter.resourceSuffix)"
+    properties:
+      name: "projects/$(parameter.project)/topics/$(parameter.topicName)-$(parameter.resourceSuffix)"
+      labels:
+        purpose: "file-notifications"
+        environment: "demo"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn: []
+
+  # Pub/Sub Subscription for consuming file notification messages
+  # Applications pull messages from this subscription to process file events
+  file-processor-subscription:
+    type: pubsub-v1:projects.subscriptions
+    name: "$(ref.project.projectId)/subscriptions/$(parameter.subscriptionName)-$(parameter.resourceSuffix)"
+    properties:
+      name: "projects/$(parameter.project)/subscriptions/$(parameter.subscriptionName)-$(parameter.resourceSuffix)"
+      topic: "$(ref.file-upload-topic.name)"
+      ackDeadlineSeconds: $(parameter.ackDeadlineSeconds)
+      messageRetentionDuration: $(parameter.messageRetentionDuration)
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      labels:
+        purpose: "file-processing"
+        environment: "demo"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+      - file-upload-topic
+
+  # Cloud Storage Bucket for file uploads
+  # This bucket stores uploaded files and generates events for Pub/Sub notifications
+  uploads-storage-bucket:
+    type: storage-v1:buckets
+    name: "$(parameter.bucketName)-$(parameter.resourceSuffix)"
+    properties:
+      name: "$(parameter.bucketName)-$(parameter.resourceSuffix)"
+      location: $(parameter.region)
+      storageClass: $(parameter.storageClass)
+      # Enable uniform bucket-level access for simplified IAM management
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Configure bucket for optimal performance and security
+      versioning:
+        enabled: false
+      # Set lifecycle rules to manage storage costs (optional)
+      lifecycle:
+        rule:
+        - action:
+            type: "Delete"
+          condition:
+            age: 30
+            matchesStorageClass:
+            - "STANDARD"
+      labels:
+        purpose: "file-uploads"
+        environment: "demo"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn: []
+
+  # Storage Notification Configuration
+  # Links the Cloud Storage bucket to the Pub/Sub topic for automatic event publishing
+  bucket-notification:
+    type: storage-v1:notifications
+    name: "notification-$(parameter.resourceSuffix)"
+    properties:
+      bucket: "$(ref.uploads-storage-bucket.name)"
+      topic: "$(ref.file-upload-topic.name)"
+      # Configure which events trigger notifications
+      event_types: $(parameter.notificationEventTypes)
+      # Use JSON API v1 format for comprehensive object metadata
+      payload_format: "JSON_API_V1"
+      # Optional: Add custom attributes to messages
+      custom_attributes:
+        source: "cloud-storage"
+        environment: "demo"
+    metadata:
+      dependsOn:
+      - uploads-storage-bucket
+      - file-upload-topic
+
+  # IAM Policy Binding for Pub/Sub Publisher Service Account
+  # Grants Cloud Storage permission to publish messages to the Pub/Sub topic
+  pubsub-publisher-binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: "storage-pubsub-publisher-$(parameter.resourceSuffix)"
+    properties:
+      resource: "projects/$(parameter.project)"
+      role: "roles/pubsub.publisher"
+      member: "serviceAccount:service-$(ref.project.projectNumber)@gs-project-accounts.iam.gserviceaccount.com"
+    metadata:
+      dependsOn:
+      - file-upload-topic
+
+  # IAM Policy Binding for Storage Service Agent
+  # Additional permissions for the storage service to interact with Pub/Sub
+  storage-service-agent-binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: "storage-service-agent-$(parameter.resourceSuffix)"
+    properties:
+      resource: "projects/$(parameter.project)"
+      role: "roles/pubsub.serviceAgent"
+      member: "serviceAccount:service-$(ref.project.projectNumber)@gs-project-accounts.iam.gserviceaccount.com"
+    metadata:
+      dependsOn:
+      - file-upload-topic
+
+  # Project reference for accessing project metadata
+  project:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    name: $(parameter.project)
+    properties:
+      projectId: $(parameter.project)
+
+# Output values for verification and integration
+outputs:
+  # Pub/Sub Topic Information
+  topicName:
+    description: "Full name of the created Pub/Sub topic"
+    value: "$(ref.file-upload-topic.name)"
+  
+  topicId:
+    description: "Short name of the Pub/Sub topic"
+    value: "$(parameter.topicName)-$(parameter.resourceSuffix)"
+  
+  # Subscription Information
+  subscriptionName:
+    description: "Full name of the created Pub/Sub subscription"
+    value: "$(ref.file-processor-subscription.name)"
+  
+  subscriptionId:
+    description: "Short name of the Pub/Sub subscription"
+    value: "$(parameter.subscriptionName)-$(parameter.resourceSuffix)"
+  
+  # Cloud Storage Information
+  bucketName:
+    description: "Name of the created Cloud Storage bucket"
+    value: "$(ref.uploads-storage-bucket.name)"
+  
+  bucketUrl:
+    description: "GS URL of the Cloud Storage bucket"
+    value: "gs://$(ref.uploads-storage-bucket.name)"
+  
+  # Notification Configuration
+  notificationId:
+    description: "ID of the storage notification configuration"
+    value: "$(ref.bucket-notification.id)"
+  
+  # Testing Commands
+  testUploadCommand:
+    description: "Command to test file upload notification"
+    value: "echo 'test content' | gcloud storage cp - gs://$(ref.uploads-storage-bucket.name)/test-file.txt"
+  
+  testPullCommand:
+    description: "Command to pull messages from subscription"
+    value: "gcloud pubsub subscriptions pull $(parameter.subscriptionName)-$(parameter.resourceSuffix) --limit=1 --auto-ack"
+  
+  # Cleanup Commands
+  cleanupCommands:
+    description: "Commands to clean up resources manually if needed"
+    value:
+    - "gcloud storage rm --recursive gs://$(ref.uploads-storage-bucket.name)"
+    - "gcloud pubsub subscriptions delete $(parameter.subscriptionName)-$(parameter.resourceSuffix)"
+    - "gcloud pubsub topics delete $(parameter.topicName)-$(parameter.resourceSuffix)"
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "File Upload Notifications with Cloud Storage and Pub/Sub"
+  author: "Google Cloud Infrastructure Manager"
+  tags:
+  - "storage"
+  - "pubsub"
+  - "notifications"
+  - "event-driven"
+  - "file-processing"

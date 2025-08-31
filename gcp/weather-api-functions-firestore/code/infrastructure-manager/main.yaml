@@ -1,0 +1,305 @@
+# Google Cloud Infrastructure Manager Configuration
+# Weather API with Cloud Functions and Firestore
+# 
+# This configuration deploys a serverless weather API using:
+# - Cloud Functions Gen2 for HTTP request handling
+# - Firestore in Native mode for weather data caching
+# - Required APIs and IAM permissions
+#
+# Prerequisites:
+# - Set WEATHER_API_KEY environment variable with your OpenWeatherMap API key
+# - Ensure billing is enabled on the target project
+
+# Import the Terraform Google Cloud provider
+terraform:
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+
+# Variables for customization
+variables:
+  project_id:
+    description: "The GCP project ID where resources will be created"
+    type: string
+    
+  region:
+    description: "The GCP region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  function_name:
+    description: "Name of the Cloud Function"
+    type: string
+    default: "weather-api"
+    
+  weather_api_key:
+    description: "OpenWeatherMap API key for fetching weather data"
+    type: string
+    sensitive: true
+
+# Configure the Google Cloud provider
+provider:
+  google:
+    project: ${var.project_id}
+    region: ${var.region}
+
+# Enable required Google Cloud APIs
+resources:
+  # Enable Cloud Functions API
+  google_project_service.cloudfunctions:
+    project: ${var.project_id}
+    service: "cloudfunctions.googleapis.com"
+    disable_dependent_services: true
+    disable_on_destroy: false
+
+  # Enable Firestore API
+  google_project_service.firestore:
+    project: ${var.project_id}
+    service: "firestore.googleapis.com"
+    disable_dependent_services: true
+    disable_on_destroy: false
+
+  # Enable Cloud Build API (required for Cloud Functions deployment)
+  google_project_service.cloudbuild:
+    project: ${var.project_id}
+    service: "cloudbuild.googleapis.com"
+    disable_dependent_services: true
+    disable_on_destroy: false
+
+  # Enable Artifact Registry API (required for Cloud Functions Gen2)
+  google_project_service.artifactregistry:
+    project: ${var.project_id}
+    service: "artifactregistry.googleapis.com"
+    disable_dependent_services: true
+    disable_on_destroy: false
+
+  # Enable Cloud Run API (required for Cloud Functions Gen2)
+  google_project_service.run:
+    project: ${var.project_id}
+    service: "run.googleapis.com"
+    disable_dependent_services: true
+    disable_on_destroy: false
+
+  # Create Firestore database in Native mode
+  google_firestore_database.weather_cache:
+    project: ${var.project_id}
+    name: "(default)"
+    location_id: ${var.region}
+    type: "FIRESTORE_NATIVE"
+    # Ensure APIs are enabled before creating database
+    depends_on:
+      - google_project_service.firestore
+
+  # Create a Cloud Storage bucket for function source code
+  google_storage_bucket.function_source:
+    name: "${var.project_id}-weather-function-source"
+    location: ${var.region}
+    project: ${var.project_id}
+    # Enable uniform bucket-level access for security
+    uniform_bucket_level_access: true
+    # Set lifecycle to clean up old function versions
+    lifecycle_rule:
+      - condition:
+          age: 7
+        action:
+          type: "Delete"
+    depends_on:
+      - google_project_service.cloudfunctions
+
+  # Create function source code as a local file
+  local_file.function_source:
+    filename: "/tmp/weather-function-source.zip"
+    content_base64: ${base64encode(data.archive_file.function_source.output_base64)}
+
+  # Archive the function source code
+  data.archive_file.function_source:
+    type: "zip"
+    output_path: "/tmp/weather-function-source.zip"
+    source:
+      - filename: "main.py"
+        content: |
+          import os
+          import json
+          import requests
+          from datetime import datetime, timedelta
+          from google.cloud import firestore
+          import functions_framework
+          
+          # Initialize Firestore client
+          db = firestore.Client()
+          
+          @functions_framework.http
+          def weather_api(request):
+              """HTTP Cloud Function to fetch and cache weather data."""
+              
+              # Handle CORS for web applications
+              if request.method == 'OPTIONS':
+                  headers = {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Max-Age': '3600'
+                  }
+                  return ('', 204, headers)
+              
+              # Set CORS headers for the main request
+              headers = {'Access-Control-Allow-Origin': '*'}
+              
+              try:
+                  city = request.args.get('city', 'London')
+                  weather_api_key = os.environ.get('WEATHER_API_KEY')
+                  
+                  if not weather_api_key:
+                      return json.dumps({'error': 'Weather API key not configured'}), 500, headers
+                  
+                  # Check cache first (data valid for 10 minutes)
+                  doc_ref = db.collection('weather_cache').document(city.lower())
+                  doc = doc_ref.get()
+                  
+                  if doc.exists:
+                      data = doc.to_dict()
+                      cache_time = data.get('timestamp')
+                      
+                      # Use cached data if less than 10 minutes old
+                      if cache_time and datetime.now() - cache_time < timedelta(minutes=10):
+                          return json.dumps(data['weather_data']), 200, headers
+                  
+                  # Fetch fresh data from OpenWeatherMap API
+                  weather_url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={weather_api_key}&units=metric"
+                  response = requests.get(weather_url, timeout=10)
+                  
+                  if response.status_code != 200:
+                      return json.dumps({'error': 'Failed to fetch weather data'}), 500, headers
+                  
+                  weather_data = response.json()
+                  
+                  # Cache the data in Firestore
+                  cache_data = {
+                      'weather_data': weather_data,
+                      'timestamp': datetime.now(),
+                      'city': city.lower()
+                  }
+                  doc_ref.set(cache_data)
+                  
+                  return json.dumps(weather_data), 200, headers
+                  
+              except Exception as e:
+                  return json.dumps({'error': str(e)}), 500, headers
+      - filename: "requirements.txt"
+        content: |
+          functions-framework==3.*
+          google-cloud-firestore==2.*
+          requests==2.*
+
+  # Upload function source to Cloud Storage
+  google_storage_bucket_object.function_source:
+    name: "weather-function-source.zip"
+    bucket: google_storage_bucket.function_source.name
+    source: data.archive_file.function_source.output_path
+    depends_on:
+      - google_storage_bucket.function_source
+      - data.archive_file.function_source
+
+  # Create the Cloud Function (Gen2)
+  google_cloudfunctions2_function.weather_api:
+    name: ${var.function_name}
+    location: ${var.region}
+    project: ${var.project_id}
+    description: "Serverless weather API with Firestore caching"
+    
+    # Build configuration
+    build_config:
+      runtime: "python311"
+      entry_point: "weather_api"
+      source:
+        storage_source:
+          bucket: google_storage_bucket.function_source.name
+          object: google_storage_bucket_object.function_source.name
+    
+    # Service configuration
+    service_config:
+      max_instance_count: 10
+      min_instance_count: 0
+      available_memory: "256Mi"
+      timeout_seconds: 60
+      max_instance_request_concurrency: 1000
+      available_cpu: "1"
+      # Environment variables for the function
+      environment_variables:
+        WEATHER_API_KEY: ${var.weather_api_key}
+      # Service account for Firestore access
+      service_account_email: google_service_account.function_sa.email
+    
+    depends_on:
+      - google_project_service.cloudfunctions
+      - google_project_service.run
+      - google_storage_bucket_object.function_source
+      - google_firestore_database.weather_cache
+
+  # Create a service account for the Cloud Function
+  google_service_account.function_sa:
+    account_id: "weather-function-sa"
+    display_name: "Weather Function Service Account"
+    description: "Service account for weather API Cloud Function"
+    project: ${var.project_id}
+
+  # Grant Firestore access to the function service account
+  google_project_iam_member.function_firestore_user:
+    project: ${var.project_id}
+    role: "roles/datastore.user"
+    member: "serviceAccount:${google_service_account.function_sa.email}"
+
+  # Allow public access to the Cloud Function
+  google_cloudfunctions2_function_iam_member.invoker:
+    project: ${var.project_id}
+    location: ${var.region}  
+    cloud_function: google_cloudfunctions2_function.weather_api.name
+    role: "roles/cloudfunctions.invoker"
+    member: "allUsers"
+
+# Outputs for verification and integration
+outputs:
+  function_url:
+    description: "The HTTP trigger URL for the weather API function"
+    value: google_cloudfunctions2_function.weather_api.service_config[0].uri
+    
+  function_name:
+    description: "The deployed Cloud Function name"
+    value: google_cloudfunctions2_function.weather_api.name
+    
+  firestore_database:
+    description: "The Firestore database name"
+    value: google_firestore_database.weather_cache.name
+    
+  project_id:
+    description: "The GCP project ID where resources were deployed"
+    value: ${var.project_id}
+    
+  region:
+    description: "The GCP region where resources were deployed"
+    value: ${var.region}
+    
+  service_account_email:
+    description: "The service account email used by the Cloud Function"
+    value: google_service_account.function_sa.email
+
+# Usage Instructions:
+#
+# 1. Set your variables in a terraform.tfvars file:
+#    project_id = "your-gcp-project-id"
+#    region = "us-central1"
+#    weather_api_key = "your-openweathermap-api-key"
+#
+# 2. Deploy using gcloud Infrastructure Manager:
+#    gcloud infra-manager deployments create weather-api-deployment \
+#        --location=us-central1 \
+#        --file=main.yaml \
+#        --input-values=project_id=your-project-id,weather_api_key=your-api-key
+#
+# 3. Test the API:
+#    curl "$(gcloud infra-manager deployments describe weather-api-deployment \
+#        --location=us-central1 --format='value(outputs.function_url.value)')?city=London"
+#
+# 4. Clean up:
+#    gcloud infra-manager deployments delete weather-api-deployment --location=us-central1

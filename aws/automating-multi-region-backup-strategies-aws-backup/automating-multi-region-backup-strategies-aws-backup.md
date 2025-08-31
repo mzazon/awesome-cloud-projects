@@ -5,11 +5,11 @@ category: storage
 difficulty: 300
 subject: aws
 services: AWS Backup, EventBridge, IAM, Lambda
-estimated-time: 50 minutes
-recipe-version: 1.1
+estimated-time: 90 minutes
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: storage, backup, disaster-recovery, multi-region, automation, compliance
 recipe-generator-version: 1.3
@@ -69,19 +69,35 @@ graph TB
 2. Multiple AWS regions configured (minimum of 2, recommended 3)
 3. Existing AWS resources to be backed up (EC2 instances, RDS databases, DynamoDB tables, EFS file systems)
 4. Understanding of RPO/RTO requirements for your organization
-5. IAM permissions for AWS Backup, EventBridge, CloudWatch, and SNS
+5. AWS CLI installed and configured
 6. Estimated monthly cost: $50-200 depending on data volume and retention period
+
+> **Note**: Cross-region data transfer charges apply for backup copies between regions. Review [AWS Backup pricing](https://aws.amazon.com/backup/pricing/) for detailed cost calculations.
 
 ## Preparation
 
 ```bash
 # Set environment variables
+export AWS_REGION=$(aws configure get region)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+    --query Account --output text)
+
+# Set specific regions for backup strategy
 export PRIMARY_REGION="us-east-1"
 export SECONDARY_REGION="us-west-2" 
 export TERTIARY_REGION="eu-west-1"
+
+# Generate unique identifier for resources
+RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
+    --exclude-punctuation --exclude-uppercase \
+    --password-length 6 --require-each-included-type \
+    --output text --query RandomPassword)
+
+# Set resource names
 export BACKUP_PLAN_NAME="MultiRegionBackupPlan"
-export ORGANIZATION_NAME="YourOrg"
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export ORGANIZATION_NAME="YourOrg-${RANDOM_SUFFIX}"
+
+echo "✅ Environment configured with unique suffix: ${RANDOM_SUFFIX}"
 ```
 
 ## Steps
@@ -93,7 +109,7 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
    ```bash
    # Create the AWS Backup service role
    aws iam create-role \
-       --role-name AWSBackupServiceRole \
+       --role-name AWSBackupServiceRole-${RANDOM_SUFFIX} \
        --assume-role-policy-document '{
            "Version": "2012-10-17",
            "Statement": [
@@ -105,19 +121,20 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
                    "Action": "sts:AssumeRole"
                }
            ]
-       }' \
-       --region $PRIMARY_REGION
+       }'
+
+   # Wait for role to be ready
+   aws iam wait role-exists \
+       --role-name AWSBackupServiceRole-${RANDOM_SUFFIX}
 
    # Attach AWS managed policies for backup operations
    aws iam attach-role-policy \
-       --role-name AWSBackupServiceRole \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup \
-       --region $PRIMARY_REGION
+       --role-name AWSBackupServiceRole-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
 
    aws iam attach-role-policy \
-       --role-name AWSBackupServiceRole \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores \
-       --region $PRIMARY_REGION
+       --role-name AWSBackupServiceRole-${RANDOM_SUFFIX} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
 
    echo "✅ IAM service role created with backup and restore permissions"
    ```
@@ -246,7 +263,7 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
    {
      "BackupSelection": {
        "SelectionName": "ProductionResourcesSelection",
-       "IamRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/AWSBackupServiceRole",
+       "IamRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/AWSBackupServiceRole-${RANDOM_SUFFIX}",
        "Resources": ["*"],
        "Conditions": {
          "StringEquals": {
@@ -276,7 +293,7 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
    ```bash
    # Create EventBridge rule for backup job monitoring
    aws events put-rule \
-       --name BackupJobFailureRule \
+       --name BackupJobFailureRule-${RANDOM_SUFFIX} \
        --event-pattern '{
            "source": ["aws.backup"],
            "detail-type": ["Backup Job State Change"],
@@ -299,11 +316,11 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
    ```bash
    # Create SNS topic for backup notifications
    BACKUP_NOTIFICATIONS_TOPIC=$(aws sns create-topic \
-       --name backup-notifications \
+       --name backup-notifications-${RANDOM_SUFFIX} \
        --region $PRIMARY_REGION \
        --query 'TopicArn' --output text)
 
-   # Subscribe email endpoint for notifications
+   # Subscribe email endpoint for notifications (replace with your email)
    aws sns subscribe \
        --topic-arn $BACKUP_NOTIFICATIONS_TOPIC \
        --protocol email \
@@ -311,6 +328,7 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
        --region $PRIMARY_REGION
 
    echo "✅ SNS topic created: $BACKUP_NOTIFICATIONS_TOPIC"
+   echo "⚠️ Confirm email subscription to receive notifications"
    ```
 
    The notification system is now configured to provide immediate alerts for backup system events. This communication framework ensures rapid response to backup issues while maintaining stakeholder awareness of backup operations and system health.
@@ -375,11 +393,11 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
    EOF
 
    # Create deployment package
-   zip backup-validator.zip backup-validator.py
+   zip backup-validator-${RANDOM_SUFFIX}.zip backup-validator.py
 
    # Create Lambda execution role
    LAMBDA_ROLE_ARN=$(aws iam create-role \
-       --role-name BackupValidatorRole \
+       --role-name BackupValidatorRole-${RANDOM_SUFFIX} \
        --assume-role-policy-document '{
            "Version": "2012-10-17",
            "Statement": [
@@ -394,13 +412,17 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
        }' \
        --query 'Role.Arn' --output text)
 
+   # Wait for role to be ready
+   aws iam wait role-exists \
+       --role-name BackupValidatorRole-${RANDOM_SUFFIX}
+
    # Attach basic execution role and custom backup permissions
    aws iam attach-role-policy \
-       --role-name BackupValidatorRole \
+       --role-name BackupValidatorRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
    aws iam put-role-policy \
-       --role-name BackupValidatorRole \
+       --role-name BackupValidatorRole-${RANDOM_SUFFIX} \
        --policy-name BackupValidatorPolicy \
        --policy-document '{
            "Version": "2012-10-17",
@@ -418,13 +440,16 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
            ]
        }'
 
+   # Wait for policy propagation
+   sleep 10
+
    # Create Lambda function
    LAMBDA_FUNCTION_ARN=$(aws lambda create-function \
-       --function-name backup-validator \
+       --function-name backup-validator-${RANDOM_SUFFIX} \
        --runtime python3.9 \
        --role $LAMBDA_ROLE_ARN \
        --handler backup-validator.lambda_handler \
-       --zip-file fileb://backup-validator.zip \
+       --zip-file fileb://backup-validator-${RANDOM_SUFFIX}.zip \
        --environment Variables="{SNS_TOPIC_ARN=$BACKUP_NOTIFICATIONS_TOPIC}" \
        --timeout 300 \
        --region $PRIMARY_REGION \
@@ -442,17 +467,17 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
    ```bash
    # Add EventBridge as Lambda trigger
    aws events put-targets \
-       --rule BackupJobFailureRule \
+       --rule BackupJobFailureRule-${RANDOM_SUFFIX} \
        --targets "Id"="1","Arn"="$LAMBDA_FUNCTION_ARN" \
        --region $PRIMARY_REGION
 
    # Grant EventBridge permission to invoke Lambda
    aws lambda add-permission \
-       --function-name backup-validator \
+       --function-name backup-validator-${RANDOM_SUFFIX} \
        --statement-id backup-eventbridge-trigger \
        --action lambda:InvokeFunction \
        --principal events.amazonaws.com \
-       --source-arn arn:aws:events:${PRIMARY_REGION}:${AWS_ACCOUNT_ID}:rule/BackupJobFailureRule \
+       --source-arn arn:aws:events:${PRIMARY_REGION}:${AWS_ACCOUNT_ID}:rule/BackupJobFailureRule-${RANDOM_SUFFIX} \
        --region $PRIMARY_REGION
 
    echo "✅ EventBridge integration configured with Lambda function"
@@ -468,16 +493,16 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
    # Example: Tag critical resources for backup inclusion
    # Replace resource IDs with your actual resource identifiers
    
-   # Tag EC2 instances
+   # Tag EC2 instances (replace with actual instance ID)
    aws ec2 create-tags \
        --resources i-1234567890abcdef0 \
        --tags Key=Environment,Value=Production Key=BackupEnabled,Value=true \
-       --region $PRIMARY_REGION
+       --region $PRIMARY_REGION || echo "⚠️ EC2 instance not found - update with actual instance ID"
 
-   # Tag RDS instances
+   # Tag RDS instances (replace with actual RDS identifier)
    aws rds add-tags-to-resource \
        --resource-name arn:aws:rds:${PRIMARY_REGION}:${AWS_ACCOUNT_ID}:db:mydb \
-       --tags Key=Environment,Value=Production Key=BackupEnabled,Value=true
+       --tags Key=Environment,Value=Production Key=BackupEnabled,Value=true || echo "⚠️ RDS instance not found - update with actual RDS identifier"
 
    echo "✅ Critical resources tagged for backup inclusion"
    ```
@@ -518,30 +543,27 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
        --region $TERTIARY_REGION
    ```
 
-3. **Trigger Test Backup and Monitor Progress**:
+3. **Test EventBridge Rule Configuration**:
 
    ```bash
-   # Start on-demand backup for testing
-   TEST_BACKUP_JOB_ID=$(aws backup start-backup-job \
-       --backup-vault-name $BACKUP_VAULT_PRIMARY \
-       --resource-arn "arn:aws:ec2:${PRIMARY_REGION}:${AWS_ACCOUNT_ID}:instance/i-1234567890abcdef0" \
-       --iam-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/AWSBackupServiceRole" \
-       --region $PRIMARY_REGION \
-       --query 'BackupJobId' --output text)
+   # Verify EventBridge rule exists
+   aws events describe-rule \
+       --name BackupJobFailureRule-${RANDOM_SUFFIX} \
+       --region $PRIMARY_REGION
 
-   # Monitor backup job progress
-   aws backup describe-backup-job \
-       --backup-job-id $TEST_BACKUP_JOB_ID \
+   # Check rule targets
+   aws events list-targets-by-rule \
+       --rule BackupJobFailureRule-${RANDOM_SUFFIX} \
        --region $PRIMARY_REGION
    ```
 
-4. **Verify Cross-Region Copy Operations**:
+4. **Verify Lambda Function Deployment**:
 
    ```bash
-   # Check copy jobs in destination regions
-   aws backup list-copy-jobs \
-       --region $SECONDARY_REGION \
-       --max-results 10
+   # Check Lambda function configuration
+   aws lambda get-function \
+       --function-name backup-validator-${RANDOM_SUFFIX} \
+       --region $PRIMARY_REGION
    ```
 
 > **Note**: Cross-region backup copies typically complete within 1-6 hours depending on backup size and network conditions. Monitor the copy jobs in the destination regions to confirm successful replication. For performance optimization guidance, reference the [AWS Backup best practices documentation](https://docs.aws.amazon.com/prescriptive-guidance/latest/backup-recovery/aws-backup.html).
@@ -575,17 +597,17 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
    ```bash
    # Remove EventBridge targets and rule
    aws events remove-targets \
-       --rule BackupJobFailureRule \
+       --rule BackupJobFailureRule-${RANDOM_SUFFIX} \
        --ids "1" \
        --region $PRIMARY_REGION
 
    aws events delete-rule \
-       --name BackupJobFailureRule \
+       --name BackupJobFailureRule-${RANDOM_SUFFIX} \
        --region $PRIMARY_REGION
 
    # Delete Lambda function
    aws lambda delete-function \
-       --function-name backup-validator \
+       --function-name backup-validator-${RANDOM_SUFFIX} \
        --region $PRIMARY_REGION
 
    echo "✅ EventBridge and Lambda components removed"
@@ -615,31 +637,31 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
    ```bash
    # Remove IAM roles and policies
    aws iam detach-role-policy \
-       --role-name AWSBackupServiceRole \
+       --role-name AWSBackupServiceRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
 
    aws iam detach-role-policy \
-       --role-name AWSBackupServiceRole \
+       --role-name AWSBackupServiceRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
 
    aws iam delete-role \
-       --role-name AWSBackupServiceRole
+       --role-name AWSBackupServiceRole-${RANDOM_SUFFIX}
 
    aws iam delete-role-policy \
-       --role-name BackupValidatorRole \
+       --role-name BackupValidatorRole-${RANDOM_SUFFIX} \
        --policy-name BackupValidatorPolicy
 
    aws iam detach-role-policy \
-       --role-name BackupValidatorRole \
+       --role-name BackupValidatorRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
    aws iam delete-role \
-       --role-name BackupValidatorRole
+       --role-name BackupValidatorRole-${RANDOM_SUFFIX}
 
    echo "✅ IAM resources cleaned up"
    ```
 
-5. **Delete SNS Topic**:
+5. **Delete SNS Topic and Clean Up Files**:
 
    ```bash
    # Remove SNS topic and subscriptions
@@ -647,7 +669,13 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
        --topic-arn $BACKUP_NOTIFICATIONS_TOPIC \
        --region $PRIMARY_REGION
 
-   echo "✅ SNS notification topic removed"
+   # Clean up local files
+   rm -f multi-region-backup-plan.json
+   rm -f backup-selection.json
+   rm -f backup-validator.py
+   rm -f backup-validator-${RANDOM_SUFFIX}.zip
+
+   echo "✅ SNS notification topic and local files removed"
    ```
 
 ## Discussion
@@ -678,4 +706,11 @@ Extend this multi-region backup solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

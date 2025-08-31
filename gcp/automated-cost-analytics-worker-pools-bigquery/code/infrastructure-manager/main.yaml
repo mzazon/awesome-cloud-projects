@@ -1,0 +1,624 @@
+# Infrastructure Manager Configuration for Automated Cost Analytics
+# This configuration deploys a complete cost analytics pipeline using Cloud Run worker pools,
+# BigQuery for data analytics, and Pub/Sub for event-driven processing.
+
+# Define input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "GCP Project ID for deploying cost analytics infrastructure"
+    
+  region:
+    type: string
+    description: "GCP region for deploying resources"
+    default: "us-central1"
+    
+  # Resource naming
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource naming"
+    default: "cost123"
+    
+  # BigQuery configuration
+  dataset_location:
+    type: string
+    description: "BigQuery dataset location"
+    default: "US"
+    
+  dataset_description:
+    type: string
+    description: "Description for the BigQuery dataset"
+    default: "Automated cost analytics dataset for billing data processing"
+    
+  # Cloud Run configuration
+  worker_memory:
+    type: string
+    description: "Memory allocation for Cloud Run workers"
+    default: "1Gi"
+    
+  worker_cpu:
+    type: string
+    description: "CPU allocation for Cloud Run workers"
+    default: "1"
+    
+  max_instances:
+    type: integer
+    description: "Maximum number of Cloud Run instances"
+    default: 10
+    
+  # Scheduling configuration
+  schedule_timezone:
+    type: string
+    description: "Timezone for Cloud Scheduler jobs"
+    default: "America/New_York"
+    
+  schedule_cron:
+    type: string
+    description: "Cron expression for daily cost processing"
+    default: "0 1 * * *"
+
+# Define outputs for reference and integration
+outputs:
+  # Dataset information
+  dataset_id:
+    description: "BigQuery dataset ID for cost analytics"
+    value: ${google_bigquery_dataset.cost_analytics.dataset_id}
+    
+  dataset_location:
+    description: "BigQuery dataset location"
+    value: ${google_bigquery_dataset.cost_analytics.location}
+    
+  # Cloud Run service details
+  service_name:
+    description: "Cloud Run service name for cost workers"
+    value: ${google_cloud_run_service.cost_worker.name}
+    
+  service_url:
+    description: "Cloud Run service URL"
+    value: ${google_cloud_run_service.cost_worker.status[0].url}
+    
+  # Pub/Sub resources
+  topic_name:
+    description: "Pub/Sub topic name for cost processing events"
+    value: ${google_pubsub_topic.cost_processing.name}
+    
+  subscription_name:
+    description: "Pub/Sub subscription name"
+    value: ${google_pubsub_subscription.cost_processing_sub.name}
+    
+  # Scheduler job
+  scheduler_job_name:
+    description: "Cloud Scheduler job name"
+    value: ${google_cloud_scheduler_job.daily_cost_analysis.name}
+    
+  # Service account
+  service_account_email:
+    description: "Service account email for cost workers"
+    value: ${google_service_account.cost_worker.email}
+
+# Resource definitions
+resources:
+  # Enable required APIs for the cost analytics pipeline
+  # Cloud Billing API for accessing billing data
+  google_project_service.cloudbilling:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudbilling.googleapis.com
+      disable_dependent_services: true
+      
+  # BigQuery API for data warehousing and analytics
+  google_project_service.bigquery:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: bigquery.googleapis.com
+      disable_dependent_services: true
+      
+  # Cloud Run API for serverless container execution
+  google_project_service.run:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: run.googleapis.com
+      disable_dependent_services: true
+      
+  # Pub/Sub API for event-driven messaging
+  google_project_service.pubsub:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: pubsub.googleapis.com
+      disable_dependent_services: true
+      
+  # Cloud Scheduler API for automated job scheduling
+  google_project_service.cloudscheduler:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudscheduler.googleapis.com
+      disable_dependent_services: true
+
+  # BigQuery dataset for storing cost analytics data
+  # Implements partitioning for efficient querying and cost optimization
+  google_bigquery_dataset.cost_analytics:
+    type: google_bigquery_dataset
+    properties:
+      dataset_id: cost_analytics_${var.random_suffix}
+      project: ${var.project_id}
+      friendly_name: "Cost Analytics Dataset"
+      description: ${var.dataset_description}
+      location: ${var.dataset_location}
+      
+      # Configure dataset access controls
+      access:
+        - role: "OWNER"
+          user_by_email: ${google_service_account.cost_worker.email}
+        - role: "READER"
+          special_group: "projectReaders"
+          
+      # Enable deletion protection for production environments
+      delete_contents_on_destroy: false
+      
+      # Configure default table expiration (optional)
+      default_table_expiration_ms: 31536000000  # 1 year in milliseconds
+      
+    depends_on:
+      - google_project_service.bigquery
+      - google_service_account.cost_worker
+
+  # Daily costs table with time partitioning for optimal performance
+  google_bigquery_table.daily_costs:
+    type: google_bigquery_table
+    properties:
+      dataset_id: ${google_bigquery_dataset.cost_analytics.dataset_id}
+      table_id: "daily_costs"
+      project: ${var.project_id}
+      
+      description: "Daily cost analytics with project breakdown and time partitioning"
+      
+      # Configure time partitioning for efficient querying
+      time_partitioning:
+        type: "DAY"
+        field: "usage_date"
+        require_partition_filter: true
+        expiration_ms: 94608000000  # 3 years retention
+        
+      # Define table schema for cost data
+      schema: |
+        [
+          {
+            "name": "usage_date",
+            "type": "DATE",
+            "mode": "REQUIRED",
+            "description": "Date when the cost was incurred"
+          },
+          {
+            "name": "project_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "GCP Project ID where the cost was incurred"
+          },
+          {
+            "name": "service",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "GCP service that generated the cost"
+          },
+          {
+            "name": "sku",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Specific SKU or resource type"
+          },
+          {
+            "name": "cost",
+            "type": "FLOAT",
+            "mode": "REQUIRED",
+            "description": "Cost amount in the specified currency"
+          },
+          {
+            "name": "currency",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Currency code (e.g., USD, EUR)"
+          },
+          {
+            "name": "labels",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "JSON string of resource labels for cost attribution"
+          }
+        ]
+        
+      # Configure clustering for query optimization
+      clustering:
+        - "project_id"
+        - "service"
+
+  # Monthly cost summary view for executive reporting
+  google_bigquery_table.monthly_cost_summary:
+    type: google_bigquery_table
+    properties:
+      dataset_id: ${google_bigquery_dataset.cost_analytics.dataset_id}
+      table_id: "monthly_cost_summary"
+      project: ${var.project_id}
+      
+      description: "Monthly cost summary by project and service for executive reporting"
+      
+      # Define view query for monthly aggregations
+      view:
+        query: |
+          SELECT 
+            FORMAT_DATE("%Y-%m", usage_date) as month,
+            project_id,
+            service,
+            SUM(cost) as total_cost,
+            currency,
+            COUNT(*) as usage_records,
+            AVG(cost) as avg_daily_cost,
+            MAX(cost) as max_daily_cost
+          FROM `${var.project_id}.cost_analytics_${var.random_suffix}.daily_costs`
+          WHERE usage_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 12 MONTH)
+          GROUP BY month, project_id, service, currency
+          ORDER BY month DESC, total_cost DESC
+        use_legacy_sql: false
+
+  # Cost trend analysis view for identifying spending patterns
+  google_bigquery_table.cost_trend_analysis:
+    type: google_bigquery_table
+    properties:
+      dataset_id: ${google_bigquery_dataset.cost_analytics.dataset_id}
+      table_id: "cost_trend_analysis"
+      project: ${var.project_id}
+      
+      description: "Cost trend analysis with week-over-week comparison for identifying patterns"
+      
+      # Define view query for trend analysis
+      view:
+        query: |
+          WITH weekly_costs AS (
+            SELECT 
+              DATE_TRUNC(usage_date, WEEK) as week_start,
+              project_id,
+              service,
+              SUM(cost) as weekly_cost
+            FROM `${var.project_id}.cost_analytics_${var.random_suffix}.daily_costs`
+            WHERE usage_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 26 WEEK)
+            GROUP BY week_start, project_id, service
+          )
+          SELECT 
+            week_start,
+            project_id,
+            service,
+            weekly_cost,
+            LAG(weekly_cost) OVER (
+              PARTITION BY project_id, service 
+              ORDER BY week_start
+            ) as previous_week_cost,
+            ROUND(
+              SAFE_DIVIDE(
+                (weekly_cost - LAG(weekly_cost) OVER (
+                  PARTITION BY project_id, service 
+                  ORDER BY week_start
+                )),
+                LAG(weekly_cost) OVER (
+                  PARTITION BY project_id, service 
+                  ORDER BY week_start
+                )
+              ) * 100, 2
+            ) as week_over_week_change_percent
+          FROM weekly_costs
+          WHERE weekly_cost > 0
+          ORDER BY week_start DESC, weekly_cost DESC
+        use_legacy_sql: false
+
+  # Service account for cost worker authentication and authorization
+  google_service_account.cost_worker:
+    type: google_service_account
+    properties:
+      account_id: cost-worker-sa-${var.random_suffix}
+      project: ${var.project_id}
+      display_name: "Cost Analytics Worker Service Account"
+      description: "Service account for cost analytics worker with minimal required permissions"
+
+  # Grant BigQuery Data Editor role for loading cost data
+  google_project_iam_member.cost_worker_bigquery:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/bigquery.dataEditor"
+      member: serviceAccount:${google_service_account.cost_worker.email}
+      
+  # Grant Billing Viewer role for accessing billing data
+  google_project_iam_member.cost_worker_billing:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/billing.viewer"
+      member: serviceAccount:${google_service_account.cost_worker.email}
+      
+  # Grant Pub/Sub Subscriber role for processing messages
+  google_project_iam_member.cost_worker_pubsub:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/pubsub.subscriber"
+      member: serviceAccount:${google_service_account.cost_worker.email}
+
+  # Pub/Sub topic for coordinating cost processing events
+  google_pubsub_topic.cost_processing:
+    type: google_pubsub_topic
+    properties:
+      name: cost-processing-${var.random_suffix}
+      project: ${var.project_id}
+      
+      # Configure message retention and delivery settings
+      message_retention_duration: "604800s"  # 7 days
+      
+      # Enable message ordering for consistent processing
+      message_storage_policy:
+        allowed_persistence_regions:
+          - ${var.region}
+          
+    depends_on:
+      - google_project_service.pubsub
+
+  # Cloud Run service for cost processing workers
+  # Implements serverless architecture with automatic scaling
+  google_cloud_run_service.cost_worker:
+    type: google_cloud_run_service
+    properties:
+      name: cost-worker-${var.random_suffix}
+      project: ${var.project_id}
+      location: ${var.region}
+      
+      # Configure service template with container specifications
+      template:
+        metadata:
+          annotations:
+            # Enable Cloud SQL connections if needed
+            "run.googleapis.com/cloudsql-instances": ""
+            # Configure CPU allocation policy
+            "run.googleapis.com/cpu-throttling": "false"
+            # Set maximum request timeout
+            "run.googleapis.com/timeout": "300"
+            
+        spec:
+          # Configure service account for authentication
+          service_account_name: ${google_service_account.cost_worker.email}
+          
+          # Set container concurrency for optimal performance
+          container_concurrency: 10
+          
+          # Configure timeout for long-running processing
+          timeout_seconds: 300
+          
+          containers:
+            - image: "gcr.io/cloudrun/hello"  # Placeholder - replace with actual worker image
+              
+              # Configure resource allocation
+              resources:
+                limits:
+                  cpu: ${var.worker_cpu}
+                  memory: ${var.worker_memory}
+                requests:
+                  cpu: ${var.worker_cpu}
+                  memory: ${var.worker_memory}
+                  
+              # Set environment variables for worker configuration
+              env:
+                - name: "DATASET_NAME"
+                  value: cost_analytics_${var.random_suffix}
+                - name: "PROJECT_ID"
+                  value: ${var.project_id}
+                - name: "TOPIC_NAME"
+                  value: ${google_pubsub_topic.cost_processing.name}
+                  
+              # Configure container port
+              ports:
+                - container_port: 8080
+                  protocol: "TCP"
+                  
+      # Configure traffic allocation and autoscaling
+      traffic:
+        - percent: 100
+          latest_revision: true
+          
+      # Configure autoscaling parameters
+      autogenerate_revision_name: true
+      
+    depends_on:
+      - google_project_service.run
+      - google_service_account.cost_worker
+      - google_pubsub_topic.cost_processing
+
+  # Configure Cloud Run autoscaling annotations
+  google_cloud_run_service_iam_policy.cost_worker_invoker:
+    type: google_cloud_run_service_iam_policy
+    properties:
+      service: ${google_cloud_run_service.cost_worker.name}
+      location: ${google_cloud_run_service.cost_worker.location}
+      project: ${var.project_id}
+      
+      policy_data: |
+        {
+          "bindings": [
+            {
+              "role": "roles/run.invoker",
+              "members": [
+                "serviceAccount:${google_service_account.cost_worker.email}",
+                "serviceAccount:service-${data.google_project.current.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+              ]
+            }
+          ]
+        }
+
+  # Data source for current project information
+  data.google_project.current:
+    type: google_project
+    properties:
+      project_id: ${var.project_id}
+
+  # Pub/Sub push subscription for triggering Cloud Run workers
+  google_pubsub_subscription.cost_processing_sub:
+    type: google_pubsub_subscription
+    properties:
+      name: cost-processing-sub-${var.random_suffix}
+      project: ${var.project_id}
+      topic: ${google_pubsub_topic.cost_processing.name}
+      
+      # Configure acknowledgment deadline for processing time
+      ack_deadline_seconds: 300
+      
+      # Configure message retention for reliability
+      message_retention_duration: "604800s"  # 7 days
+      
+      # Configure retry policy for failed messages
+      retry_policy:
+        minimum_backoff: "10s"
+        maximum_backoff: "600s"
+        
+      # Configure dead letter queue for unprocessable messages
+      dead_letter_policy:
+        dead_letter_topic: ${google_pubsub_topic.cost_processing_dlq.id}
+        max_delivery_attempts: 5
+        
+      # Configure push endpoint to Cloud Run service
+      push_config:
+        push_endpoint: ${google_cloud_run_service.cost_worker.status[0].url}
+        
+        # Configure authentication for push delivery
+        oidc_token:
+          service_account_email: ${google_service_account.cost_worker.email}
+          
+        # Configure request attributes
+        attributes:
+          x-goog-version: "v1"
+          
+    depends_on:
+      - google_pubsub_topic.cost_processing
+      - google_cloud_run_service.cost_worker
+
+  # Dead letter queue for handling failed message processing
+  google_pubsub_topic.cost_processing_dlq:
+    type: google_pubsub_topic
+    properties:
+      name: cost-processing-dlq-${var.random_suffix}
+      project: ${var.project_id}
+      
+      message_retention_duration: "2592000s"  # 30 days
+      
+    depends_on:
+      - google_project_service.pubsub
+
+  # Cloud Scheduler job for automated daily cost processing
+  google_cloud_scheduler_job.daily_cost_analysis:
+    type: google_cloud_scheduler_job
+    properties:
+      name: daily-cost-analysis-${var.random_suffix}
+      project: ${var.project_id}
+      region: ${var.region}
+      
+      description: "Daily automated cost analytics processing job"
+      
+      # Configure schedule using cron expression
+      schedule: ${var.schedule_cron}
+      time_zone: ${var.schedule_timezone}
+      
+      # Configure retry settings for reliability
+      retry_config:
+        retry_count: 3
+        max_retry_duration: "300s"
+        min_backoff_duration: "5s"
+        max_backoff_duration: "120s"
+        max_doublings: 3
+        
+      # Configure Pub/Sub target for triggering processing
+      pubsub_target:
+        topic_name: ${google_pubsub_topic.cost_processing.id}
+        data: base64encode(jsonencode({
+          trigger: "daily_cost_analysis"
+          date: "auto"
+          source: "cloud_scheduler"
+        }))
+        
+        # Configure message attributes
+        attributes:
+          event_type: "scheduled_processing"
+          version: "v1"
+          
+    depends_on:
+      - google_project_service.cloudscheduler
+      - google_pubsub_topic.cost_processing
+
+  # Configure monitoring and alerting for the cost analytics pipeline
+  # Create notification channel for cost alerts
+  google_monitoring_notification_channel.cost_alerts:
+    type: google_monitoring_notification_channel
+    properties:
+      project: ${var.project_id}
+      display_name: "Cost Analytics Alerts"
+      type: "email"
+      description: "Email notifications for cost analytics pipeline alerts"
+      
+      # Configure email endpoint (customize as needed)
+      labels:
+        email_address: "admin@example.com"  # Replace with actual email
+        
+      # Enable notification channel
+      enabled: true
+
+  # Create alerting policy for Cloud Run service errors
+  google_monitoring_alert_policy.cost_worker_errors:
+    type: google_monitoring_alert_policy
+    properties:
+      project: ${var.project_id}
+      display_name: "Cost Worker Error Rate Alert"
+      
+      # Configure alert conditions
+      conditions:
+        - display_name: "High error rate in cost workers"
+          condition_threshold:
+            filter: |
+              resource.type="cloud_run_revision"
+              resource.labels.service_name="${google_cloud_run_service.cost_worker.name}"
+              metric.type="run.googleapis.com/request_count"
+              metric.labels.response_code_class="5xx"
+              
+            comparison: "COMPARISON_GREATER_THAN"
+            threshold_value: 5
+            duration: "300s"
+            
+            aggregations:
+              - alignment_period: "300s"
+                per_series_aligner: "ALIGN_RATE"
+                cross_series_reducer: "REDUCE_SUM"
+                group_by_fields:
+                  - "resource.labels.service_name"
+                  
+      # Configure notification settings
+      notification_channels:
+        - ${google_monitoring_notification_channel.cost_alerts.name}
+        
+      # Configure alert policy settings
+      alert_strategy:
+        auto_close: "1800s"  # 30 minutes
+        
+      documentation:
+        content: |
+          This alert triggers when the cost analytics worker experiences high error rates.
+          
+          Troubleshooting steps:
+          1. Check Cloud Run service logs for error details
+          2. Verify BigQuery dataset and table accessibility
+          3. Check Pub/Sub subscription health
+          4. Validate service account permissions
+          
+      # Enable alert policy
+      enabled: true
+      
+    depends_on:
+      - google_cloud_run_service.cost_worker
+      - google_monitoring_notification_channel.cost_alerts

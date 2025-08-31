@@ -4,19 +4,18 @@ id: 66aa1419
 category: analytics
 difficulty: 400
 subject: aws
-services: s3,lake,formation,glue,iam
+services: s3, lakeformation, glue, iam
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-lake, lake-formation, s3, glue, governance, fine-grained-access-control
 recipe-generator-version: 1.3
 ---
 
 # Data Lake Architectures with Lake Formation
-
 
 ## Problem
 
@@ -388,7 +387,7 @@ echo "✅ Created encrypted S3 buckets: ${RAW_BUCKET}, ${PROCESSED_BUCKET}, ${CU
            }]
        }'
    
-   # Attach policies to Glue crawler role
+   # Attach AWS managed policy for Glue service role
    aws iam attach-role-policy \
        --role-name GlueCrawlerRole \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
@@ -493,11 +492,12 @@ echo "✅ Created encrypted S3 buckets: ${RAW_BUCKET}, ${PROCESSED_BUCKET}, ${CU
            }]
        }'
    
-   # Attach basic policies
+   # Attach basic policies for analytics access
    aws iam attach-role-policy \
        --role-name DataAnalystRole \
        --policy-arn arn:aws:iam::aws:policy/AmazonAthenaFullAccess
    
+   # Attach basic policies for data engineering access
    aws iam attach-role-policy \
        --role-name DataEngineerRole \
        --policy-arn arn:aws:iam::aws:policy/AWSGlueConsoleFullAccess
@@ -506,8 +506,6 @@ echo "✅ Created encrypted S3 buckets: ${RAW_BUCKET}, ${PROCESSED_BUCKET}, ${CU
    ```
 
    The role-based access control framework is now established with distinct roles for different user types. These roles will be enhanced with Lake Formation permissions in subsequent steps, combining IAM's identity management with Lake Formation's fine-grained data access controls. This layered security approach ensures that users can only access data appropriate to their job functions while maintaining the flexibility to adapt permissions as organizational needs evolve.
-
-   > **Note**: Follow the [principle of least privilege](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege) when configuring IAM permissions for production environments.
 
 9. **Configure Fine-Grained Access Control with Lake Formation**:
 
@@ -906,7 +904,7 @@ echo "✅ Created encrypted S3 buckets: ${RAW_BUCKET}, ${PROCESSED_BUCKET}, ${CU
 
 This comprehensive data lake architecture demonstrates how AWS Lake Formation transforms basic S3 storage into a governed, secure data lake platform. The solution addresses key enterprise requirements including data discovery, cataloging, fine-grained access control, and regulatory compliance.
 
-**Lake Formation's Permission Model**: Lake Formation uses a hybrid permission model where it can either work alongside IAM permissions or completely override them. When a resource is registered with Lake Formation, it's crucial to understand that LF permissions take precedence over IAM S3 permissions. This centralized approach simplifies governance but requires careful planning during migration from IAM-only setups.
+**Lake Formation's Permission Model**: Lake Formation uses a hybrid permission model where it can either work alongside IAM permissions or completely override them. When a resource is registered with Lake Formation, it's crucial to understand that LF permissions take precedence over IAM S3 permissions. This centralized approach simplifies governance but requires careful planning during migration from IAM-only setups. The [Lake Formation permission model](https://docs.aws.amazon.com/lake-formation/latest/dg/lf-permissions-overview.html) documentation provides detailed guidance on this behavior.
 
 **Data Zone Architecture**: The three-tier storage approach (Raw, Processed, Curated) reflects modern data lake best practices. Raw data maintains source fidelity, processed data is cleaned and standardized, and curated data is business-ready and optimized for analytics. This separation enables different governance policies and access controls for each zone, supporting both data engineering workflows and business analytics requirements.
 
@@ -914,7 +912,7 @@ This comprehensive data lake architecture demonstrates how AWS Lake Formation tr
 
 > **Tip**: Use LF-Tags consistently across your organization to create a unified data governance framework. Consider implementing a comprehensive [tagging strategy](https://docs.aws.amazon.com/whitepapers/latest/tagging-best-practices/tagging-best-practices.html) that includes data classification, department ownership, and compliance requirements.
 
-The data cell filters demonstrated here provide both column-level and row-level security, enabling compliance with regulations like GDPR, HIPAA, and PCI-DSS. These filters operate at the query level, automatically applying restrictions based on the requesting principal's permissions, ensuring that sensitive data remains protected without impacting query performance significantly.
+The data cell filters demonstrated here provide both column-level and row-level security, enabling compliance with regulations like GDPR, HIPAA, and PCI-DSS. These filters operate at the query level, automatically applying restrictions based on the requesting principal's permissions, ensuring that sensitive data remains protected without impacting query performance significantly. Learn more about [data filtering and cell-level security](https://docs.aws.amazon.com/lake-formation/latest/dg/data-filtering.html) in the AWS documentation.
 
 ## Challenge
 
@@ -932,4 +930,11 @@ Extend this data lake architecture by implementing these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,21 +1,21 @@
 ---
-title: E-commerce Personalization with Retail API and Cloud Functions
+title: E-commerce Personalization with Vertex AI Search for Commerce and Cloud Functions
 id: f8e2d1c3
 category: machine-learning
 difficulty: 200
 subject: gcp
-services: Retail API, Cloud Functions, Cloud Firestore, Cloud Storage
+services: Vertex AI Search for Commerce, Cloud Functions, Cloud Firestore, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: e-commerce, personalization, machine-learning, recommendations, serverless
 recipe-generator-version: 1.3
 ---
 
-# E-commerce Personalization with Retail API and Cloud Functions
+# E-commerce Personalization with Vertex AI Search for Commerce and Cloud Functions
 
 ## Problem
 
@@ -23,7 +23,7 @@ E-commerce platforms struggle to deliver personalized shopping experiences that 
 
 ## Solution
 
-This solution leverages Google Cloud's Vertex AI Search for Commerce (Retail API) combined with Cloud Functions to create an intelligent personalization engine that analyzes customer behavior, manages product catalogs, and delivers real-time recommendations. The serverless architecture automatically scales based on traffic while machine learning models continuously improve recommendation quality through user interactions and feedback loops.
+This solution leverages Google Cloud's Vertex AI Search for Commerce combined with Cloud Functions to create an intelligent personalization engine that analyzes customer behavior, manages product catalogs, and delivers real-time recommendations. The serverless architecture automatically scales based on traffic while machine learning models continuously improve recommendation quality through user interactions and feedback loops.
 
 ## Architecture Diagram
 
@@ -76,13 +76,13 @@ graph TB
 
 ## Prerequisites
 
-1. Google Cloud project with billing enabled and appropriate permissions for Retail API, Cloud Functions, Firestore, and Cloud Storage
+1. Google Cloud project with billing enabled and appropriate permissions for Vertex AI Search for Commerce, Cloud Functions, Firestore, and Cloud Storage
 2. Google Cloud CLI (gcloud) installed and configured, or access to Cloud Shell
 3. Basic understanding of e-commerce concepts, recommendation systems, and serverless architecture
 4. Node.js development experience for Cloud Functions implementation
 5. Estimated cost: $50-100 for initial setup and testing (varies based on data volume and API usage)
 
-> **Note**: Vertex AI Search for Commerce includes machine learning capabilities that automatically improve recommendation quality over time. See [Google Cloud Retail API documentation](https://cloud.google.com/retail/docs) for detailed service information.
+> **Note**: Vertex AI Search for Commerce includes machine learning capabilities that automatically improve recommendation quality over time. See [Google Cloud Vertex AI Search for Commerce documentation](https://cloud.google.com/retail/docs) for detailed service information.
 
 ## Preparation
 
@@ -137,7 +137,7 @@ echo "✅ Bucket created: ${BUCKET_NAME}"
    echo "✅ Default branch available: ${BRANCH_NAME}"
    ```
 
-   The Retail API uses a hierarchical structure where catalogs contain product data and branches represent different environments (e.g., staging, production). This separation enables safe testing of recommendation models while maintaining production stability.
+   The Vertex AI Search for Commerce API uses a hierarchical structure where catalogs contain product data and branches represent different environments (e.g., staging, production). This separation enables safe testing of recommendation models while maintaining production stability.
 
 2. **Create Cloud Function for Product Catalog Management**:
 
@@ -154,7 +154,7 @@ echo "✅ Bucket created: ${BUCKET_NAME}"
      "name": "catalog-sync-function",
      "version": "1.0.0",
      "dependencies": {
-       "@google-cloud/retail": "^3.0.0",
+       "@google-cloud/retail": "^4.0.0",
        "@google-cloud/storage": "^7.0.0",
        "@google-cloud/functions-framework": "^3.0.0"
      }
@@ -219,7 +219,7 @@ echo "✅ Bucket created: ${BUCKET_NAME}"
    echo "✅ Catalog sync function deployed successfully"
    ```
 
-   The catalog sync function processes product data and maintains consistency between your inventory system and the Retail API. This enables real-time availability updates and ensures recommendations reflect current product status and pricing.
+   The catalog sync function processes product data and maintains consistency between your inventory system and the Vertex AI Search for Commerce API. This enables real-time availability updates and ensures recommendations reflect current product status and pricing.
 
 3. **Create Cloud Function for User Event Tracking**:
 
@@ -236,7 +236,7 @@ echo "✅ Bucket created: ${BUCKET_NAME}"
      "name": "user-events-function",
      "version": "1.0.0",
      "dependencies": {
-       "@google-cloud/retail": "^3.0.0",
+       "@google-cloud/retail": "^4.0.0",
        "@google-cloud/firestore": "^7.0.0",
        "@google-cloud/functions-framework": "^3.0.0"
      }
@@ -327,7 +327,7 @@ echo "✅ Bucket created: ${BUCKET_NAME}"
    echo "✅ User events tracking function deployed successfully"
    ```
 
-   This function creates a dual-track system: events are sent to the Retail API for machine learning training while user profiles are maintained in Firestore for additional personalization features. This hybrid approach enables both algorithmic and rule-based personalization strategies.
+   This function creates a dual-track system: events are sent to the Vertex AI Search for Commerce API for machine learning training while user profiles are maintained in Firestore for additional personalization features. This hybrid approach enables both algorithmic and rule-based personalization strategies.
 
 4. **Create Cloud Function for Recommendation Serving**:
 
@@ -344,7 +344,7 @@ echo "✅ Bucket created: ${BUCKET_NAME}"
      "name": "recommendations-function",
      "version": "1.0.0",
      "dependencies": {
-       "@google-cloud/retail": "^3.0.0",
+       "@google-cloud/retail": "^4.0.0",
        "@google-cloud/firestore": "^7.0.0",
        "@google-cloud/functions-framework": "^3.0.0"
      }
@@ -453,7 +453,7 @@ echo "✅ Bucket created: ${BUCKET_NAME}"
    echo "✅ Recommendations function deployed successfully"
    ```
 
-   This function combines machine learning predictions from the Retail API with user profile data from Firestore to provide contextually relevant recommendations. The hybrid approach enables both behavioral and collaborative filtering strategies.
+   This function combines machine learning predictions from the Vertex AI Search for Commerce API with user profile data from Firestore to provide contextually relevant recommendations. The hybrid approach enables both behavioral and collaborative filtering strategies.
 
 5. **Create Sample Product Data and Test Catalog Sync**:
 
@@ -569,7 +569,7 @@ echo "✅ Bucket created: ${BUCKET_NAME}"
    echo "Events Function URL: ${EVENTS_FUNCTION_URL}"
    ```
 
-   These test events demonstrate the variety of user interactions that feed into the recommendation system. The Retail API uses this behavioral data to understand user preferences and improve recommendation quality over time.
+   These test events demonstrate the variety of user interactions that feed into the recommendation system. The Vertex AI Search for Commerce API uses this behavioral data to understand user preferences and improve recommendation quality over time.
 
 7. **Test Recommendation Generation**:
 
@@ -622,7 +622,7 @@ echo "✅ Bucket created: ${BUCKET_NAME}"
    gsutil ls gs://${BUCKET_NAME}/firestore-export/
    ```
 
-3. Validate product catalog in Retail API:
+3. Validate product catalog in Vertex AI Search for Commerce:
 
    ```bash
    # List products in the catalog using gcloud
@@ -698,11 +698,11 @@ echo "✅ Bucket created: ${BUCKET_NAME}"
 
 This intelligent e-commerce personalization solution demonstrates the power of combining Google Cloud's managed machine learning services with serverless computing to create scalable, cost-effective recommendation systems. The Vertex AI Search for Commerce service eliminates the complexity of building and maintaining recommendation algorithms while providing enterprise-grade performance and accuracy. By leveraging Cloud Functions for event processing and Firestore for user profile management, the architecture automatically scales to handle varying traffic loads while maintaining low latency for real-time recommendations.
 
-The hybrid approach of using both machine learning predictions and rule-based personalization provides flexibility to address different business requirements. The Retail API's machine learning models improve over time as they process more user interaction data, while the Firestore-based user profiles enable immediate personalization based on explicit user preferences and demographic information. This combination ensures that both new and returning customers receive relevant product suggestions that drive engagement and conversion.
+The hybrid approach of using both machine learning predictions and rule-based personalization provides flexibility to address different business requirements. The Vertex AI Search for Commerce API's machine learning models improve over time as they process more user interaction data, while the Firestore-based user profiles enable immediate personalization based on explicit user preferences and demographic information. This combination ensures that both new and returning customers receive relevant product suggestions that drive engagement and conversion.
 
-The serverless architecture provides significant operational benefits including automatic scaling, reduced infrastructure management overhead, and pay-per-use pricing that aligns costs with business value. Cloud Functions handle traffic spikes gracefully while the managed services (Retail API, Firestore) provide high availability and global distribution. This approach enables businesses to focus on developing personalization strategies rather than managing infrastructure, accelerating time-to-market for new features and improvements.
+The serverless architecture provides significant operational benefits including automatic scaling, reduced infrastructure management overhead, and pay-per-use pricing that aligns costs with business value. Cloud Functions handle traffic spikes gracefully while the managed services (Vertex AI Search for Commerce, Firestore) provide high availability and global distribution. This approach enables businesses to focus on developing personalization strategies rather than managing infrastructure, accelerating time-to-market for new features and improvements.
 
-Security and privacy considerations are built into the Google Cloud platform, with IAM controls, data encryption, and compliance certifications that meet enterprise requirements. The event tracking system can be configured to respect user privacy preferences and comply with regulations like GDPR, while still providing valuable insights for personalization algorithms.
+Security and privacy considerations are built into the Google Cloud platform, with IAM controls, data encryption, and compliance certifications that meet enterprise requirements. The event tracking system can be configured to respect user privacy preferences and comply with regulations like GDPR, while still providing valuable insights for personalization algorithms. For more information on Google Cloud security best practices, see the [Google Cloud Security documentation](https://cloud.google.com/security/best-practices).
 
 > **Tip**: Monitor recommendation click-through rates and conversion metrics to continuously optimize the personalization strategy. Use A/B testing with different recommendation models and fallback strategies to maximize business impact.
 
@@ -722,4 +722,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

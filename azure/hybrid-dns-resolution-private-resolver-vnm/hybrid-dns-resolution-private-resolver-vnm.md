@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure DNS Private Resolver, Azure Virtual Network Manager, Azure Private DNS
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: dns, hybrid, networking, private-resolver, virtual-network-manager, connectivity
 recipe-generator-version: 1.3
@@ -90,7 +90,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions to create DNS Private Resolver, Virtual Network Manager, and networking resources
-2. Azure CLI v2.50.0 or later installed and configured (or Azure Cloud Shell)
+2. Azure CLI v2.60.0 or later installed and configured (or Azure Cloud Shell)
 3. On-premises network connectivity to Azure via VPN Gateway or ExpressRoute
 4. Basic understanding of DNS concepts, Azure networking, and hybrid cloud architectures
 5. Estimated cost: $50-100/month for DNS Private Resolver, VNet Manager, and supporting infrastructure
@@ -238,7 +238,7 @@ echo "✅ Hub virtual network created with DNS resolver subnets"
        --resource-group ${RESOURCE_GROUP} \
        --name inbound-endpoint \
        --location ${LOCATION} \
-       --subnet /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/${HUB_VNET_NAME}/subnets/dns-inbound-subnet
+       --ip-configurations '[{"privateIpAllocationMethod":"Dynamic","subnet":{"id":"/subscriptions/'${SUBSCRIPTION_ID}'/resourceGroups/'${RESOURCE_GROUP}'/providers/Microsoft.Network/virtualNetworks/'${HUB_VNET_NAME}'/subnets/dns-inbound-subnet"}}]'
 
    # Create outbound endpoint for Azure to on-premises queries
    az dns-resolver outbound-endpoint create \
@@ -263,7 +263,7 @@ echo "✅ Hub virtual network created with DNS resolver subnets"
        --name "onprem-forwarding-ruleset" \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --outbound-endpoints /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/dnsResolvers/${DNS_RESOLVER_NAME}/outboundEndpoints/outbound-endpoint
+       --outbound-endpoints '[{"id":"/subscriptions/'${SUBSCRIPTION_ID}'/resourceGroups/'${RESOURCE_GROUP}'/providers/Microsoft.Network/dnsResolvers/'${DNS_RESOLVER_NAME}'/outboundEndpoints/outbound-endpoint"}]'
 
    # Create forwarding rule for on-premises domain
    az dns-resolver forwarding-rule create \
@@ -279,13 +279,13 @@ echo "✅ Hub virtual network created with DNS resolver subnets"
        --name "hub-vnet-link" \
        --resource-group ${RESOURCE_GROUP} \
        --ruleset-name "onprem-forwarding-ruleset" \
-       --virtual-network ${HUB_VNET_NAME}
+       --virtual-network /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/${HUB_VNET_NAME}
 
    az dns-resolver forwarding-ruleset virtual-network-link create \
        --name "spoke1-vnet-link" \
        --resource-group ${RESOURCE_GROUP} \
        --ruleset-name "onprem-forwarding-ruleset" \
-       --virtual-network ${SPOKE1_VNET_NAME}
+       --virtual-network /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/${SPOKE1_VNET_NAME}
 
    echo "✅ DNS forwarding ruleset configured for on-premises resolution"
    ```
@@ -364,6 +364,19 @@ echo "✅ Hub virtual network created with DNS resolver subnets"
    Private endpoints provide secure, private connectivity to Azure services by creating network interfaces within your virtual network. These endpoints automatically register DNS records in the private DNS zone, enabling name resolution from both Azure and on-premises environments. This demonstrates the practical application of hybrid DNS resolution for accessing Azure services securely.
 
    ```bash
+   # Create private DNS zone for storage private endpoints
+   az network private-dns zone create \
+       --resource-group ${RESOURCE_GROUP} \
+       --name "privatelink.blob.core.windows.net"
+
+   # Link private DNS zone to virtual networks
+   az network private-dns link vnet create \
+       --resource-group ${RESOURCE_GROUP} \
+       --zone-name "privatelink.blob.core.windows.net" \
+       --name hub-vnet-link \
+       --virtual-network ${HUB_VNET_NAME} \
+       --registration-enabled false
+
    # Create storage account for private endpoint demonstration
    az storage account create \
        --name ${STORAGE_ACCOUNT_NAME} \
@@ -489,10 +502,9 @@ echo "✅ Hub virtual network created with DNS resolver subnets"
 
    ```bash
    # Check Virtual Network Manager deployment status
-   az network manager list-active-connectivity-config \
+   az network manager list-effective-connectivity-config \
        --resource-group ${RESOURCE_GROUP} \
-       --network-manager-name ${NETWORK_MANAGER_NAME} \
-       --regions ${LOCATION}
+       --virtual-network-name ${SPOKE1_VNET_NAME}
    ```
 
    Expected output: Active connectivity configuration with hub-spoke topology
@@ -579,4 +591,9 @@ Extend this hybrid DNS solution by implementing these advanced configurations:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

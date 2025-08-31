@@ -4,12 +4,12 @@ id: f7a9c2e8
 category: analytics
 difficulty: 400
 subject: azure
-services: Azure AI Content Understanding, Azure Stream Analytics, Azure Functions, Azure Event Hubs
+services: Azure Cognitive Services, Azure Stream Analytics, Azure Functions, Azure Event Hubs
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: real-time analytics, ai content analysis, financial trading, stream processing, multimodal ai
 recipe-generator-version: 1.3
@@ -136,17 +136,17 @@ echo "✅ Storage account created for content and data processing"
 
 ## Steps
 
-1. **Deploy Azure AI Content Understanding Service**:
+1. **Deploy Azure AI Foundry Resource for Content Understanding**:
 
    Azure AI Content Understanding enables multimodal content analysis, extracting structured insights from videos, documents, images, and audio content. This service processes unstructured financial content like news videos, research reports, and earnings call recordings to identify key entities, sentiment, and trading-relevant information that would otherwise require manual analysis.
 
    ```bash
-   # Create Azure AI Services multi-service resource for Content Understanding
+   # Create Azure AI Foundry resource for Content Understanding
    az cognitiveservices account create \
        --name ${AI_SERVICES_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --kind CognitiveServices \
+       --kind AIServices \
        --sku S0 \
        --custom-domain ${AI_SERVICES_NAME} \
        --assign-identity
@@ -162,10 +162,10 @@ echo "✅ Storage account created for content and data processing"
        --resource-group ${RESOURCE_GROUP} \
        --query key1 --output tsv)
 
-   echo "✅ Azure AI Services deployed with endpoint: ${AI_ENDPOINT}"
+   echo "✅ Azure AI Foundry resource deployed with endpoint: ${AI_ENDPOINT}"
    ```
 
-   The AI Services account provides access to Content Understanding capabilities along with other cognitive services. This unified approach simplifies authentication and billing while enabling comprehensive content analysis workflows for financial trading applications.
+   The AI Foundry resource provides access to Content Understanding capabilities along with other AI services. This unified approach simplifies authentication and billing while enabling comprehensive content analysis workflows for financial trading applications. The multi-service resource type supports various AI workloads with a single endpoint.
 
 2. **Configure Event Hubs for Real-time Data Ingestion**:
 
@@ -221,7 +221,7 @@ echo "✅ Storage account created for content and data processing"
        --sku Standard \
        --streaming-units 6 \
        --data-locale "en-US" \
-       --output-error-policy "Stop" \
+       --output-error-policy "Drop" \
        --events-out-of-order-policy "Adjust"
 
    # Configure Event Hub as input source
@@ -279,7 +279,7 @@ echo "✅ Storage account created for content and data processing"
        --name "Signals" \
        --partition-key-path "/symbol" \
        --throughput 1000 \
-       --default-ttl 604800
+       --ttl 604800
 
    # Get Cosmos DB connection details
    COSMOS_ENDPOINT=$(az cosmosdb show \
@@ -302,12 +302,12 @@ echo "✅ Storage account created for content and data processing"
    Azure Functions provides serverless compute for processing enriched trading signals, implementing business logic for signal validation, risk assessment, and alert generation. The event-driven architecture enables automatic scaling while maintaining cost efficiency for variable workloads typical in financial markets.
 
    ```bash
-   # Create Function App with dedicated hosting plan for performance
+   # Create Function App with Premium hosting plan for performance
    az functionapp plan create \
        --name "plan-${FUNCTION_APP_NAME}" \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --sku P1V2 \
+       --sku P1V3 \
        --is-linux false
 
    az functionapp create \
@@ -390,7 +390,7 @@ echo "✅ Storage account created for content and data processing"
        --resource-group ${RESOURCE_GROUP} \
        --name "TradingSignalsTransformation" \
        --streaming-units 6 \
-       --query "$(cat trading_signals_query.sql)"
+       --saql "$(cat trading_signals_query.sql)"
 
    echo "✅ Advanced trading signals query deployed with multi-timeframe analysis"
    ```
@@ -617,12 +617,12 @@ echo "✅ Storage account created for content and data processing"
     cat > function_code/ContentProcessor.csproj << 'EOF'
     <Project Sdk="Microsoft.NET.Sdk">
       <PropertyGroup>
-        <TargetFramework>net6.0</TargetFramework>
+        <TargetFramework>net8.0</TargetFramework>
         <AzureFunctionsVersion>v4</AzureFunctionsVersion>
       </PropertyGroup>
       <ItemGroup>
-        <PackageReference Include="Microsoft.NET.Sdk.Functions" Version="4.1.1" />
-        <PackageReference Include="Microsoft.Azure.Cosmos" Version="3.32.3" />
+        <PackageReference Include="Microsoft.NET.Sdk.Functions" Version="4.4.0" />
+        <PackageReference Include="Microsoft.Azure.Cosmos" Version="3.45.0" />
         <PackageReference Include="Azure.AI.TextAnalytics" Version="5.3.0" />
       </ItemGroup>
     </Project>
@@ -687,9 +687,9 @@ echo "✅ Storage account created for content and data processing"
    az functionapp show \
        --name ${FUNCTION_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query '{name:name, state:state, runtime:siteConfig.linuxFxVersion}'
+       --query '{name:name, state:state, functionsVersion:siteConfig.functionsRuntimeVersion}'
 
-   echo "Expected: Function App should be in 'Running' state"
+   echo "Expected: Function App should be in 'Running' state with Functions v4 runtime"
    ```
 
 5. **Simulate Trading Signal Generation**:
@@ -701,7 +701,7 @@ echo "✅ Storage account created for content and data processing"
      "symbol": "AAPL",
      "price": 150.25,
      "volume": 1500000,
-     "timestamp": "2025-07-12T10:30:00Z"
+     "timestamp": "2025-07-23T10:30:00Z"
    }
    EOF
 
@@ -817,4 +817,9 @@ Extend this intelligent trading signal analysis system with these advanced enhan
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

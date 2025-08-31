@@ -1,0 +1,791 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Resource Cleanup Automation with Lambda and Tags
+  
+  This template creates an automated resource cleanup system using AWS Lambda to identify 
+  and terminate EC2 instances based on specific tags, with SNS notifications to alert 
+  administrators about cleanup actions. This serverless approach provides cost-effective 
+  resource governance by automatically removing resources tagged for cleanup while 
+  maintaining audit trails through notifications.
+  
+  Recipe ID: a3b4c5d6
+  Category: Management
+  Services: Lambda, EC2, SNS
+  Estimated Time: 30 minutes
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - SNSTopicName
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Cleanup Configuration"
+        Parameters:
+          - CleanupTagKey
+          - CleanupTagValues
+          - EnableScheduledExecution
+          - ScheduleExpression
+      - Label:
+          default: "Testing Configuration"
+        Parameters:
+          - CreateTestInstance
+          - TestInstanceType
+    ParameterLabels:
+      NotificationEmail:
+        default: "Email Address for Notifications"
+      SNSTopicName:
+        default: "SNS Topic Name"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      LambdaTimeout:
+        default: "Function Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Function Memory Size (MB)"
+      CleanupTagKey:
+        default: "Cleanup Tag Key"
+      CleanupTagValues:
+        default: "Cleanup Tag Values"
+      EnableScheduledExecution:
+        default: "Enable Scheduled Execution"
+      ScheduleExpression:
+        default: "Schedule Expression"
+      CreateTestInstance:
+        default: "Create Test Instance"
+      TestInstanceType:
+        default: "Test Instance Type"
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive cleanup notifications
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    ConstraintDescription: Must be a valid email address
+    
+  SNSTopicName:
+    Type: String
+    Description: Name for the SNS topic that will send cleanup notifications
+    Default: resource-cleanup-alerts
+    MinLength: 1
+    MaxLength: 256
+    AllowedPattern: ^[a-zA-Z0-9_-]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+    
+  LambdaFunctionName:
+    Type: String
+    Description: Name for the Lambda function that performs resource cleanup
+    Default: resource-cleanup-function
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z0-9_-]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+    
+  LambdaTimeout:
+    Type: Number
+    Description: Timeout for the Lambda function execution in seconds
+    Default: 300
+    MinValue: 1
+    MaxValue: 900
+    ConstraintDescription: Must be between 1 and 900 seconds
+    
+  LambdaMemorySize:
+    Type: Number
+    Description: Memory allocation for the Lambda function in MB
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3072]
+    ConstraintDescription: Must be a valid Lambda memory size
+    
+  CleanupTagKey:
+    Type: String
+    Description: Tag key that identifies resources for cleanup
+    Default: AutoCleanup
+    MinLength: 1
+    MaxLength: 127
+    ConstraintDescription: Must be between 1 and 127 characters
+    
+  CleanupTagValues:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of tag values that trigger cleanup
+    Default: "true,True,TRUE"
+    
+  EnableScheduledExecution:
+    Type: String
+    Description: Enable automatic scheduled execution of the cleanup function
+    Default: false
+    AllowedValues: [true, false]
+    
+  ScheduleExpression:
+    Type: String
+    Description: CloudWatch Events schedule expression (e.g., 'rate(1 day)' or 'cron(0 2 * * ? *)')
+    Default: rate(1 day)
+    
+  CreateTestInstance:
+    Type: String
+    Description: Create a test EC2 instance with cleanup tag for validation
+    Default: false
+    AllowedValues: [true, false]
+    
+  TestInstanceType:
+    Type: String
+    Description: Instance type for the test instance (if created)
+    Default: t2.micro
+    AllowedValues: [t2.micro, t2.small, t2.medium, t3.micro, t3.small, t3.medium]
+
+Conditions:
+  # Condition to enable scheduled execution
+  EnableSchedule: !Equals [!Ref EnableScheduledExecution, true]
+  
+  # Condition to create test instance
+  CreateTest: !Equals [!Ref CreateTestInstance, true]
+
+Mappings:
+  # Latest Amazon Linux 2023 AMI IDs by region
+  RegionMap:
+    us-east-1:
+      AMI: ami-0c02fb55956c7d316
+    us-east-2:
+      AMI: ami-0f924dc71d44d23e2
+    us-west-1:
+      AMI: ami-0d53d72369335a9d6
+    us-west-2:
+      AMI: ami-008fe2fc65df48dac
+    eu-west-1:
+      AMI: ami-01dd271720c1ba44f
+    eu-west-2:
+      AMI: ami-0a7493ba2bc35c1e9
+    eu-west-3:
+      AMI: ami-0302f42a44bf53a45
+    eu-central-1:
+      AMI: ami-0592c673f0b1e7665
+    ap-southeast-1:
+      AMI: ami-0c802847a7dd848c0
+    ap-southeast-2:
+      AMI: ami-0310483fb2b488153
+    ap-northeast-1:
+      AMI: ami-0bcc04756a966c837
+
+Resources:
+  # SNS Topic for cleanup notifications
+  CleanupNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref SNSTopicName
+      DisplayName: Resource Cleanup Notifications
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Purpose
+          Value: ResourceCleanup
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Recipe
+          Value: simple-resource-cleanup-lambda-tags
+          
+  # SNS Subscription for email notifications
+  CleanupEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CleanupNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      
+  # IAM Role for Lambda function execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${LambdaFunctionName}-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ResourceCleanupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # EC2 permissions for instance management
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:TerminateInstances
+                  - ec2:DescribeTags
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref AWS::Region
+              # SNS permissions for notifications
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CleanupNotificationTopic
+              # CloudWatch Logs permissions (explicitly defined for better control)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}*"
+      Tags:
+        - Key: Purpose
+          Value: ResourceCleanup
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Recipe
+          Value: simple-resource-cleanup-lambda-tags
+          
+  # CloudWatch Log Group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LambdaFunctionName}"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt LogGroupKMSKey.Arn
+      Tags:
+        - Key: Purpose
+          Value: ResourceCleanup
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Recipe
+          Value: simple-resource-cleanup-lambda-tags
+          
+  # KMS Key for CloudWatch Logs encryption
+  LogGroupKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for Resource Cleanup Lambda Log Group encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}"
+      Tags:
+        - Key: Purpose
+          Value: ResourceCleanup
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Recipe
+          Value: simple-resource-cleanup-lambda-tags
+          
+  # KMS Key Alias for easier reference
+  LogGroupKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/resource-cleanup-logs-${AWS::StackName}"
+      TargetKeyId: !Ref LogGroupKMSKey
+      
+  # Lambda function for resource cleanup
+  ResourceCleanupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: 1
+      DeadLetterConfig:
+        TargetArn: !Ref CleanupNotificationTopic
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CleanupNotificationTopic
+          CLEANUP_TAG_KEY: !Ref CleanupTagKey
+          CLEANUP_TAG_VALUES: !Join [',', !Ref CleanupTagValues]
+          AWS_REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timezone
+          from typing import List, Dict, Any
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              AWS Lambda function to automatically clean up EC2 instances based on tags.
+              
+              This function:
+              1. Queries EC2 instances with the specified cleanup tag
+              2. Terminates matching instances
+              3. Sends SNS notifications about cleanup actions
+              4. Provides detailed logging for audit trails
+              
+              Environment Variables:
+              - SNS_TOPIC_ARN: ARN of SNS topic for notifications
+              - CLEANUP_TAG_KEY: Tag key to identify resources for cleanup
+              - CLEANUP_TAG_VALUES: Comma-separated list of tag values that trigger cleanup
+              - AWS_REGION: AWS region for operations
+              """
+              
+              # Initialize AWS clients
+              ec2 = boto3.client('ec2')
+              sns = boto3.client('sns')
+              
+              # Get configuration from environment variables
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              cleanup_tag_key = os.environ.get('CLEANUP_TAG_KEY', 'AutoCleanup')
+              cleanup_tag_values = os.environ.get('CLEANUP_TAG_VALUES', 'true,True,TRUE').split(',')
+              aws_region = os.environ.get('AWS_REGION', 'us-east-1')
+              
+              print(f"Starting resource cleanup in region: {aws_region}")
+              print(f"Looking for tag: {cleanup_tag_key} with values: {cleanup_tag_values}")
+              
+              try:
+                  # Query instances with cleanup tag
+                  response = ec2.describe_instances(
+                      Filters=[
+                          {
+                              'Name': f'tag:{cleanup_tag_key}',
+                              'Values': cleanup_tag_values
+                          },
+                          {
+                              'Name': 'instance-state-name',
+                              'Values': ['running', 'stopped', 'stopping', 'pending']
+                          }
+                      ]
+                  )
+                  
+                  instances_to_cleanup = []
+                  
+                  # Extract instance information
+                  for reservation in response['Reservations']:
+                      for instance in reservation['Instances']:
+                          instance_id = instance['InstanceId']
+                          instance_name = 'Unnamed'
+                          instance_type = instance.get('InstanceType', 'Unknown')
+                          instance_state = instance['State']['Name']
+                          launch_time = instance.get('LaunchTime', 'Unknown')
+                          
+                          # Get instance name from tags
+                          for tag in instance.get('Tags', []):
+                              if tag['Key'] == 'Name':
+                                  instance_name = tag['Value']
+                                  break
+                          
+                          instances_to_cleanup.append({
+                              'InstanceId': instance_id,
+                              'Name': instance_name,
+                              'State': instance_state,
+                              'Type': instance_type,
+                              'LaunchTime': launch_time.isoformat() if hasattr(launch_time, 'isoformat') else str(launch_time)
+                          })
+                          
+                          print(f"Found instance for cleanup: {instance_id} ({instance_name}) - State: {instance_state}")
+                  
+                  if not instances_to_cleanup:
+                      message = f"No instances found with tag {cleanup_tag_key} matching values {cleanup_tag_values}"
+                      print(message)
+                      
+                      # Send informational notification
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject='AWS Resource Cleanup - No Action Required',
+                          Message=f"""
+          AWS Resource Cleanup Report
+          Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
+          Region: {aws_region}
+          
+          No EC2 instances were found matching the cleanup criteria.
+          
+          Search criteria:
+          - Tag Key: {cleanup_tag_key}
+          - Tag Values: {', '.join(cleanup_tag_values)}
+          
+          This is normal if no resources are currently tagged for cleanup.
+          """
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': message,
+                              'instances_found': 0,
+                              'instances_terminated': 0
+                          })
+                      }
+                  
+                  # Terminate instances
+                  instance_ids = [inst['InstanceId'] for inst in instances_to_cleanup]
+                  
+                  print(f"Terminating {len(instance_ids)} instances: {instance_ids}")
+                  
+                  termination_response = ec2.terminate_instances(InstanceIds=instance_ids)
+                  
+                  # Verify termination was initiated
+                  terminating_instances = []
+                  for term_inst in termination_response.get('TerminatingInstances', []):
+                      terminating_instances.append({
+                          'InstanceId': term_inst['InstanceId'],
+                          'CurrentState': term_inst['CurrentState']['Name'],
+                          'PreviousState': term_inst['PreviousState']['Name']
+                      })
+                  
+                  # Send detailed SNS notification
+                  message = f"""
+          AWS Resource Cleanup Report
+          Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
+          Region: {aws_region}
+          
+          The following EC2 instances were terminated:
+          
+          """
+                  
+                  total_estimated_monthly_cost = 0
+                  
+                  for instance in instances_to_cleanup:
+                      # Basic cost estimation (rough approximation)
+                      instance_type = instance['Type']
+                      estimated_hourly_cost = get_estimated_hourly_cost(instance_type)
+                      estimated_monthly_cost = estimated_hourly_cost * 24 * 30
+                      total_estimated_monthly_cost += estimated_monthly_cost
+                      
+                      message += f"""
+          Instance Details:
+          - Name: {instance['Name']}
+          - Instance ID: {instance['InstanceId']}
+          - Instance Type: {instance['Type']}
+          - Previous State: {instance['State']}
+          - Launch Time: {instance['LaunchTime']}
+          - Estimated Monthly Cost: ${estimated_monthly_cost:.2f}
+          
+          """
+                  
+                  message += f"""
+          Summary:
+          - Total instances terminated: {len(instances_to_cleanup)}
+          - Total estimated monthly savings: ${total_estimated_monthly_cost:.2f}
+          - Cleanup tag: {cleanup_tag_key}
+          - Matched values: {', '.join(cleanup_tag_values)}
+          
+          Note: Cost estimates are approximate and based on on-demand pricing.
+          Actual costs may vary based on usage patterns, reserved instances, and spot pricing.
+          """
+                  
+                  # Publish comprehensive notification
+                  sns.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject=f'AWS Resource Cleanup Completed - {len(instances_to_cleanup)} Instances Terminated',
+                      Message=message
+                  )
+                  
+                  print(f"Successfully initiated termination of {len(instances_to_cleanup)} instances")
+                  print(f"Estimated monthly savings: ${total_estimated_monthly_cost:.2f}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully initiated cleanup of {len(instances_to_cleanup)} instances',
+                          'instances_found': len(instances_to_cleanup),
+                          'instances_terminated': len(instances_to_cleanup),
+                          'estimated_monthly_savings': round(total_estimated_monthly_cost, 2),
+                          'terminated_instances': [inst['InstanceId'] for inst in instances_to_cleanup]
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Error during cleanup: {str(e)}"
+                  print(f"ERROR: {error_message}")
+                  
+                  # Send error notification
+                  try:
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject='AWS Resource Cleanup Error',
+                          Message=f"""
+          AWS Resource Cleanup Error Report
+          Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
+          Region: {aws_region}
+          
+          An error occurred during resource cleanup:
+          
+          Error: {error_message}
+          
+          Please check the CloudWatch logs for more details:
+          Log Group: /aws/lambda/{context.function_name if context else 'unknown'}
+          
+          This may require manual intervention to resolve.
+          """
+                      )
+                  except Exception as sns_error:
+                      print(f"CRITICAL ERROR: Failed to send error notification: {sns_error}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': error_message,
+                          'instances_found': 0,
+                          'instances_terminated': 0
+                      })
+                  }
+          
+          def get_estimated_hourly_cost(instance_type: str) -> float:
+              """
+              Get estimated hourly cost for EC2 instance type (US East 1 pricing).
+              These are approximate costs and may not reflect current pricing.
+              """
+              cost_map = {
+                  't2.micro': 0.0116,
+                  't2.small': 0.023,
+                  't2.medium': 0.0464,
+                  't2.large': 0.0928,
+                  't3.micro': 0.0104,
+                  't3.small': 0.0208,
+                  't3.medium': 0.0416,
+                  't3.large': 0.0832,
+                  'm5.large': 0.096,
+                  'm5.xlarge': 0.192,
+                  'c5.large': 0.085,
+                  'c5.xlarge': 0.17,
+                  'r5.large': 0.126,
+                  'r5.xlarge': 0.252
+              }
+              
+              return cost_map.get(instance_type, 0.10)  # Default estimate for unknown types
+      Tags:
+        - Key: Purpose
+          Value: ResourceCleanup
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Recipe
+          Value: simple-resource-cleanup-lambda-tags
+          
+  # CloudWatch Events Rule for scheduled execution (conditional)
+  ScheduledCleanupRule:
+    Type: AWS::Events::Rule
+    Condition: EnableSchedule
+    Properties:
+      Description: Scheduled execution rule for resource cleanup Lambda function
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ResourceCleanupFunction.Arn
+          Id: ResourceCleanupTarget
+          
+  # Permission for CloudWatch Events to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableSchedule
+    Properties:
+      FunctionName: !Ref ResourceCleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledCleanupRule.Arn
+      
+  # Test EC2 Instance (conditional)
+  TestInstance:
+    Type: AWS::EC2::Instance
+    Condition: CreateTest
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref TestInstanceType
+      IamInstanceProfile: !Ref TestInstanceProfile
+      SecurityGroupIds:
+        - !Ref TestSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          
+          # Install CloudWatch agent for monitoring
+          yum install -y amazon-cloudwatch-agent
+          
+          # Create a marker file to indicate this is a test instance
+          echo "Test instance created by CloudFormation for resource cleanup validation" > /tmp/cleanup-test-marker.txt
+          echo "Stack: ${AWS::StackName}" >> /tmp/cleanup-test-marker.txt
+          echo "Created: $(date)" >> /tmp/cleanup-test-marker.txt
+          
+          # Log instance details
+          echo "Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)" >> /tmp/cleanup-test-marker.txt
+          echo "Instance Type: $(curl -s http://169.254.169.254/latest/meta-data/instance-type)" >> /tmp/cleanup-test-marker.txt
+          
+      Tags:
+        - Key: Name
+          Value: !Sub "test-cleanup-instance-${AWS::StackName}"
+        - Key: !Ref CleanupTagKey
+          Value: !Select [0, !Ref CleanupTagValues]
+        - Key: Environment
+          Value: test
+        - Key: Purpose
+          Value: cleanup-testing
+        - Key: CreatedBy
+          Value: CloudFormation
+        - Key: Stack
+          Value: !Ref AWS::StackName
+        - Key: Recipe
+          Value: simple-resource-cleanup-lambda-tags
+        - Key: AutoTerminate
+          Value: true
+          
+  # IAM Role for test instance
+  TestInstanceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateTest
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Purpose
+          Value: TestInstance
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Recipe
+          Value: simple-resource-cleanup-lambda-tags
+          
+  # Instance profile for test instance
+  TestInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: CreateTest
+    Properties:
+      Roles:
+        - !Ref TestInstanceRole
+        
+  # Security group for test instance (minimal access)
+  TestSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateTest
+    Properties:
+      GroupDescription: Security group for resource cleanup test instance
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS API calls
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP outbound for package updates
+      Tags:
+        - Key: Name
+          Value: !Sub "test-cleanup-sg-${AWS::StackName}"
+        - Key: Purpose
+          Value: TestInstance
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Recipe
+          Value: simple-resource-cleanup-lambda-tags
+
+Outputs:
+  # SNS Topic Information
+  SNSTopicArn:
+    Description: ARN of the SNS topic for cleanup notifications
+    Value: !Ref CleanupNotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopic"
+      
+  SNSTopicName:
+    Description: Name of the SNS topic for cleanup notifications
+    Value: !GetAtt CleanupNotificationTopic.TopicName
+    
+  # Lambda Function Information
+  LambdaFunctionArn:
+    Description: ARN of the resource cleanup Lambda function
+    Value: !GetAtt ResourceCleanupFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunction"
+      
+  LambdaFunctionName:
+    Description: Name of the resource cleanup Lambda function
+    Value: !Ref ResourceCleanupFunction
+    
+  LambdaLogGroupName:
+    Description: CloudWatch Log Group name for the Lambda function
+    Value: !Ref LambdaLogGroup
+    
+  # IAM Role Information
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    
+  # Scheduled Rule Information (conditional)
+  ScheduledRuleArn:
+    Condition: EnableSchedule
+    Description: ARN of the CloudWatch Events rule for scheduled execution
+    Value: !GetAtt ScheduledCleanupRule.Arn
+    
+  ScheduleExpression:
+    Condition: EnableSchedule
+    Description: Schedule expression for automated cleanup
+    Value: !Ref ScheduleExpression
+    
+  # Test Instance Information (conditional)
+  TestInstanceId:
+    Condition: CreateTest
+    Description: Instance ID of the test instance (will be terminated by cleanup function)
+    Value: !Ref TestInstance
+    
+  TestInstancePrivateIP:
+    Condition: CreateTest
+    Description: Private IP address of the test instance
+    Value: !GetAtt TestInstance.PrivateIp
+    
+  # Configuration Information
+  CleanupConfiguration:
+    Description: Tag configuration used for identifying resources to cleanup
+    Value: !Sub "Tag Key: ${CleanupTagKey}, Tag Values: ${CleanupTagValues}"
+    
+  # Management Console Links
+  LambdaConsoleURL:
+    Description: Direct link to Lambda function in AWS Console
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${ResourceCleanupFunction}"
+    
+  SNSConsoleURL:
+    Description: Direct link to SNS topic in AWS Console
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/sns/v3/home?region=${AWS::Region}#/topic/${CleanupNotificationTopic}"
+    
+  CloudWatchLogsURL:
+    Description: Direct link to CloudWatch Logs for the Lambda function
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Flambda$252F${LambdaFunctionName}"
+    
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this solution (excludes terminated instances)
+    Value: "$0.50 - $2.00 (Lambda executions + SNS notifications)"
+    
+  # Usage Instructions
+  ManualExecutionCommand:
+    Description: AWS CLI command to manually execute the cleanup function
+    Value: !Sub "aws lambda invoke --function-name ${ResourceCleanupFunction} --payload '{}' response.json"
+    
+  TestCommand:
+    Description: Command to verify the solution is working
+    Value: !Sub "aws ec2 describe-instances --filters 'Name=tag:${CleanupTagKey},Values=${CleanupTagValues}' --query 'Reservations[].Instances[].{InstanceId:InstanceId,Name:Tags[?Key==`Name`].Value|[0],State:State.Name}'"

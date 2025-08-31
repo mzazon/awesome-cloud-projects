@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Workstations, Artifact Registry, Cloud Run
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: debugging, workstations, containers, devops, remote-development
 recipe-generator-version: 1.3
@@ -331,11 +331,13 @@ EXPOSE 8080 9229
 CMD ["npm", "start"]
 EOF
    
-   # Build and deploy to Cloud Run
-   gcloud builds submit --tag gcr.io/${PROJECT_ID}/${SERVICE_NAME}
+   # Build and deploy to Cloud Run using Artifact Registry
+   export APP_IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY_NAME}/${SERVICE_NAME}:latest"
+   
+   gcloud builds submit --tag ${APP_IMAGE_URI}
    
    gcloud run deploy ${SERVICE_NAME} \
-       --image gcr.io/${PROJECT_ID}/${SERVICE_NAME} \
+       --image ${APP_IMAGE_URI} \
        --platform managed \
        --region ${REGION} \
        --allow-unauthenticated \
@@ -396,14 +398,14 @@ EOF
    Configuring monitoring and logging integration enables comprehensive observability during debugging sessions while providing audit trails and performance insights. This setup connects workstation activities with application behavior and system metrics for effective troubleshooting workflows.
 
    ```bash
+   # Create Pub/Sub topic for debug activities
+   gcloud pubsub topics create debug-activities
+   
    # Create Cloud Logging sink for workstation activities
    gcloud logging sinks create workstation-debug-sink \
        pubsub.googleapis.com/projects/${PROJECT_ID}/topics/debug-activities \
        --log-filter='resource.type="gce_instance" AND 
                     resource.labels.instance_name:workstation'
-   
-   # Enable Cloud Monitoring for workstation metrics
-   gcloud services enable monitoring.googleapis.com
    
    # Create monitoring dashboard for debugging workflow
    cat > debug-dashboard.json << 'EOF'
@@ -570,6 +572,9 @@ EOF
    # Delete logging sink
    gcloud logging sinks delete workstation-debug-sink --quiet
    
+   # Delete Pub/Sub topic
+   gcloud pubsub topics delete debug-activities --quiet
+   
    # Clean up local files
    rm -rf workstation-debug-image sample-app debug-dashboard.json
    rm -f /tmp/cluster_state.txt /tmp/workstation_state.txt
@@ -578,6 +583,7 @@ EOF
    unset PROJECT_ID REGION ZONE RANDOM_SUFFIX
    unset WORKSTATION_CLUSTER WORKSTATION_CONFIG REPOSITORY_NAME
    unset SERVICE_NAME IMAGE_URI SERVICE_URL WORKSTATION_URL WORKSTATION_NAME
+   unset APP_IMAGE_URI
    
    echo "✅ All debugging workflow resources cleaned up"
    ```
@@ -612,4 +618,9 @@ Extend this debugging workflow solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

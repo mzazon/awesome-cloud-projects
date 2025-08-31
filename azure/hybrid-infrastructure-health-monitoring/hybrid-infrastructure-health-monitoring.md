@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Functions, Azure Update Manager, Azure Event Grid, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: automation, monitoring, infrastructure, updates, serverless, health-checks
 recipe-generator-version: 1.3
@@ -122,7 +122,7 @@ az monitor log-analytics workspace create \
     --resource-group ${RESOURCE_GROUP} \
     --workspace-name ${LOG_ANALYTICS_NAME} \
     --location ${LOCATION} \
-    --sku PerGB2018
+    --sku "PerGB2018"
 
 echo "✅ Log Analytics workspace created"
 ```
@@ -143,17 +143,17 @@ echo "✅ Log Analytics workspace created"
        --subnet-name ${SUBNET_NAME} \
        --subnet-prefixes 10.0.1.0/24
    
-   # Configure subnet delegation for Azure Functions
+   # Configure subnet delegation for Azure Functions Flex Consumption
    az network vnet subnet update \
        --resource-group ${RESOURCE_GROUP} \
        --vnet-name ${VNET_NAME} \
        --name ${SUBNET_NAME} \
-       --delegations Microsoft.App/environments
+       --service-endpoints Microsoft.Storage Microsoft.KeyVault
    
-   echo "✅ Virtual network configured with function delegation"
+   echo "✅ Virtual network configured with service endpoints"
    ```
 
-   The virtual network now provides the foundation for secure communication between Azure Functions and your hybrid infrastructure. Subnet delegation enables Azure Functions Flex Consumption to integrate with the virtual network while maintaining serverless scaling capabilities.
+   The virtual network now provides the foundation for secure communication between Azure Functions and your hybrid infrastructure. Service endpoints enable secure access to Azure services while maintaining network isolation.
 
 2. **Create Azure Storage Account for Function App**:
 
@@ -194,7 +194,9 @@ echo "✅ Log Analytics workspace created"
        --location ${LOCATION} \
        --sku standard \
        --enabled-for-template-deployment true \
-       --enable-rbac-authorization false
+       --enable-rbac-authorization false \
+       --enable-soft-delete true \
+       --retention-days 7
    
    # Store storage connection string in Key Vault
    az keyvault secret set \
@@ -251,11 +253,10 @@ echo "✅ Log Analytics workspace created"
    Azure Functions Flex Consumption plan provides serverless compute with enhanced networking capabilities and configurable instance memory. This plan enables virtual network integration while maintaining the cost benefits of pay-per-execution billing, making it ideal for infrastructure monitoring workloads that require secure connectivity.
 
    ```bash
-   # Get subnet ID for VNet integration
-   SUBNET_ID=$(az network vnet subnet show \
+   # Get virtual network resource ID for integration
+   VNET_ID=$(az network vnet show \
        --resource-group ${RESOURCE_GROUP} \
-       --vnet-name ${VNET_NAME} \
-       --name ${SUBNET_NAME} \
+       --name ${VNET_NAME} \
        --query id --output tsv)
    
    # Create Function App with Flex Consumption plan
@@ -263,18 +264,12 @@ echo "✅ Log Analytics workspace created"
        --name ${FUNCTION_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --storage-account ${STORAGE_ACCOUNT_NAME} \
-       --functions-version 4 \
+       --flexconsumption-location ${LOCATION} \
        --runtime python \
        --runtime-version 3.11 \
-       --os-type Linux \
-       --consumption-plan-location ${LOCATION} \
-       --plan-name flexconsumption
-   
-   # Enable virtual network integration
-   az functionapp vnet-integration add \
-       --name ${FUNCTION_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --subnet ${SUBNET_ID}
+       --functions-version 4 \
+       --vnet ${VNET_ID} \
+       --subnet ${SUBNET_NAME}
    
    echo "✅ Function App created with Flex Consumption and VNet integration"
    ```
@@ -335,14 +330,14 @@ echo "✅ Log Analytics workspace created"
    
    # Create requirements.txt for dependencies
    cat > requirements.txt << 'EOF'
-   azure-functions==1.18.0
-   azure-identity==1.15.0
-   azure-keyvault-secrets==4.7.0
-   azure-eventgrid==4.17.0
-   azure-monitor-query==1.2.0
-   azure-mgmt-automation==1.1.0
-   requests==2.31.0
-   EOF
+azure-functions==1.18.0
+azure-identity==1.15.0
+azure-keyvault-secrets==4.7.0
+azure-eventgrid==4.17.0
+azure-monitor-query==1.2.0
+azure-mgmt-automation==1.1.0
+requests==2.31.0
+EOF
    
    echo "✅ Function project structure created with required dependencies"
    ```
@@ -362,7 +357,7 @@ import logging
 import os
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
-from azure.eventgrid import EventGridPublisherClient
+from azure.eventgrid import EventGridPublisherClient, EventGridEvent
 from azure.monitor.query import LogsQueryClient
 from datetime import datetime, timedelta
 import requests
@@ -489,23 +484,23 @@ def process_health_results(health_results, eg_client):
 def trigger_update_assessment(issues, eg_client):
     """Trigger Azure Update Manager assessment for critical issues"""
     
-    event_data = {
-        'eventType': 'Infrastructure.HealthCheck.Critical',
-        'subject': 'infrastructure/health/critical',
-        'data': {
+    event_data = [EventGridEvent(
+        event_type='Infrastructure.HealthCheck.Critical',
+        subject='infrastructure/health/critical',
+        data={
             'severity': 'Critical',
             'issueCount': len(issues),
             'issues': issues,
             'action': 'trigger_update_assessment',
             'timestamp': datetime.utcnow().isoformat()
         },
-        'dataVersion': '1.0'
-    }
+        data_version='1.0'
+    )]
     
     try:
         # Send event to Event Grid
+        eg_client.send(event_data)
         logging.info("Triggering critical update assessment")
-        # Note: In production, implement actual Event Grid publishing
         
     except Exception as e:
         logging.error(f"Failed to trigger update assessment: {str(e)}")
@@ -513,37 +508,45 @@ def trigger_update_assessment(issues, eg_client):
 def schedule_maintenance_assessment(issues, eg_client):
     """Schedule maintenance window for warning-level issues"""
     
-    event_data = {
-        'eventType': 'Infrastructure.HealthCheck.Warning',
-        'subject': 'infrastructure/health/warning',
-        'data': {
+    event_data = [EventGridEvent(
+        event_type='Infrastructure.HealthCheck.Warning',
+        subject='infrastructure/health/warning',
+        data={
             'severity': 'Warning',
             'issueCount': len(issues),
             'issues': issues,
             'action': 'schedule_maintenance',
             'timestamp': datetime.utcnow().isoformat()
         },
-        'dataVersion': '1.0'
-    }
+        data_version='1.0'
+    )]
     
-    logging.info("Scheduling maintenance window assessment")
+    try:
+        eg_client.send(event_data)
+        logging.info("Scheduling maintenance window assessment")
+    except Exception as e:
+        logging.error(f"Failed to schedule maintenance: {str(e)}")
 
 def send_health_alert(severity, message, eg_client):
     """Send health alert through Event Grid"""
     
-    alert_data = {
-        'eventType': f'Infrastructure.Alert.{severity}',
-        'subject': 'infrastructure/alerts',
-        'data': {
+    alert_data = [EventGridEvent(
+        event_type=f'Infrastructure.Alert.{severity}',
+        subject='infrastructure/alerts',
+        data={
             'alertSeverity': severity,
             'message': message,
             'timestamp': datetime.utcnow().isoformat(),
             'source': 'HealthMonitor'
         },
-        'dataVersion': '1.0'
-    }
+        data_version='1.0'
+    )]
     
-    logging.info(f"Sending {severity} alert: {message}")
+    try:
+        eg_client.send(alert_data)
+        logging.info(f"Sending {severity} alert: {message}")
+    except Exception as e:
+        logging.error(f"Failed to send alert: {str(e)}")
 EOF
    
    echo "✅ Health monitoring logic implemented with Azure integration"
@@ -564,7 +567,6 @@ import logging
 import os
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
-from azure.eventgrid import EventGridEvent
 from datetime import datetime
 
 def main(event: func.EventGridEvent):
@@ -572,7 +574,7 @@ def main(event: func.EventGridEvent):
     
     try:
         # Parse Event Grid event
-        event_data = json.loads(event.get_body().decode('utf-8'))
+        event_data = event.get_json()
         logging.info(f'Received event: {event_data}')
         
         # Initialize Azure clients
@@ -592,8 +594,10 @@ def main(event: func.EventGridEvent):
             handle_critical_health_event(event_data, credential)
         elif 'Infrastructure.HealthCheck.Warning' in event_type:
             handle_warning_health_event(event_data, credential)
-        elif 'Microsoft.Automation.UpdateManagement' in event_type:
-            handle_update_manager_event(event_data, credential)
+        elif 'Microsoft.Maintenance.PreMaintenanceEvent' in event_type:
+            handle_pre_maintenance_event(event_data, credential)
+        elif 'Microsoft.Maintenance.PostMaintenanceEvent' in event_type:
+            handle_post_maintenance_event(event_data, credential)
         else:
             logging.info(f'Unhandled event type: {event_type}')
         
@@ -631,21 +635,27 @@ def handle_warning_health_event(event_data, credential):
     # Send standard notifications
     send_standard_notifications(event_data)
 
-def handle_update_manager_event(event_data, credential):
-    """Handle Azure Update Manager events"""
+def handle_pre_maintenance_event(event_data, credential):
+    """Handle Azure Update Manager pre-maintenance events"""
     
-    logging.info('Processing Update Manager event')
+    logging.info('Processing pre-maintenance event')
     
-    # Extract update information
-    update_data = event_data.get('data', {})
-    operation_type = update_data.get('operationType', '')
+    # Extract maintenance information
+    maintenance_data = event_data.get('data', {})
     
-    if operation_type == 'Assessment':
-        process_assessment_results(update_data)
-    elif operation_type == 'Installation':
-        process_installation_results(update_data)
-    else:
-        logging.info(f'Unhandled Update Manager operation: {operation_type}')
+    # Perform pre-maintenance tasks
+    perform_pre_maintenance_tasks(maintenance_data)
+
+def handle_post_maintenance_event(event_data, credential):
+    """Handle Azure Update Manager post-maintenance events"""
+    
+    logging.info('Processing post-maintenance event')
+    
+    # Extract maintenance information
+    maintenance_data = event_data.get('data', {})
+    
+    # Perform post-maintenance tasks
+    perform_post_maintenance_tasks(maintenance_data)
 
 def trigger_immediate_assessment(issues):
     """Trigger immediate update assessment for critical issues"""
@@ -680,49 +690,43 @@ def schedule_maintenance_window(issues):
     
     logging.info(f'Maintenance request: {json.dumps(maintenance_request, indent=2)}')
 
-def process_assessment_results(update_data):
-    """Process Update Manager assessment results"""
+def perform_pre_maintenance_tasks(maintenance_data):
+    """Perform pre-maintenance tasks"""
     
-    logging.info('Processing assessment results')
+    logging.info('Executing pre-maintenance tasks')
     
-    # Extract assessment information
-    assessment_results = {
-        'assessment_id': update_data.get('assessmentId'),
-        'completion_status': update_data.get('status'),
-        'updates_available': update_data.get('updatesAvailable', 0),
-        'critical_updates': update_data.get('criticalUpdates', 0),
+    # Example pre-maintenance tasks:
+    # - Create snapshots
+    # - Stop non-critical services
+    # - Send notifications
+    
+    pre_tasks = {
+        'snapshot_creation': 'initiated',
+        'service_shutdown': 'completed',
+        'notification_sent': 'completed',
         'timestamp': datetime.utcnow().isoformat()
     }
     
-    # Determine next actions based on assessment
-    if assessment_results['critical_updates'] > 0:
-        prioritize_critical_updates(assessment_results)
-    elif assessment_results['updates_available'] > 0:
-        schedule_standard_updates(assessment_results)
-    
-    logging.info(f'Assessment processed: {json.dumps(assessment_results, indent=2)}')
+    logging.info(f'Pre-maintenance tasks: {json.dumps(pre_tasks, indent=2)}')
 
-def process_installation_results(update_data):
-    """Process Update Manager installation results"""
+def perform_post_maintenance_tasks(maintenance_data):
+    """Perform post-maintenance tasks"""
     
-    logging.info('Processing installation results')
+    logging.info('Executing post-maintenance tasks')
     
-    installation_results = {
-        'installation_id': update_data.get('installationId'),
-        'completion_status': update_data.get('status'),
-        'successful_updates': update_data.get('successfulUpdates', 0),
-        'failed_updates': update_data.get('failedUpdates', 0),
+    # Example post-maintenance tasks:
+    # - Restart services
+    # - Validate systems
+    # - Send completion notifications
+    
+    post_tasks = {
+        'service_restart': 'completed',
+        'system_validation': 'passed',
+        'completion_notification': 'sent',
         'timestamp': datetime.utcnow().isoformat()
     }
     
-    # Handle installation failures
-    if installation_results['failed_updates'] > 0:
-        handle_installation_failures(installation_results)
-    
-    # Update compliance tracking
-    update_compliance_tracking(installation_results)
-    
-    logging.info(f'Installation processed: {json.dumps(installation_results, indent=2)}')
+    logging.info(f'Post-maintenance tasks: {json.dumps(post_tasks, indent=2)}')
 
 def create_incident_ticket(event_data):
     """Create incident ticket for critical issues"""
@@ -771,32 +775,12 @@ def get_next_maintenance_window():
     # to find optimal maintenance windows
     
     return "Next available weekend window"
-
-def prioritize_critical_updates(assessment_results):
-    """Prioritize critical updates for immediate installation"""
-    
-    logging.info('Prioritizing critical updates for immediate installation')
-
-def schedule_standard_updates(assessment_results):
-    """Schedule standard updates for next maintenance window"""
-    
-    logging.info('Scheduling standard updates for maintenance window')
-
-def handle_installation_failures(installation_results):
-    """Handle failed update installations"""
-    
-    logging.error(f'Update installation failures detected: {installation_results}')
-
-def update_compliance_tracking(installation_results):
-    """Update compliance tracking with installation results"""
-    
-    logging.info('Updating compliance tracking records')
 EOF
    
    echo "✅ Update event handler implemented with comprehensive automation"
    ```
 
-   The update event handler now provides comprehensive automation for responding to infrastructure health events and Update Manager notifications. This event-driven architecture ensures rapid response to critical issues while maintaining appropriate scheduling for routine maintenance.
+   The update event handler now provides comprehensive automation for responding to infrastructure health events and Update Manager maintenance notifications. This event-driven architecture ensures rapid response to critical issues while maintaining appropriate scheduling for routine maintenance.
 
 10. **Deploy Function App and Configure Update Manager Integration**:
 
@@ -832,9 +816,6 @@ EOF
     
     echo "✅ Function App deployed with managed identity and permissions"
     
-    # Configure Update Manager integration
-    az extension add --name automation --upgrade
-    
     # Create Event Grid subscription for Update Manager events
     FUNCTION_ENDPOINT="https://${FUNCTION_APP_NAME}.azurewebsites.net/runtime/webhooks/eventgrid?functionName=UpdateEventHandler"
     
@@ -844,13 +825,13 @@ EOF
         --endpoint ${FUNCTION_ENDPOINT} \
         --endpoint-type webhook \
         --included-event-types \
-            "Microsoft.Automation.UpdateManagement.AssessmentCompleted" \
-            "Microsoft.Automation.UpdateManagement.InstallationCompleted"
+            "Microsoft.Maintenance.PreMaintenanceEvent" \
+            "Microsoft.Maintenance.PostMaintenanceEvent"
     
     echo "✅ Update Manager integration configured with Event Grid subscriptions"
     ```
 
-    The Function App is now deployed with comprehensive Azure service integration. Managed identity provides secure access to Key Vault and Event Grid, while Update Manager event subscriptions enable automated response to infrastructure update events.
+    The Function App is now deployed with comprehensive Azure service integration. Managed identity provides secure access to Key Vault and Event Grid, while Update Manager event subscriptions enable automated response to infrastructure maintenance events.
 
 ## Validation & Testing
 
@@ -913,17 +894,18 @@ EOF
    ```bash
    # Simulate Update Manager event (for testing)
    cat > test-event.json << 'EOF'
-   {
-     "eventType": "Microsoft.Automation.UpdateManagement.AssessmentCompleted",
-     "subject": "test/assessment",
+   [{
+     "id": "test-event-id",
+     "eventType": "Microsoft.Maintenance.PreMaintenanceEvent",
+     "subject": "test/maintenance",
+     "eventTime": "2025-07-23T10:00:00Z",
      "data": {
-       "operationType": "Assessment",
-       "status": "Succeeded",
-       "updatesAvailable": 5,
-       "criticalUpdates": 2
+       "maintenanceConfiguration": "test-config",
+       "resourceId": "/subscriptions/test/resourceGroups/test/providers/Microsoft.Compute/virtualMachines/test-vm",
+       "status": "Scheduled"
      },
      "dataVersion": "1.0"
-   }
+   }]
    EOF
    
    # Send test event to Event Grid
@@ -985,10 +967,14 @@ EOF
 4. **Remove Networking and Security Resources**:
 
    ```bash
-   # Delete Key Vault
+   # Delete Key Vault (with purge protection)
    az keyvault delete \
        --name ${KEY_VAULT_NAME} \
        --resource-group ${RESOURCE_GROUP}
+   
+   az keyvault purge \
+       --name ${KEY_VAULT_NAME} \
+       --location ${LOCATION}
    
    # Delete virtual network
    az network vnet delete \
@@ -1013,11 +999,11 @@ EOF
 
 ## Discussion
 
-Azure Functions Flex Consumption plan represents a significant advancement in serverless computing for enterprise infrastructure management. Unlike the traditional Consumption plan, Flex Consumption provides virtual network integration capabilities while maintaining the cost benefits of pay-per-execution billing. This combination is particularly valuable for infrastructure monitoring scenarios where secure connectivity to hybrid environments is essential, but dedicated infrastructure would be cost-prohibitive. For comprehensive guidance on serverless architectures, see the [Azure Functions documentation](https://docs.microsoft.com/en-us/azure/azure-functions/) and [Flex Consumption plan features](https://docs.microsoft.com/en-us/azure/azure-functions/flex-consumption-plan).
+Azure Functions Flex Consumption plan represents a significant advancement in serverless computing for enterprise infrastructure management. Unlike the traditional Consumption plan, Flex Consumption provides virtual network integration capabilities while maintaining the cost benefits of pay-per-execution billing. This combination is particularly valuable for infrastructure monitoring scenarios where secure connectivity to hybrid environments is essential, but dedicated infrastructure would be cost-prohibitive. For comprehensive guidance on serverless architectures, see the [Azure Functions documentation](https://docs.microsoft.com/en-us/azure/azure-functions/) and [Flex Consumption plan features](https://docs.microsoft.com/en-us/azure/azure-functions/flex-consumption-how-to).
 
-Azure Update Manager serves as the centralized update management solution, replacing the deprecated Azure Automation Update Management. This modern service provides unified update visibility across Azure, hybrid, and multi-cloud environments through Azure Arc integration. The event-driven architecture enabled by Event Grid creates responsive automation that can react to update assessments and installations in real-time, ensuring rapid response to critical security updates while maintaining appropriate change management processes. The [Azure Update Manager documentation](https://docs.microsoft.com/en-us/azure/update-manager/overview) provides detailed guidance on assessment scheduling and compliance tracking.
+Azure Update Manager serves as the centralized update management solution, replacing the deprecated Azure Automation Update Management. This modern service provides unified update visibility across Azure, hybrid, and multi-cloud environments through Azure Arc integration. The event-driven architecture enabled by Event Grid creates responsive automation that can react to pre and post maintenance events in real-time, ensuring rapid response to critical security updates while maintaining appropriate change management processes. The [Azure Update Manager documentation](https://docs.microsoft.com/en-us/azure/update-manager/overview) provides detailed guidance on maintenance configurations and event-driven automation.
 
-The integration of Azure Functions with virtual networks enables secure communication with on-premises infrastructure without compromising serverless benefits. This architecture pattern supports enterprise security requirements while maintaining operational efficiency through automated health monitoring and update coordination. Key Vault integration ensures that sensitive configuration data remains secure and compliant with enterprise security policies. For implementation best practices, reference the [Azure Functions networking options](https://docs.microsoft.com/en-us/azure/azure-functions/functions-networking-options) and [virtual network integration guidance](https://docs.microsoft.com/en-us/azure/azure-functions/functions-create-vnet).
+The integration of Azure Functions with virtual networks enables secure communication with on-premises infrastructure without compromising serverless benefits. This architecture pattern supports enterprise security requirements while maintaining operational efficiency through automated health monitoring and update coordination. Key Vault integration ensures that sensitive configuration data remains secure and compliant with enterprise security policies. For implementation best practices, reference the [Azure Functions networking options](https://docs.microsoft.com/en-us/azure/azure-functions/functions-networking-options) and [virtual network integration guidance](https://docs.microsoft.com/en-us/azure/azure-functions/flex-consumption-how-to).
 
 From a cost optimization perspective, the Flex Consumption plan's enhanced networking capabilities justify the slightly higher cost compared to the standard Consumption plan. The ability to securely access hybrid infrastructure without dedicated compute resources or VPN gateways significantly reduces total infrastructure costs while improving security posture. The [Azure Functions pricing guide](https://azure.microsoft.com/en-us/pricing/details/functions/) provides detailed cost analysis for different hosting plans.
 
@@ -1039,4 +1025,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

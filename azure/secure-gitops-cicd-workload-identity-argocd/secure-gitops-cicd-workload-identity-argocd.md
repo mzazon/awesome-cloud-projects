@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Kubernetes Service, Azure Key Vault, Azure Workload Identity, ArgoCD
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: gitops, argocd, kubernetes, security, workload-identity, key-vault, ci-cd
 recipe-generator-version: 1.3
@@ -72,7 +72,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with permissions to create AKS clusters, managed identities, and Key Vault resources
-2. Azure CLI v2.47.0 or later installed and configured
+2. Azure CLI v2.75.0 or later installed and configured
 3. kubectl command-line tool installed
 4. Git repository for storing application manifests
 5. Basic understanding of Kubernetes, GitOps principles, and Azure identity concepts
@@ -86,7 +86,7 @@ Azure Workload Identity enables secure authentication between Kubernetes pods an
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-gitops-demo"
+export RESOURCE_GROUP="rg-gitops-demo-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export CLUSTER_NAME="aks-gitops-cluster"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
@@ -236,8 +236,6 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --name argocd \
        --extension-type Microsoft.ArgoCD \
        --auto-upgrade false \
-       --release-train preview \
-       --version 0.0.7-preview \
        --config workloadIdentity.enable=true \
        --config workloadIdentity.clientId=${USER_ASSIGNED_CLIENT_ID} \
        --config deployWithHighAvailability=false \
@@ -281,6 +279,9 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Kubernetes service accounts with workload identity annotations enable seamless authentication to Azure services. These annotations establish the connection between pod identities and Azure managed identities, enabling automatic token exchange for secure resource access.
 
    ```bash
+   # Wait for ArgoCD extension to be fully deployed
+   sleep 30
+
    # Annotate ArgoCD service accounts with workload identity
    kubectl annotate serviceaccount argocd-application-controller \
        -n argocd \
@@ -454,7 +455,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
     EOF
 
     # Wait for ArgoCD to sync the application
-    kubectl wait --for=condition=Synced application/sample-app-gitops -n argocd --timeout=300s
+    kubectl wait --for=condition=Synced application/sample-app-gitops \
+        -n argocd --timeout=300s
 
     echo "✅ ArgoCD application created and synced"
     ```
@@ -484,10 +486,12 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    kubectl get serviceaccount sample-app-sa -n sample-app -o yaml
 
    # Check if secrets are mounted correctly
-   kubectl exec -it deployment/sample-app -n sample-app -- ls -la /mnt/secrets
+   kubectl exec -it deployment/sample-app -n sample-app -- \
+       ls -la /mnt/secrets
 
    # Verify environment variable is set
-   kubectl exec -it deployment/sample-app -n sample-app -- env | grep DATABASE_CONNECTION_STRING
+   kubectl exec -it deployment/sample-app -n sample-app -- \
+       env | grep DATABASE_CONNECTION_STRING
    ```
 
    Expected output: Service account should have workload identity annotations, secrets should be mounted at `/mnt/secrets`, and environment variables should contain Key Vault values.
@@ -509,7 +513,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        -o jsonpath="{.data.password}" | base64 -d
 
    # Get LoadBalancer IP
-   kubectl get service argocd-server-lb -n argocd -o jsonpath="{.status.loadBalancer.ingress[0].ip}"
+   kubectl get service argocd-server-lb -n argocd \
+       -o jsonpath="{.status.loadBalancer.ingress[0].ip}"
    ```
 
    Expected output: LoadBalancer IP address and admin password for accessing ArgoCD UI.
@@ -597,7 +602,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    # Clean up environment variables
    unset RESOURCE_GROUP LOCATION CLUSTER_NAME SUBSCRIPTION_ID
    unset RANDOM_SUFFIX KEY_VAULT_NAME MANAGED_IDENTITY_NAME
-   unset USER_ASSIGNED_CLIENT_ID AKS_OIDC_ISSUER
+   unset USER_ASSIGNED_CLIENT_ID USER_ASSIGNED_PRINCIPAL_ID AKS_OIDC_ISSUER
    ```
 
 ## Discussion
@@ -628,4 +633,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

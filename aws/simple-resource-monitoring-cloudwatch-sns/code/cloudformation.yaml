@@ -1,0 +1,483 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Simple Resource Monitoring with CloudWatch and SNS
+  Creates EC2 instance monitoring with CloudWatch alarms and SNS email notifications.
+  Based on recipe: simple-resource-monitoring-cloudwatch-sns
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - AlarmName
+      - Label:
+          default: "EC2 Configuration"
+        Parameters:
+          - InstanceType
+          - InstanceName
+          - KeyPairName
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - CPUThreshold
+          - EvaluationPeriods
+          - MonitoringPeriod
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+    ParameterLabels:
+      NotificationEmail:
+        default: "Email Address for Alerts"
+      AlarmName:
+        default: "CloudWatch Alarm Name"
+      InstanceType:
+        default: "EC2 Instance Type"
+      InstanceName:
+        default: "EC2 Instance Name"
+      KeyPairName:
+        default: "EC2 Key Pair Name"
+      CPUThreshold:
+        default: "CPU Utilization Threshold (%)"
+      EvaluationPeriods:
+        default: "Evaluation Periods"
+      MonitoringPeriod:
+        default: "Monitoring Period (seconds)"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+
+# Input Parameters
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive CloudWatch alarm notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address format
+
+  AlarmName:
+    Type: String
+    Description: Name for the CloudWatch alarm
+    Default: high-cpu-alarm
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: ^[a-zA-Z0-9_-]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  InstanceType:
+    Type: String
+    Description: EC2 instance type for monitoring demonstration
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t3.micro
+      - t3.small
+      - t3.medium
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  InstanceName:
+    Type: String
+    Description: Name tag for the EC2 instance
+    Default: monitoring-demo
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: ^[a-zA-Z0-9_-]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for instance access (optional for monitoring-only setup)
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+
+  CPUThreshold:
+    Type: Number
+    Description: CPU utilization percentage threshold for alarm
+    Default: 70
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  EvaluationPeriods:
+    Type: Number
+    Description: Number of periods to evaluate for alarm state
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: Must be between 1 and 10
+
+  MonitoringPeriod:
+    Type: Number
+    Description: Period in seconds for metric evaluation
+    Default: 300
+    AllowedValues: [60, 300, 900, 3600]
+    ConstraintDescription: Must be 60, 300, 900, or 3600 seconds
+
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for resource names to ensure uniqueness
+    Default: simple-monitoring
+    MinLength: 1
+    MaxLength: 20
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+# Conditions for optional resources
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, ""]]
+  CreateTestingResources: !Equals [!Ref InstanceType, "t2.micro"]
+
+# AWS Resources
+Resources:
+  # SNS Topic for notifications
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-cpu-alerts"
+      DisplayName: !Sub "${ResourcePrefix} CPU Monitoring Alerts"
+      KmsMasterKeyId: alias/aws/sns
+    Metadata:
+      Purpose: "Central notification hub for CloudWatch alarms"
+
+  # SNS Topic Policy for CloudWatch access
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+    Metadata:
+      Purpose: "Allow CloudWatch service to publish alarm notifications"
+
+  # Email subscription to SNS topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: !Ref NotificationEmail
+    Metadata:
+      Purpose: "Email endpoint for receiving alarm notifications"
+
+  # Security Group for EC2 instance
+  MonitoringSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ResourcePrefix}-monitoring-sg"
+      GroupDescription: Security group for monitoring demonstration EC2 instance
+      VpcId: !Ref AWS::NoValue  # Use default VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-monitoring-sg"
+        - Key: Purpose
+          Value: "Monitoring demonstration"
+    Metadata:
+      Purpose: "Minimal security group for monitoring demonstration"
+
+  # IAM Role for EC2 instance (Systems Manager access)
+  EC2MonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-ec2-monitoring-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Purpose
+          Value: "Monitoring demonstration"
+    Metadata:
+      Purpose: "IAM role for EC2 instance with Systems Manager access"
+
+  # Instance Profile for EC2 role
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ResourcePrefix}-ec2-monitoring-profile"
+      Roles:
+        - !Ref EC2MonitoringRole
+    Metadata:
+      Purpose: "Instance profile to attach IAM role to EC2 instance"
+
+  # EC2 Instance for monitoring
+  MonitoringInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      InstanceType: !Ref InstanceType
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue"]
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref MonitoringSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          
+          # Install CloudWatch agent
+          yum install -y amazon-cloudwatch-agent
+          
+          # Install stress testing tools for alarm validation
+          yum install -y stress-ng
+          
+          # Create CloudWatch agent config for detailed monitoring
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+          {
+            "metrics": {
+              "namespace": "CWAgent",
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": [
+                    "cpu_usage_idle",
+                    "cpu_usage_iowait",
+                    "cpu_usage_user",
+                    "cpu_usage_system"
+                  ],
+                  "metrics_collection_interval": 60
+                },
+                "disk": {
+                  "measurement": [
+                    "used_percent"
+                  ],
+                  "metrics_collection_interval": 60,
+                  "resources": [
+                    "*"
+                  ]
+                },
+                "diskio": {
+                  "measurement": [
+                    "io_time"
+                  ],
+                  "metrics_collection_interval": 60,
+                  "resources": [
+                    "*"
+                  ]
+                },
+                "mem": {
+                  "measurement": [
+                    "mem_used_percent"
+                  ],
+                  "metrics_collection_interval": 60
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          
+          # Signal CloudFormation that instance is ready
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource MonitoringInstance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-${InstanceName}"
+        - Key: Purpose
+          Value: "CloudWatch monitoring demonstration"
+        - Key: Environment
+          Value: "Demo"
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT10M
+    Metadata:
+      Purpose: "EC2 instance that generates metrics for monitoring demonstration"
+
+  # CloudWatch Alarm for high CPU utilization
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-${AlarmName}"
+      AlarmDescription: !Sub "Alert when CPU exceeds ${CPUThreshold}% on ${InstanceName}"
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: !Ref MonitoringPeriod
+      EvaluationPeriods: !Ref EvaluationPeriods
+      Threshold: !Ref CPUThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref MonitoringInstance
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+      TreatMissingData: breaching
+      Unit: Percent
+      Tags:
+        - Key: Purpose
+          Value: "CPU monitoring alarm"
+        - Key: Instance
+          Value: !Ref MonitoringInstance
+    DependsOn:
+      - AlertTopicPolicy
+    Metadata:
+      Purpose: "CloudWatch alarm for monitoring EC2 CPU utilization"
+
+  # CloudWatch Alarm for instance status check (additional monitoring)
+  InstanceStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-instance-status-check"
+      AlarmDescription: !Sub "Alert when instance ${InstanceName} fails status checks"
+      MetricName: StatusCheckFailed_Instance
+      Namespace: AWS/EC2
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref MonitoringInstance
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: breaching
+      Tags:
+        - Key: Purpose
+          Value: "Instance health monitoring"
+        - Key: Instance
+          Value: !Ref MonitoringInstance
+    DependsOn:
+      - AlertTopicPolicy
+    Metadata:
+      Purpose: "CloudWatch alarm for monitoring EC2 instance health status"
+
+  # Systems Manager Document for CPU stress testing
+  CPUStressDocument:
+    Type: AWS::SSM::Document
+    Condition: CreateTestingResources
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      Name: !Sub "${ResourcePrefix}-cpu-stress-test"
+      Content:
+        schemaVersion: '2.2'
+        description: 'Generate CPU load for testing CloudWatch alarms'
+        parameters:
+          duration:
+            type: String
+            description: 'Duration of stress test in seconds'
+            default: '300'
+          cpus:
+            type: String
+            description: 'Number of CPU cores to stress'
+            default: '2'
+        mainSteps:
+          - action: 'aws:runShellScript'
+            name: 'generateCPULoad'
+            inputs:
+              timeoutSeconds: '900'
+              runCommand:
+                - '#!/bin/bash'
+                - 'echo "Starting CPU stress test..."'
+                - 'stress-ng --cpu {{ cpus }} --timeout {{ duration }}s --metrics-brief'
+                - 'echo "CPU stress test completed"'
+      Tags:
+        - Key: Purpose
+          Value: "Testing CloudWatch alarms"
+    Metadata:
+      Purpose: "Systems Manager document for generating CPU load during testing"
+
+# Stack Outputs
+Outputs:
+  InstanceId:
+    Description: ID of the created EC2 instance for monitoring
+    Value: !Ref MonitoringInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceId"
+
+  InstancePublicIP:
+    Description: Public IP address of the monitoring instance
+    Value: !GetAtt MonitoringInstance.PublicIp
+    Condition: CreateTestingResources
+    Export:
+      Name: !Sub "${AWS::StackName}-InstancePublicIP"
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for alarm notifications
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicArn"
+
+  CPUAlarmName:
+    Description: Name of the CloudWatch CPU utilization alarm
+    Value: !Ref HighCPUAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-CPUAlarmName"
+
+  StatusCheckAlarmName:
+    Description: Name of the CloudWatch instance status check alarm
+    Value: !Ref InstanceStatusAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-StatusCheckAlarmName"
+
+  SecurityGroupId:
+    Description: ID of the security group created for the monitoring instance
+    Value: !Ref MonitoringSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"
+
+  IAMRoleArn:
+    Description: ARN of the IAM role attached to the monitoring instance
+    Value: !GetAtt EC2MonitoringRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-IAMRoleArn"
+
+  EmailSubscriptionArn:
+    Description: ARN of the email subscription (requires confirmation)
+    Value: !Ref EmailSubscription
+    Export:
+      Name: !Sub "${AWS::StackName}-EmailSubscriptionArn"
+
+  TestingDocumentName:
+    Description: Name of the Systems Manager document for CPU stress testing
+    Value: !Ref CPUStressDocument
+    Condition: CreateTestingResources
+    Export:
+      Name: !Sub "${AWS::StackName}-TestingDocumentName"
+
+  MonitoringDashboardURL:
+    Description: URL to CloudWatch console for monitoring the created resources
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:alarm/${ResourcePrefix}-${AlarmName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-MonitoringDashboardURL"
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for running this monitoring setup (USD)
+    Value: !Sub |
+      EC2 t2.micro: $8.50/month
+      CloudWatch alarms (2): $0.20/month
+      SNS email notifications: $0.00 (first 1,000 free)
+      CloudWatch detailed monitoring: $2.10/month
+      Total estimated: ~$10.80/month
+    Export:
+      Name: !Sub "${AWS::StackName}-EstimatedMonthlyCost"

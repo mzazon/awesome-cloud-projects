@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Distributed Cloud Edge, Vertex AI Pipelines, Cloud Storage, Cloud Monitoring
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: mlops, edge-computing, machine-learning, hybrid-cloud, pipelines
 recipe-generator-version: 1.3
@@ -168,14 +168,8 @@ echo "✅ Project configured: ${PROJECT_ID}"
    Vertex AI provides the centralized MLOps platform that orchestrates our entire machine learning lifecycle. The Model Registry serves as the single source of truth for model versions, metadata, and deployment configurations, ensuring consistent model governance across all edge locations.
 
    ```bash
-   # Create Vertex AI Model Registry entry
-   export MODEL_NAME="edge-inference-model"
-   
-   gcloud ai models upload \
-       --region=${REGION} \
-       --display-name=${MODEL_NAME} \
-       --description="Edge inference model for distributed deployment" \
-       --version-aliases=latest
+   # Initialize Vertex AI
+   gcloud ai-platform regions set us-central1
    
    # Create Vertex AI Pipeline workspace
    export PIPELINE_ROOT="gs://${MLOPS_BUCKET}/pipeline-root"
@@ -241,16 +235,16 @@ echo "✅ Project configured: ${PROJECT_ID}"
    ```bash
    # Create training pipeline definition
    cat > training_pipeline.py << 'EOF'
-from kfp.v2 import dsl
-from kfp.v2.dsl import component, pipeline, Input, Output, Dataset, Model
+from kfp import dsl
+from kfp.dsl import component, pipeline, Input, Output, Dataset, Model
 from google.cloud import aiplatform
 
 @component(
     base_image="python:3.9",
-    packages_to_install=["google-cloud-aiplatform", "scikit-learn", "pandas"]
+    packages_to_install=["google-cloud-aiplatform", "scikit-learn", \
+                        "pandas", "joblib"]
 )
 def train_model(
-    training_data: Input[Dataset],
     model: Output[Model],
     model_name: str = "edge-inference-model"
 ):
@@ -270,7 +264,9 @@ def train_model(
     X = data[['feature1', 'feature2']]
     y = data['target']
     
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, \
+                                                       test_size=0.2, \
+                                                       random_state=42)
     
     # Train model
     clf = RandomForestClassifier(n_estimators=100, random_state=42)
@@ -306,7 +302,8 @@ def prepare_edge_deployment(
     model_path = f"{model.path}/model.joblib"
     if os.path.exists(model_path):
         model_blob.upload_from_filename(model_path)
-        print(f"Model uploaded to edge bucket: {edge_bucket}/models/{model_version}/")
+        print(f"Model uploaded to edge bucket: " \
+              f"{edge_bucket}/models/{model_version}/")
     else:
         print("Model file not found")
 
@@ -315,19 +312,11 @@ def prepare_edge_deployment(
     description="MLOps pipeline for edge model training and deployment"
 )
 def edge_training_pipeline(
-    training_data_path: str,
     edge_bucket: str,
     model_version: str = "v1"
 ):
-    # Create training dataset component
-    training_data = dsl.importer(
-        artifact_uri=training_data_path,
-        artifact_class=Dataset,
-        reimport=False
-    )
-    
     # Train model
-    training_task = train_model(training_data=training_data.output)
+    training_task = train_model()
     
     # Prepare for edge deployment
     deployment_task = prepare_edge_deployment(
@@ -337,22 +326,37 @@ def edge_training_pipeline(
     )
 EOF
    
-   # Compile and submit pipeline
+   # Compile and run pipeline
    python3 -c "
-from kfp.v2 import compiler
+import os
 exec(open('training_pipeline.py').read())
+from kfp import compiler
+from google.cloud import aiplatform
 
+# Initialize Vertex AI
+aiplatform.init(project='${PROJECT_ID}', location='${REGION}')
+
+# Compile pipeline
 compiler.Compiler().compile(
     pipeline_func=edge_training_pipeline,
     package_path='edge_training_pipeline.json'
 )
+
+# Create and run pipeline job
+job = aiplatform.PipelineJob(
+    display_name='edge-mlops-training',
+    template_path='edge_training_pipeline.json',
+    pipeline_root='${PIPELINE_ROOT}',
+    parameter_values={
+        'edge_bucket': '${EDGE_MODELS_BUCKET}',
+        'model_version': 'v1'
+    }
+)
+
+# Submit pipeline
+job.submit()
+print('Pipeline submitted successfully')
 "
-   
-   # Submit pipeline to Vertex AI
-   gcloud ai custom-jobs create \
-       --region=${REGION} \
-       --display-name="edge-mlops-training" \
-       --config=training_pipeline.py
    
    echo "✅ ML training pipeline deployed to Vertex AI"
    ```
@@ -400,7 +404,7 @@ spec:
         args:
         - -c
         - |
-          pip install google-cloud-storage scikit-learn joblib flask
+          pip install google-cloud-storage==2.10.0 scikit-learn joblib flask
           cat > app.py << 'PYEOF'
           from flask import Flask, request, jsonify
           from google.cloud import storage
@@ -428,7 +432,8 @@ spec:
           
           @app.route('/health', methods=['GET'])
           def health():
-              return jsonify({'status': 'healthy', 'model_loaded': model is not None})
+              return jsonify({'status': 'healthy', \
+                             'model_loaded': model is not None})
           
           @app.route('/predict', methods=['POST'])
           def predict():
@@ -437,7 +442,8 @@ spec:
               
               try:
                   data = request.json
-                  features = [[data.get('feature1', 0), data.get('feature2', 0)]]
+                  features = [[data.get('feature1', 0), \
+                              data.get('feature2', 0)]]
                   prediction = model.predict(features)[0]
                   return jsonify({'prediction': int(prediction)})
               except Exception as e:
@@ -594,6 +600,7 @@ from google.cloud import storage
 from google.cloud import aiplatform
 import json
 import logging
+import datetime
 
 logging.basicConfig(level=logging.INFO)
 
@@ -603,24 +610,12 @@ def update_edge_models(request):
     
     try:
         # Parse request
-        request_json = request.get_json(silent=True)
+        request_json = request.get_json(silent=True) or {}
         model_version = request_json.get('model_version', 'latest')
         edge_locations = request_json.get('edge_locations', ['default'])
         
         # Initialize clients
         storage_client = storage.Client()
-        aiplatform.init()
-        
-        # Get model from Vertex AI Model Registry
-        models = aiplatform.Model.list(
-            filter=f'display_name="edge-inference-model"'
-        )
-        
-        if not models:
-            return {'error': 'No models found'}, 404
-        
-        latest_model = models[0]
-        logging.info(f"Found model: {latest_model.display_name}")
         
         # Update model in edge buckets
         results = []
@@ -632,8 +627,7 @@ def update_edge_models(request):
                 # Create deployment manifest
                 manifest = {
                     'model_version': model_version,
-                    'model_uri': latest_model.uri,
-                    'timestamp': '2025-07-12T00:00:00Z',
+                    'timestamp': datetime.datetime.utcnow().isoformat(),
                     'deployment_status': 'pending'
                 }
                 
@@ -721,7 +715,7 @@ spec:
         args:
         - -c
         - |
-          pip install google-cloud-storage flask
+          pip install google-cloud-storage==2.10.0 flask
           cat > collector.py << 'PYEOF'
           from flask import Flask, request, jsonify
           from google.cloud import storage
@@ -809,14 +803,13 @@ EOF
 
    ```bash
    # Check Vertex AI components
-   gcloud ai models list --region=${REGION}
    gcloud ai experiments list --region=${REGION}
    
    # Verify storage buckets
    gsutil ls -p ${PROJECT_ID}
    ```
 
-   Expected output: Model registry entries and configured storage buckets
+   Expected output: Experiment entries and configured storage buckets
 
 2. Test edge inference service:
 
@@ -925,7 +918,7 @@ EOF
 6. Remove Vertex AI resources:
 
    ```bash
-   # Delete Vertex AI experiments and models
+   # Delete Vertex AI experiments
    gcloud ai experiments delete edge-mlops-experiment \
        --region=${REGION} \
        --quiet
@@ -965,4 +958,9 @@ Extend this solution by implementing these advanced MLOps capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

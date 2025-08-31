@@ -6,16 +6,16 @@ difficulty: 300
 subject: aws
 services: storage-gateway,s3,cloudwatch,kms
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: hybrid-cloud,storage-gateway,file-shares,s3,cache
 recipe-generator-version: 1.3
 ---
 
-# Seamless Hybrid Cloud Storage
+# Seamless Hybrid Cloud Storage with AWS Storage Gateway
 
 ## Problem
 
@@ -72,7 +72,7 @@ graph TB
 3. VMware vSphere, Hyper-V, or KVM hypervisor for VM deployment
 4. Understanding of file systems, iSCSI, and NFS/SMB protocols
 5. On-premises network connectivity to AWS (Direct Connect or VPN recommended)
-6. Estimated cost: $20-50/month for gateway resources and S3 storage
+6. Estimated cost: $30-80/month for gateway resources and S3 storage
 
 > **Note**: This recipe demonstrates multiple gateway types. You can implement only the type(s) relevant to your use case.
 
@@ -94,11 +94,15 @@ export GATEWAY_NAME="hybrid-gateway-${RANDOM_SUFFIX}"
 export S3_BUCKET_NAME="storage-gateway-bucket-${RANDOM_SUFFIX}"
 export KMS_KEY_ALIAS="alias/storage-gateway-key-${RANDOM_SUFFIX}"
 
-# Create S3 bucket for File Gateway
-aws s3api create-bucket \
-    --bucket ${S3_BUCKET_NAME} \
-    --region ${AWS_REGION} \
-    --create-bucket-configuration LocationConstraint=${AWS_REGION}
+# Create S3 bucket for File Gateway (handle us-east-1 special case)
+if [ "$AWS_REGION" = "us-east-1" ]; then
+    aws s3api create-bucket --bucket ${S3_BUCKET_NAME} --region ${AWS_REGION}
+else
+    aws s3api create-bucket \
+        --bucket ${S3_BUCKET_NAME} \
+        --region ${AWS_REGION} \
+        --create-bucket-configuration LocationConstraint=${AWS_REGION}
+fi
 
 # Enable versioning on S3 bucket
 aws s3api put-bucket-versioning \
@@ -145,16 +149,16 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
    
    # Create IAM role
    aws iam create-role \
-       --role-name StorageGatewayRole \
+       --role-name StorageGatewayRole-${RANDOM_SUFFIX} \
        --assume-role-policy-document file://storage-gateway-trust-policy.json
    
    # Attach required policies
    aws iam attach-role-policy \
-       --role-name StorageGatewayRole \
+       --role-name StorageGatewayRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/StorageGatewayServiceRole
    
    GATEWAY_ROLE_ARN=$(aws iam get-role \
-       --role-name StorageGatewayRole \
+       --role-name StorageGatewayRole-${RANDOM_SUFFIX} \
        --query Role.Arn --output text)
    
    export GATEWAY_ROLE_ARN
@@ -178,11 +182,11 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
    
    # Create security group for Storage Gateway
    SG_ID=$(aws ec2 create-security-group \
-       --group-name storage-gateway-sg \
+       --group-name storage-gateway-sg-${RANDOM_SUFFIX} \
        --description "Security group for Storage Gateway" \
        --query GroupId --output text)
    
-   # Add required inbound rules
+   # Add required inbound rules for Storage Gateway operation
    aws ec2 authorize-security-group-ingress \
        --group-id ${SG_ID} \
        --protocol tcp --port 80 \
@@ -198,20 +202,28 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
        --protocol tcp --port 2049 \
        --cidr 10.0.0.0/8
    
+   aws ec2 authorize-security-group-ingress \
+       --group-id ${SG_ID} \
+       --protocol tcp --port 445 \
+       --cidr 10.0.0.0/8
+   
    # Launch Storage Gateway instance
    INSTANCE_ID=$(aws ec2 run-instances \
        --image-id ${GATEWAY_AMI} \
        --instance-type m5.large \
        --security-group-ids ${SG_ID} \
+       --tag-specifications \
+       'ResourceType=instance,Tags=[{Key=Name,Value=StorageGateway-'${RANDOM_SUFFIX}'}]' \
        --query 'Instances[0].InstanceId' \
        --output text)
    
    export INSTANCE_ID
+   export SG_ID
    
    echo "✅ Storage Gateway instance launched: ${INSTANCE_ID}"
    ```
 
-   The Storage Gateway EC2 instance is now running and configured with appropriate security group rules. The instance will boot the Storage Gateway software and prepare for activation. Port 80/443 enable communication with AWS services, while port 2049 (NFS) allows client access to file shares.
+   The Storage Gateway EC2 instance is now running and configured with appropriate security group rules. The instance will boot the Storage Gateway software and prepare for activation. Ports 80/443 enable communication with AWS services, while ports 2049 (NFS) and 445 (SMB) allow client access to file shares.
 
 3. **Wait for Instance and Get Activation Key**:
 
@@ -235,8 +247,9 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
    echo "Waiting for Storage Gateway to be ready..."
    sleep 300
    
-   # Get activation key
-   ACTIVATION_KEY=$(curl -s "http://${GATEWAY_IP}/?activationRegion=${AWS_REGION}" | \
+   # Get activation key using proper method
+   ACTIVATION_KEY=$(curl -f -s -S -w '%{redirect_url}' \
+       "http://${GATEWAY_IP}/?activationRegion=${AWS_REGION}&gatewayType=FILE_S3" | \
        grep -o 'activationKey=[^&]*' | cut -d'=' -f2)
    
    export ACTIVATION_KEY
@@ -280,6 +293,8 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
            --instance-ids ${INSTANCE_ID} \
            --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' \
            --output text) \
+       --tag-specifications \
+       'ResourceType=volume,Tags=[{Key=Name,Value=StorageGateway-Cache-'${RANDOM_SUFFIX}'}]' \
        --query VolumeId --output text)
    
    # Wait for volume to be available
@@ -294,9 +309,7 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
    # Wait for attachment
    sleep 30
    
-   # List local disks
-   aws storagegateway list-local-disks \
-       --gateway-arn ${GATEWAY_ARN}
+   export VOLUME_ID
    
    echo "✅ Additional storage volume attached: ${VOLUME_ID}"
    ```
@@ -333,10 +346,11 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
    FILE_SHARE_ARN=$(aws storagegateway create-nfs-file-share \
        --client-token $(date +%s) \
        --gateway-arn ${GATEWAY_ARN} \
-       --location-arn arn:aws:s3:::${S3_BUCKET_NAME} \
+       --location-arn arn:aws:s3:::${S3_BUCKET_NAME}/nfs-share \
        --role ${GATEWAY_ROLE_ARN} \
        --default-storage-class S3_STANDARD \
-       --nfs-file-share-defaults "{\"FileMode\":\"0644\",\"DirectoryMode\":\"0755\",\"GroupId\":65534,\"OwnerId\":65534}" \
+       --nfs-file-share-defaults \
+       '{"FileMode":"0644","DirectoryMode":"0755","GroupId":65534,"OwnerId":65534}' \
        --client-list "10.0.0.0/8" \
        --squash RootSquash \
        --query FileShareARN --output text)
@@ -390,47 +404,7 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
 
    CloudWatch monitoring is now capturing gateway performance metrics and operational logs. This telemetry data enables you to track cache efficiency, identify performance bottlenecks, and set up automated alerts for operational issues.
 
-10. **Enable S3 Bucket Notifications**:
-
-    S3 bucket notifications provide real-time visibility into file operations performed through Storage Gateway, enabling event-driven automation and audit logging. These notifications can trigger Lambda functions, send messages to SQS queues, or log events to CloudWatch for comprehensive activity tracking and automated workflows.
-
-    ```bash
-    # Create notification configuration
-    cat > s3-notification-config.json << EOF
-    {
-        "CloudWatchConfigurations": [
-            {
-                "Id": "StorageGatewayNotification",
-                "CloudWatchConfiguration": {
-                    "LogGroupName": "/aws/storagegateway/${GATEWAY_NAME}"
-                },
-                "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
-                "Filter": {
-                    "Key": {
-                        "FilterRules": [
-                            {
-                                "Name": "prefix",
-                                "Value": "storage-gateway/"
-                            }
-                        ]
-                    }
-                }
-            }
-        ]
-    }
-    EOF
-    
-    # Apply notification configuration
-    aws s3api put-bucket-notification-configuration \
-        --bucket ${S3_BUCKET_NAME} \
-        --notification-configuration file://s3-notification-config.json
-    
-    echo "✅ S3 bucket notifications enabled"
-    ```
-
-    S3 bucket notifications are now configured to capture all file operations through your Storage Gateway. This enables comprehensive audit trails and can trigger automated processing workflows when files are created, modified, or deleted.
-
-11. **Test File Share Connectivity**:
+10. **Test File Share Connectivity**:
 
     Validating file share connectivity ensures your Storage Gateway is properly configured and accessible from client systems. The gateway exposes file shares through standard network protocols, allowing seamless integration with existing applications and workflows without requiring application modifications.
 
@@ -445,8 +419,13 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
         --query 'NetworkInterfaces[0].Ipv4Address' \
         --output text)
     
-    echo "NFS mount command: sudo mount -t nfs ${GATEWAY_NETWORK_INTERFACE}:/bucket-name /local/mount/point"
-    echo "SMB mount command: sudo mount -t cifs //${GATEWAY_NETWORK_INTERFACE}/bucket-name /local/mount/point"
+    # Get NFS file share path
+    NFS_PATH=$(aws storagegateway describe-nfs-file-shares \
+        --file-share-arn-list ${FILE_SHARE_ARN} \
+        --query 'NFSFileShareInfoList[0].Path' --output text)
+    
+    echo "NFS mount command: sudo mount -t nfs ${GATEWAY_NETWORK_INTERFACE}:${NFS_PATH} /local/mount/point"
+    echo "SMB mount command: net use Z: \\\\${GATEWAY_NETWORK_INTERFACE}\\smb-share"
     
     echo "✅ File shares ready for mounting"
     ```
@@ -485,8 +464,10 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
    # Check S3 bucket contents
    aws s3 ls s3://${S3_BUCKET_NAME}/ --recursive
    
-   # Test file upload (if you have local access to mount point)
-   # Files uploaded to mounted share should appear in S3
+   # Test file upload through S3 (simulates file share operation)
+   echo "Test file from S3" > test-file.txt
+   aws s3 cp test-file.txt s3://${S3_BUCKET_NAME}/test-file.txt
+   aws s3 ls s3://${S3_BUCKET_NAME}/
    ```
 
 4. **Monitor Gateway Performance**:
@@ -532,6 +513,11 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
 3. **Remove AWS Resources**:
 
    ```bash
+   # Detach and delete EBS volume
+   aws ec2 detach-volume --volume-id ${VOLUME_ID}
+   aws ec2 wait volume-available --volume-ids ${VOLUME_ID}
+   aws ec2 delete-volume --volume-id ${VOLUME_ID}
+   
    # Terminate EC2 instance
    aws ec2 terminate-instances --instance-ids ${INSTANCE_ID}
    
@@ -543,7 +529,7 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
    aws s3 rm s3://${S3_BUCKET_NAME} --recursive
    aws s3api delete-bucket --bucket ${S3_BUCKET_NAME}
    
-   echo "✅ EC2 instance and S3 bucket removed"
+   echo "✅ EC2 instance, EBS volume, and S3 bucket removed"
    ```
 
 4. **Clean up IAM and KMS resources**:
@@ -551,10 +537,10 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
    ```bash
    # Detach and delete IAM role
    aws iam detach-role-policy \
-       --role-name StorageGatewayRole \
+       --role-name StorageGatewayRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/StorageGatewayServiceRole
    
-   aws iam delete-role --role-name StorageGatewayRole
+   aws iam delete-role --role-name StorageGatewayRole-${RANDOM_SUFFIX}
    
    # Delete KMS key alias and schedule key deletion
    aws kms delete-alias --alias-name ${KMS_KEY_ALIAS}
@@ -571,7 +557,7 @@ echo "✅ KMS key created: ${KMS_KEY_ID}"
        --log-group-name /aws/storagegateway/${GATEWAY_NAME}
    
    # Clean up local files
-   rm -f storage-gateway-trust-policy.json s3-notification-config.json
+   rm -f storage-gateway-trust-policy.json test-file.txt
    
    echo "✅ CloudWatch logs and local files cleaned up"
    ```
@@ -584,9 +570,9 @@ File Gateway offers the most straightforward approach for organizations looking 
 
 Volume Gateway provides block-level storage integration, supporting both stored volumes for low-latency access to frequently used data and cached volumes for frequently accessed data subsets. This flexibility allows organizations to optimize for either performance or cost based on their specific use cases. The integration with EBS snapshots enables point-in-time recovery and disaster recovery scenarios.
 
-The architecture supports multiple deployment models including on-premises VM deployment, hardware appliance deployment, and cloud-based deployment using EC2 instances. This flexibility enables organizations to choose the most appropriate deployment model based on their infrastructure constraints and requirements. [AWS Storage Gateway Documentation](https://docs.aws.amazon.com/storagegateway/) provides comprehensive guidance for advanced configuration scenarios.
+The architecture supports multiple deployment models including on-premises VM deployment, hardware appliance deployment, and cloud-based deployment using EC2 instances. This flexibility enables organizations to choose the most appropriate deployment model based on their infrastructure constraints and requirements. The [AWS Storage Gateway User Guide](https://docs.aws.amazon.com/storagegateway/latest/userguide/) provides comprehensive guidance for advanced configuration scenarios and best practices for production deployments.
 
-> **Tip**: Use CloudWatch metrics to monitor cache hit ratios and optimize local storage allocation for better performance.
+> **Tip**: Use CloudWatch metrics to monitor cache hit ratios and optimize local storage allocation for better performance. Cache hit ratios above 80% typically indicate well-sized cache storage.
 
 > **Warning**: Ensure adequate network bandwidth between your gateway and AWS to prevent performance bottlenecks during large file transfers or initial data sync operations.
 
@@ -594,16 +580,23 @@ The architecture supports multiple deployment models including on-premises VM de
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Site Deployment**: Configure Storage Gateway across multiple on-premises locations with centralized S3 storage and implement cross-site replication strategies.
+1. **Multi-Site Deployment**: Configure Storage Gateway across multiple on-premises locations with centralized S3 storage and implement cross-site replication strategies using S3 Cross-Region Replication.
 
-2. **Advanced Monitoring**: Set up comprehensive CloudWatch dashboards with custom metrics, alarms for cache performance, and automated scaling responses for EC2-based deployments.
+2. **Advanced Monitoring**: Set up comprehensive CloudWatch dashboards with custom metrics, alarms for cache performance, and automated scaling responses for EC2-based deployments using Auto Scaling Groups.
 
-3. **Disaster Recovery Integration**: Implement automated backup and restore procedures using EBS snapshots and cross-region replication for Volume Gateway configurations.
+3. **Disaster Recovery Integration**: Implement automated backup and restore procedures using EBS snapshots and cross-region replication for Volume Gateway configurations with AWS Backup.
 
-4. **Performance Optimization**: Configure multiple cache disks, implement bandwidth throttling, and optimize storage classes based on access patterns using S3 Intelligent Tiering.
+4. **Performance Optimization**: Configure multiple cache disks, implement bandwidth throttling, and optimize storage classes based on access patterns using S3 Intelligent Tiering and S3 Analytics.
 
 5. **Enterprise Integration**: Integrate with existing backup solutions using Tape Gateway, implement Active Directory authentication for SMB shares, and configure VPC endpoints for private connectivity.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Batch, Vertex AI Feature Store, Pub/Sub, BigQuery
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: machine learning, feature engineering, real-time processing, batch processing, mlops
 recipe-generator-version: 1.3
@@ -143,7 +143,16 @@ echo "✅ APIs enabled for ML feature pipeline"
        event_type:STRING,session_duration:FLOAT,\
        purchase_amount:FLOAT,category:STRING
    
-   echo "✅ BigQuery dataset and tables created"
+   # Insert sample data for testing
+   bq query --use_legacy_sql=false \
+       "INSERT INTO \`${PROJECT_ID}.${DATASET_NAME}.raw_user_events\`
+        VALUES 
+        ('user1', TIMESTAMP('2025-07-20 10:00:00'), 'login', 15.5, 0.0, 'electronics'),
+        ('user1', TIMESTAMP('2025-07-20 10:30:00'), 'purchase', 0.0, 99.99, 'electronics'),
+        ('user2', TIMESTAMP('2025-07-20 11:00:00'), 'login', 8.2, 0.0, 'books'),
+        ('user2', TIMESTAMP('2025-07-20 11:15:00'), 'purchase', 0.0, 24.99, 'books')"
+   
+   echo "✅ BigQuery dataset and tables created with sample data"
    ```
 
    The feature table schema includes both numerical and categorical features with timestamps, enabling time-series analysis and feature versioning. This structure supports the Vertex AI Feature Store's requirements for entity IDs, feature values, and temporal consistency.
@@ -190,8 +199,12 @@ echo "✅ APIs enabled for ML feature pipeline"
            AVG(session_duration) as avg_session_duration,
            COUNT(CASE WHEN event_type = 'purchase' THEN 1 END) as total_purchases,
            DATE_DIFF(CURRENT_DATE(), MAX(DATE(event_timestamp)), DAY) as days_since_last_login,
-           COUNT(*) / DATE_DIFF(CURRENT_DATE(), MIN(DATE(event_timestamp)), DAY) as purchase_frequency,
-           MODE()[ORDINAL(1)] category as preferred_category
+           CASE 
+             WHEN DATE_DIFF(CURRENT_DATE(), MIN(DATE(event_timestamp)), DAY) > 0 
+             THEN COUNT(*) / DATE_DIFF(CURRENT_DATE(), MIN(DATE(event_timestamp)), DAY)
+             ELSE 0
+           END as purchase_frequency,
+           APPROX_TOP_COUNT(category, 1)[OFFSET(0)].value as preferred_category
          FROM `{project_id}.{dataset_name}.raw_user_events`
          WHERE event_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
          GROUP BY user_id
@@ -317,13 +330,20 @@ echo "✅ APIs enabled for ML feature pipeline"
        --location=${REGION} \
        --config=batch_job_config.json
    
-   # Wait for job completion
+   # Wait for job completion (polling every 30 seconds)
    echo "Waiting for batch job to complete..."
-   gcloud batch jobs describe ${BATCH_JOB_NAME} \
-       --location=${REGION} \
-       --format="value(status.state)"
+   while true; do
+     JOB_STATE=$(gcloud batch jobs describe ${BATCH_JOB_NAME} \
+         --location=${REGION} \
+         --format="value(status.state)")
+     echo "Current job state: ${JOB_STATE}"
+     if [[ "${JOB_STATE}" == "SUCCEEDED" || "${JOB_STATE}" == "FAILED" ]]; then
+       break
+     fi
+     sleep 30
+   done
    
-   echo "✅ Batch job submitted: ${BATCH_JOB_NAME}"
+   echo "✅ Batch job completed: ${BATCH_JOB_NAME}"
    ```
 
 7. **Create Vertex AI Feature Store Resources**:
@@ -331,61 +351,71 @@ echo "✅ APIs enabled for ML feature pipeline"
    Vertex AI Feature Store provides managed feature serving with low-latency access and automatic feature versioning. Creating feature groups and features enables centralized feature management with built-in monitoring and governance capabilities for production ML workflows.
 
    ```bash
-   # Create feature group for user features
-   gcloud ai feature-groups create ${FEATURE_GROUP_NAME} \
-       --location=${REGION} \
-       --source-bigquery-uri="bq://${PROJECT_ID}.${DATASET_NAME}.${FEATURE_TABLE}" \
-       --entity-id-columns=user_id \
-       --description="User behavior features for ML models"
+   # Create feature group for user features using REST API approach
+   # Note: The gcloud ai feature-groups commands may not be available in all regions
+   
+   # First, get an access token
+   ACCESS_TOKEN=$(gcloud auth print-access-token)
+   
+   # Create feature group via REST API
+   curl -X POST \
+     -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+     -H "Content-Type: application/json" \
+     "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/featureGroups?featureGroupId=${FEATURE_GROUP_NAME}" \
+     -d "{
+       'bigQuery': {
+         'bigQuerySource': {
+           'inputUri': 'bq://${PROJECT_ID}.${DATASET_NAME}.${FEATURE_TABLE}'
+         },
+         'entityIdColumns': ['user_id']
+       },
+       'description': 'User behavior features for ML models'
+     }"
    
    # Wait for feature group creation
-   sleep 30
+   sleep 45
    
-   # Create individual features within the group
-   gcloud ai features create avg_session_duration \
-       --feature-group=${FEATURE_GROUP_NAME} \
-       --location=${REGION} \
-       --value-type=DOUBLE \
-       --description="Average session duration in minutes"
-   
-   gcloud ai features create total_purchases \
-       --feature-group=${FEATURE_GROUP_NAME} \
-       --location=${REGION} \
-       --value-type=INT64 \
-       --description="Total number of purchases"
-   
-   gcloud ai features create purchase_frequency \
-       --feature-group=${FEATURE_GROUP_NAME} \
-       --location=${REGION} \
-       --value-type=DOUBLE \
-       --description="Purchase frequency per day"
-   
-   echo "✅ Vertex AI Feature Store resources created"
+   echo "✅ Vertex AI Feature Group created via REST API"
    ```
 
    The feature group configuration links BigQuery as the source of truth while providing metadata management and serving infrastructure for real-time feature access.
 
 8. **Set Up Online Feature Serving**:
 
-   Online feature serving enables real-time feature access for ML model predictions with sub-second latency. The feature view provides a curated subset of features optimized for serving, with automatic caching and scaling based on prediction workload demands.
+   Online feature serving enables real-time feature access for ML model predictions with sub-second latency. The online store provides a managed infrastructure for serving features with automatic caching and scaling based on prediction workload demands.
 
    ```bash
    # Create online store instance for real-time serving
-   gcloud ai online-stores create user-features-store-${RANDOM_SUFFIX} \
-       --location=${REGION} \
-       --description="Online store for user features"
+   curl -X POST \
+     -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+     -H "Content-Type: application/json" \
+     "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/onlineStores?onlineStoreId=user-features-store-${RANDOM_SUFFIX}" \
+     -d "{
+       'description': 'Online store for user features',
+       'dedicatedServingEndpoint': {
+         'publicEndpointEnabled': true
+       }
+     }"
    
    # Wait for online store creation
-   sleep 60
+   sleep 90
    
    # Create feature view for online serving
-   gcloud ai feature-views create user-feature-view-${RANDOM_SUFFIX} \
-       --online-store=user-features-store-${RANDOM_SUFFIX} \
-       --location=${REGION} \
-       --source-feature-group=${FEATURE_GROUP_NAME} \
-       --feature-view-sync-config-cron="0 */6 * * *"
+   curl -X POST \
+     -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+     -H "Content-Type: application/json" \
+     "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/onlineStores/user-features-store-${RANDOM_SUFFIX}/featureViews?featureViewId=user-feature-view-${RANDOM_SUFFIX}" \
+     -d "{
+       'bigQuerySource': {
+         'uri': 'bq://${PROJECT_ID}.${DATASET_NAME}.${FEATURE_TABLE}',
+         'entityIdColumns': ['user_id']
+       },
+       'syncConfig': {
+         'cron': '0 */6 * * *'
+       }
+     }"
    
-   echo "✅ Online feature serving configured"
+   echo "✅ Online feature serving configured via REST API"
    ```
 
 9. **Create Cloud Function for Event Processing**:
@@ -399,31 +429,35 @@ echo "✅ APIs enabled for ML feature pipeline"
    import json
    from google.cloud import batch_v1
    import os
+   import functions_framework
    
+   @functions_framework.cloud_event
    def trigger_feature_pipeline(cloud_event):
        # Decode Pub/Sub message
        message_data = base64.b64decode(cloud_event.data['message']['data']).decode('utf-8')
        print(f"Processing message: {message_data}")
        
-       # Initialize Batch client
-       client = batch_v1.BatchServiceClient()
        project_id = os.environ['PROJECT_ID']
        region = os.environ['REGION']
        
-       # Create job request (simplified for demo)
-       print("Feature pipeline triggered by Pub/Sub event")
-       return "Success"
+       # Log pipeline trigger (simplified for demo)
+       print(f"Feature pipeline triggered by Pub/Sub event for project: {project_id}")
+       print("In production, this would submit a new Cloud Batch job")
+       
+       return {"status": "success", "message": "Pipeline triggered"}
    EOF
    
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
-   google-cloud-batch==0.17.0
-   google-cloud-storage==2.10.0
+   functions-framework==3.8.1
+   google-cloud-batch==0.17.26
+   google-cloud-storage==2.16.0
    EOF
    
    # Deploy Cloud Function with Pub/Sub trigger
    gcloud functions deploy trigger-feature-pipeline \
-       --runtime python39 \
+       --gen2 \
+       --runtime python312 \
        --trigger-topic ${PUBSUB_TOPIC} \
        --source . \
        --entry-point trigger_feature_pipeline \
@@ -451,12 +485,15 @@ echo "✅ APIs enabled for ML feature pipeline"
 2. Test Vertex AI Feature Store feature serving:
 
    ```bash
-   # List feature groups to verify creation
-   gcloud ai feature-groups list --location=${REGION}
+   # List feature groups using REST API
+   curl -X GET \
+     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+     "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/featureGroups"
    
-   # Check feature group details
-   gcloud ai feature-groups describe ${FEATURE_GROUP_NAME} \
-       --location=${REGION}
+   # Check online stores
+   curl -X GET \
+     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+     "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/onlineStores"
    ```
 
 3. Validate Cloud Batch job execution:
@@ -482,6 +519,7 @@ echo "✅ APIs enabled for ML feature pipeline"
    
    # Check Cloud Function logs
    gcloud functions logs read trigger-feature-pipeline \
+       --gen2 \
        --limit=10
    ```
 
@@ -491,26 +529,19 @@ echo "✅ APIs enabled for ML feature pipeline"
 
    ```bash
    # Delete feature view
-   gcloud ai feature-views delete user-feature-view-${RANDOM_SUFFIX} \
-       --online-store=user-features-store-${RANDOM_SUFFIX} \
-       --location=${REGION} \
-       --quiet
+   curl -X DELETE \
+     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+     "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/onlineStores/user-features-store-${RANDOM_SUFFIX}/featureViews/user-feature-view-${RANDOM_SUFFIX}"
    
    # Delete online store
-   gcloud ai online-stores delete user-features-store-${RANDOM_SUFFIX} \
-       --location=${REGION} \
-       --quiet
-   
-   # Delete features
-   gcloud ai features delete avg_session_duration \
-       --feature-group=${FEATURE_GROUP_NAME} \
-       --location=${REGION} \
-       --quiet
+   curl -X DELETE \
+     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+     "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/onlineStores/user-features-store-${RANDOM_SUFFIX}"
    
    # Delete feature group
-   gcloud ai feature-groups delete ${FEATURE_GROUP_NAME} \
-       --location=${REGION} \
-       --quiet
+   curl -X DELETE \
+     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+     "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/featureGroups/${FEATURE_GROUP_NAME}"
    
    echo "✅ Vertex AI Feature Store resources deleted"
    ```
@@ -530,7 +561,10 @@ echo "✅ APIs enabled for ML feature pipeline"
 
    ```bash
    # Delete Cloud Function
-   gcloud functions delete trigger-feature-pipeline --quiet
+   gcloud functions delete trigger-feature-pipeline \
+       --gen2 \
+       --region=${REGION} \
+       --quiet
    
    # Delete Pub/Sub subscription and topic
    gcloud pubsub subscriptions delete feature-pipeline-sub --quiet
@@ -569,7 +603,7 @@ The integration of Pub/Sub enables event-driven architecture patterns, allowing 
 
 Key architectural decisions include using BigQuery as the single source of truth for feature data, which simplifies data governance and enables SQL-based feature engineering. The separation of batch processing (Cloud Batch) from online serving (Vertex AI Feature Store) allows independent scaling of each component based on workload requirements. This design pattern follows Google Cloud's best practices for building production ML systems that can scale from prototype to enterprise workloads.
 
-> **Tip**: Monitor feature drift using Vertex AI Feature Store's built-in monitoring capabilities to ensure model performance remains stable over time. See [Vertex AI Feature Store monitoring documentation](https://cloud.google.com/vertex-ai/docs/featurestore/latest/monitoring) for implementation guidance.
+> **Tip**: Monitor feature drift using Vertex AI Feature Store's built-in monitoring capabilities to ensure model performance remains stable over time. See [Vertex AI Feature Store monitoring documentation](https://cloud.google.com/vertex-ai/docs/featurestore/latest/monitor-features) for implementation guidance.
 
 The pipeline's event-driven nature makes it suitable for real-time applications like recommendation systems, fraud detection, and personalization engines where feature freshness directly impacts business outcomes. The cost-effective design using serverless and managed services ensures you only pay for actual processing time and storage usage, making it viable for both development and production environments.
 
@@ -585,4 +619,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -1,0 +1,304 @@
+# Infrastructure Manager Configuration for Age Calculator API with Cloud Run and Storage
+# This template deploys a serverless Flask API using Cloud Run with Cloud Storage for request logging
+# Recipe: Age Calculator API with Cloud Run and Storage (ID: 4a7b2c9d)
+
+# Configuration metadata
+metadata:
+  title: "Age Calculator API Infrastructure"
+  description: "Serverless Flask API with Cloud Run and Cloud Storage for request logging"
+  version: "1.0"
+
+# Input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    default: ""
+  
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+  
+  # Service configuration
+  service_name:
+    type: string
+    description: "Name of the Cloud Run service"
+    default: "age-calculator-api"
+    
+  bucket_name_suffix:
+    type: string
+    description: "Suffix for the storage bucket name to ensure uniqueness"
+    default: "logs"
+  
+  # Cloud Run configuration
+  memory:
+    type: string
+    description: "Memory allocation for Cloud Run service"
+    default: "512Mi"
+    
+  cpu:
+    type: string
+    description: "CPU allocation for Cloud Run service (millicores)"
+    default: "1000m"
+    
+  max_instances:
+    type: integer
+    description: "Maximum number of Cloud Run instances"
+    default: 10
+    
+  concurrency:
+    type: integer
+    description: "Maximum concurrent requests per instance"
+    default: 80
+    
+  timeout:
+    type: integer
+    description: "Request timeout in seconds"
+    default: 300
+
+# Resource definitions
+resources:
+  
+  # Enable required Google Cloud APIs
+  run_api:
+    type: gcp-types/serviceusage-v1:services
+    name: run-api
+    properties:
+      name: projects/${var.project_id}/services/run.googleapis.com
+    metadata:
+      dependsOn: []
+      
+  storage_api:
+    type: gcp-types/serviceusage-v1:services
+    name: storage-api
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+    metadata:
+      dependsOn: []
+      
+  cloudbuild_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudbuild-api
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Create service account for Cloud Run service
+  cloudrun_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    name: age-calc-api-sa
+    properties:
+      accountId: age-calc-api-sa
+      serviceAccount:
+        displayName: "Age Calculator API Service Account"
+        description: "Service account for Age Calculator API Cloud Run service"
+    metadata:
+      dependsOn:
+        - run_api
+
+  # Cloud Storage bucket for request logging
+  request_logs_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: age-calc-logs-bucket
+    properties:
+      name: ${var.project_id}-age-calc-${var.bucket_name_suffix}
+      location: ${var.region}
+      storageClass: STANDARD
+      # Uniform bucket-level access for better security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          # Optional: Delete objects after 7 years
+          - action:
+              type: Delete
+            condition:
+              age: 2555  # 7 years in days
+      # Versioning disabled for log files to reduce costs
+      versioning:
+        enabled: false
+      # Enable uniform bucket-level access
+      labels:
+        purpose: "api-request-logging"
+        service: "age-calculator-api"
+        environment: "production"
+    metadata:
+      dependsOn:
+        - storage_api
+
+  # IAM binding for service account to access storage bucket
+  bucket_iam_binding:
+    type: gcp-types/storage-v1:buckets.setIamPolicy
+    name: bucket-iam-policy
+    properties:
+      bucket: $(ref.request_logs_bucket.name)
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.cloudrun_service_account.email)
+    metadata:
+      dependsOn:
+        - request_logs_bucket
+        - cloudrun_service_account
+
+  # Cloud Run service for the Age Calculator API
+  age_calculator_service:
+    type: gcp-types/run-v1:namespaces.services
+    name: age-calculator-api-service
+    properties:
+      parent: namespaces/${var.project_id}
+      location: ${var.region}
+      body:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: ${var.service_name}
+          labels:
+            service: "age-calculator-api"
+            version: "1.0"
+          annotations:
+            # Cloud Run specific annotations
+            run.googleapis.com/ingress: "all"
+            run.googleapis.com/execution-environment: "gen2"
+        spec:
+          template:
+            metadata:
+              annotations:
+                # Resource limits and scaling configuration
+                autoscaling.knative.dev/maxScale: "${var.max_instances}"
+                run.googleapis.com/cpu-throttling: "true"
+                run.googleapis.com/memory: ${var.memory}
+                run.googleapis.com/cpu: ${var.cpu}
+            spec:
+              # Use custom service account with least privilege
+              serviceAccountName: $(ref.cloudrun_service_account.email)
+              containerConcurrency: ${var.concurrency}
+              timeoutSeconds: ${var.timeout}
+              containers:
+                - name: age-calculator-api
+                  # Placeholder image - will be replaced during deployment
+                  image: gcr.io/cloudrun/hello
+                  ports:
+                    - name: http1
+                      containerPort: 8080
+                      protocol: TCP
+                  env:
+                    # Environment variable for storage bucket name
+                    - name: BUCKET_NAME
+                      value: $(ref.request_logs_bucket.name)
+                    - name: PORT
+                      value: "8080"
+                  resources:
+                    limits:
+                      cpu: ${var.cpu}
+                      memory: ${var.memory}
+                  # Health check configuration
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                    failureThreshold: 2
+          traffic:
+            - percent: 100
+              latestRevision: true
+    metadata:
+      dependsOn:
+        - run_api
+        - cloudrun_service_account
+        - bucket_iam_binding
+
+  # IAM policy to allow unauthenticated access to Cloud Run service
+  cloudrun_invoker_policy:
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    name: cloudrun-invoker-policy
+    properties:
+      resource: projects/${var.project_id}/locations/${var.region}/services/${var.service_name}
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - age_calculator_service
+
+# Output values for reference and testing
+outputs:
+  service_url:
+    description: "URL of the deployed Cloud Run service"
+    value: $(ref.age_calculator_service.status.url)
+    
+  bucket_name:
+    description: "Name of the Cloud Storage bucket for request logs"
+    value: $(ref.request_logs_bucket.name)
+    
+  service_account_email:
+    description: "Email of the service account used by Cloud Run"
+    value: $(ref.cloudrun_service_account.email)
+    
+  region:
+    description: "Region where resources are deployed"
+    value: ${var.region}
+    
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+
+# Deployment instructions and notes
+# 
+# Prerequisites:
+# 1. Google Cloud CLI installed and authenticated
+# 2. Infrastructure Manager API enabled
+# 3. Appropriate IAM permissions (Editor or specific roles)
+# 4. Application source code available for deployment
+#
+# Deployment steps:
+# 1. Set variables in a variables.yaml file or use --set-variable flags
+# 2. Deploy infrastructure: gcloud infra-manager deployments apply
+# 3. Build and deploy application code to Cloud Run service
+# 4. Test the API endpoints
+#
+# Security considerations:
+# - Service account follows principle of least privilege
+# - Bucket access is restricted to service account only
+# - Cloud Run service allows unauthenticated access (modify if needed)
+# - Lifecycle policies manage storage costs automatically
+#
+# Cost optimization:
+# - Storage lifecycle policies reduce long-term costs
+# - Cloud Run scales to zero when not in use
+# - Memory and CPU limits prevent excessive charges
+# - Standard storage class balances performance and cost
+#
+# Monitoring and observability:
+# - Health checks ensure service availability
+# - Request logs stored in Cloud Storage for analysis
+# - Cloud Run provides built-in metrics and logging
+# - Consider adding Cloud Monitoring alerts for production use

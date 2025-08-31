@@ -1,0 +1,332 @@
+# Infrastructure Manager configuration for URL Shortener with Cloud Functions and Firestore
+# This configuration deploys a serverless URL shortening service using Google Cloud Functions
+# for HTTP request handling and Cloud Firestore for persistent NoSQL storage.
+
+imports: []
+
+variables:
+  # Project configuration
+  project_id:
+    description: "Google Cloud project ID"
+    type: string
+    default: "url-shortener-demo"
+    
+  region:
+    description: "Google Cloud region for deploying resources"
+    type: string
+    default: "us-central1"
+    
+  # Function configuration
+  function_name:
+    description: "Name of the Cloud Function"
+    type: string
+    default: "url-shortener"
+    
+  function_memory:
+    description: "Memory allocation for the Cloud Function in MB"
+    type: integer
+    default: 256
+    
+  function_timeout:
+    description: "Timeout for the Cloud Function in seconds"
+    type: integer
+    default: 60
+    
+  function_max_instances:
+    description: "Maximum number of function instances"
+    type: integer
+    default: 10
+    
+  # Firestore configuration
+  firestore_location:
+    description: "Location for Firestore database (must be a valid Firestore location)"
+    type: string
+    default: "us-central"
+    
+  # Source code configuration
+  source_archive_bucket:
+    description: "Cloud Storage bucket for storing function source code"
+    type: string
+    default: "url-shortener-source-bucket"
+    
+  # Security and access configuration
+  allow_unauthenticated:
+    description: "Allow unauthenticated access to the Cloud Function"
+    type: boolean
+    default: true
+
+resources:
+  # Enable required APIs for the project
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/cloudfunctions.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+
+  - name: enable-firestore-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/firestore.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/storage.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+
+  # Get project information for resource references
+  - name: project
+    type: gcp-types/cloudresourcemanager-v1:projects
+    action: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.get
+    properties:
+      projectId: $(var.project_id)
+
+  # Create Cloud Storage bucket for storing function source code
+  - name: source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.source_archive_bucket)-$(ref.project.projectNumber)
+      project: $(ref.project.projectId)
+      location: $(var.region)
+      storageClass: REGIONAL
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30  # Delete source archives older than 30 days
+              isLive: false
+      # Enable uniform bucket-level access for better security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Create Firestore database in Native mode
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/$(ref.project.projectId)
+      databaseId: "(default)"
+      type: FIRESTORE_NATIVE
+      locationId: $(var.firestore_location)
+      # Enable point-in-time recovery for data protection
+      pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+      # Delete protection prevents accidental database deletion
+      deleteProtectionState: DELETE_PROTECTION_ENABLED
+    metadata:
+      dependsOn:
+        - enable-firestore-api
+
+  # Create a Cloud Storage object containing the function source code
+  - name: function-source-archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.source-bucket.name)
+      name: source.zip
+      # In a real deployment, this would contain the actual zipped source code
+      # For this template, we're creating a placeholder that would be replaced
+      # with actual source code during deployment
+      metadata:
+        description: "Cloud Function source code archive"
+    metadata:
+      dependsOn:
+        - source-bucket
+
+  # Deploy the URL shortener Cloud Function
+  - name: url-shortener-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project.projectId)/locations/$(var.region)
+      function: $(var.function_name)
+      # Source code configuration
+      sourceArchiveUrl: gs://$(ref.source-bucket.name)/$(ref.function-source-archive.name)
+      
+      # Runtime configuration
+      runtime: nodejs20
+      entryPoint: urlShortener
+      availableMemoryMb: $(var.function_memory)
+      timeout: $(var.function_timeout)s
+      maxInstances: $(var.function_max_instances)
+      
+      # HTTP trigger configuration
+      httpsTrigger: {}
+      
+      # Environment variables for the function
+      environmentVariables:
+        FIRESTORE_PROJECT_ID: $(ref.project.projectId)
+        FUNCTION_REGION: $(var.region)
+        
+      # Service account configuration (uses default App Engine service account)
+      serviceAccountEmail: $(ref.project.projectId)@appspot.gserviceaccount.com
+      
+      # Security and networking
+      ingressSettings: ALLOW_ALL
+      
+      # Labels for resource management
+      labels:
+        component: url-shortener
+        environment: production
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - enable-cloudbuild-api
+        - firestore-database
+        - function-source-archive
+
+  # IAM policy to allow unauthenticated access to the function (if enabled)
+  - name: function-invoker-policy
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.url-shortener-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - url-shortener-function
+    # Only create this policy if unauthenticated access is enabled
+    when: $(var.allow_unauthenticated)
+
+  # Create IAM binding for the Cloud Function to access Firestore
+  - name: function-firestore-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project.projectId)
+      role: roles/datastore.user
+      member: serviceAccount:$(ref.project.projectId)@appspot.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - url-shortener-function
+
+  # Create Firestore security rules for URL mappings collection
+  - name: firestore-rules
+    type: gcp-types/firestore-v1:projects.databases.securityRules
+    properties:
+      parent: projects/$(ref.project.projectId)/databases/(default)
+      # Security rules that allow public read access to URL mappings
+      # but restrict write access to prevent unauthorized modifications
+      source:
+        files:
+          - name: firestore.rules
+            content: |
+              rules_version = '2';
+              service cloud.firestore {
+                match /databases/{database}/documents {
+                  // Allow read access to url-mappings for redirects
+                  match /url-mappings/{shortId} {
+                    allow read: if true;
+                    allow write: if false; // Only Cloud Function can write via service account
+                  }
+                  
+                  // Allow the Cloud Function service account full access
+                  match /{document=**} {
+                    allow read, write: if request.auth != null && 
+                      request.auth.token.email == '$(ref.project.projectId)@appspot.gserviceaccount.com';
+                  }
+                  
+                  // Deny all other access by default
+                  match /{document=**} {
+                    allow read, write: if false;
+                  }
+                }
+              }
+    metadata:
+      dependsOn:
+        - firestore-database
+        - function-firestore-user-binding
+
+  # Cloud Function logs configuration for monitoring and debugging
+  - name: function-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/$(ref.project.projectId)
+      sink: url-shortener-function-logs
+      destination: storage.googleapis.com/$(ref.source-bucket.name)/logs
+      filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(var.function_name)"'
+      # Include caller identity in logs for security auditing
+      includeChildren: true
+    metadata:
+      dependsOn:
+        - url-shortener-function
+        - source-bucket
+
+# Output important values for verification and integration
+outputs:
+  - name: function_url
+    description: "HTTPS URL of the deployed Cloud Function"
+    value: $(ref.url-shortener-function.httpsTrigger.url)
+
+  - name: function_name
+    description: "Name of the deployed Cloud Function"
+    value: $(ref.url-shortener-function.name)
+
+  - name: project_id
+    description: "Google Cloud project ID"
+    value: $(ref.project.projectId)
+
+  - name: firestore_database
+    description: "Firestore database information"
+    value: $(ref.firestore-database.name)
+
+  - name: source_bucket
+    description: "Cloud Storage bucket containing function source code"
+    value: $(ref.source-bucket.name)
+
+  - name: function_region
+    description: "Region where the Cloud Function is deployed"
+    value: $(var.region)
+
+  - name: api_endpoints
+    description: "Available API endpoints for the URL shortener service"
+    value:
+      shorten_url: "POST $(ref.url-shortener-function.httpsTrigger.url)/shorten"
+      redirect: "GET $(ref.url-shortener-function.httpsTrigger.url)/{shortId}"
+      documentation: "GET $(ref.url-shortener-function.httpsTrigger.url)/"
+
+  - name: firestore_console_url
+    description: "URL to view Firestore data in the Google Cloud Console"
+    value: "https://console.firebase.google.com/project/$(ref.project.projectId)/firestore"
+
+  - name: function_logs_url
+    description: "URL to view Cloud Function logs in the Google Cloud Console"
+    value: "https://console.cloud.google.com/functions/details/$(var.region)/$(var.function_name)?project=$(ref.project.projectId)&tab=logs"
+
+# Metadata for Infrastructure Manager deployment tracking
+metadata:
+  version: "1.0"
+  description: "URL Shortener service using Cloud Functions and Firestore"
+  author: "Infrastructure Manager Template"
+  created: "2025-01-27"
+  tags:
+    - serverless
+    - url-shortener
+    - cloud-functions
+    - firestore
+    - http-functions

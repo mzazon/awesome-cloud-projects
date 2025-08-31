@@ -1,0 +1,389 @@
+# Infrastructure Manager Configuration for Automated Code Documentation with Gemini and Cloud Build
+# This configuration deploys the complete infrastructure for automated code documentation generation
+# using Vertex AI Gemini, Cloud Build, Cloud Storage, and Cloud Functions
+
+# Define the import template schema
+imports:
+- path: resources.jinja
+
+resources:
+# Service Account for Documentation Automation
+- name: doc-automation-sa
+  type: iam.v1.serviceAccount
+  properties:
+    accountId: doc-automation-sa
+    displayName: "Documentation Automation Service Account"
+    description: "Service account for automated documentation generation using Gemini AI"
+
+# IAM Policy Bindings for Service Account
+# Vertex AI User Role
+- name: doc-automation-sa-aiplatform-user
+  type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+  properties:
+    resource: $(ref.project-id.projectId)
+    role: roles/aiplatform.user
+    member: serviceAccount:$(ref.doc-automation-sa.email)
+
+# Storage Object Admin Role
+- name: doc-automation-sa-storage-admin
+  type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+  properties:
+    resource: $(ref.project-id.projectId)
+    role: roles/storage.objectAdmin
+    member: serviceAccount:$(ref.doc-automation-sa.email)
+
+# Cloud Functions Invoker Role
+- name: doc-automation-sa-functions-invoker
+  type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+  properties:
+    resource: $(ref.project-id.projectId)
+    role: roles/cloudfunctions.invoker
+    member: serviceAccount:$(ref.doc-automation-sa.email)
+
+# Cloud Build Editor Role for build triggers
+- name: doc-automation-sa-build-editor
+  type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+  properties:
+    resource: $(ref.project-id.projectId)
+    role: roles/cloudbuild.builds.editor
+    member: serviceAccount:$(ref.doc-automation-sa.email)
+
+# Cloud Storage Bucket for Documentation Storage
+- name: code-docs-bucket
+  type: storage.v1.bucket
+  properties:
+    name: code-docs-$(ref.random-suffix.value)
+    location: $(ref.region.value)
+    storageClass: STANDARD
+    versioning:
+      enabled: true
+    lifecycle:
+      rule:
+      - condition:
+          age: 90
+          numNewerVersions: 5
+        action:
+          type: Delete
+    iamConfiguration:
+      uniformBucketLevelAccess:
+        enabled: true
+    publicAccessPrevention: enforced
+
+# Cloud Function for Documentation Processing
+- name: doc-processor-function
+  type: gcp-types/cloudfunctions-v2:projects.locations.functions
+  properties:
+    parent: projects/$(ref.project-id.projectId)/locations/$(ref.region.value)
+    functionId: doc-processor-$(ref.random-suffix.value)
+    function:
+      description: "Function for generating documentation using Gemini AI"
+      buildConfig:
+        runtime: python312
+        entryPoint: generate_docs
+        source:
+          storageSource:
+            bucket: $(ref.code-docs-bucket.name)
+            object: function-source.zip
+        environmentVariables:
+          BUCKET_NAME: $(ref.code-docs-bucket.name)
+      serviceConfig:
+        serviceAccountEmail: $(ref.doc-automation-sa.email)
+        availableMemory: 512M
+        timeoutSeconds: 300
+        maxInstanceCount: 10
+        minInstanceCount: 0
+        allTrafficOnLatestRevision: true
+        ingressSettings: ALLOW_ALL
+        environmentVariables:
+          BUCKET_NAME: $(ref.code-docs-bucket.name)
+          GOOGLE_CLOUD_PROJECT: $(ref.project-id.projectId)
+
+# IAM Binding to make function publicly accessible
+- name: doc-processor-function-invoker
+  type: gcp-types/cloudfunctions-v2:projects.locations.functions.setIamPolicy
+  properties:
+    resource: $(ref.doc-processor-function.name)
+    policy:
+      bindings:
+      - role: roles/cloudfunctions.invoker
+        members:
+        - allUsers
+        - serviceAccount:$(ref.doc-automation-sa.email)
+
+# Cloud Function for Notification Processing
+- name: doc-notifier-function
+  type: gcp-types/cloudfunctions-v2:projects.locations.functions
+  properties:
+    parent: projects/$(ref.project-id.projectId)/locations/$(ref.region.value)
+    functionId: doc-notifier-$(ref.random-suffix.value)
+    function:
+      description: "Function for sending notifications when documentation is updated"
+      buildConfig:
+        runtime: python312
+        entryPoint: notify_team
+        source:
+          storageSource:
+            bucket: $(ref.code-docs-bucket.name)
+            object: notifier-source.zip
+      serviceConfig:
+        serviceAccountEmail: $(ref.doc-automation-sa.email)
+        availableMemory: 256M
+        timeoutSeconds: 60
+        maxInstanceCount: 5
+        minInstanceCount: 0
+        allTrafficOnLatestRevision: true
+      eventTrigger:
+        eventType: google.cloud.storage.object.v1.finalized
+        eventFilters:
+        - attribute: bucket
+          value: $(ref.code-docs-bucket.name)
+        retryPolicy: RETRY_POLICY_RETRY
+
+# Cloud Build Trigger for Manual Documentation Generation
+- name: doc-automation-trigger-manual
+  type: gcp-types/cloudbuild-v1:projects.triggers
+  properties:
+    name: doc-automation-$(ref.random-suffix.value)-manual
+    description: "Manual trigger for documentation generation pipeline"
+    disabled: false
+    substitutions:
+      _FUNCTION_URL: $(ref.doc-processor-function-url.value)
+      _BUCKET_NAME: $(ref.code-docs-bucket.name)
+      _REGION: $(ref.region.value)
+    build:
+      steps:
+      # Step 1: Analyze repository structure
+      - name: 'gcr.io/cloud-builders/git'
+        entryPoint: 'bash'
+        args:
+        - '-c'
+        - |
+          echo "Analyzing repository structure..."
+          find . -name "*.py" -o -name "*.js" -o -name "*.go" -o -name "*.java" | head -10 > files_to_document.txt
+          echo "Found files for documentation:"
+          cat files_to_document.txt
+
+      # Step 2: Generate API documentation for Python files
+      - name: 'gcr.io/cloud-builders/curl'
+        entryPoint: 'bash'
+        args:
+        - '-c'
+        - |
+          echo "Generating API documentation..."
+          for file in $$(grep "\.py$$" files_to_document.txt); do
+            if [ -f "$$file" ]; then
+              echo "Processing $$file..."
+              content=$$(cat "$$file" | head -50)
+              escaped_content=$$(echo "$$content" | sed 's/"/\\"/g' | tr '\n' ' ')
+              curl -X POST "${_FUNCTION_URL}" \
+                -H "Content-Type: application/json" \
+                -d "{\"repo_path\":\"$$file\",\"file_content\":\"$$escaped_content\",\"doc_type\":\"api\"}"
+            fi
+          done
+
+      # Step 3: Generate README documentation
+      - name: 'gcr.io/cloud-builders/curl'
+        entryPoint: 'bash'
+        args:
+        - '-c'
+        - |
+          echo "Generating README documentation..."
+          repo_structure=$$(find . -type f -name "*.py" -o -name "*.js" -o -name "*.md" | head -20 | xargs ls -la)
+          escaped_structure=$$(echo "$$repo_structure" | sed 's/"/\\"/g' | tr '\n' ' ')
+          curl -X POST "${_FUNCTION_URL}" \
+            -H "Content-Type: application/json" \
+            -d "{\"repo_path\":\"project_root\",\"file_content\":\"$$escaped_structure\",\"doc_type\":\"readme\"}"
+
+      # Step 4: Generate code comments for key files
+      - name: 'gcr.io/cloud-builders/curl'
+        entryPoint: 'bash'
+        args:
+        - '-c'
+        - |
+          echo "Generating enhanced code comments..."
+          for file in $$(head -3 files_to_document.txt); do
+            if [ -f "$$file" ]; then
+              echo "Adding comments to $$file..."
+              content=$$(cat "$$file")
+              escaped_content=$$(echo "$$content" | sed 's/"/\\"/g' | tr '\n' ' ')
+              curl -X POST "${_FUNCTION_URL}" \
+                -H "Content-Type: application/json" \
+                -d "{\"repo_path\":\"$$file\",\"file_content\":\"$$escaped_content\",\"doc_type\":\"comments\"}"
+            fi
+          done
+
+      # Step 5: Create documentation index
+      - name: 'gcr.io/cloud-builders/gsutil'
+        entryPoint: 'bash'
+        args:
+        - '-c'
+        - |
+          echo "Creating documentation index..."
+          echo "# Documentation Index" > index.md
+          echo "Generated on: $$(date)" >> index.md
+          echo "" >> index.md
+          echo "## Available Documentation" >> index.md
+          echo "- API Documentation: gs://${_BUCKET_NAME}/api/" >> index.md
+          echo "- README Files: gs://${_BUCKET_NAME}/readme/" >> index.md
+          echo "- Enhanced Code: gs://${_BUCKET_NAME}/comments/" >> index.md
+          gsutil cp index.md gs://${_BUCKET_NAME}/
+
+      options:
+        logging: CLOUD_LOGGING_ONLY
+        substitutionOption: ALLOW_LOOSE
+        machineType: E2_MEDIUM
+
+# Compute helper resources for dynamic values
+- name: project-id
+  type: gcp-types/cloudresourcemanager-v1:projects
+  properties:
+    projectId: $(env["deployment"]["project"])
+
+- name: region
+  type: compute.v1.instance
+  metadata:
+    dependsOn: []
+  properties:
+    # This is a virtual resource to provide region value
+    name: region-helper
+    zone: us-central1-a
+    machineType: zones/us-central1-a/machineTypes/e2-micro
+    networkInterfaces:
+    - network: global/networks/default
+    disks:
+    - boot: true
+      initializeParams:
+        sourceImage: projects/debian-cloud/global/images/family/debian-11
+    metadata:
+      items:
+      - key: startup-script
+        value: |
+          #!/bin/bash
+          echo "us-central1" > /tmp/region.txt
+    # Mark as template-only, not for actual deployment
+    labels:
+      template-only: "true"
+
+# Generate random suffix for unique resource names
+- name: random-suffix
+  type: gcp-types/cloudresourcemanager-v1:projects
+  metadata:
+    runtimePolicy:
+    - CREATE
+  properties:
+    projectId: $(env["deployment"]["project"])
+
+outputs:
+# Service Account Email
+- name: service-account-email
+  value: $(ref.doc-automation-sa.email)
+
+# Storage Bucket Name
+- name: storage-bucket-name
+  value: $(ref.code-docs-bucket.name)
+
+# Storage Bucket URL
+- name: storage-bucket-url
+  value: gs://$(ref.code-docs-bucket.name)
+
+# Documentation Processor Function URL
+- name: doc-processor-function-url
+  value: $(ref.doc-processor-function-url.value)
+
+# Notification Function Name
+- name: doc-notifier-function-name
+  value: $(ref.doc-notifier-function.name)
+
+# Build Trigger Name
+- name: build-trigger-name
+  value: $(ref.doc-automation-trigger-manual.name)
+
+# Documentation Website URL
+- name: documentation-website-url
+  value: https://storage.googleapis.com/$(ref.code-docs-bucket.name)/website/index.html
+
+# Project Information
+- name: project-id
+  value: $(ref.project-id.projectId)
+
+- name: region
+  value: us-central1
+
+# Instructions for next steps
+- name: setup-instructions
+  value: |
+    ## Next Steps:
+    1. Upload function source code to the storage bucket
+    2. Configure repository connection in Cloud Build console
+    3. Test the documentation generation pipeline
+    4. Set up team notification integrations
+    
+    ## Function URLs:
+    - Documentation Processor: $(ref.doc-processor-function-url.value)
+    
+    ## Storage:
+    - Documentation Bucket: gs://$(ref.code-docs-bucket.name)
+    
+    ## Manual Testing:
+    - Trigger Name: $(ref.doc-automation-trigger-manual.name)
+    - Run: gcloud builds triggers run $(ref.doc-automation-trigger-manual.name)
+
+# Helper outputs for function URL retrieval
+- name: doc-processor-function-url
+  type: gcp-types/cloudfunctions-v2:projects.locations.functions
+  metadata:
+    dependsOn:
+    - doc-processor-function
+  properties:
+    name: $(ref.doc-processor-function.name)
+    # This creates a computed output for the function URL
+    serviceConfig:
+      uri: https://$(ref.region.value)-$(ref.project-id.projectId).cloudfunctions.net/$(ref.doc-processor-function.name)
+
+# Schema definitions for validation
+schema:
+  info:
+    title: "Automated Code Documentation Infrastructure"
+    description: "Infrastructure Manager template for deploying automated code documentation system using Gemini AI"
+    version: "1.0"
+  
+  properties:
+    project:
+      type: string
+      description: "Google Cloud Project ID"
+    
+    region:
+      type: string
+      description: "Google Cloud Region for resource deployment"
+      default: "us-central1"
+    
+    # Additional customizable properties
+    bucket-location:
+      type: string
+      description: "Storage bucket location"
+      default: "us-central1"
+    
+    function-memory:
+      type: string
+      description: "Memory allocation for Cloud Functions"
+      default: "512M"
+      enum: ["256M", "512M", "1G", "2G"]
+    
+    function-timeout:
+      type: integer
+      description: "Timeout for Cloud Functions in seconds"
+      default: 300
+      minimum: 60
+      maximum: 540
+
+  required:
+  - project
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: 1
+  dependsOn: []
+  runtimePolicy:
+  - CREATE
+  - UPDATE
+  - DELETE

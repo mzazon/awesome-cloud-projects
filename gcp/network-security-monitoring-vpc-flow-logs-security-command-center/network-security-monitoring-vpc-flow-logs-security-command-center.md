@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: VPC Flow Logs, Cloud Security Command Center, Cloud Logging, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: network-security, vpc-flow-logs, security-command-center, monitoring, threat-detection
 recipe-generator-version: 1.3
@@ -83,7 +83,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for consistent resource naming
+# Set environment variables for GCP resources
 export PROJECT_ID=$(gcloud config get-value project)
 export REGION="us-central1"
 export ZONE="us-central1-a"
@@ -95,7 +95,8 @@ RANDOM_SUFFIX=$(openssl rand -hex 3)
 export INSTANCE_NAME="test-vm-${RANDOM_SUFFIX}"
 export LOG_SINK_NAME="vpc-flow-security-sink-${RANDOM_SUFFIX}"
 
-# Set default region for gcloud commands
+# Set default project and region
+gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
 
@@ -104,6 +105,7 @@ gcloud services enable compute.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable securitycenter.googleapis.com
+gcloud services enable bigquery.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Region set to: ${REGION}"
@@ -114,7 +116,7 @@ echo "✅ Required APIs enabled successfully"
 
 1. **Create VPC Network with Security Monitoring Configuration**:
 
-   Virtual Private Cloud (VPC) networks form the foundation of Google Cloud networking, providing isolated environments for resources. Creating a custom VPC allows precise control over network topology, routing, and security policies. This step establishes the network infrastructure that will generate the flow logs essential for security monitoring and threat detection.
+   Google Cloud Virtual Private Cloud (VPC) networks provide isolated network environments for your cloud resources. Creating a custom VPC allows precise control over network topology, routing, and security policies. This step establishes the network infrastructure that will generate the flow logs essential for security monitoring and threat detection.
 
    ```bash
    # Create custom VPC network for security monitoring
@@ -216,8 +218,7 @@ echo "✅ Required APIs enabled successfully"
    # Create logging sink to route flow logs to BigQuery
    gcloud logging sinks create ${LOG_SINK_NAME} \
        bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/security_monitoring \
-       --log-filter='resource.type="gce_subnetwork" AND 
-                     protoPayload.methodName="compute.subnetworks.insert" OR
+       --log-filter='resource.type="gce_subnetwork"
                      logName:"compute.googleapis.com%2Fvpc_flows"' \
        --description="Sink for VPC Flow Logs security monitoring"
    
@@ -301,7 +302,9 @@ echo "✅ Required APIs enabled successfully"
    gcloud services enable securitycenter.googleapis.com
    
    # Create a custom security source for VPC Flow Log findings
-   ORG_ID=$(gcloud organizations list --format="value(name)" --filter="displayName:${PROJECT_ID}")
+   ORG_ID=$(gcloud organizations list \
+       --format="value(name)" \
+       --filter="displayName:${PROJECT_ID}" 2>/dev/null || echo "")
    
    if [ ! -z "$ORG_ID" ]; then
        echo "Organization found: ${ORG_ID}"
@@ -411,7 +414,8 @@ echo "✅ Required APIs enabled successfully"
    ```bash
    # Query BigQuery for recent VPC Flow Logs
    bq query --use_legacy_sql=false \
-       "SELECT timestamp, jsonPayload.connection.src_ip, jsonPayload.connection.dest_ip, 
+       "SELECT timestamp, jsonPayload.connection.src_ip, 
+               jsonPayload.connection.dest_ip, 
                jsonPayload.connection.protocol 
         FROM \`${PROJECT_ID}.security_monitoring.compute_googleapis_com_vpc_flows_*\` 
         WHERE timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR) 
@@ -515,7 +519,7 @@ The integration with Cloud Security Command Center creates a centralized securit
 
 Cloud Monitoring's alerting capabilities complement the Security Command Center by providing proactive notifications based on network metrics and patterns. The combination of threshold-based alerts and machine learning-driven anomaly detection creates a multi-layered security monitoring approach that adapts to changing traffic patterns while maintaining sensitivity to genuine threats.
 
-For production deployments, consider implementing additional security measures such as [VPC Service Controls](https://cloud.google.com/vpc-service-controls) for data exfiltration protection, [Cloud Armor](https://cloud.google.com/armor) for DDoS protection, and [Chronicle SOAR](https://cloud.google.com/security-command-center/docs/chronicles-soar-overview) for automated incident response workflows.
+For production deployments, consider implementing additional security measures such as [VPC Service Controls](https://cloud.google.com/vpc-service-controls) for data exfiltration protection, [Cloud Armor](https://cloud.google.com/armor) for DDoS protection, and [Chronicle SOAR](https://cloud.google.com/security-command-center/docs/chronicles-soar-overview) for automated incident response workflows. Additionally, leverage [Google Cloud's security best practices](https://cloud.google.com/security/best-practices) and the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) for comprehensive security posture management.
 
 > **Tip**: Use BigQuery's machine learning capabilities to build custom anomaly detection models based on your organization's specific traffic patterns. The ML.DETECT_ANOMALIES function can identify unusual network behavior that might indicate security threats.
 
@@ -535,4 +539,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

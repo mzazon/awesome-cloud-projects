@@ -4,14 +4,14 @@ id: 9190556c
 category: analytics
 difficulty: 400
 subject: aws
-services: 'emr,on,eks','amazon,eks','apache,flink','kinesis,data,streams'
+services: EMR, EKS, Kinesis, S3
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: 'analytics','streaming','flink','kubernetes','emr','real-time'
+tags: analytics, streaming, flink, kubernetes, emr, real-time
 recipe-generator-version: 1.3
 ---
 
@@ -163,7 +163,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    metadata:
      name: ${CLUSTER_NAME}
      region: ${AWS_REGION}
-     version: "1.28"
+     version: "1.30"
    
    iam:
      withOIDC: true
@@ -181,7 +181,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
            - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
            - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
            - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
-           - arn:aws:iam::aws:policy/AmazonS3FullAccess
+           - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
          withAddonPolicies:
            ebs: true
            cloudWatch: true
@@ -202,7 +202,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    echo "✅ EKS cluster created successfully"
    ```
 
-   The EKS cluster is now operational with managed node groups optimized for streaming analytics workloads. The OIDC provider enables secure IAM integration for service accounts, while the EBS CSI driver provides persistent storage for checkpoints. This foundational infrastructure supports the high-throughput, low-latency requirements of real-time stream processing.
+   The EKS cluster is now operational with managed node groups optimized for streaming analytics workloads. The OIDC provider enables secure IAM integration for service accounts, while the EBS CSI driver provides persistent storage for checkpoints. This foundational infrastructure supports the high-throughput, low-latency requirements of real-time stream processing as defined in the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
 2. **Set up IAM Roles for EMR on EKS**:
 
@@ -233,7 +233,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
        --role-name EMRContainersServiceRole \
        --policy-arn arn:aws:iam::aws:policy/AmazonEMRContainersServiceRolePolicy
    
-   # Create job execution role
+   # Create job execution role with OIDC trust policy
    OIDC_ISSUER=$(aws eks describe-cluster \
        --name ${CLUSTER_NAME} \
        --query "cluster.identity.oidc.issuer" \
@@ -263,23 +263,66 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
        --role-name EMRFlinkJobExecutionRole \
        --assume-role-policy-document file://job-execution-trust-policy.json
    
-   # Attach necessary policies
-   aws iam attach-role-policy \
-       --role-name EMRFlinkJobExecutionRole \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+   # Create custom policy with minimal required permissions
+   cat > flink-job-policy.json << EOF
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": [
+           "s3:GetObject",
+           "s3:PutObject",
+           "s3:DeleteObject",
+           "s3:ListBucket"
+         ],
+         "Resource": [
+           "arn:aws:s3:::${BUCKET_NAME}",
+           "arn:aws:s3:::${BUCKET_NAME}/*"
+         ]
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "kinesis:DescribeStream",
+           "kinesis:GetShardIterator",
+           "kinesis:GetRecords",
+           "kinesis:ListStreams",
+           "kinesis:PutRecord",
+           "kinesis:PutRecords"
+         ],
+         "Resource": [
+           "arn:aws:kinesis:${AWS_REGION}:${AWS_ACCOUNT_ID}:stream/${STREAM_NAME_TRADING}",
+           "arn:aws:kinesis:${AWS_REGION}:${AWS_ACCOUNT_ID}:stream/${STREAM_NAME_MARKET}"
+         ]
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "logs:CreateLogGroup",
+           "logs:CreateLogStream",
+           "logs:PutLogEvents",
+           "logs:DescribeLogGroups",
+           "logs:DescribeLogStreams"
+         ],
+         "Resource": "arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:*"
+       }
+     ]
+   }
+   EOF
+   
+   aws iam create-policy \
+       --policy-name EMRFlinkJobExecutionPolicy \
+       --policy-document file://flink-job-policy.json
    
    aws iam attach-role-policy \
        --role-name EMRFlinkJobExecutionRole \
-       --policy-arn arn:aws:iam::aws:policy/AmazonKinesisFullAccess
-   
-   aws iam attach-role-policy \
-       --role-name EMRFlinkJobExecutionRole \
-       --policy-arn arn:aws:iam::aws:policy/CloudWatchFullAccess
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/EMRFlinkJobExecutionPolicy
    
    echo "✅ IAM roles configured for EMR on EKS"
    ```
 
-   The IAM roles are now configured with appropriate trust relationships and permissions. The OIDC-based trust policy enables secure credential assumption without long-lived access keys, while the attached managed policies provide necessary access to AWS services. This security foundation ensures Flink applications can securely interact with data sources and sinks while maintaining compliance and auditability.
+   The IAM roles are now configured with appropriate trust relationships and minimal permissions following the principle of least privilege. The OIDC-based trust policy enables secure credential assumption without long-lived access keys, while the custom policies provide only necessary access to specific AWS services. This security foundation ensures Flink applications can securely interact with data sources and sinks while maintaining compliance and auditability as recommended in [AWS IAM best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
 
 3. **Create EMR Virtual Cluster and Install Flink Operator**:
 
@@ -319,31 +362,48 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    
    echo "Virtual Cluster ID: ${VIRTUAL_CLUSTER_ID}"
    
-   # Install Flink Kubernetes operator using Helm
-   helm repo add flink-operator-repo \
-       https://downloads.apache.org/flink/flink-kubernetes-operator-1.7.0/
-   helm repo update
+   # Install cert-manager (required for Flink operator)
+   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.12.0/cert-manager.yaml
    
+   # Wait for cert-manager to be ready
+   kubectl wait --for=condition=Available deployment/cert-manager \
+       --namespace=cert-manager --timeout=300s
+   
+   # Install Flink Kubernetes operator using Helm OCI registry
+   export EMR_VERSION=7.8.0
    helm install flink-kubernetes-operator \
-       flink-operator-repo/flink-kubernetes-operator \
-       --namespace ${EMR_NAMESPACE} \
-       --set image.repository=public.ecr.aws/emr-on-eks/flink/flink-kubernetes-operator \
-       --set image.tag=1.7.0-emr-7.0.0
+       oci://public.ecr.aws/emr-on-eks/flink-kubernetes-operator \
+       --version ${EMR_VERSION} \
+       --namespace ${EMR_NAMESPACE}
+   
+   # Wait for operator to be ready
+   kubectl wait deployment flink-kubernetes-operator \
+       --namespace ${EMR_NAMESPACE} --for condition=Available=True \
+       --timeout=180s
    
    echo "✅ EMR virtual cluster and Flink operator installed"
    ```
 
-   The EMR virtual cluster is now operational and linked to the EKS namespace, enabling managed execution of Flink jobs. The Flink operator is monitoring the namespace for FlinkDeployment resources and is ready to provision job managers and task managers. This setup provides a bridge between EMR's enterprise features and Kubernetes' container orchestration capabilities, creating a robust platform for production streaming workloads.
+   The EMR virtual cluster is now operational and linked to the EKS namespace, enabling managed execution of Flink jobs. The Flink operator is monitoring the namespace for FlinkDeployment resources and is ready to provision job managers and task managers. This setup provides a bridge between EMR's enterprise features and Kubernetes' container orchestration capabilities, creating a robust platform for production streaming workloads as documented in the [EMR on EKS user guide](https://docs.aws.amazon.com/emr/latest/EMR-on-EKS-DevelopmentGuide/jobruns-flink-kubernetes-operator.html).
 
 4. **Create Supporting Infrastructure**:
 
    Supporting infrastructure provides the data persistence, ingestion, and lifecycle management capabilities essential for streaming analytics. S3 serves as the durable checkpoint storage for Flink's exactly-once processing guarantees and provides cost-optimized storage through intelligent lifecycle policies. Kinesis Data Streams handles real-time data ingestion with automatic scaling, partitioning for parallel processing, and built-in durability. This infrastructure ensures data reliability, cost optimization, and seamless integration with the Flink processing layer.
 
    ```bash
-   # Create S3 bucket for checkpoints and results
+   # Create S3 bucket with versioning and encryption
    aws s3 mb s3://${BUCKET_NAME} --region ${AWS_REGION}
    
-   # Configure S3 bucket lifecycle policy
+   aws s3api put-bucket-versioning \
+       --bucket ${BUCKET_NAME} \
+       --versioning-configuration Status=Enabled
+   
+   aws s3api put-bucket-encryption \
+       --bucket ${BUCKET_NAME} \
+       --server-side-encryption-configuration \
+       'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+   
+   # Configure S3 bucket lifecycle policy for cost optimization
    cat > lifecycle-policy.json << EOF
    {
      "Rules": [
@@ -372,7 +432,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
        --bucket ${BUCKET_NAME} \
        --lifecycle-configuration file://lifecycle-policy.json
    
-   # Create Kinesis data streams
+   # Create Kinesis data streams with appropriate shard counts
    aws kinesis create-stream \
        --stream-name ${STREAM_NAME_TRADING} \
        --shard-count 4
@@ -390,7 +450,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    echo "✅ Supporting infrastructure created"
    ```
 
-   The supporting infrastructure is now ready to handle production streaming workloads. S3 provides reliable checkpoint storage with automatic cost optimization through lifecycle policies, while Kinesis streams are configured with appropriate shard counts for expected throughput. This foundation enables fault-tolerant stream processing with exactly-once semantics and efficient resource utilization across the entire data pipeline.
+   The supporting infrastructure is now ready to handle production streaming workloads. S3 provides reliable checkpoint storage with automatic cost optimization through lifecycle policies, while Kinesis streams are configured with appropriate shard counts for expected throughput. This foundation enables fault-tolerant stream processing with exactly-once semantics and efficient resource utilization across the entire data pipeline, following [S3 best practices](https://docs.aws.amazon.com/AmazonS3/latest/userguide/best-practices.html) for data lakes.
 
 5. **Deploy Fraud Detection Flink Application**:
 
@@ -405,8 +465,8 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
      name: fraud-detection
      namespace: ${EMR_NAMESPACE}
    spec:
-     image: public.ecr.aws/emr-on-eks/flink/flink:1.17.1-emr-7.0.0
-     flinkVersion: v1_17
+     image: public.ecr.aws/emr-on-eks/flink/flink:1.18.1-emr-7.8.0
+     flinkVersion: v1_18
      flinkConfiguration:
        taskmanager.numberOfTaskSlots: "4"
        state.backend: rocksdb
@@ -414,6 +474,8 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
        state.checkpoint-storage: filesystem
        execution.checkpointing.interval: 60s
        execution.checkpointing.mode: EXACTLY_ONCE
+       execution.checkpointing.min-pause: 10s
+       execution.checkpointing.timeout: 300s
        restart-strategy: exponential-delay
        restart-strategy.exponential-delay.initial-backoff: 10s
        restart-strategy.exponential-delay.max-backoff: 2min
@@ -421,6 +483,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
        restart-strategy.exponential-delay.reset-backoff-threshold: 10min
        high-availability: org.apache.flink.kubernetes.highavailability.KubernetesHaServicesFactory
        high-availability.storageDir: s3://${BUCKET_NAME}/ha/fraud-detection
+       kubernetes.jobmanager.replicas: 1
      serviceAccount: emr-containers-sa-flink-operator
      jobManager:
        resource:
@@ -467,7 +530,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    echo "✅ Fraud detection Flink job deployed"
    ```
 
-   The fraud detection application is now processing trading events in real-time with exactly-once guarantees. The Flink operator has created the job manager and task managers, established checkpointing to S3, and configured high availability for automatic failover. This deployment demonstrates how complex event processing applications can achieve production-grade reliability and performance on the EMR on EKS platform.
+   The fraud detection application is now processing trading events in real-time with exactly-once guarantees. The Flink operator has created the job manager and task managers, established checkpointing to S3, and configured high availability for automatic failover. This deployment demonstrates how complex event processing applications can achieve production-grade reliability and performance on the EMR on EKS platform with enhanced checkpointing configurations for better fault tolerance.
 
 > **Warning**: Flink checkpoints contain application state and should be stored in durable, versioned storage. Never delete checkpoint directories while jobs are running as this will cause data loss and processing failures.
 
@@ -484,8 +547,8 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
      name: risk-analytics
      namespace: ${EMR_NAMESPACE}
    spec:
-     image: public.ecr.aws/emr-on-eks/flink/flink:1.17.1-emr-7.0.0
-     flinkVersion: v1_17
+     image: public.ecr.aws/emr-on-eks/flink/flink:1.18.1-emr-7.8.0
+     flinkVersion: v1_18
      flinkConfiguration:
        taskmanager.numberOfTaskSlots: "2"
        state.backend: rocksdb
@@ -541,7 +604,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    echo "✅ Risk analytics Flink job deployed"
    ```
 
-   The risk analytics application is now operational alongside the fraud detection system, processing market data with different performance characteristics. This demonstrates the platform's ability to support multiple streaming workloads with different SLAs and resource requirements. The Prometheus metrics endpoint enables comprehensive monitoring of job health, throughput, and resource utilization patterns.
+   The risk analytics application is now operational alongside the fraud detection system, processing market data with different performance characteristics. This demonstrates the platform's ability to support multiple streaming workloads with different SLAs and resource requirements. The Prometheus metrics endpoint enables comprehensive monitoring of job health, throughput, and resource utilization patterns for operational excellence.
 
 7. **Configure Monitoring with Prometheus and Grafana**:
 
@@ -554,12 +617,14 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    helm repo add grafana https://grafana.github.io/helm-charts
    helm repo update
    
-   # Install Prometheus
+   # Install Prometheus stack with proper configurations
    helm install prometheus prometheus-community/kube-prometheus-stack \
        --namespace monitoring \
        --create-namespace \
        --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
-       --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false
+       --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
+       --set prometheus.prometheusSpec.retention=7d \
+       --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=50Gi
    
    # Create service monitor for Flink metrics
    cat > flink-service-monitor.yaml << EOF
@@ -585,45 +650,50 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    
    kubectl apply -f flink-service-monitor.yaml
    
-   # Configure CloudWatch logging
-   cat > fluentd-config.yaml << EOF
+   # Configure AWS for Fluent Bit for log forwarding
+   cat > fluent-bit-config.yaml << EOF
    apiVersion: v1
    kind: ConfigMap
    metadata:
-     name: fluentd-config
+     name: fluent-bit-config
      namespace: ${EMR_NAMESPACE}
    data:
-     fluent.conf: |
-       <source>
-         @type tail
-         path /opt/flink/log/*.log
-         pos_file /var/log/fluentd-flink.log.pos
-         tag flink.*
-         format none
-       </source>
+     fluent-bit.conf: |
+       [SERVICE]
+           Flush         1
+           Log_Level     info
+           Daemon        off
+           Parsers_File  parsers.conf
        
-       <match flink.*>
-         @type cloudwatch_logs
-         log_group_name /aws/emr-containers/flink
-         log_stream_name ${EMR_NAMESPACE}
-         region ${AWS_REGION}
-         auto_create_stream true
-       </match>
+       [INPUT]
+           Name              tail
+           Path              /opt/flink/log/*.log
+           Tag               flink.*
+           Parser            none
+           Refresh_Interval  5
+       
+       [OUTPUT]
+           Name cloudwatch_logs
+           Match flink.*
+           region ${AWS_REGION}
+           log_group_name /aws/emr-containers/flink
+           log_stream_name \${EMR_NAMESPACE}
+           auto_create_group true
    EOF
    
-   kubectl apply -f fluentd-config.yaml
+   kubectl apply -f fluent-bit-config.yaml
    
    echo "✅ Monitoring and logging configured"
    ```
 
-   The monitoring infrastructure is now collecting comprehensive metrics and logs from the streaming platform. Prometheus is scraping Flink job metrics and Kubernetes resource metrics, while Fluentd is forwarding application logs to CloudWatch. This observability foundation enables real-time monitoring of streaming jobs, capacity planning, and rapid troubleshooting of issues in production environments.
+   The monitoring infrastructure is now collecting comprehensive metrics and logs from the streaming platform. Prometheus is scraping Flink job metrics and Kubernetes resource metrics with appropriate retention settings, while Fluent Bit is forwarding application logs to CloudWatch. This observability foundation enables real-time monitoring of streaming jobs, capacity planning, and rapid troubleshooting of issues in production environments according to [CloudWatch best practices](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Best_Practices_For_Alarms.html).
 
 8. **Create Data Generator for Testing**:
 
    The data generator simulates realistic trading events to validate the streaming pipeline end-to-end. This containerized application produces JSON-formatted trading transactions at a controlled rate, enabling testing of throughput, latency, and fault tolerance characteristics. Running the generator as a Kubernetes deployment allows for easy scaling to simulate various load conditions and validate auto-scaling behavior of the Flink applications.
 
    ```bash
-   # Create a simple data generator pod
+   # Create a data generator deployment with proper resource limits
    cat > data-generator.yaml << EOF
    apiVersion: apps/v1
    kind: Deployment
@@ -640,6 +710,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
          labels:
            app: data-generator
        spec:
+         serviceAccountName: emr-containers-sa-flink-operator
          containers:
          - name: generator
            image: amazon/aws-cli:latest
@@ -665,6 +736,13 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
            env:
            - name: AWS_DEFAULT_REGION
              value: ${AWS_REGION}
+           resources:
+             requests:
+               memory: "128Mi"
+               cpu: "100m"
+             limits:
+               memory: "256Mi"
+               cpu: "200m"
    EOF
    
    kubectl apply -f data-generator.yaml
@@ -672,7 +750,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    echo "✅ Data generator deployed for testing"
    ```
 
-   The data generator is now producing test events to validate the complete streaming pipeline. This enables verification of data flow from Kinesis ingestion through Flink processing to S3 output, while providing a controlled mechanism for load testing and performance validation. The generator's scalable design allows testing various scenarios from normal operations to peak load conditions.
+   The data generator is now producing test events to validate the complete streaming pipeline. This enables verification of data flow from Kinesis ingestion through Flink processing to S3 output, while providing a controlled mechanism for load testing and performance validation. The generator's scalable design with proper resource limits allows testing various scenarios from normal operations to peak load conditions.
 
 ## Validation & Testing
 
@@ -682,30 +760,30 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    # Check Flink deployments status
    kubectl get flinkdeployments -n ${EMR_NAMESPACE}
    
-   # Check pod status
+   # Check pod status for all components
    kubectl get pods -n ${EMR_NAMESPACE} | grep -E "(fraud-detection|risk-analytics)"
    
-   # Get job manager logs
+   # Get job manager logs for troubleshooting
    kubectl logs -n ${EMR_NAMESPACE} \
        $(kubectl get pods -n ${EMR_NAMESPACE} \
        -l app=fraud-detection,component=jobmanager -o name) \
        -f --tail=50
    ```
 
-   Expected output: Flink deployments should show "READY" status, and logs should indicate successful job startup.
+   Expected output: Flink deployments should show "READY" status, and logs should indicate successful job startup with checkpoint creation.
 
 2. **Test Stream Processing**:
 
    ```bash
-   # Check if data is being processed
+   # Check Kinesis stream status and metrics
    aws kinesis describe-stream-summary \
        --stream-name ${STREAM_NAME_TRADING} \
        --query 'StreamDescriptionSummary.OpenShardCount'
    
-   # Check S3 for checkpoint data
+   # Verify S3 checkpoint data is being created
    aws s3 ls s3://${BUCKET_NAME}/checkpoints/ --recursive
    
-   # Monitor Kinesis metrics
+   # Monitor Kinesis ingestion metrics
    aws cloudwatch get-metric-statistics \
        --namespace AWS/Kinesis \
        --metric-name IncomingRecords \
@@ -725,7 +803,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    
    echo "Flink UI available at: http://localhost:8081"
    
-   # Port forward to Grafana (find the service name first)
+   # Port forward to Grafana
    kubectl get svc -n monitoring | grep grafana
    kubectl port-forward -n monitoring \
        service/prometheus-grafana 3000:80 &
@@ -741,11 +819,11 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    kubectl scale deployment trading-data-generator \
        -n ${EMR_NAMESPACE} --replicas=3
    
-   # Monitor task manager scaling
+   # Monitor task manager scaling and resource usage
    watch kubectl get pods -n ${EMR_NAMESPACE} \
        -l component=taskmanager
    
-   # Check resource usage
+   # Check resource usage metrics
    kubectl top pods -n ${EMR_NAMESPACE}
    ```
 
@@ -754,7 +832,7 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
 1. **Remove Flink Applications**:
 
    ```bash
-   # Delete Flink deployments
+   # Delete Flink deployments gracefully
    kubectl delete flinkdeployment fraud-detection -n ${EMR_NAMESPACE}
    kubectl delete flinkdeployment risk-analytics -n ${EMR_NAMESPACE}
    
@@ -789,16 +867,17 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    aws s3 rm s3://${BUCKET_NAME} --recursive
    aws s3 rb s3://${BUCKET_NAME}
    
-   # Delete IAM roles
+   # Delete IAM resources
    aws iam detach-role-policy \
        --role-name EMRFlinkJobExecutionRole \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/EMRFlinkJobExecutionPolicy
+   
+   aws iam delete-policy \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/EMRFlinkJobExecutionPolicy
+   
    aws iam detach-role-policy \
-       --role-name EMRFlinkJobExecutionRole \
-       --policy-arn arn:aws:iam::aws:policy/AmazonKinesisFullAccess
-   aws iam detach-role-policy \
-       --role-name EMRFlinkJobExecutionRole \
-       --policy-arn arn:aws:iam::aws:policy/CloudWatchFullAccess
+       --role-name EMRContainersServiceRole \
+       --policy-arn arn:aws:iam::aws:policy/AmazonEMRContainersServiceRolePolicy
    
    aws iam delete-role --role-name EMRFlinkJobExecutionRole
    aws iam delete-role --role-name EMRContainersServiceRole
@@ -815,37 +894,45 @@ echo "✅ Environment prepared for EMR on EKS with Flink deployment"
    # Clean up local files
    rm -f cluster-config.yaml emr-trust-policy.json job-execution-trust-policy.json
    rm -f lifecycle-policy.json fraud-detection-job.yaml risk-analytics-job.yaml
-   rm -f flink-service-monitor.yaml fluentd-config.yaml data-generator.yaml
+   rm -f flink-service-monitor.yaml fluent-bit-config.yaml data-generator.yaml
+   rm -f flink-job-policy.json
    
    echo "✅ EKS cluster and local files removed"
    ```
 
 ## Discussion
 
-This recipe demonstrates an enterprise-grade streaming analytics platform that combines the power of Apache Flink with the operational excellence of Kubernetes on AWS. The EMR on EKS approach provides several key advantages over traditional EMR clusters or managed Flink services.
+This recipe demonstrates an enterprise-grade streaming analytics platform that combines the power of Apache Flink with the operational excellence of Kubernetes on AWS. The EMR on EKS approach provides several key advantages over traditional EMR clusters or managed Flink services, including better resource utilization, faster scaling, and integration with cloud-native observability tools.
 
-The architecture leverages Kubernetes' native resource management and auto-scaling capabilities while maintaining Flink's advanced stream processing features. The Flink Kubernetes operator handles job lifecycle management, including automatic restarts, savepoint management, and rolling upgrades. This operational model reduces complexity while providing fine-grained control over resource allocation and job configuration.
+The architecture leverages Kubernetes' native resource management and auto-scaling capabilities while maintaining Flink's advanced stream processing features. The Flink Kubernetes operator handles job lifecycle management, including automatic restarts, savepoint management, and rolling upgrades. This operational model reduces complexity while providing fine-grained control over resource allocation and job configuration, supporting the reliability pillar of the AWS Well-Architected Framework.
 
-The integration with AWS services creates a comprehensive data pipeline. Kinesis Data Streams provides scalable data ingestion with guaranteed ordering and exactly-once delivery semantics. S3 serves as the checkpoint and high-availability storage, ensuring fault tolerance and state recovery. CloudWatch and Prometheus integration provides observability across the entire stack, enabling proactive monitoring and alerting.
+The integration with AWS services creates a comprehensive data pipeline following cloud security best practices. Kinesis Data Streams provides scalable data ingestion with guaranteed ordering and exactly-once delivery semantics. S3 serves as the checkpoint and high-availability storage with encryption at rest, ensuring fault tolerance and state recovery. CloudWatch and Prometheus integration provides observability across the entire stack, enabling proactive monitoring and alerting as recommended in the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
-The solution supports complex event processing patterns typical in financial services, including windowed aggregations, pattern matching, and stateful computations. The exactly-once processing guarantee ensures data consistency, which is critical for financial calculations and compliance requirements. The exponential backoff restart strategy and high-availability configuration provide resilience against transient failures.
+The solution supports complex event processing patterns typical in financial services, including windowed aggregations, pattern matching, and stateful computations. The exactly-once processing guarantee ensures data consistency, which is critical for financial calculations and compliance requirements. The exponential backoff restart strategy and high-availability configuration provide resilience against transient failures, demonstrating the operational excellence principles outlined in [Amazon EMR best practices](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-plan-instances.html).
 
-> **Tip**: Use Flink's savepoint feature before deploying application updates to ensure zero data loss during rolling deployments.
+> **Tip**: Use Flink's savepoint feature before deploying application updates to ensure zero data loss during rolling deployments. This enables blue-green deployment patterns for streaming applications.
 
 ## Challenge
 
 Extend this streaming analytics platform with these advanced capabilities:
 
-1. **Implement Complex Event Processing (CEP)** - Add pattern detection for identifying sophisticated fraud scenarios using Flink CEP library with custom pattern definitions and dynamic rule updates.
+1. **Implement Complex Event Processing (CEP)** - Add pattern detection for identifying sophisticated fraud scenarios using Flink CEP library with custom pattern definitions and dynamic rule updates through Kafka Connect.
 
-2. **Build Multi-Cluster Federation** - Deploy Flink jobs across multiple EKS clusters in different regions with cross-cluster state replication and automated failover mechanisms.
+2. **Build Multi-Cluster Federation** - Deploy Flink jobs across multiple EKS clusters in different regions with cross-cluster state replication and automated failover mechanisms using AWS Transit Gateway.
 
-3. **Add Machine Learning Integration** - Integrate real-time ML model inference using Amazon SageMaker endpoints for dynamic fraud scoring and risk assessment.
+3. **Add Machine Learning Integration** - Integrate real-time ML model inference using Amazon SageMaker endpoints for dynamic fraud scoring and risk assessment with model versioning and A/B testing.
 
-4. **Implement Schema Evolution** - Add Apache Avro with schema registry support for handling evolving data formats without breaking existing Flink jobs.
+4. **Implement Schema Evolution** - Add Apache Avro with Amazon MSK Schema Registry support for handling evolving data formats without breaking existing Flink jobs.
 
-5. **Create Advanced Monitoring** - Build custom Grafana dashboards with SLA monitoring, predictive scaling alerts, and automated remediation workflows using AWS Lambda.
+5. **Create Advanced Monitoring** - Build custom Grafana dashboards with SLA monitoring, predictive scaling alerts, and automated remediation workflows using AWS Lambda and EventBridge.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

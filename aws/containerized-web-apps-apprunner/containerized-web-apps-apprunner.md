@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: App Runner, RDS, Secrets Manager, CloudWatch
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers, web-application, database, serverless, monitoring
 recipe-generator-version: 1.3
@@ -184,7 +184,7 @@ echo "✅ AWS environment and networking configured"
      "dependencies": {
        "express": "^4.18.2",
        "pg": "^8.11.0",
-       "aws-sdk": "^2.1414.0"
+       "@aws-sdk/client-secrets-manager": "^3.400.0"
      }
    }
    EOF
@@ -193,23 +193,26 @@ echo "✅ AWS environment and networking configured"
    cat > server.js << EOF
    const express = require('express');
    const { Client } = require('pg');
-   const AWS = require('aws-sdk');
+   const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
    
    const app = express();
    const port = process.env.PORT || 8080;
    
    // Configure AWS SDK
-   AWS.config.update({ region: process.env.AWS_REGION || 'us-east-1' });
-   const secretsManager = new AWS.SecretsManager();
+   const secretsManager = new SecretsManagerClient({ 
+     region: process.env.AWS_REGION || 'us-east-1' 
+   });
    
    let dbClient;
    
    // Initialize database connection
    async function initDB() {
      try {
-       const secretName = process.env.DB_SECRET_NAME;
-       const secret = await secretsManager.getSecretValue({ SecretId: secretName }).promise();
-       const credentials = JSON.parse(secret.SecretString);
+       const command = new GetSecretValueCommand({
+         SecretId: process.env.DB_SECRET_NAME
+       });
+       const response = await secretsManager.send(command);
+       const credentials = JSON.parse(response.SecretString);
        
        dbClient = new Client({
          host: credentials.host,
@@ -294,12 +297,12 @@ echo "✅ AWS environment and networking configured"
        --db-subnet-group-description "Subnet group for webapp database" \
        --subnet-ids ${SUBNET1_ID} ${SUBNET2_ID}
    
-   # Create RDS instance
+   # Create RDS instance with latest PostgreSQL version
    aws rds create-db-instance \
        --db-instance-identifier ${DB_NAME} \
        --db-instance-class db.t3.micro \
        --engine postgres \
-       --engine-version 14.9 \
+       --engine-version 15.4 \
        --master-username postgres \
        --master-user-password TempPassword123! \
        --allocated-storage 20 \
@@ -359,8 +362,8 @@ echo "✅ AWS environment and networking configured"
    App Runner requires specific IAM permissions to access ECR for container images, Secrets Manager for database credentials, and CloudWatch for logging. Creating a dedicated service role ensures least-privilege access while enabling all required functionality.
 
    ```bash
-   # Create App Runner service role
-   cat > apprunner-trust-policy.json << EOF
+   # Create App Runner access role for ECR
+   cat > apprunner-access-trust-policy.json << EOF
    {
      "Version": "2012-10-17",
      "Statement": [
@@ -376,8 +379,8 @@ echo "✅ AWS environment and networking configured"
    EOF
    
    aws iam create-role \
-       --role-name AppRunnerServiceRole-${RANDOM_SUFFIX} \
-       --assume-role-policy-document file://apprunner-trust-policy.json
+       --role-name AppRunnerECRAccessRole-${RANDOM_SUFFIX} \
+       --assume-role-policy-document file://apprunner-access-trust-policy.json
    
    # Create instance role for runtime permissions
    cat > apprunner-instance-trust-policy.json << EOF
@@ -419,18 +422,19 @@ echo "✅ AWS environment and networking configured"
        --policy-name SecretsManagerAccess-${RANDOM_SUFFIX} \
        --policy-document file://secrets-policy.json
    
-   # Attach policies to roles
+   # Attach managed policy to access role
    aws iam attach-role-policy \
-       --role-name AppRunnerServiceRole-${RANDOM_SUFFIX} \
+       --role-name AppRunnerECRAccessRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
    
+   # Attach custom policy to instance role
    aws iam attach-role-policy \
        --role-name AppRunnerInstanceRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/SecretsManagerAccess-${RANDOM_SUFFIX}
    
    # Get role ARNs
-   export SERVICE_ROLE_ARN=$(aws iam get-role \
-       --role-name AppRunnerServiceRole-${RANDOM_SUFFIX} \
+   export ACCESS_ROLE_ARN=$(aws iam get-role \
+       --role-name AppRunnerECRAccessRole-${RANDOM_SUFFIX} \
        --query 'Role.Arn' --output text)
    
    export INSTANCE_ROLE_ARN=$(aws iam get-role \
@@ -438,7 +442,7 @@ echo "✅ AWS environment and networking configured"
        --query 'Role.Arn' --output text)
    
    # Clean up temporary files
-   rm -f apprunner-trust-policy.json apprunner-instance-trust-policy.json secrets-policy.json
+   rm -f apprunner-access-trust-policy.json apprunner-instance-trust-policy.json secrets-policy.json
    
    echo "✅ IAM roles created for App Runner service"
    ```
@@ -467,6 +471,7 @@ echo "✅ AWS environment and networking configured"
          },
          "ImageRepositoryType": "ECR"
        },
+       "AccessRoleArn": "${ACCESS_ROLE_ARN}",
        "AutoDeploymentsEnabled": true
      },
      "InstanceConfiguration": {
@@ -474,7 +479,6 @@ echo "✅ AWS environment and networking configured"
        "Memory": "0.5 GB",
        "InstanceRoleArn": "${INSTANCE_ROLE_ARN}"
      },
-     "AutoScalingConfigurationArn": "",
      "HealthCheckConfiguration": {
        "Protocol": "HTTP",
        "Path": "/health",
@@ -482,14 +486,6 @@ echo "✅ AWS environment and networking configured"
        "Timeout": 5,
        "HealthyThreshold": 1,
        "UnhealthyThreshold": 5
-     },
-     "EncryptionConfiguration": {
-       "KmsKey": ""
-     },
-     "NetworkConfiguration": {
-       "EgressConfiguration": {
-         "EgressType": "DEFAULT"
-       }
      },
      "ObservabilityConfiguration": {
        "ObservabilityEnabled": true
@@ -499,8 +495,7 @@ echo "✅ AWS environment and networking configured"
    
    # Create App Runner service
    aws apprunner create-service \
-       --cli-input-json file://apprunner-service.json \
-       --service-role-arn ${SERVICE_ROLE_ARN}
+       --cli-input-json file://apprunner-service.json
    
    # Wait for service to be running
    echo "⏳ Waiting for App Runner service to be running (this may take 5-10 minutes)..."
@@ -677,7 +672,7 @@ echo "✅ AWS environment and networking configured"
    
    # Detach and delete IAM policies
    aws iam detach-role-policy \
-       --role-name AppRunnerServiceRole-${RANDOM_SUFFIX} \
+       --role-name AppRunnerECRAccessRole-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
    
    aws iam detach-role-policy \
@@ -687,7 +682,7 @@ echo "✅ AWS environment and networking configured"
    aws iam delete-policy \
        --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/SecretsManagerAccess-${RANDOM_SUFFIX}
    
-   aws iam delete-role --role-name AppRunnerServiceRole-${RANDOM_SUFFIX}
+   aws iam delete-role --role-name AppRunnerECRAccessRole-${RANDOM_SUFFIX}
    aws iam delete-role --role-name AppRunnerInstanceRole-${RANDOM_SUFFIX}
    
    echo "✅ Secrets and IAM resources deleted"
@@ -728,7 +723,7 @@ The integration with Amazon RDS demonstrates how managed database services compl
 
 The CloudWatch monitoring configuration provides comprehensive observability with custom metrics, alarms, and centralized logging. This enables proactive issue detection and performance optimization, essential for production workloads. The health check configuration ensures that App Runner can automatically detect and replace unhealthy instances, maintaining application availability even during failures.
 
-Key architectural decisions include using private subnets for the RDS database to ensure network isolation, implementing IAM roles with least-privilege access, and enabling encryption at rest for both database and application layers. These choices balance security requirements with operational simplicity, demonstrating how AWS services can provide enterprise-grade security without increasing complexity.
+Key architectural decisions include using private subnets for the RDS database to ensure network isolation, implementing IAM roles with least-privilege access, and enabling encryption at rest for both database and application layers. These choices balance security requirements with operational simplicity, demonstrating how AWS services can provide enterprise-grade security without increasing complexity. The recipe also demonstrates the proper separation of access roles (for ECR) and instance roles (for runtime permissions) in App Runner architecture.
 
 > **Tip**: Consider implementing [AWS X-Ray](https://docs.aws.amazon.com/xray/latest/devguide/) for distributed tracing to gain deeper insights into application performance and identify bottlenecks across your serverless architecture.
 
@@ -750,4 +745,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

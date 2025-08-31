@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: mediastore,cloudfront,s3,iam
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: media-services,video-streaming,cloudfront,mediastore,vod-platform
 recipe-generator-version: 1.3
@@ -70,7 +70,7 @@ graph TB
 4. Sample video content for testing (MP4 format recommended)
 5. Estimated cost: $5-15 for testing resources (varies by data transfer)
 
-> **Warning**: AWS Elemental MediaStore support will end on November 13, 2025. Consider migrating to S3 with CloudFront for new implementations.
+> **Warning**: AWS Elemental MediaStore support will end on November 13, 2025. Consider migrating to S3 with CloudFront for new implementations. See [AWS blog post](https://aws.amazon.com/blogs/media/support-for-aws-elemental-mediastore-ending-soon/) for migration guidance.
 
 ## Preparation
 
@@ -124,15 +124,13 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
 
    The container is now provisioned and provides a high-performance HTTPS endpoint optimized for video delivery. This endpoint will serve as the origin for our CloudFront distribution, enabling global content delivery with minimal latency for video streaming applications.
 
-> **Note**: MediaStore containers provide millisecond-level latency for video segment requests, making them ideal for live streaming and on-demand video delivery. See [AWS MediaStore documentation](https://docs.aws.amazon.com/mediastore/) for performance optimization guidelines.
-
 2. **Configure Container Security Policy**:
 
    Security policies in MediaStore control access to video content using fine-grained resource-based permissions. The policy enforces HTTPS-only access to protect content in transit and separates read access (for viewers) from write access (for content publishers). This security model is essential for protecting premium video content while enabling efficient CDN distribution.
 
    ```bash
    # Create container policy for secure access
-   cat > mediastore-policy.json << 'EOF'
+   cat > mediastore-policy.json << EOF
    {
        "Version": "2012-10-17",
        "Statement": [
@@ -519,6 +517,8 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
 
     The video-on-demand platform is now fully operational with optimized content delivery capabilities. The testing confirms that video content can be efficiently delivered from global edge locations, providing the foundation for a scalable streaming platform capable of serving millions of concurrent viewers.
 
+> **Note**: MediaStore containers provide millisecond-level latency for video segment requests, making them ideal for live streaming and on-demand video delivery. See [AWS MediaStore documentation](https://docs.aws.amazon.com/mediastore/) for performance optimization guidelines.
+
 ## Validation & Testing
 
 1. **Verify MediaStore Container Status**:
@@ -574,25 +574,37 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
 1. **Delete CloudFront Distribution**:
 
    ```bash
-   # Get distribution ETag
-   ETAG=$(aws cloudfront get-distribution \
+   # Get distribution configuration and ETag
+   aws cloudfront get-distribution-config \
        --id ${DISTRIBUTION_ID} \
-       --query ETag --output text)
+       --query '[DistributionConfig,ETag]' \
+       --output json > distribution-config.json
+   
+   # Extract ETag and config
+   ETAG=$(cat distribution-config.json | jq -r '.[1]')
+   
+   # Update configuration to disable distribution
+   cat distribution-config.json | jq '.[0] | .Enabled = false' \
+       > disabled-config.json
    
    # Disable distribution first
    aws cloudfront update-distribution \
        --id ${DISTRIBUTION_ID} \
-       --distribution-config file://cloudfront-config.json \
-       --if-match ${ETAG} \
-       --query Distribution.Id --output text
+       --distribution-config file://disabled-config.json \
+       --if-match ${ETAG}
    
    # Wait for deployment and then delete
    aws cloudfront wait distribution-deployed \
        --id ${DISTRIBUTION_ID}
    
+   # Get new ETag after update
+   NEW_ETAG=$(aws cloudfront get-distribution \
+       --id ${DISTRIBUTION_ID} \
+       --query ETag --output text)
+   
    aws cloudfront delete-distribution \
        --id ${DISTRIBUTION_ID} \
-       --if-match ${ETAG}
+       --if-match ${NEW_ETAG}
    
    echo "✅ CloudFront distribution deleted"
    ```
@@ -606,9 +618,11 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
        --path / \
        --query Items[].Name --output text | \
    while read -r object; do
-       aws mediastore-data delete-object \
-           --endpoint-url ${MEDIASTORE_ENDPOINT} \
-           --path "/${object}"
+       if [ -n "$object" ]; then
+           aws mediastore-data delete-object \
+               --endpoint-url ${MEDIASTORE_ENDPOINT} \
+               --path "/${object}"
+       fi
    done
    
    # Delete container
@@ -650,6 +664,7 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
    rm -f trust-policy.json mediastore-access-policy.json
    rm -f cloudfront-config.json cache-behavior.json
    rm -f lifecycle-policy.json downloaded-video.mp4
+   rm -f distribution-config.json disabled-config.json
    rm -rf sample-content/
    
    echo "✅ Local files cleaned up"
@@ -657,15 +672,15 @@ echo "✅ Environment prepared with unique suffix: ${RANDOM_SUFFIX}"
 
 ## Discussion
 
-AWS Elemental MediaStore was specifically designed for video workloads, providing optimized storage for high-performance video delivery. The service offered low-latency access patterns ideal for video streaming applications, with built-in security features and seamless integration with CloudFront for global content delivery. The container-based storage model allowed for fine-grained access control and efficient content organization.
+AWS Elemental MediaStore was specifically designed for video workloads, providing optimized storage for high-performance video delivery. The service offered low-latency access patterns ideal for video streaming applications, with built-in security features and seamless integration with CloudFront for global content delivery. The container-based storage model allowed for fine-grained access control and efficient content organization, making it particularly suitable for live streaming and video-on-demand applications.
 
-The integration between MediaStore and CloudFront created a powerful video-on-demand platform capable of serving millions of concurrent viewers. CloudFront's global edge network cached video content close to users, reducing latency and improving the viewing experience. The combination also provided cost optimization through efficient caching strategies and reduced origin load.
+The integration between MediaStore and CloudFront created a powerful video-on-demand platform capable of serving millions of concurrent viewers. CloudFront's global edge network cached video content close to users, reducing latency and improving the viewing experience. The combination also provided cost optimization through efficient caching strategies and reduced origin load, while supporting adaptive bitrate streaming and various video formats.
 
-Security was handled through multiple layers: HTTPS enforcement, IAM-based access control, and container policies that defined precisely who could access what content. The CORS configuration enabled secure web-based video players to access content directly from the CDN. This architecture supported both public video platforms and private enterprise video libraries with appropriate access controls.
+Security was handled through multiple layers: HTTPS enforcement, IAM-based access control, and container policies that defined precisely who could access what content. The CORS configuration enabled secure web-based video players to access content directly from the CDN. This architecture supported both public video platforms and private enterprise video libraries with appropriate access controls, following AWS Well-Architected Framework security principles.
 
-However, it's crucial to note that AWS will discontinue support for MediaStore on November 13, 2025. Organizations currently using MediaStore should plan migration to alternative solutions such as Amazon S3 with CloudFront, which provides similar capabilities for video-on-demand platforms. The migration path typically involves moving content to S3 and reconfiguring CloudFront distributions to use S3 as the origin.
+However, it's crucial to note that AWS will discontinue support for MediaStore on November 13, 2025. Organizations currently using MediaStore should plan migration to alternative solutions such as Amazon S3 with CloudFront, which provides similar capabilities for video-on-demand platforms. The migration path typically involves moving content to S3, reconfiguring CloudFront distributions to use S3 as the origin, and potentially integrating with AWS Elemental MediaConvert for video processing workflows. See the [AWS blog post](https://aws.amazon.com/blogs/media/support-for-aws-elemental-mediastore-ending-soon/) for detailed migration guidance and timelines.
 
-> **Warning**: Plan your migration from MediaStore before November 13, 2025. Consider using S3 with CloudFront and AWS Elemental MediaConvert for new video-on-demand implementations.
+> **Warning**: Plan your migration from MediaStore before November 13, 2025. Consider using S3 with CloudFront and AWS Elemental MediaConvert for new video-on-demand implementations. The [AWS Migration Hub](https://docs.aws.amazon.com/migrationhub/) provides tools and guidance for planning your migration strategy.
 
 ## Challenge
 
@@ -679,4 +694,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

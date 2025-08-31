@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Arc, Azure Policy, Azure Monitor, Azure Resource Graph
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: hybrid-cloud, governance, compliance, multi-cloud, policy-enforcement
 recipe-generator-version: 1.3
@@ -116,16 +116,11 @@ az monitor log-analytics workspace create \
     --workspace-name ${WORKSPACE_NAME} \
     --location ${LOCATION}
 
-# Get workspace ID and key for later use
+# Get workspace ID for later use
 export WORKSPACE_ID=$(az monitor log-analytics workspace show \
     --resource-group ${RESOURCE_GROUP} \
     --workspace-name ${WORKSPACE_NAME} \
     --query customerId --output tsv)
-
-export WORKSPACE_KEY=$(az monitor log-analytics workspace get-shared-keys \
-    --resource-group ${RESOURCE_GROUP} \
-    --workspace-name ${WORKSPACE_NAME} \
-    --query primarySharedKey --output tsv)
 
 echo "✅ Resource group and Log Analytics workspace created"
 ```
@@ -137,6 +132,9 @@ echo "✅ Resource group and Log Analytics workspace created"
    Azure Arc-enabled Kubernetes provides a centralized control plane to manage policy, governance, and security across Kubernetes clusters running anywhere. The Arc agent establishes a secure outbound connection to Azure, enabling you to project your clusters into Azure Resource Manager. This projection allows you to apply Azure-native management capabilities to non-Azure Kubernetes infrastructure while maintaining local cluster autonomy.
 
    ```bash
+   # Install or update the connectedk8s extension
+   az extension add --name connectedk8s --upgrade
+   
    # Set cluster name and create Arc connection
    export CLUSTER_NAME="arc-k8s-onprem-${RANDOM_SUFFIX}"
    
@@ -158,11 +156,14 @@ echo "✅ Resource group and Log Analytics workspace created"
 
    The Kubernetes cluster is now projected into Azure Resource Manager as an Arc-enabled resource. This enables centralized management while the cluster continues to run independently in your on-premises environment. The Arc agents maintain a secure, authenticated connection to Azure for policy synchronization and compliance reporting.
 
-2. **Enable Azure Policy Add-on for Arc-enabled Kubernetes**:
+2. **Enable Azure Policy Extension for Arc-enabled Kubernetes**:
 
    Azure Policy for Kubernetes extends Open Policy Agent (OPA) Gatekeeper v3 to apply at-scale enforcements and safeguards on your clusters in a centralized, consistent manner. By enabling the Azure Policy extension, you can use Azure Policy definitions to govern cluster components like pods, namespaces, and ingress rules. The extension continuously synchronizes policy assignments and reports compliance status back to Azure.
 
    ```bash
+   # Install k8s-extension if not already available
+   az extension add --name k8s-extension --upgrade
+   
    # Enable Azure Policy extension on the Arc-enabled cluster
    az k8s-extension create \
        --name azurepolicy \
@@ -186,15 +187,13 @@ echo "✅ Resource group and Log Analytics workspace created"
    echo "✅ Azure Policy extension installed on Kubernetes cluster"
    ```
 
+   The Azure Policy extension is now installed and operational on your Kubernetes cluster. This extension deploys OPA Gatekeeper components and establishes communication channels with Azure Policy service, enabling real-time policy evaluation and compliance reporting across your Kubernetes workloads.
+
 3. **Connect On-Premises Servers to Azure Arc**:
 
    Azure Arc-enabled servers allow you to manage Windows and Linux physical servers and virtual machines hosted outside of Azure with the same Azure-native management capabilities. The Azure Connected Machine agent establishes the connection and enables features like Azure Policy guest configuration, Azure Monitor integration, and Azure Update Management. This unified approach eliminates the need for separate tools across different environments.
 
    ```bash
-   # Generate script for server onboarding
-   export SERVER_RESOURCE_GROUP=${RESOURCE_GROUP}
-   export SERVER_LOCATION=${LOCATION}
-   
    # Create service principal for server onboarding
    export SP_NAME="sp-arc-onboarding-${RANDOM_SUFFIX}"
    SP_CREDENTIALS=$(az ad sp create-for-rbac \
@@ -208,11 +207,21 @@ echo "✅ Resource group and Log Analytics workspace created"
    export TENANT_ID=$(echo $SP_CREDENTIALS | jq -r '.tenant')
    
    echo "✅ Service principal created for server onboarding"
-   echo "Use the following command on each server to connect to Azure Arc:"
+   echo "Use the following commands on each server to connect to Azure Arc:"
    echo ""
    echo "# For Linux servers:"
-   echo "wget https://aka.ms/azcmagent -O ~/install_linux_azcmagent.sh"
-   echo "bash ~/install_linux_azcmagent.sh"
+   echo "wget https://aka.ms/azcmagent -O ~/Install_linux_azcmagent.sh"
+   echo "bash ~/Install_linux_azcmagent.sh"
+   echo "azcmagent connect \\"
+   echo "    --service-principal-id '${SP_ID}' \\"
+   echo "    --service-principal-secret '${SP_SECRET}' \\"
+   echo "    --tenant-id '${TENANT_ID}' \\"
+   echo "    --subscription-id '${SUBSCRIPTION_ID}' \\"
+   echo "    --resource-group '${RESOURCE_GROUP}' \\"
+   echo "    --location '${LOCATION}'"
+   echo ""
+   echo "# For Windows servers:"
+   echo "Download and install: https://aka.ms/AzureConnectedMachineAgent"
    echo "azcmagent connect \\"
    echo "    --service-principal-id '${SP_ID}' \\"
    echo "    --service-principal-secret '${SP_SECRET}' \\"
@@ -221,6 +230,8 @@ echo "✅ Resource group and Log Analytics workspace created"
    echo "    --resource-group '${RESOURCE_GROUP}' \\"
    echo "    --location '${LOCATION}'"
    ```
+
+   The service principal and connection commands are now configured for Arc-enabled server onboarding. Run the provided commands on each server you want to connect. Once connected, servers appear in Azure Resource Manager and can be managed using Azure tools while continuing to operate in their current location.
 
 4. **Create and Assign Governance Policies**:
 
@@ -304,6 +315,8 @@ echo "✅ Resource group and Log Analytics workspace created"
    echo "✅ Monitoring configured for Arc resources"
    ```
 
+   Monitoring infrastructure is now established for your Arc-enabled resources. Container insights will collect performance metrics, logs, and telemetry from Kubernetes workloads, while the data collection rule ensures Arc-enabled servers send performance counters to the centralized workspace for analysis and alerting.
+
 6. **Set Up Azure Resource Graph Queries for Compliance Reporting**:
 
    Azure Resource Graph provides a powerful query language to explore resources at scale across subscriptions. For hybrid governance, Resource Graph enables you to query compliance status, resource configurations, and policy evaluation results across all Arc-enabled resources. This capability is essential for creating compliance dashboards and generating audit reports.
@@ -355,6 +368,8 @@ echo "✅ Resource group and Log Analytics workspace created"
    
    echo "✅ Automated remediation configured for policy compliance"
    ```
+
+   Automated remediation is now active for your hybrid environment. The remediation task will automatically correct non-compliant configurations on Arc-enabled servers, ensuring continuous adherence to organizational standards without manual intervention.
 
 ## Validation & Testing
 
@@ -477,7 +492,7 @@ Azure Arc fundamentally transforms hybrid cloud governance by extending Azure's 
 
 The combination of Azure Arc, Azure Policy, and Azure Monitor creates a powerful compliance and governance framework that addresses the key challenges of hybrid cloud management. By projecting non-Azure resources into Azure Resource Manager, organizations gain centralized visibility through Azure Resource Graph, enabling complex queries across their entire infrastructure portfolio. This approach aligns with the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of operational excellence and security, providing automated compliance assessment, drift detection, and remediation capabilities that would be impossible to achieve with traditional management tools.
 
-From a security perspective, Azure Arc's agent-based architecture maintains a secure outbound connection to Azure, eliminating the need for inbound firewall rules while ensuring all management operations are authenticated and authorized through Azure Active Directory. The integration with Azure Security Center and Microsoft Defender provides advanced threat detection and security posture management across hybrid workloads. For detailed security guidance, review the [Azure Arc security baseline](https://docs.microsoft.com/en-us/azure/azure-arc/servers/security-overview) and [governance best practices](https://docs.microsoft.com/en-us/azure/cloud-adoption-framework/scenarios/hybrid/arc-enabled-servers/eslz-security-governance-and-compliance).
+From a security perspective, Azure Arc's agent-based architecture maintains a secure outbound connection to Azure, eliminating the need for inbound firewall rules while ensuring all management operations are authenticated and authorized through Microsoft Entra ID. The integration with Microsoft Defender for Cloud provides advanced threat detection and security posture management across hybrid workloads. For detailed security guidance, review the [Azure Arc security baseline](https://docs.microsoft.com/en-us/azure/azure-arc/servers/security-overview) and [governance best practices](https://docs.microsoft.com/en-us/azure/cloud-adoption-framework/scenarios/hybrid/arc-enabled-servers/eslz-security-governance-and-compliance).
 
 > **Tip**: Use Azure Policy's built-in initiative definitions as a starting point for hybrid governance. These initiatives include hundreds of policies aligned with regulatory standards like ISO 27001, NIST, and CIS benchmarks, significantly accelerating your compliance journey.
 
@@ -493,4 +508,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: DataZone, Config, EventBridge, Lambda
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-governance, compliance, automation, data-catalog, monitoring
 recipe-generator-version: 1.3
@@ -533,16 +533,7 @@ EOF
            "RetryPolicy": {
                "MaximumRetryAttempts": 3,
                "MaximumEventAge": 3600
-           },
-           "DeadLetterConfig": {
-               "Arn": "arn:aws:sqs:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':governance-dlq"
            }
-       }]' 2>/dev/null || \
-   aws events put-targets \
-       --rule ${EVENT_RULE_NAME} \
-       --targets '[{
-           "Id": "1",
-           "Arn": "arn:aws:lambda:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':function:'${LAMBDA_FUNCTION_NAME}'"
        }]'
    
    # Grant EventBridge permission to invoke Lambda
@@ -889,4 +880,11 @@ Extend this governance solution by implementing these advanced capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

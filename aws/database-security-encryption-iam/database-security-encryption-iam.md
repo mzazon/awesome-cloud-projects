@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: rds,kms,iam,cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: rds,database-security,encryption,iam-database-authentication,kms,security,cloudwatch
 recipe-generator-version: 1.3
@@ -232,7 +232,43 @@ echo "KMS key alias: ${KMS_KEY_ALIAS}"
 
    The database subnet group establishes the network foundation for RDS deployment, ensuring the database instance will be placed in appropriate subnets with proper network isolation and availability zone distribution.
 
-4. **Create IAM Role and Policy for Database Authentication**:
+4. **Create IAM Role for Enhanced Monitoring**:
+
+   Enhanced monitoring requires an IAM role that allows the RDS service to publish detailed metrics to CloudWatch. This role must be created before the RDS instance to ensure proper monitoring configuration. The monitoring role enables comprehensive performance visibility and security event tracking.
+
+   ```bash
+   # Create IAM role for enhanced monitoring
+   cat > monitoring-trust-policy.json << EOF
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Principal": {
+           "Service": "monitoring.rds.amazonaws.com"
+         },
+         "Action": "sts:AssumeRole"
+       }
+     ]
+   }
+   EOF
+   
+   # Create monitoring role
+   aws iam create-role \
+       --role-name "rds-monitoring-role" \
+       --assume-role-policy-document file://monitoring-trust-policy.json
+   
+   # Attach AWS managed policy for enhanced monitoring
+   aws iam attach-role-policy \
+       --role-name "rds-monitoring-role" \
+       --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+   
+   echo "✅ Created enhanced monitoring role"
+   ```
+
+   The monitoring role is now configured to enable detailed RDS performance monitoring and will be referenced during RDS instance creation.
+
+5. **Create IAM Role and Policy for Database Authentication**:
 
    IAM database authentication eliminates the need for database passwords by using AWS IAM credentials to generate temporary authentication tokens. This approach provides centralized access management, automatic credential rotation, and detailed audit trails. The IAM role defines which AWS principals can assume database access permissions, while the policy specifies the exact database resources and operations that are permitted.
 
@@ -301,7 +337,7 @@ echo "KMS key alias: ${KMS_KEY_ALIAS}"
 
    The IAM role and policy are now configured to enable secure database authentication without passwords. Applications assuming this role can generate temporary authentication tokens that provide secure, auditable access to the database while maintaining centralized access control through IAM.
 
-5. **Create Encrypted RDS Instance with IAM Authentication**:
+6. **Create Encrypted RDS Instance with IAM Authentication**:
 
    The RDS instance configuration implements multiple layers of security including encryption at rest, IAM authentication, SSL enforcement, and enhanced monitoring. Parameter groups enforce SSL connections, while encryption protects data storage and backups. Performance Insights provides detailed monitoring capabilities while maintaining encryption for sensitive performance data.
 
@@ -309,7 +345,7 @@ echo "KMS key alias: ${KMS_KEY_ALIAS}"
    # Create parameter group for enhanced security
    aws rds create-db-parameter-group \
        --db-parameter-group-name "secure-postgres-params-${RANDOM_SUFFIX}" \
-       --db-parameter-group-family "postgres15" \
+       --db-parameter-group-family "postgres16" \
        --description "Security-enhanced PostgreSQL parameters"
    
    # Modify parameter group to force SSL
@@ -322,7 +358,7 @@ echo "KMS key alias: ${KMS_KEY_ALIAS}"
        --db-instance-identifier "${DB_INSTANCE_ID}" \
        --db-instance-class "db.r5.large" \
        --engine "postgres" \
-       --engine-version "15.7" \
+       --engine-version "16.6" \
        --master-username "dbadmin" \
        --master-user-password "TempPassword123!" \
        --allocated-storage 100 \
@@ -358,7 +394,7 @@ echo "KMS key alias: ${KMS_KEY_ALIAS}"
 
    The RDS instance is now deployed with comprehensive security controls including customer-managed KMS encryption, IAM authentication, SSL enforcement, and enhanced monitoring. This configuration provides enterprise-grade security while maintaining high availability and performance monitoring capabilities.
 
-6. **Create RDS Proxy for Enhanced Security**:
+7. **Create RDS Proxy for Enhanced Security**:
 
    RDS Proxy provides additional security layers including connection pooling, automatic failover, and TLS enforcement. By acting as an intermediary between applications and the database, RDS Proxy reduces the number of direct database connections while maintaining security through IAM authentication and TLS encryption. This architecture improves scalability and resilience while enforcing consistent security policies.
 
@@ -387,7 +423,7 @@ echo "KMS key alias: ${KMS_KEY_ALIAS}"
 
    The RDS Proxy is now configured to provide secure, scalable database connections with TLS enforcement and IAM authentication. Applications connecting through the proxy benefit from connection pooling, improved failover handling, and consistent security policy enforcement.
 
-7. **Configure Database User for IAM Authentication**:
+8. **Configure Database User for IAM Authentication**:
 
    Database user configuration for IAM authentication involves creating a PostgreSQL user with the `rds_iam` role, which enables token-based authentication. This eliminates the need for traditional passwords while maintaining proper database permissions. The user is granted appropriate privileges on application schemas and tables while being configured to accept IAM authentication tokens.
 
@@ -441,7 +477,7 @@ echo "KMS key alias: ${KMS_KEY_ALIAS}"
 
    The database user is now configured with IAM authentication capabilities and appropriate application permissions. This user can authenticate using IAM tokens instead of passwords, providing secure and auditable database access.
 
-8. **Set Up CloudWatch Monitoring and Alerts**:
+9. **Set Up CloudWatch Monitoring and Alerts**:
 
    CloudWatch monitoring provides comprehensive visibility into database security events, performance metrics, and operational health. Security monitoring includes tracking authentication failures, connection patterns, and unusual activity. The alerting configuration enables proactive response to security incidents and performance issues, ensuring continuous monitoring of the database environment.
 
@@ -481,42 +517,6 @@ echo "KMS key alias: ${KMS_KEY_ALIAS}"
    ```
 
    CloudWatch monitoring is now configured to track database performance and security events. The alarms will trigger when abnormal conditions are detected, enabling proactive incident response and security monitoring.
-
-9. **Enable Enhanced Monitoring and Performance Insights**:
-
-   Enhanced monitoring and Performance Insights provide detailed visibility into database performance, resource utilization, and query execution patterns. The monitoring role enables RDS to publish detailed metrics to CloudWatch, while Performance Insights provides query-level performance analysis. This monitoring capability is essential for detecting performance anomalies and security-related issues.
-
-   ```bash
-   # Create IAM role for enhanced monitoring
-   cat > monitoring-trust-policy.json << EOF
-   {
-     "Version": "2012-10-17",
-     "Statement": [
-       {
-         "Effect": "Allow",
-         "Principal": {
-           "Service": "monitoring.rds.amazonaws.com"
-         },
-         "Action": "sts:AssumeRole"
-       }
-     ]
-   }
-   EOF
-   
-   # Create monitoring role
-   aws iam create-role \
-       --role-name "rds-monitoring-role" \
-       --assume-role-policy-document file://monitoring-trust-policy.json
-   
-   # Attach AWS managed policy for enhanced monitoring
-   aws iam attach-role-policy \
-       --role-name "rds-monitoring-role" \
-       --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
-   
-   echo "✅ Enhanced monitoring and Performance Insights enabled"
-   ```
-
-   Enhanced monitoring is now fully configured, providing detailed performance metrics and insights into database operations. This monitoring capability enables proactive performance management and security monitoring.
 
 10. **Create Security Compliance Report**:
 
@@ -773,4 +773,11 @@ Extend this solution by implementing these security enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

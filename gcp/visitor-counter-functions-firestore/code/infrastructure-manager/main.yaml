@@ -1,0 +1,174 @@
+# Infrastructure Manager Configuration for Simple Visitor Counter
+# This configuration deploys Cloud Functions and Firestore for a serverless visitor counter
+# Based on recipe: Simple Visitor Counter with Cloud Functions and Firestore
+
+# Configuration schema version
+schemaVersion: create.deploymentmanager.alpha.provider
+
+# Import templates and type providers
+imports:
+  - path: templates/function.jinja
+    name: function-template
+
+resources:
+  # Enable required APIs for the visitor counter solution
+  - name: enable-cloudfunctions-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: projects/{{ env["project"] }}
+      serviceName: cloudfunctions.googleapis.com
+
+  - name: enable-firestore-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: projects/{{ env["project"] }}
+      serviceName: firestore.googleapis.com
+
+  - name: enable-cloudbuild-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: projects/{{ env["project"] }}
+      serviceName: cloudbuild.googleapis.com
+
+  # Create Firestore database in Native mode for ACID transactions
+  # This provides the NoSQL document store for visitor counters
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/{{ env["project"] }}
+      databaseId: "(default)"
+      type: FIRESTORE_NATIVE
+      locationId: {{ properties["region"] }}
+      concurrencyMode: OPTIMISTIC
+      appEngineIntegrationMode: DISABLED
+    metadata:
+      dependsOn:
+        - enable-firestore-api
+
+  # Cloud Storage bucket for function source code
+  # Required for Cloud Functions deployment
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{ env["project"] }}-function-source-{{ properties["randomSuffix"] }}
+      location: {{ properties["region"] }}
+      storageClass: REGIONAL
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: false
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 7
+              matchesStorageClass: ["REGIONAL"]
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+
+  # Service Account for Cloud Function execution
+  # Follows principle of least privilege with minimal required permissions
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: visit-counter-function-sa
+      displayName: "Visitor Counter Function Service Account"
+      description: "Service account for Cloud Function to access Firestore"
+      project: {{ env["project"] }}
+
+  # IAM binding to grant Firestore access to the service account
+  # Allows the function to read and write counter documents
+  - name: firestore-access-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      role: roles/datastore.user
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+        - firestore-database
+
+  # Cloud Function for visitor counter logic
+  # Handles HTTP requests and manages Firestore counter increments
+  - name: visit-counter-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/{{ env["project"] }}/locations/{{ properties["region"] }}
+      function:
+        name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/{{ properties["functionName"] }}
+        description: "Serverless visitor counter using Firestore for persistence"
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/visit-counter-source.zip
+        entryPoint: visitCounter
+        runtime: nodejs20
+        httpsTrigger: {}
+        timeout: 60s
+        availableMemoryMb: 256
+        maxInstances: 100
+        serviceAccountEmail: $(ref.function-service-account.email)
+        environmentVariables:
+          FIRESTORE_PROJECT_ID: {{ env["project"] }}
+          NODE_ENV: production
+        labels:
+          purpose: visitor-tracking
+          environment: production
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - enable-cloudbuild-api
+        - function-source-bucket
+        - function-service-account
+        - firestore-access-binding
+
+  # IAM policy to allow unauthenticated function invocation
+  # Required for public access to the visitor counter endpoint
+  - name: function-invoker-policy
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.visit-counter-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - visit-counter-function
+
+outputs:
+  # Cloud Function HTTP endpoint URL for visitor counter requests
+  - name: function-url
+    value: $(ref.visit-counter-function.httpsTrigger.url)
+    description: "HTTP endpoint URL for the visitor counter function"
+
+  # Firestore database information
+  - name: firestore-database-name
+    value: $(ref.firestore-database.name)
+    description: "Firestore database resource name"
+
+  # Service account email for troubleshooting
+  - name: service-account-email
+    value: $(ref.function-service-account.email)
+    description: "Service account email used by the Cloud Function"
+
+  # Function name for management operations
+  - name: function-name
+    value: $(ref.visit-counter-function.name)
+    description: "Full resource name of the deployed Cloud Function"
+
+  # Storage bucket for function source code
+  - name: source-bucket-name
+    value: $(ref.function-source-bucket.name)
+    description: "Cloud Storage bucket containing function source code"
+
+  # Project information for reference
+  - name: project-id
+    value: {{ env["project"] }}
+    description: "Google Cloud Project ID"
+
+  # Region information for reference
+  - name: deployment-region
+    value: {{ properties["region"] }}
+    description: "Deployment region for all resources"

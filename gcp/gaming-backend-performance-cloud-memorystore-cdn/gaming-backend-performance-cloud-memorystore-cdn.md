@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Memorystore, Cloud CDN, Cloud Load Balancing, Compute Engine
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: gaming, performance, caching, content-delivery, redis, leaderboards
 recipe-generator-version: 1.3
@@ -103,7 +103,6 @@ gcloud config set compute/zone ${ZONE}
 gcloud services enable compute.googleapis.com
 gcloud services enable redis.googleapis.com
 gcloud services enable storage.googleapis.com
-gcloud services enable cloudcdn.googleapis.com
 gcloud services enable firestore.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
@@ -177,7 +176,9 @@ echo "✅ Gaming backend infrastructure APIs enabled"
    gsutil setmeta -h "Cache-Control:public, max-age=86400" \
        gs://${BUCKET_NAME}/configs/game-config.json
    gsutil setmeta -h "Cache-Control:public, max-age=604800" \
-       gs://${BUCKET_NAME}/assets/**
+       gs://${BUCKET_NAME}/assets/textures/texture-pack.bin
+   gsutil setmeta -h "Cache-Control:public, max-age=604800" \
+       gs://${BUCKET_NAME}/assets/audio/audio-track.mp3
    
    echo "✅ Game assets uploaded with optimized caching headers"
    ```
@@ -196,7 +197,7 @@ echo "✅ Gaming backend infrastructure APIs enabled"
        --network-tier=PREMIUM \
        --maintenance-policy=MIGRATE \
        --provisioning-model=STANDARD \
-       --image-family=ubuntu-2004-lts \
+       --image-family=ubuntu-2404-lts \
        --image-project=ubuntu-os-cloud \
        --boot-disk-size=20GB \
        --boot-disk-type=pd-standard \
@@ -226,7 +227,7 @@ echo "✅ Gaming backend infrastructure APIs enabled"
    gcloud compute instance-templates create game-server-template \
        --machine-type=n2-standard-2 \
        --network-tier=PREMIUM \
-       --image-family=ubuntu-2004-lts \
+       --image-family=ubuntu-2404-lts \
        --image-project=ubuntu-os-cloud \
        --tags=game-server,http-server \
        --metadata=startup-script='#!/bin/bash
@@ -365,7 +366,7 @@ echo "✅ Gaming backend infrastructure APIs enabled"
    # Simulate gaming data operations
    redis-cli -h ${REDIS_IP} -a '${REDIS_AUTH}' <<EOF
    # Store player session data
-   HSET player:12345 name 'PlayerOne' level 25 score 15000 lastSeen $(date +%s)
+   HSET player:12345 name 'PlayerOne' level 25 score 15000 lastSeen \$(date +%s)
    
    # Update leaderboard
    ZADD global_leaderboard 15000 'PlayerOne'
@@ -533,4 +534,9 @@ Extend this gaming backend solution by implementing these advanced features:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

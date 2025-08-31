@@ -4,12 +4,12 @@ id: f4e7a9b3
 category: security
 difficulty: 300
 subject: azure
-services: Azure External ID, Azure Resource Manager Private Link, Azure API Management, Azure Key Vault
+services: Azure External ID, Azure Private Link, Azure API Management, Azure Key Vault
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: multi-tenant, identity-isolation, external-id, private-link, api-management, key-vault
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ SaaS providers serving multiple enterprise customers face critical challenges in
 
 ## Solution
 
-This recipe implements a comprehensive multi-tenant customer identity management system using Azure External ID customer tenants for complete identity boundary isolation, Azure Resource Manager Private Link for secure network connectivity, and Azure API Management with Azure Key Vault for centralized security governance. This architecture ensures each customer operates within their own isolated identity domain while maintaining private network connectivity and centralized API security policies.
+This recipe implements a comprehensive multi-tenant customer identity management system using Azure External ID customer tenants for complete identity boundary isolation, Azure Private Link for secure network connectivity, and Azure API Management with Azure Key Vault for centralized security governance. This architecture ensures each customer operates within their own isolated identity domain while maintaining private network connectivity and centralized API security policies.
 
 ## Architecture Diagram
 
@@ -42,7 +42,7 @@ graph TB
     subgraph "SaaS Provider Network"
         subgraph "Private Network Zone"
             APIM[API Management<br/>Private Endpoint]
-            ARM_PE[ARM Private Link<br/>Management Endpoint]
+            PLS[Private Link Scope<br/>Management Endpoint]
             KV[Key Vault<br/>Per-Tenant Secrets]
         end
         
@@ -62,19 +62,19 @@ graph TB
     B_USERS --> B_APPS
     A_APPS -.->|Private Link| APIM
     B_APPS -.->|Private Link| APIM
-    APIM --> ARM_PE
+    APIM --> PLS
     APIM --> KV
-    ARM_PE --> RBAC
+    PLS --> RBAC
     APIM --> MONITOR
     
     APIM -.-> PE_SUBNET
-    ARM_PE -.-> PE_SUBNET
+    PLS -.-> PE_SUBNET
     KV -.-> PE_SUBNET
     
     style A_USERS fill:#FF6B6B
     style B_USERS fill:#4ECDC4
     style APIM fill:#45B7D1
-    style ARM_PE fill:#96CEB4
+    style PLS fill:#96CEB4
     style KV fill:#FFEAA7
 ```
 
@@ -101,7 +101,6 @@ export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 UNIQUE_SUFFIX=$(openssl rand -hex 4)
 export APIM_NAME="apim-tenant-isolation-${UNIQUE_SUFFIX}"
 export KEYVAULT_NAME="kv-tenants-${UNIQUE_SUFFIX}"
-export STORAGE_NAME="stmtidentity${UNIQUE_SUFFIX}"
 
 # Create main resource group for the solution
 az group create \
@@ -124,7 +123,7 @@ az network vnet subnet create \
     --vnet-name ${VNET_NAME} \
     --name private-endpoints \
     --address-prefixes 10.0.1.0/24 \
-    --disable-private-endpoint-network-policies true
+    --private-endpoint-network-policies Disabled
 
 # Create subnet for API Management
 az network vnet subnet create \
@@ -204,9 +203,9 @@ echo "✅ Virtual network and subnets configured for private connectivity"
 
    The API Management instance now provides a secure, private gateway for all customer API requests. Private endpoint connectivity ensures that customer traffic remains within the Azure backbone network, meeting strict network isolation requirements while enabling centralized API governance and security policy enforcement.
 
-3. **Configure Azure Resource Manager Private Link for Secure Management**:
+3. **Configure Azure Monitor Private Link Scope for Secure Management**:
 
-   Azure Resource Manager Private Link enables secure management operations without exposing management endpoints to public networks. This creates a private management plane that allows centralized administration while maintaining network-level isolation, essential for enterprise-grade multi-tenant solutions.
+   Azure Monitor Private Link Scope enables secure monitoring and logging operations without exposing monitoring endpoints to public networks. This creates a private management plane that allows centralized monitoring while maintaining network-level isolation, essential for enterprise-grade multi-tenant solutions.
 
    ```bash
    # Create resource management group for organized access control
@@ -215,32 +214,32 @@ echo "✅ Virtual network and subnets configured for private connectivity"
        --location ${LOCATION} \
        --tags purpose=tenant-management scope=private-management
    
-   # Create private link scope for ARM management
+   # Create private link scope for monitoring
    az monitor private-link-scope create \
        --resource-group "rg-tenant-management" \
-       --scope-name "pls-arm-management" \
-       --location global
+       --name "pls-monitoring-management" \
+       --tags purpose=monitoring scope=private
    
    # Get the private link scope resource ID
-   ARM_PLS_ID=$(az monitor private-link-scope show \
+   PLS_RESOURCE_ID=$(az monitor private-link-scope show \
        --resource-group "rg-tenant-management" \
-       --scope-name "pls-arm-management" \
+       --name "pls-monitoring-management" \
        --query id --output tsv)
    
-   # Create private endpoint for ARM management
+   # Create private endpoint for monitoring management
    az network private-endpoint create \
        --resource-group ${RESOURCE_GROUP} \
-       --name pe-arm-management \
+       --name pe-monitoring-management \
        --vnet-name ${VNET_NAME} \
        --subnet private-endpoints \
-       --private-connection-resource-id ${ARM_PLS_ID} \
+       --private-connection-resource-id ${PLS_RESOURCE_ID} \
        --group-ids azuremonitor \
-       --connection-name arm-management-connection
+       --connection-name monitoring-management-connection
    
-   echo "✅ Azure Resource Manager private link configured for secure management"
+   echo "✅ Azure Monitor private link configured for secure management"
    ```
 
-   The ARM Private Link configuration now enables secure, private management operations across all tenant resources. This ensures that administrative activities occur over private networks while maintaining the ability to centrally manage multi-tenant infrastructure and security policies.
+   The Monitor Private Link configuration now enables secure, private monitoring operations across all tenant resources. This ensures that monitoring and diagnostic activities occur over private networks while maintaining the ability to centrally manage multi-tenant infrastructure observability and security policies.
 
 4. **Deploy Azure Key Vault with Per-Tenant Secret Isolation**:
 
@@ -512,7 +511,7 @@ echo "✅ Virtual network and subnets configured for private connectivity"
    
    az network private-endpoint delete \
        --resource-group ${RESOURCE_GROUP} \
-       --name pe-arm-management
+       --name pe-monitoring-management
    
    echo "✅ Private endpoints deleted"
    ```
@@ -550,7 +549,7 @@ echo "✅ Virtual network and subnets configured for private connectivity"
 
 This comprehensive multi-tenant customer identity isolation solution addresses the critical security and operational challenges faced by enterprise SaaS providers. By leveraging Azure External ID customer tenants, the architecture achieves the highest level of identity isolation possible within Azure, ensuring that customer identities exist in completely separate identity domains with no possibility of cross-tenant discovery or access.
 
-The integration of Azure Resource Manager Private Link provides essential network-level isolation that meets enterprise security requirements. Unlike traditional approaches that rely on network segmentation within shared infrastructure, this solution ensures that all management and customer traffic flows through private networks, eliminating exposure to public internet threats and meeting strict compliance requirements for regulated industries.
+The integration of Azure Private Link provides essential network-level isolation that meets enterprise security requirements. Unlike traditional approaches that rely on network segmentation within shared infrastructure, this solution ensures that all management and customer traffic flows through private networks, eliminating exposure to public internet threats and meeting strict compliance requirements for regulated industries.
 
 Azure API Management serves as the central orchestration point that enables both isolation and operational efficiency. The dynamic tenant identification and routing capabilities allow for centralized policy management while maintaining strict tenant boundaries. This approach significantly reduces operational overhead compared to completely separate infrastructure deployments while providing equivalent security guarantees. For detailed API Management security patterns, see the [Azure API Management security documentation](https://learn.microsoft.com/en-us/azure/api-management/api-management-security-controls).
 
@@ -574,4 +573,9 @@ Extend this solution by implementing these advanced enterprise capabilities:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

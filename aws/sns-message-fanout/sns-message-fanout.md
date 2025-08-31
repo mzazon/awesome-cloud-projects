@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: sns,sqs,iam,cloudwatch
 estimated-time: 45 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-25
 passed-qa: null
 tags: sns,sqs,iam,cloudwatch
 recipe-generator-version: 1.3
@@ -64,10 +64,10 @@ graph TB
     SNS-->SQS3
     SNS-->SQS4
     
-    SQS1-->DLQ1
-    SQS2-->DLQ2
-    SQS3-->DLQ3
-    SQS4-->DLQ4
+    SQS1-.->DLQ1
+    SQS2-.->DLQ2
+    SQS3-.->DLQ3
+    SQS4-.->DLQ4
     
     SQS1-->CONSUMER1
     SQS2-->CONSUMER2
@@ -111,23 +111,7 @@ export PAYMENT_QUEUE_NAME="payment-processing-${RANDOM_SUFFIX}"
 export SHIPPING_QUEUE_NAME="shipping-notifications-${RANDOM_SUFFIX}"
 export ANALYTICS_QUEUE_NAME="analytics-reporting-${RANDOM_SUFFIX}"
 
-# Create IAM role for SNS to SQS delivery
-aws iam create-role \
-    --role-name sns-sqs-fanout-role-${RANDOM_SUFFIX} \
-    --assume-role-policy-document '{
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {
-                    "Service": "sns.amazonaws.com"
-                },
-                "Action": "sts:AssumeRole"
-            }
-        ]
-    }'
-
-export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${RANDOM_SUFFIX}"
+echo "✅ AWS environment configured with region: ${AWS_REGION}"
 ```
 
 ## Steps
@@ -285,7 +269,7 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
        --topic-arn "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${TOPIC_NAME}" \
        --query Attributes.TopicArn --output text)
    
-   # Enable delivery status logging for monitoring
+   # Configure delivery policy for reliable message delivery
    aws sns set-topic-attributes \
        --topic-arn $TOPIC_ARN \
        --attribute-name DeliveryPolicy \
@@ -342,7 +326,7 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
            "Statement": [
                {
                    "Effect": "Allow",
-                   "Principal": "*",
+                   "Principal": {"Service": "sns.amazonaws.com"},
                    "Action": "sqs:SendMessage",
                    "Resource": "'$INVENTORY_QUEUE_ARN'",
                    "Condition": {
@@ -362,7 +346,7 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
            "Statement": [
                {
                    "Effect": "Allow",
-                   "Principal": "*",
+                   "Principal": {"Service": "sns.amazonaws.com"},
                    "Action": "sqs:SendMessage",
                    "Resource": "'$PAYMENT_QUEUE_ARN'",
                    "Condition": {
@@ -382,7 +366,7 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
            "Statement": [
                {
                    "Effect": "Allow",
-                   "Principal": "*",
+                   "Principal": {"Service": "sns.amazonaws.com"},
                    "Action": "sqs:SendMessage",
                    "Resource": "'$SHIPPING_QUEUE_ARN'",
                    "Condition": {
@@ -402,7 +386,7 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
            "Statement": [
                {
                    "Effect": "Allow",
-                   "Principal": "*",
+                   "Principal": {"Service": "sns.amazonaws.com"},
                    "Action": "sqs:SendMessage",
                    "Resource": "'$ANALYTICS_QUEUE_ARN'",
                    "Condition": {
@@ -417,7 +401,7 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
    echo "✅ Configured SQS queue policies for SNS access"
    ```
 
-   The queue policies are now active, creating secure communication channels that allow SNS message delivery while preventing unauthorized access. Each policy includes conditional logic that validates the source ARN, ensuring that only messages from our designated SNS topic can reach the queues. This security model protects against message tampering and unauthorized data injection while maintaining the performance characteristics required for high-volume e-commerce operations.
+   The queue policies are now active, creating secure communication channels that allow SNS message delivery while preventing unauthorized access. Each policy includes conditional logic that validates the source ARN, ensuring that only messages from our designated SNS topic can reach the queues. The policies now use the more secure `sns.amazonaws.com` service principal instead of wildcard access, following AWS security best practices.
 
 5. **Create SNS Subscriptions with Message Filtering**:
 
@@ -591,23 +575,6 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
    Comprehensive observability requires detailed metrics collection and centralized dashboards that provide real-time visibility into system performance. CloudWatch dashboards create unified views of distributed system health, enabling operations teams to quickly identify bottlenecks, performance trends, and potential issues across the entire message processing pipeline. Enhanced logging provides detailed audit trails that support troubleshooting and compliance requirements in regulated e-commerce environments.
 
    ```bash
-   # Enable detailed CloudWatch metrics for SQS queues
-   aws sqs set-queue-attributes \
-       --queue-url $INVENTORY_QUEUE_URL \
-       --attributes EnableLogging=true
-   
-   aws sqs set-queue-attributes \
-       --queue-url $PAYMENT_QUEUE_URL \
-       --attributes EnableLogging=true
-   
-   aws sqs set-queue-attributes \
-       --queue-url $SHIPPING_QUEUE_URL \
-       --attributes EnableLogging=true
-   
-   aws sqs set-queue-attributes \
-       --queue-url $ANALYTICS_QUEUE_URL \
-       --attributes EnableLogging=true
-   
    # Create custom CloudWatch dashboard for fan-out monitoring
    aws cloudwatch put-dashboard \
        --dashboard-name "sns-fanout-dashboard-${RANDOM_SUFFIX}" \
@@ -615,25 +582,33 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
            "widgets": [
                {
                    "type": "metric",
+                   "x": 0,
+                   "y": 0,
+                   "width": 12,
+                   "height": 6,
                    "properties": {
                        "metrics": [
                            ["AWS/SNS", "NumberOfMessagesPublished", "TopicName", "'$TOPIC_NAME'"],
-                           ["AWS/SNS", "NumberOfNotificationsFailed", "TopicName", "'$TOPIC_NAME'"]
+                           [".", "NumberOfNotificationsFailed", ".", "."]
                        ],
                        "period": 300,
                        "stat": "Sum",
                        "region": "'$AWS_REGION'",
-                       "title": "SNS Message Publishing"
+                       "title": "SNS Message Publishing Metrics"
                    }
                },
                {
                    "type": "metric",
+                   "x": 0,
+                   "y": 6,
+                   "width": 12,
+                   "height": 6,
                    "properties": {
                        "metrics": [
                            ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "'$INVENTORY_QUEUE_NAME'"],
-                           ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "'$PAYMENT_QUEUE_NAME'"],
-                           ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "'$SHIPPING_QUEUE_NAME'"],
-                           ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "'$ANALYTICS_QUEUE_NAME'"]
+                           [".", ".", ".", "'$PAYMENT_QUEUE_NAME'"],
+                           [".", ".", ".", "'$SHIPPING_QUEUE_NAME'"],
+                           [".", ".", ".", "'$ANALYTICS_QUEUE_NAME'"]
                        ],
                        "period": 300,
                        "stat": "Average",
@@ -711,17 +686,17 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
 4. **Test dead letter queue functionality**:
 
    ```bash
-   # Send message to inventory queue and simulate processing failures
+   # Receive message without deleting to simulate processing failure
    MESSAGE_RECEIPT=$(aws sqs receive-message \
        --queue-url $INVENTORY_QUEUE_URL \
        --max-number-of-messages 1 \
-       --query Messages[0].ReceiptHandle --output text)
+       --query 'Messages[0].ReceiptHandle' --output text)
    
-   # Simulate processing failure by not deleting message (it will return to queue)
-   # After visibility timeout, message will be available again
-   # After 3 failed attempts, message will move to DLQ
+   # Message will return to queue after visibility timeout
+   # After 3 failed processing attempts, it moves to DLQ
+   echo "Message receipt handle: $MESSAGE_RECEIPT"
    
-   # Check DLQ after simulated failures
+   # Check DLQ after simulated failures (may take time for retries)
    aws sqs get-queue-attributes \
        --queue-url $INVENTORY_DLQ_URL \
        --attribute-names ApproximateNumberOfMessages
@@ -763,7 +738,9 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
        --output text)
    
    for SUB_ARN in $SUBSCRIPTION_ARNS; do
-       aws sns unsubscribe --subscription-arn $SUB_ARN
+       if [ "$SUB_ARN" != "None" ]; then
+           aws sns unsubscribe --subscription-arn $SUB_ARN
+       fi
    done
    
    # Delete SNS topic
@@ -807,21 +784,12 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
    echo "✅ Deleted CloudWatch alarms and dashboard"
    ```
 
-4. **Delete IAM role**:
-
-   ```bash
-   # Delete IAM role
-   aws iam delete-role --role-name "sns-sqs-fanout-role-${RANDOM_SUFFIX}"
-   
-   echo "✅ Deleted IAM role"
-   ```
-
-5. **Clean up environment variables**:
+4. **Clean up environment variables**:
 
    ```bash
    # Unset environment variables
    unset AWS_REGION AWS_ACCOUNT_ID RANDOM_SUFFIX
-   unset TOPIC_NAME TOPIC_ARN SNS_ROLE_ARN
+   unset TOPIC_NAME TOPIC_ARN
    unset INVENTORY_QUEUE_NAME INVENTORY_QUEUE_URL INVENTORY_QUEUE_ARN
    unset PAYMENT_QUEUE_NAME PAYMENT_QUEUE_URL PAYMENT_QUEUE_ARN
    unset SHIPPING_QUEUE_NAME SHIPPING_QUEUE_URL SHIPPING_QUEUE_ARN
@@ -836,13 +804,13 @@ export SNS_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/sns-sqs-fanout-role-${R
 
 ## Discussion
 
-The SNS-SQS fan-out pattern is a cornerstone of modern distributed systems architecture, enabling loose coupling between services while maintaining high availability and scalability. This pattern addresses the fundamental challenge of distributing events to multiple consumers without creating direct dependencies between publishers and subscribers. By using SNS as a central message broker, applications can publish events once and have them automatically distributed to all interested parties.
+The SNS-SQS fan-out pattern is a cornerstone of modern distributed systems architecture, enabling loose coupling between services while maintaining high availability and scalability. This pattern addresses the fundamental challenge of distributing events to multiple consumers without creating direct dependencies between publishers and subscribers. By using SNS as a central message broker, applications can publish events once and have them automatically distributed to all interested parties, following the AWS Well-Architected Framework's reliability pillar.
 
-Message filtering capabilities in SNS subscriptions provide powerful routing logic that reduces unnecessary processing and network traffic. In our e-commerce example, inventory services only receive inventory-related events, while payment services receive payment-specific messages. This selective delivery improves system efficiency and reduces the cognitive load on individual services. The analytics service receives all events without filtering, demonstrating how different consumption patterns can coexist in the same architecture.
+Message filtering capabilities in SNS subscriptions provide powerful routing logic that reduces unnecessary processing and network traffic. According to the [Amazon SNS message filtering documentation](https://docs.aws.amazon.com/sns/latest/dg/sns-message-filtering.html), filter policies can be applied to message attributes or message body content, enabling sophisticated routing decisions. In our e-commerce example, inventory services only receive inventory-related events, while payment services receive payment-specific messages. This selective delivery improves system efficiency and reduces the cognitive load on individual services. The analytics service receives all events without filtering, demonstrating how different consumption patterns can coexist in the same architecture.
 
-Dead letter queues (DLQs) provide critical error handling and debugging capabilities in asynchronous messaging systems. When messages fail to process after the configured number of retries, they are automatically moved to DLQs for later analysis and potential reprocessing. This prevents message loss and provides visibility into system failures. The three-retry configuration with exponential backoff helps handle transient failures while avoiding infinite retry loops that could overwhelm downstream systems.
+Dead letter queues (DLQs) provide critical error handling and debugging capabilities in asynchronous messaging systems. When messages fail to process after the configured number of retries, they are automatically moved to DLQs for later analysis and potential reprocessing. This prevents message loss and provides visibility into system failures. The three-retry configuration with linear backoff helps handle transient failures while avoiding infinite retry loops that could overwhelm downstream systems, supporting the AWS Well-Architected Framework's operational excellence principles.
 
-Monitoring and observability are essential for maintaining reliable message-driven architectures. CloudWatch metrics for queue depths, message ages, and delivery failures provide real-time insights into system health. Setting up proactive alarms ensures that operations teams are notified of potential issues before they impact end users. The CloudWatch dashboard provides a centralized view of the entire fan-out system, making it easier to identify bottlenecks and performance issues.
+Monitoring and observability are essential for maintaining reliable message-driven architectures. CloudWatch metrics for queue depths, message ages, and delivery failures provide real-time insights into system health. Setting up proactive alarms ensures that operations teams are notified of potential issues before they impact end users. The CloudWatch dashboard provides a centralized view of the entire fan-out system, making it easier to identify bottlenecks and performance issues, aligning with best practices for distributed system observability.
 
 > **Tip**: Use SNS message attributes for filtering instead of parsing message bodies, as attribute-based filtering is more efficient and reduces processing overhead for subscribers.
 
@@ -850,16 +818,23 @@ Monitoring and observability are essential for maintaining reliable message-driv
 
 Extend this solution by implementing these enhancements:
 
-1. **Implement priority-based message routing** by creating separate high-priority and low-priority queues for each service, with different visibility timeouts and processing guarantees.
+1. **Implement priority-based message routing** by creating separate high-priority and low-priority queues for each service, with different visibility timeouts and processing guarantees based on message priority attributes.
 
-2. **Add message deduplication** by implementing FIFO queues for critical services like payment processing, ensuring exactly-once delivery for financial transactions.
+2. **Add message deduplication** by implementing FIFO queues for critical services like payment processing, ensuring exactly-once delivery for financial transactions while maintaining message ordering.
 
-3. **Create a message replay system** by implementing an S3-based message archive that captures all published events, allowing for historical data analysis and system recovery scenarios.
+3. **Create a message replay system** by implementing an S3-based message archive that captures all published events, allowing for historical data analysis and system recovery scenarios during outages.
 
 4. **Build auto-scaling consumers** by integrating the queues with Lambda functions that scale automatically based on queue depth, implementing backpressure mechanisms when processing capacity is exceeded.
 
-5. **Implement cross-region message replication** by setting up SNS topics in multiple regions with cross-region subscriptions, ensuring global availability and disaster recovery capabilities.
+5. **Implement cross-region message replication** by setting up SNS topics in multiple regions with cross-region subscriptions, ensuring global availability and disaster recovery capabilities following multi-region architecture patterns.
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Memorystore, Pub/Sub, Cloud Functions, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: real-time, event-processing, redis, messaging, serverless, performance
 recipe-generator-version: 1.3
@@ -105,6 +105,7 @@ gcloud services enable pubsub.googleapis.com
 gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
 gcloud services enable monitoring.googleapis.com
+gcloud services enable vpcaccess.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled and region set to: ${REGION}"
@@ -127,9 +128,12 @@ echo "✅ APIs enabled and region set to: ${REGION}"
        --redis-config="maxmemory-policy=allkeys-lru"
    
    # Wait for instance to be ready (this may take 3-5 minutes)
-   gcloud redis instances describe ${REDIS_INSTANCE} \
+   while [[ $(gcloud redis instances describe ${REDIS_INSTANCE} \
        --region=${REGION} \
-       --format="value(state)"
+       --format="value(state)") != "READY" ]]; do
+     echo "Waiting for Redis instance to be ready..."
+     sleep 30
+   done
    
    # Get Redis instance connection details
    export REDIS_HOST=$(gcloud redis instances describe ${REDIS_INSTANCE} \
@@ -173,7 +177,34 @@ echo "✅ APIs enabled and region set to: ${REGION}"
 
    The Pub/Sub infrastructure now provides reliable message delivery with automatic retry logic and dead letter queuing for failed messages. The 7-day message retention ensures data durability during processing outages, while the 60-second acknowledgment deadline allows sufficient time for complex event processing operations.
 
-3. **Create Cloud Function for Event Processing**:
+3. **Create Serverless VPC Access Connector**:
+
+   Serverless VPC Access enables Cloud Functions to connect to resources within your VPC network, including the private Cloud Memorystore Redis instance. The VPC connector creates a secure communication bridge between the serverless environment and your VPC-based resources, allowing functions to access private IP addresses while maintaining the security benefits of private networking.
+
+   ```bash
+   # Create VPC connector for Cloud Functions to access Redis
+   gcloud compute networks vpc-access connectors create redis-connector \
+       --region=${REGION} \
+       --subnet=default \
+       --subnet-project=${PROJECT_ID} \
+       --min-instances=2 \
+       --max-instances=10 \
+       --machine-type=e2-micro
+   
+   # Wait for connector to be ready
+   while [[ $(gcloud compute networks vpc-access connectors describe redis-connector \
+       --region=${REGION} \
+       --format="value(state)") != "READY" ]]; do
+     echo "Waiting for VPC connector to be ready..."
+     sleep 30
+   done
+   
+   echo "✅ VPC connector created: redis-connector"
+   ```
+
+   The VPC connector provides secure, scalable access to private VPC resources from Cloud Functions. With 2-10 instances that automatically scale based on traffic, it ensures reliable connectivity while optimizing costs through dynamic scaling.
+
+4. **Create Cloud Function for Event Processing**:
 
    Cloud Functions provides serverless compute that automatically scales based on incoming events, eliminating the need to provision or manage servers. When triggered by Pub/Sub messages, functions can process events in parallel while maintaining stateless execution, ensuring consistent performance regardless of traffic spikes. The integration with Cloud Memorystore enables sub-millisecond data access for real-time caching and session management.
 
@@ -191,7 +222,6 @@ echo "✅ APIs enabled and region set to: ${REGION}"
      "main": "index.js",
      "dependencies": {
        "@google-cloud/functions-framework": "^3.3.0",
-       "@google-cloud/pubsub": "^4.0.7",
        "@google-cloud/bigquery": "^7.3.0",
        "redis": "^4.6.13"
      }
@@ -295,35 +325,12 @@ echo "✅ APIs enabled and region set to: ${REGION}"
 
    The function code implements efficient caching patterns with time-based expiration and memory management, ensuring optimal Redis utilization. The integration with BigQuery enables long-term analytics while maintaining real-time performance through in-memory caching of frequently accessed data.
 
-4. **Deploy Cloud Function with Pub/Sub Trigger**:
+5. **Deploy Cloud Function with Pub/Sub Trigger**:
 
-   Deploying the Cloud Function with Pub/Sub triggers creates an event-driven processing pipeline that automatically scales based on message volume. The function runtime environment provides access to the VPC network containing the Memorystore instance, while environment variables securely pass connection details without hardcoding credentials in the source code.
+   Deploying the Cloud Function with Pub/Sub triggers creates an event-driven processing pipeline that automatically scales based on message volume. The function runtime environment provides access to the VPC network containing the Memorystore instance through the VPC connector, while environment variables securely pass connection details without hardcoding credentials in the source code.
 
    ```bash
-   # Deploy function with Pub/Sub trigger
-   gcloud functions deploy ${FUNCTION_NAME} \
-       --gen2 \
-       --runtime=nodejs20 \
-       --source=. \
-       --entry-point=processEvent \
-       --trigger-topic=${PUBSUB_TOPIC} \
-       --memory=512MB \
-       --timeout=540s \
-       --max-instances=100 \
-       --vpc-connector=projects/${PROJECT_ID}/locations/${REGION}/connectors/redis-connector \
-       --set-env-vars="REDIS_HOST=${REDIS_HOST},REDIS_PORT=${REDIS_PORT}" \
-       --allow-unauthenticated
-   
-   # Create VPC connector for Redis access if it doesn't exist
-   gcloud compute networks vpc-access connectors create redis-connector \
-       --region=${REGION} \
-       --subnet=default \
-       --subnet-project=${PROJECT_ID} \
-       --min-instances=2 \
-       --max-instances=10 \
-       --machine-type=e2-micro
-   
-   # Redeploy function with VPC connector
+   # Deploy function with Pub/Sub trigger and VPC connector
    gcloud functions deploy ${FUNCTION_NAME} \
        --gen2 \
        --runtime=nodejs20 \
@@ -340,9 +347,9 @@ echo "✅ APIs enabled and region set to: ${REGION}"
    echo "✅ VPC connector configured for Redis access"
    ```
 
-   The serverless function deployment establishes secure connectivity to the Redis instance through VPC Access Connector, enabling private network communication. The configuration supports up to 100 concurrent instances with automatic scaling, providing the capacity to handle millions of events per minute while maintaining consistent sub-second response times.
+   The serverless function deployment establishes secure connectivity to the Redis instance through Serverless VPC Access, enabling private network communication. The configuration supports up to 100 concurrent instances with automatic scaling, providing the capacity to handle millions of events per minute while maintaining consistent sub-second response times.
 
-5. **Create BigQuery Dataset for Analytics**:
+6. **Create BigQuery Dataset for Analytics**:
 
    BigQuery provides a serverless data warehouse that complements the real-time caching layer by storing processed events for long-term analytics and business intelligence. While Redis handles sub-millisecond queries for operational data, BigQuery enables complex analytical queries across historical event data, supporting data-driven decision making and performance optimization insights.
 
@@ -372,7 +379,7 @@ echo "✅ APIs enabled and region set to: ${REGION}"
 
    The BigQuery infrastructure now supports both real-time ingestion and analytical workloads with date-based partitioning and clustering on frequently queried fields. This configuration optimizes query performance and cost management for time-series event data analysis.
 
-6. **Configure Cloud Monitoring for System Observability**:
+7. **Configure Cloud Monitoring for System Observability**:
 
    Cloud Monitoring provides comprehensive observability across the event processing pipeline, tracking Redis performance metrics, Pub/Sub message rates, and Cloud Functions execution statistics. This integrated monitoring approach enables proactive performance optimization and rapid troubleshooting of latency or throughput issues in the real-time processing system.
 
@@ -393,7 +400,7 @@ echo "✅ APIs enabled and region set to: ${REGION}"
                  {
                    "timeSeriesQuery": {
                      "timeSeriesFilter": {
-                       "filter": "resource.type=\"gce_instance\" AND metric.type=\"redis.googleapis.com/stats/operations_per_second\"",
+                       "filter": "resource.type=\"redis_instance\" AND metric.type=\"redis.googleapis.com/stats/operations_per_second\"",
                        "aggregation": {
                          "alignmentPeriod": "60s",
                          "perSeriesAligner": "ALIGN_RATE"
@@ -441,7 +448,7 @@ echo "✅ APIs enabled and region set to: ${REGION}"
        --display-name="Redis Memory Alert" \
        --documentation="Alert when Redis memory usage exceeds 80%" \
        --condition-display-name="High Memory Usage" \
-       --condition-filter='resource.type="gce_instance"' \
+       --condition-filter='resource.type="redis_instance"' \
        --condition-comparison="COMPARISON_GREATER_THAN" \
        --condition-threshold-value=0.8 \
        --notification-channels=""
@@ -482,7 +489,7 @@ echo "✅ APIs enabled and region set to: ${REGION}"
    ```bash
    # Publish test event to Pub/Sub topic
    gcloud pubsub topics publish ${PUBSUB_TOPIC} \
-       --message='{"id":"test-001","userId":"user123","type":"login","timestamp":"2025-07-12T10:00:00Z","metadata":{"source":"web","ip":"192.168.1.1"}}'
+       --message='{"id":"test-001","userId":"user123","type":"login","timestamp":"2025-07-23T10:00:00Z","metadata":{"source":"web","ip":"192.168.1.1"}}'
    
    # Check function logs for processing confirmation
    gcloud functions logs read ${FUNCTION_NAME} \
@@ -584,7 +591,7 @@ The Redis caching strategy implemented here follows the [cache-aside pattern](ht
 
 Performance optimization in this architecture relies on strategic use of Redis data structures and TTL (time-to-live) policies to balance memory efficiency with access speed. The JSON serialization approach trades some performance for flexibility, but could be optimized using binary protocols like MessagePack for higher throughput scenarios. The BigQuery integration provides long-term analytics capabilities while maintaining the sub-millisecond response times required for real-time operations through the Redis caching layer.
 
-The monitoring and observability configuration follows [Google Cloud's operational excellence principles](https://cloud.google.com/architecture/framework/operational-excellence), providing comprehensive visibility into system performance and enabling proactive optimization. The combination of Cloud Monitoring dashboards, alerting policies, and Cloud Logging creates a foundation for continuous improvement and rapid incident response, essential for maintaining high-performance real-time systems.
+The [Serverless VPC Access](https://cloud.google.com/vpc/docs/serverless-vpc-access) connector enables secure communication between Cloud Functions and private VPC resources like Memorystore Redis instances. This configuration follows Google Cloud's [operational excellence principles](https://cloud.google.com/architecture/framework/operational-excellence), providing comprehensive visibility into system performance and enabling proactive optimization. The combination of Cloud Monitoring dashboards, alerting policies, and Cloud Logging creates a foundation for continuous improvement and rapid incident response, essential for maintaining high-performance real-time systems.
 
 > **Tip**: For production workloads, consider implementing Redis Cluster mode through Memorystore's Standard tier to achieve horizontal scaling beyond single-instance memory limits. Additionally, use Pub/Sub's ordering keys feature when event sequence matters for specific user sessions or business processes.
 
@@ -604,4 +611,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

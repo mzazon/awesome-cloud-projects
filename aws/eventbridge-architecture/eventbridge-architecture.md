@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: eventbridge,lambda,sns,sqs
 estimated-time: 45 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: eventbridge,lambda,sns,sqs
 recipe-generator-version: 1.3
@@ -93,7 +93,7 @@ graph TB
 1. AWS account with permissions to create EventBridge resources, Lambda functions, and IAM roles
 2. AWS CLI v2 installed and configured with appropriate credentials
 3. Basic understanding of event-driven architecture and microservices patterns
-4. Python 3.9+ for Lambda functions and event simulation
+4. Python 3.11+ for Lambda functions and event simulation
 5. Understanding of JSON event patterns and filtering
 6. Estimated cost: EventBridge (~$1.00/million events), Lambda (~$0.20/million requests), SNS (~$0.50/million notifications)
 
@@ -126,7 +126,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
 
 1. **Create custom EventBridge event bus**:
 
-   Custom event buses provide logical separation between different applications and business domains. Amazon EventBridge supports up to 100 custom event buses per region, allowing you to organize events by business domain or application lifecycle. Creating a dedicated event bus for your e-commerce application ensures event isolation, enables fine-grained access control, and allows independent scaling of different event workflows. For detailed information on event bus concepts, see the [Amazon EventBridge documentation](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-what-is-how-it-works-concepts.html).
+   Custom event buses provide logical separation between different applications and business domains. Amazon EventBridge supports up to 300 custom event buses per region, allowing you to organize events by business domain or application lifecycle. Creating a dedicated event bus for your e-commerce application ensures event isolation, enables fine-grained access control, and allows independent scaling of different event workflows. For detailed information on event bus concepts, see the [Amazon EventBridge documentation](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-what-is-how-it-works-concepts.html).
 
    ```bash
    # Create custom event bus
@@ -134,12 +134,12 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
        --name ${EVENT_BUS_NAME} \
        --tags Key=Name,Value=${EVENT_BUS_NAME} \
            Key=Purpose,Value=ECommerce-Events
-   
+
    # Get event bus ARN
    EVENT_BUS_ARN=$(aws events describe-event-bus \
        --name ${EVENT_BUS_NAME} \
        --query 'Arn' --output text)
-   
+
    echo "✅ Created custom event bus"
    echo "Event Bus ARN: ${EVENT_BUS_ARN}"
    ```
@@ -155,7 +155,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
    SNS_TOPIC_ARN=$(aws sns create-topic \
        --name ${SNS_TOPIC_NAME} \
        --query 'TopicArn' --output text)
-   
+
    # Create SQS queue for batch processing
    SQS_QUEUE_URL=$(aws sqs create-queue \
        --queue-name ${SQS_QUEUE_NAME} \
@@ -164,13 +164,13 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
          "MessageRetentionPeriod": "1209600"
        }' \
        --query 'QueueUrl' --output text)
-   
+
    # Get SQS queue ARN
    SQS_QUEUE_ARN=$(aws sqs get-queue-attributes \
        --queue-url ${SQS_QUEUE_URL} \
        --attribute-names QueueArn \
        --query 'Attributes.QueueArn' --output text)
-   
+
    echo "✅ Created SNS topic and SQS queue"
    echo "SNS Topic ARN: ${SNS_TOPIC_ARN}"
    echo "SQS Queue ARN: ${SQS_QUEUE_ARN}"
@@ -198,12 +198,12 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
      ]
    }
    EOF
-   
+
    # Create IAM role
    aws iam create-role \
        --role-name EventBridgeExecutionRole \
        --assume-role-policy-document file://eventbridge-trust-policy.json
-   
+
    # Create policy for EventBridge targets
    cat > eventbridge-targets-policy.json << EOF
    {
@@ -233,17 +233,17 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
      ]
    }
    EOF
-   
+
    aws iam put-role-policy \
        --role-name EventBridgeExecutionRole \
        --policy-name EventBridgeTargetsPolicy \
        --policy-document file://eventbridge-targets-policy.json
-   
+
    # Get role ARN
    EVENTBRIDGE_ROLE_ARN=$(aws iam get-role \
        --role-name EventBridgeExecutionRole \
        --query 'Role.Arn' --output text)
-   
+
    echo "✅ Created IAM role for EventBridge"
    ```
 
@@ -269,30 +269,30 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
      ]
    }
    EOF
-   
+
    aws iam create-role \
        --role-name EventProcessorLambdaRole \
        --assume-role-policy-document file://lambda-trust-policy.json
-   
+
    aws iam attach-role-policy \
        --role-name EventProcessorLambdaRole \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-   
+
    # Get Lambda role ARN
    LAMBDA_ROLE_ARN=$(aws iam get-role \
        --role-name EventProcessorLambdaRole \
        --query 'Role.Arn' --output text)
-   
+
    # Create Lambda function
    cat > event_processor.py << 'EOF'
    import json
    import logging
    from datetime import datetime
-   
+
    # Configure logging
    logger = logging.getLogger()
    logger.setLevel(logging.INFO)
-   
+
    def lambda_handler(event, context):
        """Process EventBridge events"""
        
@@ -324,7 +324,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
                'statusCode': 500,
                'body': json.dumps({'error': str(e)})
            }
-   
+
    def process_event(source, event_type, detail):
        """Process different types of events"""
        
@@ -336,7 +336,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
            return process_payment_event(event_type, detail)
        else:
            return process_generic_event(event_type, detail)
-   
+
    def process_order_event(event_type, detail):
        """Process order-related events"""
        
@@ -368,7 +368,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
            }
        
        return {'action': 'order_event_processed'}
-   
+
    def process_user_event(event_type, detail):
        """Process user-related events"""
        
@@ -386,7 +386,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
            }
        
        return {'action': 'user_event_processed'}
-   
+
    def process_payment_event(event_type, detail):
        """Process payment-related events"""
        
@@ -403,7 +403,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
            }
        
        return {'action': 'payment_event_processed'}
-   
+
    def process_generic_event(event_type, detail):
        """Process generic events"""
        
@@ -414,21 +414,21 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
            'eventType': event_type
        }
    EOF
-   
+
    # Create deployment package
    zip event_processor.zip event_processor.py
-   
+
    # Create Lambda function
    LAMBDA_FUNCTION_ARN=$(aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.11 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler event_processor.lambda_handler \
        --zip-file fileb://event_processor.zip \
        --timeout 30 \
        --memory-size 256 \
        --query 'FunctionArn' --output text)
-   
+
    echo "✅ Created Lambda function for event processing"
    ```
 
@@ -448,13 +448,13 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
          "detail-type": ["Order Created", "Order Updated", "Order Cancelled"]
        }' \
        --description "Route order events to Lambda processor"
-   
+
    # Add Lambda target to order events rule
    aws events put-targets \
        --rule "OrderEventsRule" \
        --event-bus-name ${EVENT_BUS_NAME} \
        --targets "Id"="1","Arn"="${LAMBDA_FUNCTION_ARN}"
-   
+
    # Grant EventBridge permission to invoke Lambda
    aws lambda add-permission \
        --function-name ${LAMBDA_FUNCTION_NAME} \
@@ -462,7 +462,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
        --action lambda:InvokeFunction \
        --principal events.amazonaws.com \
        --source-arn "arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:rule/${EVENT_BUS_NAME}/OrderEventsRule"
-   
+
    # Rule 2: Route high-value orders to SNS for immediate notification
    aws events put-rule \
        --name "HighValueOrdersRule" \
@@ -475,13 +475,13 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
          }
        }' \
        --description "Route high-value orders to SNS for notifications"
-   
+
    # Add SNS target to high-value orders rule
    aws events put-targets \
        --rule "HighValueOrdersRule" \
        --event-bus-name ${EVENT_BUS_NAME} \
        --targets "Id"="1","Arn"="${SNS_TOPIC_ARN}","RoleArn"="${EVENTBRIDGE_ROLE_ARN}"
-   
+
    # Rule 3: Route all events to SQS for batch processing
    aws events put-rule \
        --name "AllEventsToSQSRule" \
@@ -490,13 +490,13 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
          "source": ["ecommerce.orders", "ecommerce.users", "ecommerce.payments"]
        }' \
        --description "Route all events to SQS for batch processing"
-   
+
    # Add SQS target to all events rule
    aws events put-targets \
        --rule "AllEventsToSQSRule" \
        --event-bus-name ${EVENT_BUS_NAME} \
        --targets "Id"="1","Arn"="${SQS_QUEUE_ARN}","RoleArn"="${EVENTBRIDGE_ROLE_ARN}"
-   
+
    # Rule 4: Route user registration events to Lambda
    aws events put-rule \
        --name "UserRegistrationRule" \
@@ -506,13 +506,13 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
          "detail-type": ["User Registered"]
        }' \
        --description "Route user registration events to Lambda"
-   
+
    # Add Lambda target to user registration rule
    aws events put-targets \
        --rule "UserRegistrationRule" \
        --event-bus-name ${EVENT_BUS_NAME} \
        --targets "Id"="1","Arn"="${LAMBDA_FUNCTION_ARN}"
-   
+
    # Grant EventBridge permission to invoke Lambda for user events
    aws lambda add-permission \
        --function-name ${LAMBDA_FUNCTION_NAME} \
@@ -520,7 +520,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
        --action lambda:InvokeFunction \
        --principal events.amazonaws.com \
        --source-arn "arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:rule/${EVENT_BUS_NAME}/UserRegistrationRule"
-   
+
    echo "✅ Created EventBridge rules for event routing"
    ```
 
@@ -540,12 +540,12 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
    import uuid
    from datetime import datetime, timezone
    import argparse
-   
+
    # Initialize EventBridge client
    eventbridge = boto3.client('events')
-   
+
    EVENT_BUS_NAME = '${EVENT_BUS_NAME}'
-   
+
    def publish_order_event(event_type='Order Created'):
        """Publish order-related events"""
        
@@ -582,7 +582,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
        print(f"   Response: {response}")
        
        return response
-   
+
    def publish_user_event(event_type='User Registered'):
        """Publish user-related events"""
        
@@ -611,7 +611,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
        print(f"   Response: {response}")
        
        return response
-   
+
    def publish_payment_event(event_type='Payment Processed'):
        """Publish payment-related events"""
        
@@ -641,7 +641,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
        print(f"   Response: {response}")
        
        return response
-   
+
    def publish_batch_events(count=10):
        """Publish a batch of mixed events"""
        
@@ -659,7 +659,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
                publish_payment_event()
            
            print()  # Add spacing between events
-   
+
    def main():
        parser = argparse.ArgumentParser(description='EventBridge Event Publisher')
        parser.add_argument('--type', choices=['order', 'user', 'payment', 'batch'],
@@ -677,13 +677,13 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
            publish_payment_event()
        else:
            publish_batch_events(args.count)
-   
+
    if __name__ == "__main__":
        main()
    EOF
-   
+
    chmod +x event_publisher.py
-   
+
    echo "✅ Created event publisher script"
    ```
 
@@ -700,19 +700,19 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
    import boto3
    import json
    from datetime import datetime, timedelta
-   
+
    # Initialize AWS clients
    eventbridge = boto3.client('events')
    cloudwatch = boto3.client('cloudwatch')
    sqs = boto3.client('sqs')
-   
+
    EVENT_BUS_NAME = '${EVENT_BUS_NAME}'
    SQS_QUEUE_URL = '${SQS_QUEUE_URL}'
-   
+
    def check_event_bus_status():
        """Check EventBridge event bus status"""
        try:
-           response = eventbridge.describe-event-bus(Name=EVENT_BUS_NAME)
+           response = eventbridge.describe_event_bus(Name=EVENT_BUS_NAME)
            
            print(f"📊 Event Bus Status: {EVENT_BUS_NAME}")
            print(f"   ARN: {response['Arn']}")
@@ -720,7 +720,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
            
        except Exception as e:
            print(f"❌ Error checking event bus: {e}")
-   
+
    def list_event_rules():
        """List EventBridge rules"""
        try:
@@ -746,7 +746,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
                
        except Exception as e:
            print(f"❌ Error listing rules: {e}")
-   
+
    def get_eventbridge_metrics():
        """Get EventBridge CloudWatch metrics"""
        try:
@@ -788,7 +788,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
            
        except Exception as e:
            print(f"❌ Error getting metrics: {e}")
-   
+
    def check_sqs_messages():
        """Check messages in SQS queue"""
        try:
@@ -823,7 +823,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
            
        except Exception as e:
            print(f"❌ Error checking SQS: {e}")
-   
+
    def main():
        print("EventBridge Architecture Monitor")
        print("=" * 35)
@@ -832,13 +832,13 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
        list_event_rules()
        get_eventbridge_metrics()
        check_sqs_messages()
-   
+
    if __name__ == "__main__":
        main()
    EOF
-   
+
    chmod +x monitor_events.py
-   
+
    echo "✅ Created monitoring script"
    ```
 
@@ -851,10 +851,10 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
    ```bash
    # Install required packages
    pip3 install boto3
-   
+
    # Publish test events
    python3 event_publisher.py --type batch --count 10
-   
+
    echo "✅ Published test events"
    ```
 
@@ -863,7 +863,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
    ```bash
    # Wait a moment for events to be processed
    sleep 30
-   
+
    # Monitor the event-driven architecture
    python3 monitor_events.py
    ```
@@ -894,9 +894,9 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
    import boto3
    import json
    from datetime import datetime, timezone
-   
+
    eventbridge = boto3.client('events')
-   
+
    event = {
        'Source': 'ecommerce.orders',
        'DetailType': 'Order Created',
@@ -909,11 +909,11 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
        }),
        'EventBusName': '${EVENT_BUS_NAME}'
    }
-   
+
    response = eventbridge.put_events(Entries=[event])
    print('High-value order event published:', response)
    "
-   
+
    echo "✅ Published high-value order event"
    ```
 
@@ -923,8 +923,9 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
 
    ```bash
    # List and delete all rules
-   RULES=$(aws events list-rules --event-bus-name ${EVENT_BUS_NAME} --query 'Rules[].Name' --output text)
-   
+   RULES=$(aws events list-rules --event-bus-name ${EVENT_BUS_NAME} \
+       --query 'Rules[].Name' --output text)
+
    for rule in $RULES; do
        # Remove targets first
        aws events remove-targets \
@@ -934,13 +935,13 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
                --rule $rule \
                --event-bus-name ${EVENT_BUS_NAME} \
                --query 'Targets[].Id' --output text)
-       
+
        # Delete rule
        aws events delete-rule \
            --name $rule \
            --event-bus-name ${EVENT_BUS_NAME}
    done
-   
+
    echo "✅ Deleted EventBridge rules and targets"
    ```
 
@@ -949,7 +950,7 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
    ```bash
    # Delete custom event bus
    aws events delete-event-bus --name ${EVENT_BUS_NAME}
-   
+
    echo "✅ Deleted EventBridge event bus"
    ```
 
@@ -958,13 +959,13 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
    ```bash
    # Delete Lambda function
    aws lambda delete-function --function-name ${LAMBDA_FUNCTION_NAME}
-   
+
    # Delete SQS queue
    aws sqs delete-queue --queue-url ${SQS_QUEUE_URL}
-   
+
    # Delete SNS topic
    aws sns delete-topic --topic-arn ${SNS_TOPIC_ARN}
-   
+
    echo "✅ Deleted Lambda function and messaging resources"
    ```
 
@@ -975,26 +976,26 @@ echo "Event Bus: ${EVENT_BUS_NAME}"
    aws iam delete-role-policy \
        --role-name EventBridgeExecutionRole \
        --policy-name EventBridgeTargetsPolicy
-   
+
    aws iam detach-role-policy \
        --role-name EventProcessorLambdaRole \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-   
+
    # Delete IAM roles
    aws iam delete-role --role-name EventBridgeExecutionRole
    aws iam delete-role --role-name EventProcessorLambdaRole
-   
+
    # Clean up local files
    rm -f eventbridge-trust-policy.json eventbridge-targets-policy.json
    rm -f lambda-trust-policy.json
    rm -f event_processor.py event_processor.zip
    rm -f event_publisher.py monitor_events.py
-   
+
    # Clear environment variables
    unset EVENT_BUS_NAME SNS_TOPIC_NAME SQS_QUEUE_NAME LAMBDA_FUNCTION_NAME
    unset EVENT_BUS_ARN SNS_TOPIC_ARN SQS_QUEUE_ARN SQS_QUEUE_URL
    unset EVENTBRIDGE_ROLE_ARN LAMBDA_ROLE_ARN LAMBDA_FUNCTION_ARN
-   
+
    echo "✅ Cleaned up IAM resources and local files"
    ```
 
@@ -1022,4 +1023,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

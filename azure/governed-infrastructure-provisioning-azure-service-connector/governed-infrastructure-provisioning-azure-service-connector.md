@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Deployment Environments, Azure Service Connector, Azure Logic Apps, Azure Event Grid
 estimated-time: 105 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, infrastructure-as-code, self-service, automation, deployment-environments, service-connector
 recipe-generator-version: 1.3
@@ -89,7 +89,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions for creating Azure Deployment Environments, Logic Apps, and Event Grid resources
-2. Azure CLI v2.50.0 or later installed and configured (or Azure CloudShell)
+2. Azure CLI v2.61.0 or later installed and configured (or Azure CloudShell)
 3. Understanding of Infrastructure as Code (IaC) concepts and Azure Resource Manager templates
 4. Familiarity with Azure Logic Apps workflow design and JSON schema validation
 5. Estimated cost: $50-100 per month for development environment (includes compute, storage, and service charges)
@@ -103,7 +103,7 @@ Azure Deployment Environments requires a structured approach to resource organiz
 ```bash
 # Set environment variables for Azure resources
 export LOCATION="eastus"
-export RESOURCE_GROUP="rg-selfservice-infra"
+export RESOURCE_GROUP="rg-selfservice-infra-${RANDOM_SUFFIX}"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique identifiers for resources
@@ -149,6 +149,9 @@ echo "✅ Event Grid topic created: ${EVENT_GRID_TOPIC}"
    Azure Deployment Environments uses a DevCenter as the central management hub that coordinates projects, catalogs, and environment definitions. The DevCenter serves as the governance layer that enforces organizational policies while enabling self-service capabilities. This foundational component establishes the security boundaries and administrative controls needed for enterprise-scale infrastructure provisioning.
 
    ```bash
+   # Install the devcenter extension for Azure CLI
+   az extension add --name devcenter --upgrade
+   
    # Create the DevCenter for managing deployment environments
    az devcenter admin devcenter create \
        --name ${DEVCENTER_NAME} \
@@ -207,15 +210,16 @@ echo "✅ Event Grid topic created: ${EVENT_GRID_TOPIC}"
        --name ${PROJECT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --devcenter-name ${DEVCENTER_NAME} \
-       --location ${LOCATION} \
-       --max-dev-boxes-per-user 3
+       --location ${LOCATION}
    
-   # Configure project environment types
+   # Configure project environment type with proper role assignments
    az devcenter admin project-environment-type create \
+       --environment-type-name "Development" \
        --project-name ${PROJECT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --environment-type-name "Development" \
-       --deployment-target-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}" \
+       --deployment-target-id "/subscriptions/${SUBSCRIPTION_ID}" \
+       --identity-type SystemAssigned \
+       --roles '{"b24988ac-6180-42a0-ab88-20f7382dd24c":{}}' \
        --status Enabled
    
    # Set up role assignments for developers
@@ -304,31 +308,27 @@ echo "✅ Event Grid topic created: ${EVENT_GRID_TOPIC}"
    This step demonstrates the end-to-end provisioning process by creating a sample environment that includes automatic service connectivity. Azure Service Connector eliminates the manual effort of configuring connection strings, authentication, and network settings by automatically establishing secure connections between application services and their dependencies.
 
    ```bash
-   # Create a sample environment using the deployment environments API
-   az rest \
-       --method POST \
-       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DevCenter/projects/${PROJECT_NAME}/users/me/environments/sample-webapp-env" \
-       --body '{
-         "environmentType": "Development",
-         "catalogName": "'${CATALOG_NAME}'",
-         "environmentDefinitionName": "WebApp",
-         "parameters": {
-           "name": "sample-webapp-'${RANDOM_SUFFIX}'"
-         }
-       }' \
-       --headers "Content-Type=application/json"
+   # Create a sample environment using the deployment environments CLI
+   az devcenter dev environment create \
+       --project-name ${PROJECT_NAME} \
+       --dev-center-name ${DEVCENTER_NAME} \
+       --environment-name "sample-webapp-env" \
+       --environment-type "Development" \
+       --catalog-name ${CATALOG_NAME} \
+       --environment-definition-name "WebApp" \
+       --parameters '{"name": "sample-webapp-'${RANDOM_SUFFIX}'"}'
    
    # Wait for environment deployment
    echo "Waiting for environment deployment..."
    sleep 60
    
    # Get the deployed web app resource ID
-   WEBAPP_ID=$(az webapp list \
+   WEBAPP_NAME=$(az webapp list \
        --resource-group ${RESOURCE_GROUP} \
-       --query "[?contains(name, 'sample-webapp')].id" \
-       --output tsv)
+       --query "[?contains(name, 'sample-webapp')].name" \
+       --output tsv | head -1)
    
-   echo "✅ Sample environment deployed successfully"
+   echo "✅ Sample environment deployed successfully with webapp: ${WEBAPP_NAME}"
    ```
 
    The sample environment demonstrates how developers can provision infrastructure using pre-approved templates. The deployment process automatically handles resource naming, networking, and basic configuration while ensuring compliance with organizational policies and security requirements.
@@ -338,6 +338,9 @@ echo "✅ Event Grid topic created: ${EVENT_GRID_TOPIC}"
    Service Connector simplifies the process of connecting applications to backing services by automatically managing authentication, connection strings, and network configuration. This step establishes a secure connection between the web application and a database, demonstrating how service connectivity is automated as part of the provisioning process.
 
    ```bash
+   # Install the Service Connector passwordless extension
+   az extension add --name serviceconnector-passwordless --upgrade
+   
    # Create Azure SQL Database for the web application
    SQL_SERVER="sql-server-${RANDOM_SUFFIX}"
    SQL_DATABASE="webapp-db"
@@ -359,11 +362,11 @@ echo "✅ Event Grid topic created: ${EVENT_GRID_TOPIC}"
    # Create Service Connector between web app and database
    az webapp connection create sql \
        --resource-group ${RESOURCE_GROUP} \
-       --name $(az webapp list --resource-group ${RESOURCE_GROUP} --query "[0].name" --output tsv) \
+       --name ${WEBAPP_NAME} \
        --target-resource-group ${RESOURCE_GROUP} \
        --server ${SQL_SERVER} \
        --database ${SQL_DATABASE} \
-       --auth-type systemAssignedIdentity \
+       --system-identity \
        --client-type dotnet
    
    echo "✅ Service Connector configured for database integration"
@@ -439,7 +442,7 @@ echo "✅ Event Grid topic created: ${EVENT_GRID_TOPIC}"
    az devcenter admin project show \
        --name ${PROJECT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query "{name:name, devCenterName:devCenterName, maxDevBoxesPerUser:maxDevBoxesPerUser}"
+       --query "{name:name, devCenterName:devCenterName}"
    ```
 
    Expected output: DevCenter and project should show "Succeeded" provisioning state with proper configuration values.
@@ -468,14 +471,14 @@ echo "✅ Event Grid topic created: ${EVENT_GRID_TOPIC}"
    # List service connections
    az webapp connection list \
        --resource-group ${RESOURCE_GROUP} \
-       --name $(az webapp list --resource-group ${RESOURCE_GROUP} --query "[0].name" --output tsv) \
+       --name ${WEBAPP_NAME} \
        --query "[].{name:name, targetService:targetService, authType:authType}"
    
    # Test connection health
    az webapp connection validate \
        --resource-group ${RESOURCE_GROUP} \
-       --name $(az webapp list --resource-group ${RESOURCE_GROUP} --query "[0].name" --output tsv) \
-       --connection-name $(az webapp connection list --resource-group ${RESOURCE_GROUP} --name $(az webapp list --resource-group ${RESOURCE_GROUP} --query "[0].name" --output tsv) --query "[0].name" --output tsv)
+       --name ${WEBAPP_NAME} \
+       --connection $(az webapp connection list --resource-group ${RESOURCE_GROUP} --name ${WEBAPP_NAME} --query "[0].name" --output tsv)
    ```
 
    Expected output: Service connections should be listed with authentication type and show successful validation results.
@@ -504,9 +507,12 @@ echo "✅ Event Grid topic created: ${EVENT_GRID_TOPIC}"
 
    ```bash
    # Delete the sample environment
-   az rest \
-       --method DELETE \
-       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DevCenter/projects/${PROJECT_NAME}/users/me/environments/sample-webapp-env"
+   az devcenter dev environment delete \
+       --project-name ${PROJECT_NAME} \
+       --dev-center-name ${DEVCENTER_NAME} \
+       --environment-name "sample-webapp-env" \
+       --user-id "me" \
+       --yes
    
    echo "✅ Sample environment deleted"
    ```
@@ -634,4 +640,9 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Bicep](code/bicep/) - Azure Bicep templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using Azure CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files

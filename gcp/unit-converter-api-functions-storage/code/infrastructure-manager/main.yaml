@@ -1,0 +1,431 @@
+# Infrastructure Manager Configuration for Unit Converter API
+# This configuration deploys a serverless unit conversion API using Cloud Functions
+# with Cloud Storage for conversion history tracking and audit trails.
+
+# Copyright 2025 Google LLC
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Import required resource types for serverless compute and storage
+imports:
+- path: https://www.googleapis.com/compute/v1/projects/{{env["project"]}}/global/projects
+- path: https://www.googleapis.com/storage/v1/projects/{{env["project"]}}/buckets
+- path: https://www.googleapis.com/cloudfunctions/v1/projects/{{env["project"]}}/locations/{{properties["region"]}}/functions
+
+# Template metadata and description
+info:
+  title: Unit Converter API with Cloud Functions and Storage
+  author: Google Cloud Recipe
+  description: |
+    Deploys a serverless HTTP API for unit conversions with automatic 
+    history tracking in Cloud Storage. Supports temperature, length, 
+    and weight conversions between metric and imperial systems.
+  version: 1.0
+
+# Input parameters for customizable deployment
+properties:
+  # Project configuration
+  project_id:
+    type: string
+    description: Google Cloud Project ID for resource deployment
+    default: "{{env['project']}}"
+  
+  # Regional deployment configuration
+  region:
+    type: string
+    description: Google Cloud region for resource deployment
+    default: us-central1
+    enum:
+      - us-central1
+      - us-east1
+      - us-west1
+      - europe-west1
+      - asia-east1
+  
+  # Function configuration parameters
+  function_name:
+    type: string
+    description: Name for the Cloud Function handling unit conversions
+    default: unit-converter
+    pattern: "^[a-z][a-z0-9-]{0,61}[a-z0-9]$"
+  
+  # Storage configuration parameters
+  bucket_name_suffix:
+    type: string
+    description: Suffix for the Cloud Storage bucket name (project-conversion-history-suffix)
+    default: "{{env['deployment']}}"
+    pattern: "^[a-z0-9-]{1,20}$"
+  
+  # Function runtime configuration
+  function_memory:
+    type: integer
+    description: Memory allocation for Cloud Function in MB
+    default: 256
+    enum: [128, 256, 512, 1024, 2048]
+  
+  function_timeout:
+    type: integer
+    description: Function timeout in seconds
+    default: 60
+    minimum: 1
+    maximum: 540
+  
+  # Source code configuration
+  function_source_archive_url:
+    type: string
+    description: GCS URL to the function source code archive
+    default: ""
+  
+  # Security and access configuration
+  allow_unauthenticated:
+    type: boolean
+    description: Allow unauthenticated access to the function
+    default: true
+
+# Resource definitions for the complete serverless architecture
+resources:
+  
+  # Enable required Google Cloud APIs for the solution
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{properties["project_id"]}}/services/cloudfunctions.googleapis.com
+      parent: projects/{{properties["project_id"]}}
+    metadata:
+      description: Enables Cloud Functions API for serverless compute
+      runtimePolicy:
+        - UPDATE_ALWAYS
+  
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{properties["project_id"]}}/services/storage.googleapis.com
+      parent: projects/{{properties["project_id"]}}
+    metadata:
+      description: Enables Cloud Storage API for object storage
+      runtimePolicy:
+        - UPDATE_ALWAYS
+  
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{properties["project_id"]}}/services/cloudbuild.googleapis.com
+      parent: projects/{{properties["project_id"]}}
+    metadata:
+      description: Enables Cloud Build API for function source compilation
+      runtimePolicy:
+        - UPDATE_ALWAYS
+
+  # Cloud Storage bucket for conversion history and audit trails
+  - name: conversion-history-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{properties["project_id"]}}-conversion-history-{{properties["bucket_name_suffix"]}}
+      project: {{properties["project_id"]}}
+      location: {{properties["region"]}}
+      
+      # Storage class optimized for frequently accessed data
+      storageClass: STANDARD
+      
+      # Enable uniform bucket-level access for consistent IAM
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      
+      # Bucket labels for organization and cost tracking
+      labels:
+        purpose: conversion-history
+        application: unit-converter-api
+        environment: production
+        managed-by: infrastructure-manager
+      
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              matchesStorageClass: [STANDARD]
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+              matchesStorageClass: [NEARLINE]
+          - action:
+              type: Delete
+            condition:
+              age: 365
+      
+      # CORS configuration for web browser compatibility
+      cors:
+        - origin: ["*"]
+          method: ["GET", "POST", "OPTIONS"]
+          responseHeader: ["Content-Type", "Access-Control-Allow-Origin"]
+          maxAgeSeconds: 3600
+      
+      # Versioning for data protection
+      versioning:
+        enabled: true
+    
+    depends_on:
+      - storage-api
+    
+    metadata:
+      description: |
+        Cloud Storage bucket for storing conversion history and audit trails.
+        Configured with lifecycle management for cost optimization and 
+        uniform bucket-level access for consistent security.
+
+  # IAM service account for Cloud Function execution
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: unit-converter-function-sa
+      project: {{properties["project_id"]}}
+      serviceAccount:
+        displayName: Unit Converter Function Service Account
+        description: |
+          Service account for the unit converter Cloud Function with 
+          minimal permissions for storage access and logging.
+    
+    metadata:
+      description: Dedicated service account for function execution with least privilege
+
+  # IAM binding for service account to access storage bucket
+  - name: function-storage-access
+    type: gcp-types/storage-v1:buckets.iam
+    properties:
+      bucket: $(ref.conversion-history-bucket.name)
+      project: {{properties["project_id"]}}
+      bindings:
+        - role: roles/storage.objectCreator
+          members:
+            - serviceAccount:$(ref.function-service-account.email)
+        - role: roles/storage.objectViewer
+          members:
+            - serviceAccount:$(ref.function-service-account.email)
+    
+    depends_on:
+      - conversion-history-bucket
+      - function-service-account
+    
+    metadata:
+      description: |
+        Grants the function service account minimal storage permissions
+        needed for reading and writing conversion history objects.
+
+  # Cloud Function for unit conversion API with HTTP trigger
+  - name: unit-converter-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/{{properties["project_id"]}}/locations/{{properties["region"]}}
+      function: {{properties["function_name"]}}
+      
+      # Function source code configuration
+      sourceArchiveUrl: {{properties["function_source_archive_url"]}}
+      
+      # Runtime and execution configuration
+      runtime: python312
+      entryPoint: convert_units
+      availableMemoryMb: {{properties["function_memory"]}}
+      timeout: {{properties["function_timeout"]}}s
+      
+      # Service account for secure execution
+      serviceAccountEmail: $(ref.function-service-account.email)
+      
+      # Environment variables for function configuration
+      environmentVariables:
+        BUCKET_NAME: $(ref.conversion-history-bucket.name)
+        PROJECT_ID: {{properties["project_id"]}}
+        REGION: {{properties["region"]}}
+      
+      # HTTP trigger configuration for REST API access
+      httpsTrigger: {}
+      
+      # Function labels for organization and monitoring
+      labels:
+        application: unit-converter-api
+        component: conversion-function
+        environment: production
+        managed-by: infrastructure-manager
+      
+      # Ingress settings for security
+      ingressSettings: ALLOW_ALL
+      
+      # VPC connector configuration (optional, commented for basic setup)
+      # vpcConnector: projects/{{properties["project_id"]}}/locations/{{properties["region"]}}/connectors/default
+      # vpcConnectorEgressSettings: ALL_TRAFFIC
+    
+    depends_on:
+      - cloudfunctions-api
+      - cloudbuild-api
+      - function-service-account
+      - conversion-history-bucket
+    
+    metadata:
+      description: |
+        Cloud Function implementing the unit conversion API with HTTP trigger.
+        Supports temperature, length, and weight conversions with automatic
+        history tracking in Cloud Storage.
+
+  # IAM policy for public function access (if enabled)
+  - name: function-public-access
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.iam
+    properties:
+      resource: projects/{{properties["project_id"]}}/locations/{{properties["region"]}}/functions/{{properties["function_name"]}}
+      bindings:
+        - role: roles/cloudfunctions.invoker
+          members:
+            - allUsers
+    
+    depends_on:
+      - unit-converter-function
+    
+    metadata:
+      description: |
+        Grants public access to the Cloud Function for HTTP API calls.
+        Remove this resource if authentication is required.
+      condition: {{properties["allow_unauthenticated"]}}
+
+  # Cloud Monitoring alert policy for function errors
+  - name: function-error-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      project: {{properties["project_id"]}}
+      alertPolicy:
+        displayName: Unit Converter Function Errors
+        documentation:
+          content: |
+            Alert when the unit converter function experiences errors.
+            This indicates potential issues with conversions or storage access.
+          mimeType: text/markdown
+        
+        conditions:
+          - displayName: Function Error Rate
+            conditionThreshold:
+              filter: |
+                resource.type="cloud_function"
+                resource.label.function_name="{{properties["function_name"]}}"
+                metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                metric.label.status!="ok"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        
+        combiner: OR
+        enabled: true
+        
+        notificationChannels: []
+        
+        alertStrategy:
+          autoClose: 1800s
+    
+    depends_on:
+      - unit-converter-function
+    
+    metadata:
+      description: |
+        Monitoring alert for function errors to enable proactive issue detection.
+        Configure notification channels for alert delivery.
+
+# Output values for integration and verification
+outputs:
+  
+  # Function endpoint for API access
+  - name: function_url
+    description: HTTPS URL for the unit conversion API endpoint
+    value: $(ref.unit-converter-function.httpsTrigger.url)
+  
+  # Function details for monitoring
+  - name: function_name
+    description: Name of the deployed Cloud Function
+    value: {{properties["function_name"]}}
+  
+  - name: function_region
+    description: Region where the function is deployed
+    value: {{properties["region"]}}
+  
+  # Storage bucket information
+  - name: storage_bucket_name
+    description: Name of the Cloud Storage bucket for conversion history
+    value: $(ref.conversion-history-bucket.name)
+  
+  - name: storage_bucket_url
+    description: GCS URL for the conversion history bucket
+    value: gs://$(ref.conversion-history-bucket.name)
+  
+  # Service account details
+  - name: service_account_email
+    description: Email of the function's service account
+    value: $(ref.function-service-account.email)
+  
+  # Monitoring and management URLs
+  - name: function_logs_url
+    description: Cloud Logging URL for function logs
+    value: https://console.cloud.google.com/logs/query;query=resource.type%3D%22cloud_function%22%0Aresource.labels.function_name%3D%22{{properties["function_name"]}}%22?project={{properties["project_id"]}}
+  
+  - name: function_monitoring_url
+    description: Cloud Monitoring URL for function metrics
+    value: https://console.cloud.google.com/monitoring/services/cloud_function/{{properties["function_name"]}}?project={{properties["project_id"]}}
+  
+  # Example API usage
+  - name: api_example_curl
+    description: Example curl command to test the API
+    value: |
+      curl -X POST $(ref.unit-converter-function.httpsTrigger.url) \
+        -H "Content-Type: application/json" \
+        -d '{"value": 25, "from_unit": "celsius", "to_unit": "fahrenheit"}'
+  
+  # Cost and resource information
+  - name: estimated_monthly_cost
+    description: Estimated monthly cost for typical usage
+    value: "$0.01-$5.00 depending on usage (2M free invocations/month)"
+  
+  - name: deployed_resources
+    description: List of deployed Google Cloud resources
+    value:
+      - Cloud Function (HTTP trigger)
+      - Cloud Storage bucket (with lifecycle management)
+      - IAM service account (least privilege)
+      - Cloud Monitoring alert policy
+      - API enablement (Functions, Storage, Build)
+
+# Configuration validation rules
+metadata:
+  dependsOn: []
+  
+  # Template validation
+  validation:
+    properties:
+      project_id:
+        description: Must be a valid Google Cloud Project ID
+        pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+      
+      region:
+        description: Must be a supported Google Cloud region
+        
+      function_name:
+        description: Must follow Cloud Functions naming conventions
+        
+      bucket_name_suffix:
+        description: Must create globally unique bucket name when combined with project ID
+
+  # Resource organization tags
+  labels:
+    application: unit-converter-api
+    component: infrastructure
+    environment: production
+    managed-by: infrastructure-manager
+    cost-center: engineering
+    data-classification: internal

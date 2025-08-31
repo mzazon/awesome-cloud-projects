@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: Resource Explorer, Config, EventBridge, Lambda
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: multi-account, resource-discovery, compliance, automation, governance
 recipe-generator-version: 1.3
@@ -169,7 +169,12 @@ echo "Organization ID: ${ORG_ID}"
                 "Service": "config.amazonaws.com"
             },
             "Action": "s3:GetBucketAcl",
-            "Resource": "arn:aws:s3:::${CONFIG_BUCKET_NAME}"
+            "Resource": "arn:aws:s3:::${CONFIG_BUCKET_NAME}",
+            "Condition": {
+                "StringEquals": {
+                    "AWS:SourceAccount": "${AWS_ACCOUNT_ID}"
+                }
+            }
         },
         {
             "Effect": "Allow",
@@ -180,7 +185,21 @@ echo "Organization ID: ${ORG_ID}"
             "Resource": "arn:aws:s3:::${CONFIG_BUCKET_NAME}/*",
             "Condition": {
                 "StringEquals": {
-                    "s3:x-amz-acl": "bucket-owner-full-control"
+                    "s3:x-amz-acl": "bucket-owner-full-control",
+                    "AWS:SourceAccount": "${AWS_ACCOUNT_ID}"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "config.amazonaws.com"
+            },
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::${CONFIG_BUCKET_NAME}",
+            "Condition": {
+                "StringEquals": {
+                    "AWS:SourceAccount": "${AWS_ACCOUNT_ID}"
                 }
             }
         }
@@ -194,6 +213,8 @@ EOF
    
    echo "✅ Service-linked roles and Config bucket created successfully"
    ```
+
+   The service-linked roles and S3 bucket now provide the necessary permissions and storage foundation for Config to operate across your multi-account environment while maintaining security best practices with proper condition statements.
 
 3. **Configure AWS Resource Explorer Multi-Account Search**:
 
@@ -212,15 +233,12 @@ EOF
    # Create default view for multi-account search
    aws resource-explorer-2 create-view \
        --view-name "organization-view" \
-       --included-properties '{
-           "IncludeCompliance": true,
-           "IncludeResourceMetadata": true
-       }' \
+       --included-properties Name=tags \
        --region ${AWS_REGION}
    
    # Associate the default view
    VIEW_ARN=$(aws resource-explorer-2 list-views \
-       --query 'Views[0].ViewArn' --output text)
+       --query 'Views[0]' --output text)
    
    aws resource-explorer-2 associate-default-view \
        --view-arn ${VIEW_ARN}
@@ -261,14 +279,12 @@ EOF
    # Create organizational aggregator
    aws configservice put-configuration-aggregator \
        --configuration-aggregator-name ${CONFIG_AGGREGATOR_NAME} \
-       --organization-aggregation-source '{
-           "RoleArn": "arn:aws:iam::'${AWS_ACCOUNT_ID}':role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig",
-           "AwsRegions": ["'${AWS_REGION}'"],
-           "AllAwsRegions": false
-       }'
+       --organization-aggregation-source RoleArn=arn:aws:iam::${AWS_ACCOUNT_ID}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig,AwsRegions=${AWS_REGION},AllAwsRegions=false
    
    echo "✅ Config aggregator created for organizational compliance monitoring"
    ```
+
+   The Config service is now recording configuration changes and the organizational aggregator will collect compliance data from all member accounts in your organization.
 
 5. **Create Lambda Function for Automated Processing**:
 
@@ -459,7 +475,7 @@ EOF
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.11 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-lambda-role \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-deployment.zip \
@@ -502,11 +518,11 @@ EOF
    # Add Lambda targets to both rules
    aws events put-targets \
        --rule ${PROJECT_NAME}-config-rule \
-       --targets "Id"="1","Arn"="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}"
+       --targets Id=1,Arn=arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}
    
    aws events put-targets \
        --rule ${PROJECT_NAME}-discovery-schedule \
-       --targets "Id"="1","Arn"="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}"
+       --targets Id=1,Arn=arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}
    
    # Grant EventBridge permissions to invoke Lambda
    aws lambda add-permission \
@@ -525,6 +541,8 @@ EOF
    
    echo "✅ EventBridge automation rules configured for real-time compliance monitoring"
    ```
+
+   EventBridge rules are now configured to automatically trigger your Lambda function when compliance violations occur or during scheduled discovery runs.
 
 7. **Deploy Config Rules for Compliance Monitoring**:
 
@@ -583,6 +601,8 @@ EOF
    echo "✅ Comprehensive compliance monitoring rules deployed"
    ```
 
+   Config rules are now actively monitoring your resources for compliance violations and will trigger EventBridge events when non-compliant resources are detected.
+
 8. **Configure Multi-Account Resource Discovery**:
 
    This step establishes the framework for resource discovery across member accounts by identifying target accounts and providing guidance for StackSet deployment to ensure consistent configuration across your organization.
@@ -619,12 +639,15 @@ Resources:
     Properties:
       AWSServiceName: config.amazonaws.com
       Description: Service-linked role for AWS Config
+    DeletionPolicy: Retain
 EOF
 
    echo "✅ Member account discovery configuration template created"
    echo "Deploy this template using AWS StackSets to member accounts"
    echo "Template saved as: member-account-template.yaml"
    ```
+
+   The member account template is ready for deployment across your organization to establish consistent resource discovery capabilities in all accounts.
 
 ## Validation & Testing
 
@@ -819,9 +842,9 @@ EOF
 
 This automated multi-account resource discovery solution demonstrates the power of combining AWS Resource Explorer's comprehensive search capabilities with Config's compliance monitoring through intelligent event-driven automation. Resource Explorer provides organization-wide resource visibility and search functionality, while Config ensures continuous compliance monitoring and governance enforcement. The integration with EventBridge and Lambda creates sophisticated automation that responds to compliance violations and resource changes in real-time, enabling proactive governance at enterprise scale.
 
-The architecture follows AWS Well-Architected Framework principles by implementing operational excellence through comprehensive automation and monitoring, security through least-privilege access and service-linked roles, reliability through event-driven processing with error handling, and cost optimization through efficient resource utilization. This approach scales seamlessly as your organization grows, automatically including new accounts and resources without manual intervention while maintaining consistent governance policies.
+The architecture follows AWS Well-Architected Framework principles by implementing operational excellence through comprehensive automation and monitoring, security through least-privilege access and service-linked roles, reliability through event-driven processing with error handling, and cost optimization through efficient resource utilization. This approach scales seamlessly as your organization grows, automatically including new accounts and resources without manual intervention while maintaining consistent governance policies across the entire multi-account environment.
 
-The solution addresses critical enterprise requirements including regulatory compliance (SOC 2, PCI DSS, HIPAA), security governance, and operational visibility across complex multi-account environments. Organizations can extend this foundation to implement automated remediation workflows, cost optimization alerts, security incident response automation, and integration with ITSM systems for comprehensive IT governance. The centralized approach significantly reduces administrative overhead while improving security posture and compliance adherence across the entire multi-account environment.
+The solution addresses critical enterprise requirements including regulatory compliance (SOC 2, PCI DSS, HIPAA), security governance, and operational visibility across complex multi-account environments. Organizations can extend this foundation to implement automated remediation workflows, cost optimization alerts, security incident response automation, and integration with ITSM systems for comprehensive IT governance. The centralized approach significantly reduces administrative overhead while improving security posture and compliance adherence across the entire organization.
 
 For production deployments, consider implementing additional security controls such as AWS Organizations Service Control Policies (SCPs) for preventive governance, AWS StackSets for consistent deployment across accounts, AWS Systems Manager for automated patch management, and AWS Security Hub for centralized security findings management. The solution integrates seamlessly with AWS Control Tower for enhanced governance and AWS CloudFormation StackSets for standardized deployments. See the [AWS Config Multi-Account Multi-Region Data Aggregation](https://docs.aws.amazon.com/config/latest/developerguide/aggregate-data.html) guide for advanced aggregation patterns and the [AWS Resource Explorer Multi-Account Search](https://docs.aws.amazon.com/resource-explorer/latest/userguide/manage-service-multi-account.html) documentation for comprehensive search capabilities.
 
@@ -839,4 +862,11 @@ Extend this automated resource discovery solution with these advanced enhancemen
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [AWS CDK (Python)](code/cdk-python/) - AWS CDK Python implementation
+- [AWS CDK (TypeScript)](code/cdk-typescript/) - AWS CDK TypeScript implementation
+- [CloudFormation](code/cloudformation.yaml) - AWS CloudFormation template
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using AWS CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files
