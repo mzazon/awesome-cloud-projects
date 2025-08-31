@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class TaxonomyMapper:
     """Maps recipes to standardized categories based on taxonomy configuration."""
     
-    def __init__(self, taxonomy_path: str = 'data/taxonomy.json'):
+    def __init__(self, taxonomy_path: str = '../data/taxonomy.json'):
         """Initialize the taxonomy mapper."""
         self.taxonomy = self._load_taxonomy(taxonomy_path)
         self.category_mappings = self._build_category_mappings()

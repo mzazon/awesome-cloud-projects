@@ -105,7 +105,7 @@ class Recipe:
 class RecipeParser:
     """Main parser class for discovering and parsing cloud recipes."""
     
-    def __init__(self, config_path: str = 'data/config.json'):
+    def __init__(self, config_path: str = '../data/config.json'):
         """Initialize the recipe parser with configuration."""
         self.config = self._load_config(config_path)
         self.recipes: List[Recipe] = []

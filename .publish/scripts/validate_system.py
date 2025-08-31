@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 class SystemValidator:
     """Comprehensive system validation for the README generation system."""
     
-    def __init__(self, config_path: str = 'data/config.json'):
+    def __init__(self, config_path: str = '../data/config.json'):
         """Initialize the system validator."""
         self.config_path = config_path
         self.validation_results = {
@@ -128,7 +128,7 @@ class SystemValidator:
                     issues.append(f"Provider directory not found: {directory} for {provider}")
             
             # Check taxonomy file
-            taxonomy_file = 'data/taxonomy.json'
+            taxonomy_file = '../data/taxonomy.json'
             if not os.path.exists(taxonomy_file):
                 issues.append(f"Taxonomy file not found: {taxonomy_file}")
             else:
@@ -164,9 +164,9 @@ class SystemValidator:
         logger.info("Validating file structure...")
         issues = []
         
-        # Required directories
+        # Required directories (relative to repository root)
         required_dirs = [
-            'scripts', 'data', 'templates', 'aws', 'azure', 'gcp', '.github/workflows'
+            '../data', '../templates', '../../aws', '../../azure', '../../gcp'
         ]
         
         for directory in required_dirs:
@@ -175,14 +175,13 @@ class SystemValidator:
         
         # Required files
         required_files = [
-            'scripts/recipe_parser.py',
-            'scripts/taxonomy_mapper.py', 
-            'scripts/readme_generator.py',
-            'scripts/requirements.txt',
-            'data/config.json',
-            'data/taxonomy.json',
-            'templates/README.jinja2',
-            '.github/workflows/update-readme.yml'
+            'recipe_parser.py',
+            'taxonomy_mapper.py', 
+            'readme_generator.py',
+            'requirements.txt',
+            '../data/config.json',
+            '../data/taxonomy.json',
+            '../templates/README.jinja2'
         ]
         
         for file_path in required_files:
@@ -196,7 +195,7 @@ class SystemValidator:
         
         return not issues
     
-    def validate_recipes(self, root_directory: str = '.') -> bool:
+    def validate_recipes(self, root_directory: str = '..') -> bool:
         """Validate recipe files and their metadata."""
         logger.info("Validating recipe files...")
         issues = []
@@ -322,7 +321,7 @@ class SystemValidator:
         issues = []
         
         # Check template files exist
-        template_files = ['templates/README.jinja2', 'templates/category_section.jinja2']
+        template_files = ['../templates/README.jinja2', '../templates/category_section.jinja2']
         
         for template_file in template_files:
             if not os.path.exists(template_file):
@@ -335,7 +334,7 @@ class SystemValidator:
                     content = f.read()
                 
                 # Basic syntax validation using Jinja2
-                env = Environment(loader=FileSystemLoader('templates'))
+                env = Environment(loader=FileSystemLoader('../templates'))
                 template = env.from_string(content)
                 
                 logger.debug(f"✅ Template valid: {template_file}")
@@ -551,7 +550,7 @@ def main():
     parser.add_argument(
         '--config', '-c',
         type=str,
-        default='data/config.json',
+        default='../data/config.json',
         help='Path to configuration file'
     )
     

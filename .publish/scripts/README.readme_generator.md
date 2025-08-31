@@ -84,8 +84,8 @@ graph TB
 ### Dependency Installation
 
 ```bash
-# Navigate to the scripts directory
-cd scripts
+# Navigate to the scripts directory inside .publish
+cd .publish/scripts
 
 # Install required dependencies
 pip3 install -r requirements.txt
@@ -100,25 +100,25 @@ Required packages:
 ### File Structure
 
 ```
-recipes/
-├── scripts/
-│   ├── recipe_parser.py           # YAML parsing & recipe discovery
-│   ├── taxonomy_mapper.py         # Category mapping & normalization
-│   ├── readme_generator.py        # Main README generation logic
-│   ├── generate_readme.py         # CLI interface
-│   ├── validate_system.py         # System validation
-│   └── requirements.txt           # Python dependencies
-├── data/
-│   ├── config.json               # Main configuration
-│   └── taxonomy.json             # 12-category taxonomy definition
-├── templates/
-│   ├── README.jinja2             # Main README template
-│   └── category_section.jinja2   # Category section template
-├── .github/workflows/
-│   └── update-readme.yml         # GitHub Actions automation
+awesome-cloud-projects/
+├── .publish/
+│   ├── scripts/
+│   │   ├── recipe_parser.py           # YAML parsing & recipe discovery
+│   │   ├── taxonomy_mapper.py         # Category mapping & normalization
+│   │   ├── readme_generator.py        # Main README generation logic
+│   │   ├── generate_readme.py         # CLI interface
+│   │   ├── validate_system.py         # System validation
+│   │   └── requirements.txt           # Python dependencies
+│   ├── data/
+│   │   ├── config.json               # Main configuration
+│   │   └── taxonomy.json             # 12-category taxonomy definition
+│   └── templates/
+│       ├── README.jinja2             # Main README template
+│       └── category_section.jinja2   # Category section template
 ├── aws/                          # AWS recipe directories
 ├── azure/                        # Azure recipe directories
 ├── gcp/                          # GCP recipe directories
+├── README.md                     # Generated README file
 └── [CSV mapping files]           # Recipe renaming mappings
 ```
 
@@ -131,46 +131,49 @@ The system provides several ways to generate and validate the README:
 #### Basic README Generation
 
 ```bash
+# Navigate to the scripts directory first
+cd .publish/scripts
+
 # Generate README.md with default settings
-python3 scripts/generate_readme.py
+python3 generate_readme.py
 
 # Generate to a custom location
-python3 scripts/generate_readme.py --output docs/README.md
+python3 generate_readme.py --output ../../docs/README.md
 
 # Use custom configuration
-python3 scripts/generate_readme.py --config myconfig.json
+python3 generate_readme.py --config ../data/myconfig.json
 ```
 
 #### Advanced Options
 
 ```bash
 # Generate with verbose logging
-python3 scripts/generate_readme.py --verbose
+python3 generate_readme.py --verbose
 
 # Generate detailed JSON report instead of README
-python3 scripts/generate_readme.py --report --output report.json
+python3 generate_readme.py --report --output ../../report.json
 
 # Validate recipes without generating README
-python3 scripts/generate_readme.py --validate-only
+python3 generate_readme.py --validate-only
 
 # Check configuration and exit
-python3 scripts/generate_readme.py --check-config
+python3 generate_readme.py --check-config
 
 # Process recipes from custom directory
-python3 scripts/generate_readme.py --root /path/to/recipes
+python3 generate_readme.py --root /path/to/recipes
 ```
 
 #### System Validation
 
 ```bash
 # Run comprehensive system validation
-python3 scripts/validate_system.py
+python3 validate_system.py
 
 # Validate with detailed output
-python3 scripts/validate_system.py --verbose
+python3 validate_system.py --verbose
 
 # Save validation report
-python3 scripts/validate_system.py --output validation_report.json
+python3 validate_system.py --output ../../validation_report.json
 ```
 
 ### Programmatic Usage
@@ -180,14 +183,14 @@ You can also use the system programmatically:
 ```python
 from readme_generator import ReadmeGenerator
 
-# Initialize generator
-generator = ReadmeGenerator('data/config.json')
+# Initialize generator (paths are relative to .publish/scripts directory)
+generator = ReadmeGenerator('../data/config.json')
 
-# Load and process recipes
-generator.load_and_process_recipes('.')
+# Load and process recipes from parent directory
+generator.load_and_process_recipes('..')
 
 # Generate README
-content = generator.generate_readme('README.md')
+content = generator.generate_readme('../../README.md')
 
 # Get detailed report
 report = generator.get_generation_report()
@@ -199,8 +202,8 @@ report = generator.get_generation_report()
 
 ```json
 {
-  "output_file": "README.md",
-  "template": "templates/README.jinja2",
+  "output_file": "../README.md",
+  "template": "../templates/README.jinja2",
   "providers": ["aws", "azure", "gcp"],
   "recipe_directories": {
     "aws": "aws",
@@ -263,8 +266,8 @@ Each category includes:
 
 **Usage**:
 ```python
-parser = RecipeParser('data/config.json')
-recipes = parser.parse_all_recipes('.')
+parser = RecipeParser('../data/config.json')
+recipes = parser.parse_all_recipes('..')
 report = parser.get_parsing_report()
 ```
 
@@ -280,7 +283,7 @@ report = parser.get_parsing_report()
 
 **Usage**:
 ```python
-mapper = TaxonomyMapper('data/taxonomy.json')
+mapper = TaxonomyMapper('../data/taxonomy.json')
 category = mapper.categorize_recipe(recipe_data)
 normalized = mapper.normalize_category_name('compute')
 ```
@@ -299,9 +302,9 @@ normalized = mapper.normalize_category_name('compute')
 
 **Usage**:
 ```python
-generator = ReadmeGenerator('data/config.json')
-generator.load_and_process_recipes('.')
-content = generator.generate_readme('README.md')
+generator = ReadmeGenerator('../data/config.json')
+generator.load_and_process_recipes('..')
+content = generator.generate_readme('../../README.md')
 ```
 
 ## GitHub Actions Automation
@@ -338,17 +341,18 @@ The system includes a comprehensive GitHub Actions workflow (`.github/workflows/
 ```
 **Solution**: Install dependencies
 ```bash
-pip3 install -r scripts/requirements.txt
+cd .publish/scripts
+pip3 install -r requirements.txt
 ```
 
 #### 2. File Path Issues
 ```bash
 ❌ can't open file 'scripts/scripts/generate_readme.py'
 ```
-**Solution**: Check current directory
+**Solution**: Check current directory and navigate to .publish/scripts
 ```bash
-pwd  # Should be in the root recipes directory
-python3 scripts/generate_readme.py  # Not scripts/scripts/
+cd .publish/scripts  # Navigate to scripts directory
+python3 generate_readme.py  # Run from .publish/scripts/
 ```
 
 #### 3. Missing Required Fields
@@ -374,15 +378,18 @@ category: compute
 ### Validation Commands
 
 ```bash
+# Navigate to scripts directory first
+cd .publish/scripts
+
 # Check system health
-python3 scripts/validate_system.py --verbose
+python3 validate_system.py --verbose
 
 # Validate specific aspects
-python3 scripts/generate_readme.py --validate-only
-python3 scripts/generate_readme.py --check-config
+python3 generate_readme.py --validate-only
+python3 generate_readme.py --check-config
 
 # Test generation without writing file
-python3 scripts/generate_readme.py --output /tmp/test_readme.md
+python3 generate_readme.py --output /tmp/test_readme.md
 ```
 
 ### Debug Mode
@@ -390,14 +397,17 @@ python3 scripts/generate_readme.py --output /tmp/test_readme.md
 Enable verbose logging for debugging:
 
 ```bash
+# Navigate to scripts directory
+cd .publish/scripts
+
 # Verbose validation
-python3 scripts/validate_system.py --verbose
+python3 validate_system.py --verbose
 
 # Verbose generation
-python3 scripts/generate_readme.py --verbose
+python3 generate_readme.py --verbose
 
 # Check parsing errors
-python3 scripts/generate_readme.py --validate-only --verbose
+python3 generate_readme.py --validate-only --verbose
 ```
 
 ## Maintenance
@@ -436,7 +446,7 @@ The system automatically reports key metrics:
 
 To add new categories or update mappings:
 
-1. Edit `data/taxonomy.json`
+1. Edit `.publish/data/taxonomy.json`
 2. Add new category with required fields:
    ```json
    {
@@ -453,16 +463,16 @@ To add new categories or update mappings:
      }
    }
    ```
-3. Test with validation: `python3 scripts/validate_system.py`
-4. Regenerate README: `python3 scripts/generate_readme.py`
+3. Test with validation: `cd .publish/scripts && python3 validate_system.py`
+4. Regenerate README: `cd .publish/scripts && python3 generate_readme.py`
 
 ### Backup and Recovery
 
 Important files to backup:
-- `data/config.json` - Main configuration
-- `data/taxonomy.json` - Category definitions
+- `.publish/data/config.json` - Main configuration
+- `.publish/data/taxonomy.json` - Category definitions
 - CSV mapping files - Recipe renames
-- Templates - Custom formatting
+- `.publish/templates/` - Custom formatting templates
 
 The system is designed to be stateless and reproducible from the source repository.
 
@@ -470,7 +480,7 @@ The system is designed to be stateless and reproducible from the source reposito
 
 For issues or questions:
 
-1. **Run validation first**: `python3 scripts/validate_system.py --verbose`
+1. **Run validation first**: `cd .publish/scripts && python3 validate_system.py --verbose`
 2. **Check logs**: Enable `--verbose` flag for detailed output
 3. **Review this documentation**: Most issues are covered here
 4. **Test in isolation**: Use `--output /tmp/test.md` to avoid overwriting files
