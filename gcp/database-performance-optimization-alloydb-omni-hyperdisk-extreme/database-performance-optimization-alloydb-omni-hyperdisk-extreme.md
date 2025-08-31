@@ -634,4 +634,11 @@ Extend this solution by implementing these enhancements:
 
 ## Infrastructure Code
 
-*Infrastructure code will be generated after recipe approval.*
+### Available Infrastructure as Code:
+
+- [Infrastructure Code Overview](code/README.md) - Detailed description of all infrastructure components
+- [Deploy 20250727 112812.Log](code/deploy-20250727-112812.log/) - Deploy 20250727 112812.Log implementation
+- [Destroy 20250727 112819.Log](code/destroy-20250727-112819.log/) - Destroy 20250727 112819.Log implementation
+- [Infrastructure Manager](code/infrastructure-manager/) - GCP Infrastructure Manager templates
+- [Bash CLI Scripts](code/scripts/) - Example bash scripts using gcloud CLI commands to deploy infrastructure
+- [Terraform](code/terraform/) - Terraform configuration files
