@@ -213,9 +213,17 @@ def parse_project_entry(line: str, current_category: str, repo_base_url: str, se
     name = match.group(1).strip()
     url = match.group(2).strip()
     description_part = match.group(3).strip()
-    
+
     # Skip if no URL or it's an external link we don't want
     if not url:
+        return None
+
+    # Skip navigation links and category headers (anchors starting with #)
+    if url.startswith('#'):
+        return None
+
+    # Skip "Back to Top" and similar navigation items
+    if 'back to top' in name.lower() or name.startswith('🔝') or name.startswith('⬆'):
         return None
     
     # Build full URL if it's a relative path
