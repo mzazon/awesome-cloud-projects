@@ -24,13 +24,25 @@ The format of these recipes has been inspired by [AWS Cookbook, by O'Reilly Medi
 ## 📊 Project Statistics
 
 - **Total Projects**: 1110+- **AWS Projects**: 492- **AZURE Projects**: 268- **GCP Projects**: 350- **Categories**: 12
-- **Average Difficulty**: 2.5/4.0
+- **Average Difficulty**: 235.5/4.0
 
 ### 🏆 Most Used Services
 - **Lambda**: 217 recipes- **Cloudwatch**: 185 recipes- **Cloud Functions**: 185 recipes- **S3**: 168 recipes- **Iam**: 137 recipes
 ## 📚 Table of Contents
 
-- [🖥️ Compute & Infrastructure](#compute--infrastructure) (287 projects)- [🗄️ Storage & Data Management](#storage--data-management) (53 projects)- [🛢️ Databases & Analytics](#databases--analytics) (203 projects)- [🌐 Networking & Content Delivery](#networking--content-delivery) (77 projects)- [🔐 Security & Identity](#security--identity) (108 projects)- [🤖 AI & Machine Learning](#ai--machine-learning) (126 projects)- [🛠️ Application Development & Deployment](#application-development--deployment) (106 projects)- [📊 Monitoring & Management](#monitoring--management) (77 projects)- [🔗 Integration & Messaging](#integration--messaging) (24 projects)- [📱 IoT & Edge Computing](#iot--edge-computing) (27 projects)- [🎬 Media & Content](#media--content) (17 projects)- [🏢 Specialized Solutions](#specialized-solutions) (5 projects)
+- [🖥️ Compute & Infrastructure](#compute--infrastructure) (287 projects)
+- [🗄️ Storage & Data Management](#storage--data-management) (53 projects)
+- [🛢️ Databases & Analytics](#databases--analytics) (203 projects)
+- [🌐 Networking & Content Delivery](#networking--content-delivery) (77 projects)
+- [🔐 Security & Identity](#security--identity) (108 projects)
+- [🤖 AI & Machine Learning](#ai--machine-learning) (126 projects)
+- [🛠️ Application Development & Deployment](#application-development--deployment) (106 projects)
+- [📊 Monitoring & Management](#monitoring--management) (77 projects)
+- [🔗 Integration & Messaging](#integration--messaging) (24 projects)
+- [📱 IoT & Edge Computing](#iot--edge-computing) (27 projects)
+- [🎬 Media & Content](#media--content) (17 projects)
+- [🏢 Specialized Solutions](#specialized-solutions) (5 projects)
+
 ---
 
 ## 🖥️ Compute & Infrastructure
@@ -2436,6 +2448,8 @@ If you use these recipes in your projects, please consider:
 - 💬 **Questions**: Join our [Community Chat](#) (coming soon)
 - 📧 **Contact**: [mzazon@gmail.com](mailto:mzazon@gmail.com)
 
+## ⭐ Star History
+
 [![Star History Chart](https://api.star-history.com/svg?repos=mzazon/awesome-cloud-projects&type=Date)](https://www.star-history.com/#mzazon/awesome-cloud-projects&Date)
 
 ---
@@ -2444,7 +2458,7 @@ If you use these recipes in your projects, please consider:
 
 **[⬆ Back to Top](#-awesome-cloud-projects)**
 
-*Last updated: 2025-08-31 15:17:34 UTC*  
+*Last updated: 2025-12-06 22:44:22 UTC*  
 *Generated automatically from 1110 cloud recipes*
 
 **Made with ❤️ for the cloud community**
