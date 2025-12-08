@@ -9,6 +9,12 @@
 [![GitHub forks](https://img.shields.io/github/forks/mzazon/awesome-cloud-projects.svg?style=social&label=Fork)](https://github.com/mzazon/awesome-cloud-projects/fork)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+## CloudProjects.dev
+
+NEW (beta!): use our FREE site at [https://cloudprojects.dev/](https://cloudprojects.dev/) to search, sort, filter, group and discover cloud projects. no login, all local storage. Feedback is welcome!
+
+## Introduction
+
 Level up your cloud knowledge and experience with 1100+ cloud rojects in this repository. Get something to talk about during your next interview, see how cloud services are used together, and learn in depth by getting hands on. Real solutions from real professionals and organizations.
 
 _A collection of cloud architecture recipes, tutorials, and real-world solutions across Amazon Web Services (AWS), Microsoft Azure, and Google Cloud Platform (GCP)._
