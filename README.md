@@ -29,7 +29,7 @@ The format of these recipes has been inspired by [AWS Cookbook, by O'Reilly Medi
 ## 📊 Project Statistics
 
 - **Total Projects**: 1110+- **AWS Projects**: 492- **AZURE Projects**: 268- **GCP Projects**: 350- **Categories**: 12
-- **Average Difficulty**: 235.5/4.0
+- **Average Difficulty**: 235.5/400
 
 ### 🏆 Most Used Services
 - **Lambda**: 217 recipes- **Cloudwatch**: 185 recipes- **Cloud Functions**: 185 recipes- **S3**: 168 recipes- **Iam**: 137 recipes
@@ -2463,7 +2463,7 @@ If you use these recipes in your projects, please consider:
 
 **[⬆ Back to Top](#-awesome-cloud-projects)**
 
-*Last updated: 2025-12-12 13:44:16 UTC*  
+*Last updated: 2025-12-12 16:13:35 UTC*  
 *Generated automatically from 1110 cloud recipes*
 
 **Made with ❤️ for the cloud community**
