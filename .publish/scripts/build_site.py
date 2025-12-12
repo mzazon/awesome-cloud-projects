@@ -49,7 +49,7 @@ def validate_project(project: dict, index: int) -> list[str]:
             errors.append(f"Project {index}: invalid provider '{project['provider']}' (must be one of {valid_providers})")
 
     if 'difficulty' in project:
-        valid_difficulties = ['beginner', 'intermediate', 'advanced']
+        valid_difficulties = ['beginner', 'intermediate', 'advanced', 'expert']
         if project['difficulty'] not in valid_difficulties:
             errors.append(f"Project {index}: invalid difficulty '{project['difficulty']}' (must be one of {valid_difficulties})")
 
