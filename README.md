@@ -1,12 +1,11 @@
-# 🌟 Awesome Cloud Projects
+![Cloud Projects](.publish/docs/og-image.png?raw=true "Cloud Projects")
 
-[![Awesome](https://awesome.re/badge.svg)](https://awesome.re)
-[![Total projects](https://img.shields.io/badge/Total_Projects-1103-blue)](https://github.com/mzazon/awesome-cloud-projects)
-[![AWS projects](https://img.shields.io/badge/AWS-492-orange)](https://github.com/mzazon/awesome-cloud-projects/tree/main/aws)
-[![Azure projects](https://img.shields.io/badge/Azure-268-0078d4)](https://github.com/mzazon/awesome-cloud-projects/tree/main/azure)
-[![GCP projects](https://img.shields.io/badge/GCP-350-DB4437)](https://github.com/mzazon/awesome-cloud-projects/tree/main/gcp)
-[![GitHub stars](https://img.shields.io/github/stars/mzazon/awesome-cloud-projects.svg?style=social&label=Star)](https://github.com/mzazon/awesome-cloud-projects)
-[![GitHub forks](https://img.shields.io/github/forks/mzazon/awesome-cloud-projects.svg?style=social&label=Fork)](https://github.com/mzazon/awesome-cloud-projects/fork)
+[![Total projects](https://img.shields.io/badge/Total_Projects-1103-blue)](https://github.com/mzazon/cloud-projects)
+[![AWS projects](https://img.shields.io/badge/AWS-492-orange)](https://github.com/mzazon/cloud-projects/tree/main/aws)
+[![Azure projects](https://img.shields.io/badge/Azure-268-0078d4)](https://github.com/mzazon/cloud-projects/tree/main/azure)
+[![GCP projects](https://img.shields.io/badge/GCP-350-DB4437)](https://github.com/mzazon/cloud-projects/tree/main/gcp)
+[![GitHub stars](https://img.shields.io/github/stars/mzazon/cloud-projects.svg?style=social&label=Star)](https://github.com/mzazon/cloud-projects)
+[![GitHub forks](https://img.shields.io/github/forks/mzazon/cloud-projects.svg?style=social&label=Fork)](https://github.com/mzazon/cloud-projects/fork)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## CloudProjects.dev
@@ -2464,7 +2463,7 @@ If you use these recipes in your projects, please consider:
 
 **[⬆ Back to Top](#-awesome-cloud-projects)**
 
-*Last updated: 2025-12-06 22:44:22 UTC*  
+*Last updated: 2025-12-12 08:43:03 UTC*  
 *Generated automatically from 1110 cloud recipes*
 
 **Made with ❤️ for the cloud community**
